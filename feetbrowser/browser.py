@@ -736,6 +736,9 @@ class Browser:
         self.active_tab = None
         self.focus = None  # "address" or None
         self.address_text = ""
+        self.address_caret = 0
+        self.address_sel = None  # (start, end) while selecting, else None
+        self.address_view = 0  # horizontal scroll offset in px
         self._resize_after = None
         self._last_size = (WIDTH, HEIGHT)
 
@@ -765,6 +768,8 @@ class Browser:
         w = self.window
         w.bind("<Down>", self._on_down)
         w.bind("<Up>", self._on_up)
+        w.bind("<Left>", self._on_left)
+        w.bind("<Right>", self._on_right)
         w.bind("<Home>", self._on_home_key)
         w.bind("<End>", self._on_end_key)
         w.bind("<Prior>", lambda e: self._scroll(-SCROLL_STEP * 4))
@@ -775,11 +780,13 @@ class Browser:
         w.bind("<Button-4>", lambda e: self._scroll(-SCROLL_STEP))
         w.bind("<Button-5>", lambda e: self._scroll(SCROLL_STEP))
         w.bind("<Button-1>", self._on_click)
+        w.bind("<B1-Motion>", self._on_drag)
         w.bind("<Button-2>", self._on_middle_click)
         w.bind("<Motion>", self._on_motion)
         w.bind("<Key>", self._on_key)
         w.bind("<Return>", self._on_enter)
         w.bind("<BackSpace>", self._on_backspace)
+        w.bind("<Delete>", self._on_delete)
         w.bind("<Escape>", self._on_escape)
         w.bind("<Configure>", self._on_resize)
         w.bind("<Control-l>", lambda e: self._focus_address())
@@ -862,10 +869,24 @@ class Browser:
         self.draw()
 
     def _on_down(self, e):
+        if self.focus == "address":
+            return
         self._scroll(SCROLL_STEP)
 
     def _on_up(self, e):
+        if self.focus == "address":
+            return
         self._scroll(-SCROLL_STEP)
+
+    def _on_left(self, e):
+        if self.focus == "address":
+            self._address_move_caret(-1, extend=bool(e.state & 0x1))
+            self.draw()
+
+    def _on_right(self, e):
+        if self.focus == "address":
+            self._address_move_caret(1, extend=bool(e.state & 0x1))
+            self.draw()
 
     def _on_wheel(self, e):
         self._scroll(-e.delta if abs(e.delta) < 30 else -int(e.delta / 30) * SCROLL_STEP)
@@ -876,19 +897,32 @@ class Browser:
             self.draw()
 
     def _on_home_key(self, e):
-        if self.focus != "address" and self.active_tab:
+        if self.focus == "address":
+            self.address_caret = 0
+            self.address_sel = None
+            self._address_ensure_visible()
+            self.draw()
+            return
+        if self.active_tab:
             self.active_tab.scroll = 0
             self.draw()
 
     def _on_end_key(self, e):
-        if self.focus != "address" and self.active_tab:
+        if self.focus == "address":
+            self.address_caret = len(self.address_text)
+            self.address_sel = None
+            self._address_ensure_visible()
+            self.draw()
+            return
+        if self.active_tab:
             self.active_tab.scroll_by(10 ** 9)
             self.draw()
 
     def _on_click(self, e):
+        was_address = self.focus == "address"
         self.focus = None
         if e.y < self.chrome_height():
-            self._chrome_click(e.x, e.y)
+            self._chrome_click(e.x, e.y, was_address)
             return
         if not self.active_tab:
             return
@@ -911,7 +945,17 @@ class Browser:
         elif dest:
             self.new_tab(str(dest))
 
-    def _chrome_click(self, x, y):
+    def _on_drag(self, e):
+        if self.focus == "address" and e.x >= self._address_bar_x() - 10:
+            if self.address_sel is None:
+                self.address_sel = (self.address_caret, self.address_caret)
+            anchor = self.address_sel[0]
+            self.address_caret = self._caret_from_x(e.x)
+            self.address_sel = (anchor, self.address_caret)
+            self._address_ensure_visible()
+            self.draw()
+
+    def _chrome_click(self, x, y, was_address=False):
         # Toe chrome bands (above the tabs).
         bands = self.chrome_bands()
         band_h = toes.band_height(bands)
@@ -963,9 +1007,11 @@ class Browser:
         # Address bar.
         if x >= 136 + self._toe_buttons_offset():
             self.focus = "address"
-            self.address_text = str(self.active_tab.url) if \
-                (self.active_tab and self.active_tab.url and
-                 not isinstance(self.active_tab.url, _AboutURL)) else ""
+            if not was_address:
+                self._address_reset_from_tab()
+            self._set_address_caret_from_x(x)
+            self.address_sel = None
+            self._address_ensure_visible()
             self.draw()
 
     def _on_motion(self, e):
@@ -985,9 +1031,7 @@ class Browser:
 
     def _on_key(self, e):
         if self.focus == "address":
-            if len(e.char) == 1 and ord(e.char) >= 32 and e.char.isprintable():
-                self.address_text += e.char
-                self.draw()
+            self._address_key(e)
             return
         # Toes get first crack at keys when no address bar has focus.
         if toes.dispatch(self.toe_contexts, "on_keypress", e):
@@ -1000,11 +1044,170 @@ class Browser:
 
     def _on_backspace(self, e):
         if self.focus == "address":
-            self.address_text = self.address_text[:-1]
+            self._address_backspace()
             self.draw()
             return
         if self.active_tab and self.active_tab.delete_char():
             self.draw()
+
+    def _on_delete(self, e):
+        if self.focus == "address":
+            self._address_forward_delete()
+            self.draw()
+
+    def _address_key(self, e):
+        ctrl = bool(getattr(e, "state", 0) & 0x4)
+        if ctrl:
+            k = getattr(e, "keysym", "").lower()
+            if k == "a":
+                self._address_select_all()
+                self.draw()
+                return
+            if k == "c":
+                self._address_copy()
+                return
+            if k == "x":
+                self._address_cut()
+                self.draw()
+                return
+            if k == "v":
+                self._address_paste()
+                self.draw()
+                return
+            if k == "u":
+                self.address_text = ""
+                self.address_caret = 0
+                self.address_sel = None
+                self._address_ensure_visible()
+                self.draw()
+                return
+        if len(e.char) == 1 and ord(e.char) >= 32 and e.char.isprintable():
+            self._address_insert(e.char)
+            self.draw()
+
+    def _address_bar_x(self):
+        """Canvas x where the address-bar text starts (after toe buttons)."""
+        return 136 + self._toe_buttons_offset() + 10
+
+    def _address_reset_from_tab(self):
+        url = str(self.active_tab.url) if \
+            (self.active_tab and self.active_tab.url and
+             not isinstance(self.active_tab.url, _AboutURL)) else ""
+        self.address_text = url
+        self.address_caret = len(url)
+        self.address_sel = None
+        self.address_view = 0
+
+    def _caret_from_x(self, x):
+        """Index of the address-bar caret under a canvas x coordinate."""
+        font = self.chrome_font
+        text = self.address_text
+        rel = max(0.0, x - self._address_bar_x() + self.address_view)
+        i = 0
+        while i < len(text) and font.measure(text[:i + 1]) <= rel:
+            i += 1
+        return i
+
+    def _set_address_caret_from_x(self, x):
+        self.address_caret = self._caret_from_x(x)
+
+    def _address_selection(self):
+        if self.address_sel is None:
+            return None
+        s, e = self.address_sel
+        s = max(0, min(s, len(self.address_text)))
+        e = max(0, min(e, len(self.address_text)))
+        if s == e:
+            return None
+        return (s, e) if s < e else (e, s)
+
+    def _address_delete_selection(self):
+        sel = self._address_selection()
+        if sel is None:
+            return False
+        s, e = sel
+        self.address_text = self.address_text[:s] + self.address_text[e:]
+        self.address_caret = s
+        self.address_sel = None
+        return True
+
+    def _address_insert(self, text):
+        self._address_delete_selection()
+        self.address_text = (self.address_text[:self.address_caret] + text
+                             + self.address_text[self.address_caret:])
+        self.address_caret += len(text)
+        self.address_sel = None
+        self._address_ensure_visible()
+
+    def _address_backspace(self):
+        if self._address_delete_selection():
+            return
+        if self.address_caret > 0:
+            self.address_text = (self.address_text[:self.address_caret - 1]
+                                 + self.address_text[self.address_caret:])
+            self.address_caret -= 1
+            self._address_ensure_visible()
+
+    def _address_forward_delete(self):
+        if self._address_delete_selection():
+            return
+        if self.address_caret < len(self.address_text):
+            self.address_text = (self.address_text[:self.address_caret]
+                                 + self.address_text[self.address_caret + 1:])
+            self._address_ensure_visible()
+
+    def _address_select_all(self):
+        self.address_caret = len(self.address_text)
+        self.address_sel = (0, len(self.address_text))
+        self._address_ensure_visible()
+
+    def _address_move_caret(self, delta, extend=False):
+        lo, hi = 0, len(self.address_text)
+        if extend:
+            if self.address_sel is None:
+                self.address_sel = (self.address_caret, self.address_caret)
+            anchor = self.address_sel[0]
+            self.address_caret = max(lo, min(hi, self.address_caret + delta))
+            self.address_sel = (anchor, self.address_caret)
+        else:
+            self.address_caret = max(lo, min(hi, self.address_caret + delta))
+            self.address_sel = None
+        self._address_ensure_visible()
+
+    def _address_copy(self):
+        sel = self._address_selection()
+        if sel is None:
+            return
+        s, e = sel
+        try:
+            self.window.clipboard_clear()
+            self.window.clipboard_append(self.address_text[s:e])
+        except tkinter.TclError:
+            pass
+
+    def _address_cut(self):
+        if self._address_selection() is None:
+            return
+        self._address_copy()
+        self._address_delete_selection()
+
+    def _address_paste(self):
+        try:
+            data = self.window.clipboard_get()
+        except tkinter.TclError:
+            return
+        if data:
+            self._address_insert(data)
+
+    def _address_ensure_visible(self):
+        """Horizontal scroll of the address text so the caret stays in view."""
+        font = self.chrome_font
+        caret_x = font.measure(self.address_text[:self.address_caret])
+        box_w = max(40, self.canvas.winfo_width() - 8 - self._address_bar_x() - 8)
+        if caret_x < self.address_view:
+            self.address_view = max(0, caret_x - 8)
+        elif caret_x > self.address_view + box_w:
+            self.address_view = caret_x - box_w + 8
 
     def _on_escape(self, e):
         if self.focus == "address":
@@ -1062,9 +1265,7 @@ class Browser:
         self.focus = "address"
         if self.active_tab:
             self.active_tab.blur_input()
-        self.address_text = str(self.active_tab.url) if \
-            (self.active_tab and self.active_tab.url and
-             not isinstance(self.active_tab.url, _AboutURL)) else ""
+        self._address_reset_from_tab()
         self.draw()
 
     def _back(self):
@@ -1177,22 +1378,73 @@ class Browser:
                            outline="#3b82f6" if self.focus == "address" else "#999",
                            fill="white", width=2 if self.focus == "address" else 1)
         if self.focus == "address":
-            text = self.address_text
-            c.create_text(addr_x + 10, top + 60, text=text, anchor="w",
-                          font=self.chrome_font, fill="#111")
-            w = self.chrome_font.measure(text)
-            c.create_line(addr_x + 12 + w, top + 52, addr_x + 12 + w,
-                          top + 68, fill="#111")
-            ph = "Type a URL or search term…" if not text else ""
-            if ph:
-                c.create_text(addr_x + 12, top + 60, text=ph, anchor="w",
-                              font=self.chrome_font, fill="#aaa")
+            self._draw_address_editor(c, addr_x, top)
         else:
             url = ""
             if tab and tab.url and not isinstance(tab.url, _AboutURL):
                 url = str(tab.url)
             c.create_text(addr_x + 10, top + 60, text=url, anchor="w",
                           font=self.chrome_font, fill="#111")
+
+    def _draw_address_editor(self, c, addr_x, top):
+        """Paint the focused address bar: text (with horizontal scroll),
+        selection highlight, and the caret."""
+        font = self.chrome_font
+        text = self.address_text
+        x0 = addr_x + 10
+        x1 = c.winfo_width() - 16
+        if x1 - x0 < 30:
+            x1 = x0 + 30
+        sel = self._address_selection()
+        view = self.address_view
+
+        if not text:
+            c.create_text(x0, top + 60, text="Type a URL or search term…",
+                          anchor="w", font=font, fill="#aaa")
+            c.create_line(x0, top + 52, x0, top + 68, fill="#111")
+            return
+
+        def char_x(i):
+            return x0 + (font.measure(text[:i]) - view)
+
+        # Visible slice of the text.
+        start = 0
+        while start < len(text) and font.measure(text[:start + 1]) <= view:
+            start += 1
+        end = start
+        while end < len(text) and font.measure(text[start:end + 1]) <= (x1 - x0):
+            end += 1
+        if self.address_caret < start:
+            start = self.address_caret
+        if self.address_caret > end:
+            end = self.address_caret
+
+        # Selection highlight.
+        if sel is not None and sel[1] > start and sel[0] < end:
+            c.create_rectangle(char_x(max(start, sel[0])), top + 51,
+                               char_x(min(end, sel[1])), top + 69,
+                               fill="#1a73e8", width=0)
+
+        y = top + 60
+        if sel is not None and sel[0] < end and sel[1] > start:
+            s1, s2 = max(start, sel[0]), min(end, sel[1])
+            part1, part2, part3 = text[start:s1], text[s1:s2], text[s2:end]
+            if part1:
+                c.create_text(char_x(start), y, text=part1, anchor="w",
+                              font=font, fill="#111")
+            if part2:
+                c.create_text(char_x(s1), y, text=part2, anchor="w",
+                              font=font, fill="white")
+            if part3:
+                c.create_text(char_x(s2), y, text=part3, anchor="w",
+                              font=font, fill="#111")
+        else:
+            c.create_text(char_x(start), y, text=text[start:end], anchor="w",
+                          font=font, fill="#111")
+
+        # Caret.
+        cx = char_x(self.address_caret)
+        c.create_line(cx, top + 52, cx, top + 68, fill="#111")
 
     def _toe_buttons(self):
         return [btn for ctx in self.toe_contexts
