@@ -10,6 +10,8 @@ second canvas so the whole browser really is "from scratch".
 
 import os
 import sys
+import json
+import html
 import threading
 import tkinter
 import urllib.parse
@@ -26,6 +28,7 @@ from . import toes as toes
 WIDTH, HEIGHT = 1000, 720
 SCROLL_STEP = 80
 CHROME_HEIGHT = 80  # tabs + address bar
+BOOKMARKS_FILE = os.path.expanduser("~/.feetbrowser_bookmarks.json")
 MAX_CACHED_IMAGES = 300
 
 # Deeply nested documents walk DOM/layout trees recursively; give Python a
@@ -769,6 +772,7 @@ class Browser:
         self.active_tab = None
         self.focus = None  # "address" or None
         self.address_text = ""
+        self.bookmarks = self._load_bookmarks()
         self.address_caret = 0
         self.address_sel = None  # (start, end) while selecting, else None
         self.address_view = 0  # horizontal scroll offset in px
@@ -801,12 +805,12 @@ class Browser:
         w = self.window
         w.bind("<Down>", self._on_down)
         w.bind("<Up>", self._on_up)
+        w.bind("<Next>", self._on_page_down)   # PageDown
+        w.bind("<Prior>", self._on_page_up)    # PageUp
         w.bind("<Left>", self._on_left)
         w.bind("<Right>", self._on_right)
-        w.bind("<Home>", self._on_home_key)
-        w.bind("<End>", self._on_end_key)
-        w.bind("<Prior>", lambda e: self._scroll(-SCROLL_STEP * 4))
-        w.bind("<Next>", lambda e: self._scroll(SCROLL_STEP * 4))
+        w.bind("<Home>", self._on_home)
+        w.bind("<End>", self._on_end)
         w.bind("<Control-Home>", self._on_home_key)
         w.bind("<Control-End>", self._on_end_key)
         w.bind("<MouseWheel>", self._on_wheel)
@@ -826,8 +830,10 @@ class Browser:
         w.bind("<Control-t>", lambda e: self.new_tab("about:blank"))
         w.bind("<Control-w>", lambda e: self.close_tab())
         w.bind("<Control-r>", lambda e: self._reload())
-        w.bind("<Control-h>", lambda e: self._home())
-        w.bind("<Control-Tab>", lambda e: self._next_tab(1))
+        w.bind("<Control-d>", lambda e: self._toggle_bookmark())
+        w.bind("<Control-h>", lambda e: self._open_history_page())
+        w.bind("<Control-Tab>", lambda e: self._cycle_tab(1))
+        w.bind("<Control-ISO_Left_Tab>", lambda e: self._cycle_tab(-1))
         w.bind("<Control-Prior>", lambda e: self._next_tab(-1))
         w.bind("<Control-Next>", lambda e: self._next_tab(1))
         w.bind("<Alt-Left>", lambda e: self._back())
@@ -851,11 +857,12 @@ class Browser:
 
     def new_tab(self, url):
         tab = Tab(self.tab_height(), self)
-        if url == "about:blank":
-            tab.load(_AboutURL())  # routes welcome page through the full pipeline
+        page = self._coerce_url(url)
+        if isinstance(page, _AboutURL):
+            tab.load(page)  # routes welcome page through the full pipeline
             tab.status = "Type a URL and press Enter"
         else:
-            tab.load(url)
+            tab.load(page)
         self.tabs.append(tab)
         self.active_tab = tab
         toes.dispatch(self.toe_contexts, "on_new_tab")
@@ -920,6 +927,33 @@ class Browser:
         if self.focus == "address":
             self._address_move_caret(1, extend=bool(e.state & 0x1))
             self.draw()
+
+    def _on_page_down(self, e):
+        if self.focus == "address":
+            return
+        self._scroll(max(1, self.tab_height() - 120))
+        return "break"
+
+    def _on_page_up(self, e):
+        if self.focus == "address":
+            return
+        self._scroll(-max(1, self.tab_height() - 120))
+        return "break"
+
+    def _on_home(self, e):
+        if self.focus == "address" or not self.active_tab:
+            return
+        self.active_tab.scroll = 0
+        self.draw()
+        return "break"
+
+    def _on_end(self, e):
+        if self.focus == "address" or not self.active_tab:
+            return
+        self.active_tab.scroll = self.active_tab.content_height()
+        self.active_tab._clamp_scroll()
+        self.draw()
+        return "break"
 
     def _on_wheel(self, e):
         self._scroll(-e.delta if abs(e.delta) < 30 else -int(e.delta / 30) * SCROLL_STEP)
@@ -1037,8 +1071,13 @@ class Browser:
                 self.draw()
                 return
             bx += 30
+        # Bookmark star (after toe buttons).
+        star_x = 136 + self._toe_buttons_offset()
+        if star_x <= x < star_x + 26 and band_h + 48 <= y < band_h + 72:
+            self._toggle_bookmark()
+            return
         # Address bar.
-        if x >= 136 + self._toe_buttons_offset():
+        if x >= 136 + self._toe_buttons_offset() + 30:
             self.focus = "address"
             if not was_address:
                 self._address_reset_from_tab()
@@ -1119,8 +1158,9 @@ class Browser:
             self.draw()
 
     def _address_bar_x(self):
-        """Canvas x where the address-bar text starts (after toe buttons)."""
-        return 136 + self._toe_buttons_offset() + 10
+        """Canvas x where the address-bar text starts (after toe buttons
+        and the bookmark star)."""
+        return 136 + self._toe_buttons_offset() + 30 + 10
 
     def _address_reset_from_tab(self):
         url = str(self.active_tab.url) if \
@@ -1267,7 +1307,7 @@ class Browser:
                     query = "https://" + query
                 dest = query
             if self.active_tab:
-                self._navigate(self.active_tab, dest)
+                self._navigate(self.active_tab, self._coerce_url(dest))
             return
         # Enter in a focused form field submits its form.
         if self.active_tab and self.active_tab.focused_input:
@@ -1300,6 +1340,101 @@ class Browser:
             self.active_tab.blur_input()
         self._address_reset_from_tab()
         self.draw()
+
+    @staticmethod
+    def _bookmark_key(url):
+        if not url or isinstance(url, (_AboutURL, _BookmarksURL)):
+            return None
+        return str(url)
+
+    def _is_bookmarked(self, url):
+        key = self._bookmark_key(url)
+        return bool(key and key in self.bookmarks)
+
+    def _toggle_bookmark(self):
+        if not self.active_tab:
+            return
+        key = self._bookmark_key(self.active_tab.url)
+        if not key:
+            self.active_tab.status = "This page can't be bookmarked"
+            self.draw()
+            return
+        if key in self.bookmarks:
+            self.bookmarks.remove(key)
+            self.active_tab.status = "Bookmark removed"
+        else:
+            self.bookmarks.append(key)
+            self.active_tab.status = "Bookmarked"
+        self._save_bookmarks()
+        self.draw()
+
+    def _history_snapshot(self):
+        tab = self.active_tab
+        if not tab:
+            return {"back": [], "current": "", "forward": []}
+        return {
+            "back": [str(url) for url, _scroll in tab.history],
+            "current": str(tab.url) if tab.url else "",
+            "forward": [str(url) for url, _scroll in reversed(tab.future)],
+        }
+
+    def _open_history_page(self):
+        if self.active_tab:
+            self.active_tab.load(self._coerce_url("about:history"))
+            self.draw()
+
+    def _cycle_tab(self, step):
+        if not self.tabs or not self.active_tab:
+            return "break"
+        i = self.tabs.index(self.active_tab)
+        self.active_tab = self.tabs[(i + step) % len(self.tabs)]
+        self.draw()
+        return "break"
+
+    def _coerce_url(self, raw):
+        if not isinstance(raw, str):
+            return raw
+        text = raw.strip().lower()
+        if text in ("about:blank", "about:newtab"):
+            return _AboutURL(lambda: list(self.bookmarks))
+        if text == "about:bookmarks":
+            return _BookmarksURL(lambda: list(self.bookmarks))
+        if text == "about:history":
+            return _HistoryURL(self._history_snapshot)
+        return raw
+
+    @staticmethod
+    def _sanitize_bookmarks(values):
+        if not isinstance(values, list):
+            return []
+        out = []
+        seen = set()
+        for item in values:
+            if not isinstance(item, str):
+                continue
+            value = item.strip()
+            if not value or value.startswith("about:"):
+                continue
+            if value in seen:
+                continue
+            seen.add(value)
+            out.append(value)
+        return out
+
+    def _load_bookmarks(self):
+        try:
+            with open(BOOKMARKS_FILE, "r", encoding="utf8") as f:
+                data = json.load(f)
+            return self._sanitize_bookmarks(data)
+        except (OSError, json.JSONDecodeError):
+            return []
+
+    def _save_bookmarks(self):
+        try:
+            with open(BOOKMARKS_FILE, "w", encoding="utf8") as f:
+                json.dump(self.bookmarks, f, indent=2)
+        except OSError:
+            pass
 
     def _back(self):
         if self.active_tab:
@@ -1404,9 +1539,12 @@ class Browser:
         btn(40, "›", bool(tab and tab.future))
         btn(72, "⟳", bool(tab))
         btn(104, "⌂", bool(tab))
+        marked = bool(tab and self._is_bookmarked(tab.url))
+        btn(136 + self._toe_buttons_offset(), "★" if marked else "☆",
+            bool(tab))
 
-        # Address bar.
-        addr_x = 136 + self._toe_buttons_offset()
+        # Address bar (after the toe buttons and bookmark star).
+        addr_x = 136 + self._toe_buttons_offset() + 30
         c.create_rectangle(addr_x, top + 48, c.winfo_width() - 8, top + 72,
                            outline="#3b82f6" if self.focus == "address" else "#999",
                            fill="white", width=2 if self.focus == "address" else 1)
@@ -1657,7 +1795,16 @@ class _AboutURL:
     view_source = False
     fragment = ""
 
+    def __init__(self, bookmarks_provider=None):
+        self.bookmarks_provider = bookmarks_provider
+
     def resolve(self, url):
+        if url == "about:blank":
+            return _AboutURL(self.bookmarks_provider)
+        if url == "about:bookmarks":
+            return _BookmarksURL(self.bookmarks_provider)
+        if url == "about:history":
+            return _HistoryURL(lambda: {"back": [], "current": "", "forward": []})
         return URL(url) if "://" in url else URL("https://" + url)
 
     def request(self, payload=None):
@@ -1665,6 +1812,116 @@ class _AboutURL:
 
     def __str__(self):
         return "about:blank"
+
+
+class _BookmarksURL:
+    """Internal URL for the bookmarks page."""
+    view_source = False
+    fragment = ""
+
+    def __init__(self, bookmarks_provider=None):
+        self.bookmarks_provider = bookmarks_provider or (lambda: [])
+
+    def resolve(self, url):
+        if url == "about:blank":
+            return _AboutURL(self.bookmarks_provider)
+        if url == "about:bookmarks":
+            return _BookmarksURL(self.bookmarks_provider)
+        if url == "about:history":
+            return _HistoryURL(lambda: {"back": [], "current": "", "forward": []})
+        return URL(url) if "://" in url else URL("https://" + url)
+
+    def request(self, payload=None):
+        return {}, bookmarks_html(self.bookmarks_provider()), "text/html"
+
+    def __str__(self):
+        return "about:bookmarks"
+
+
+class _HistoryURL:
+    """Internal URL for the current tab's history page."""
+    view_source = False
+    fragment = ""
+
+    def __init__(self, snapshot_provider=None):
+        self.snapshot_provider = snapshot_provider or (
+            lambda: {"back": [], "current": "", "forward": []})
+
+    def resolve(self, url):
+        if url == "about:blank":
+            return _AboutURL()
+        if url == "about:bookmarks":
+            return _BookmarksURL()
+        if url == "about:history":
+            return _HistoryURL(self.snapshot_provider)
+        return URL(url) if "://" in url else URL("https://" + url)
+
+    def request(self, payload=None):
+        return {}, history_html(self.snapshot_provider()), "text/html"
+
+    def __str__(self):
+        return "about:history"
+
+
+def bookmarks_html(bookmarks):
+    items = []
+    for entry in bookmarks:
+        safe = html.escape(entry, quote=True)
+        items.append(f'<li><a href="{safe}">{safe}</a></li>')
+    listing = "\n".join(items) if items else "<li>No bookmarks yet.</li>"
+    return f"""
+<!doctype html>
+<html><head><title>Bookmarks</title>
+<style>
+  body {{ font-family: Helvetica; margin: 60px; color: #222; }}
+  h1 {{ font-size: 40px; color: #1a73e8; }}
+  .sub {{ color: #666; font-size: 18px; }}
+  li {{ margin-top: 8px; }}
+  a {{ color: #1a73e8; word-break: break-all; }}
+</style></head>
+<body>
+  <h1>Bookmarks</h1>
+  <p class="sub">Saved pages from Ctrl-D or the star button.</p>
+  <ul>{listing}</ul>
+</body></html>
+"""
+
+
+def history_html(snapshot):
+    back_items = []
+    for url in snapshot.get("back", []):
+        safe = html.escape(url, quote=True)
+        back_items.append(f'<li><a href="{safe}">{safe}</a></li>')
+    current = html.escape(snapshot.get("current", "") or "(none)", quote=True)
+    forward_items = []
+    for url in snapshot.get("forward", []):
+        safe = html.escape(url, quote=True)
+        forward_items.append(f'<li><a href="{safe}">{safe}</a></li>')
+    back_list = "\n".join(back_items) if back_items else "<li>None</li>"
+    forward_list = "\n".join(forward_items) if forward_items else "<li>None</li>"
+    return f"""
+<!doctype html>
+<html><head><title>History</title>
+<style>
+  body {{ font-family: Helvetica; margin: 60px; color: #222; }}
+  h1 {{ font-size: 40px; color: #1a73e8; }}
+  h2 {{ margin-top: 30px; }}
+  .sub {{ color: #666; font-size: 18px; }}
+  li {{ margin-top: 8px; }}
+  a {{ color: #1a73e8; word-break: break-all; }}
+  .current {{ background: #f0f4ff; padding: 10px; border-left: 4px solid #1a73e8; }}
+</style></head>
+<body>
+  <h1>History</h1>
+  <p class="sub">Current tab timeline. Open with <b>Ctrl-H</b>.</p>
+  <h2>Back stack (oldest → newest)</h2>
+  <ul>{back_list}</ul>
+  <h2>Current page</h2>
+  <p class="current">{current}</p>
+  <h2>Forward stack (next first)</h2>
+  <ul>{forward_list}</ul>
+</body></html>
+"""
 
 
 WELCOME_HTML = """
@@ -1689,6 +1946,8 @@ WELCOME_HTML = """
     <li><a href="https://info.cern.ch/hypertext/WWW/TheProject.html">the first web page ever</a></li>
     <li><a href="https://news.ycombinator.com">Hacker News</a></li>
     <li><a href="https://en.wikipedia.org/wiki/Web_browser">Wikipedia: Web browser</a></li>
+    <li><a href="about:bookmarks">about:bookmarks</a> — your saved pages</li>
+    <li><a href="about:history">about:history</a> — back/forward timeline</li>
     <li><a href="view-source:https://example.com">view-source:example.com</a></li>
   </ul>
   <h3>Your toes</h3>
@@ -1701,8 +1960,8 @@ WELCOME_HTML = """
   <ul>
     <li><b>Ctrl-L</b> focus address bar &nbsp; <b>Ctrl-T</b> new tab &nbsp;
         <b>Ctrl-W</b> close tab &nbsp; <b>Ctrl-Tab</b> / <b>Ctrl-PgUp/Dn</b> cycle tabs</li>
-    <li><b>Ctrl-R</b> reload &nbsp; <b>Ctrl-H</b> / <b>⌂</b> home &nbsp;
-        <b>Alt-Left/Right</b> back / forward</li>
+    <li><b>Ctrl-R</b> reload &nbsp; <b>Ctrl-D</b> bookmark page &nbsp;
+        <b>Ctrl-H</b> history &nbsp; <b>Alt-Left/Right</b> back / forward</li>
     <li><b>↑ ↓ / wheel</b> scroll &nbsp; <b>PgUp/Dn</b> scroll by page &nbsp;
         <b>Home / End</b> jump to top / bottom &nbsp; <b>Esc</b> blur</li>
     <li><b>Middle-click</b> or <b>Ctrl-click</b> a link to open it in a new tab</li>

@@ -5,9 +5,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from feetbrowser.net import URL
 from feetbrowser.htmlparser import HTMLParser, Element, Text
 from feetbrowser.cssparser import CSSParser, style
-from feetbrowser.browser import (Tab, Browser, _AboutURL, tree_to_list,
-                                  find_base_href, FormAction)
 from feetbrowser.layout import DrawText
+from feetbrowser.browser import (
+    Tab, Browser, _AboutURL, _BookmarksURL, _HistoryURL,
+    bookmarks_html, history_html, tree_to_list, find_base_href, FormAction
+)
 
 
 def eq(a, b, msg=""):
@@ -102,6 +104,102 @@ def test_welcome_and_reload():
     # Reloading an internal page must not crash (regression test).
     tab.load(tab.url, push=False)
     eq(tab.title, "New Tab", "welcome reloads cleanly")
+
+
+def test_bookmarks_internal_page():
+    bookmarks = ["https://example.org", "https://info.cern.ch/hypertext/WWW/TheProject.html"]
+    tab = Tab(700)
+    tab.load(_BookmarksURL(lambda: bookmarks))
+    eq(tab.title, "Bookmarks", "bookmarks title")
+    links = [n for n in tree_to_list(tab.nodes, []) if isinstance(n, Element)
+             and n.tag == "a"]
+    hrefs = [n.attributes.get("href", "") for n in links]
+    assert bookmarks[0] in hrefs
+
+
+def test_bookmarks_html_escapes():
+    page = bookmarks_html(['https://x.test/?q=<script>alert(1)</script>'])
+    assert "<script>" not in page
+    assert "&lt;script&gt;" in page
+
+
+def test_about_page_can_resolve_bookmarks():
+    about = _AboutURL(lambda: ["https://example.org"])
+    dest = about.resolve("about:bookmarks")
+    assert isinstance(dest, _BookmarksURL)
+    _h, body, _c = dest.request()
+    nodes = HTMLParser(body).parse()
+    links = [n for n in tree_to_list(nodes, []) if isinstance(n, Element)
+             and n.tag == "a"]
+    assert links and links[0].attributes.get("href") == "https://example.org"
+
+
+def test_about_page_can_resolve_history():
+    about = _AboutURL(lambda: [])
+    dest = about.resolve("about:history")
+    assert isinstance(dest, _HistoryURL)
+    _h, body, _c = dest.request()
+    assert "<title>History</title>" in body
+
+
+def test_history_html_escapes():
+    page = history_html({
+        "back": ['https://x.test/?q=<script>alert(1)</script>'],
+        "current": "https://safe.test/",
+        "forward": [],
+    })
+    assert "<script>" not in page
+    assert "&lt;script&gt;" in page
+
+
+def test_history_internal_page_loads():
+    tab = Tab(700)
+    tab.load(_AboutURL())
+    tab.load(_BookmarksURL(lambda: ["https://example.org"]))
+    tab.load(_HistoryURL(lambda: {
+        "back": ["https://example.org"],
+        "current": "about:history",
+        "forward": ["https://news.ycombinator.com"],
+    }))
+    eq(tab.title, "History", "history title")
+    links = [n for n in tree_to_list(tab.nodes, []) if isinstance(n, Element)
+             and n.tag == "a"]
+    hrefs = {n.attributes.get("href", "") for n in links}
+    expected = {"https://example.org", "https://news.ycombinator.com"}
+    assert expected.issubset(hrefs)
+
+
+def test_browser_tab_cycle_wraps():
+    tabs = [object(), object(), object()]
+    stub = type("Stub", (), {})()
+    stub.tabs = tabs
+    stub.active_tab = tabs[0]
+    stub.draw_calls = 0
+
+    def draw():
+        stub.draw_calls += 1
+    stub.draw = draw
+
+    Browser._cycle_tab(stub, 1)
+    assert stub.active_tab is tabs[1]
+    Browser._cycle_tab(stub, 1)
+    assert stub.active_tab is tabs[2]
+    Browser._cycle_tab(stub, 1)
+    assert stub.active_tab is tabs[0]
+    Browser._cycle_tab(stub, -1)
+    assert stub.active_tab is tabs[2]
+    assert stub.draw_calls == 4
+
+
+def test_page_scroll_shortcuts_call_scroll():
+    stub = type("Stub", (), {})()
+    stub.focus = None
+    stub.calls = []
+    stub._scroll = lambda delta: stub.calls.append(delta)
+    stub.tab_height = lambda: 700
+    eq(Browser._on_page_down(stub, None), "break", "pagedown returns break")
+    eq(Browser._on_page_up(stub, None), "break", "pageup returns break")
+    eq(stub.calls, [580, -580], "page shortcuts use viewport-sized steps")
 
 
 def test_error_page_fallback():

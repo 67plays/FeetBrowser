@@ -29,7 +29,7 @@ wrap Chromium, WebKit, Gecko, or any HTTP library — it implements its own:
 - **Browser UI** — a hand-drawn chrome on a Tk canvas: tabs, an address bar
   with search fallback, back / forward / reload / home buttons,
   hover + clickable links, middle-click / ctrl-click to open in a new tab,
-  scrolling, a scrollbar, and a status bar.
+  scrolling, a scrollbar, bookmark toggling, and a status bar.
 - **Extensions (Toes)** — a from-scratch hooking system. A toe is a plain
   Python module dropped into `toes/` that can rewrite pages, inject CSS,
   take over navigations (custom schemes like `toe://`), draw on the canvas,
@@ -69,10 +69,11 @@ and then `python3 -m feetbrowser <url>`.
 |-----|--------|-----|--------|
 | `Ctrl-L` | focus address bar | `Ctrl-T` | new tab |
 | `Ctrl-W` | close tab | `Ctrl-R` | reload |
-| `Ctrl-H` | home page | `Alt-←` / `Alt-→` | back / forward |
-| `↑` / `↓` | scroll | `PgUp` / `PgDn` | page scroll |
-| `Home` / `End` | jump to top / bottom | `Esc` | blur address / input |
-| `Ctrl-Tab`, `Ctrl-PgUp/Dn` | cycle tabs | middle / `Ctrl`-click | open link in new tab |
+| `Ctrl-D` | toggle bookmark | `about:bookmarks` | open bookmarks page |
+| `Ctrl-H` | open `about:history` | `Ctrl-Tab` / `Ctrl-Shift-Tab` | next / previous tab |
+| `PgUp` / `PgDn` / `Home` / `End` | page scroll controls | `Alt-←` / `Alt-→` | back / forward |
+| `↑` / `↓` / wheel | scroll | `Esc` | blur address / input |
+| middle / `Ctrl`-click | open link in new tab | `Ctrl-PgUp/Dn` | cycle tabs |
 
 Type a URL in the address bar and press Enter, or type words to search
 (DuckDuckGo HTML). Bare hosts without a scheme (`example.com:8080`,
