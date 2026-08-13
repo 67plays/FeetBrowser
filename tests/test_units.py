@@ -103,13 +103,14 @@ def test_welcome_and_reload():
 
 
 def test_bookmarks_internal_page():
-    bookmarks = ["https://example.com", "https://info.cern.ch/hypertext/WWW/TheProject.html"]
+    bookmarks = ["https://example.org", "https://info.cern.ch/hypertext/WWW/TheProject.html"]
     tab = Tab(700)
     tab.load(_BookmarksURL(lambda: bookmarks))
     eq(tab.title, "Bookmarks", "bookmarks title")
-    text = "".join(n.text for n in tree_to_list(tab.nodes, []) if isinstance(n, Text))
-    assert "Saved pages" in text
-    assert "https://example.com" in text
+    links = [n for n in tree_to_list(tab.nodes, []) if isinstance(n, Element)
+             and n.tag == "a"]
+    hrefs = [n.attributes.get("href", "") for n in links]
+    assert bookmarks[0] in hrefs
 
 
 def test_bookmarks_html_escapes():
@@ -119,11 +120,14 @@ def test_bookmarks_html_escapes():
 
 
 def test_about_page_can_resolve_bookmarks():
-    about = _AboutURL(lambda: ["https://example.com"])
+    about = _AboutURL(lambda: ["https://example.org"])
     dest = about.resolve("about:bookmarks")
     assert isinstance(dest, _BookmarksURL)
     _h, body, _c = dest.request()
-    assert "https://example.com" in body
+    nodes = HTMLParser(body).parse()
+    links = [n for n in tree_to_list(nodes, []) if isinstance(n, Element)
+             and n.tag == "a"]
+    assert links and links[0].attributes.get("href") == "https://example.org"
 
 
 def test_error_page_fallback():
