@@ -6,5 +6,12 @@ __pycache__/
 # local session helper
 session
 
+# throwaway clone for local runs
+feetbrowser-run/
+
+# user-installed toes are never committed
+toes/*
+!toes/README.md
+
 # per-toe persisted settings
 toes/*/settings.json

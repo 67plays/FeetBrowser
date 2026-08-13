@@ -161,8 +161,13 @@ class Tab:
         try:
             handled = None
             if self.browser:
-                handled = toes.first(self.browser.toe_contexts, "handle",
-                                     url, self)
+                # The built-in ToeHub handles toehub:// and framework toe://
+                # pages before any installed toe gets a say.
+                from . import toehub
+                handled = toehub.handle(url, self)
+                if handled is None:
+                    handled = toes.first(self.browser.toe_contexts, "handle",
+                                         url, self)
             if handled is not None:
                 _headers, body, ctype = handled
             else:
@@ -844,6 +849,21 @@ class Browser:
     def chrome_bands(self):
         """Chrome bands declared by toes, as [(id, height, y), ...]."""
         return toes.compute_bands(self.toe_contexts)
+
+    def reload_toes(self):
+        """Re-discover installed toes and rebuild their contexts live.
+
+        Called by the ToeHub after an install/uninstall so changes take
+        effect without restarting the browser.
+        """
+        self.toes = toes.discover_toes()
+        self.toe_contexts = [toes.Context(self, toe.module)
+                             for toe in self.toes]
+        self.toe_handlers = {}
+        for ctx in self.toe_contexts:
+            for btn in (ctx.call("buttons") or []):
+                self.toe_handlers[btn.id] = ctx
+        self.draw()
 
     def chrome_height(self):
         """Total chrome height: the fixed chrome plus any toe bands."""
