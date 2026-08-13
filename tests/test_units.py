@@ -5,7 +5,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from feetbrowser.net import URL
 from feetbrowser.htmlparser import HTMLParser, Element, Text
 from feetbrowser.cssparser import CSSParser, style
-from feetbrowser.browser import Tab, _AboutURL, tree_to_list
+from feetbrowser.browser import Tab, _AboutURL, _BookmarksURL, bookmarks_html, tree_to_list
 
 
 def eq(a, b, msg=""):
@@ -100,6 +100,30 @@ def test_welcome_and_reload():
     # Reloading an internal page must not crash (regression test).
     tab.load(tab.url, push=False)
     eq(tab.title, "New Tab", "welcome reloads cleanly")
+
+
+def test_bookmarks_internal_page():
+    bookmarks = ["https://example.com", "https://info.cern.ch/hypertext/WWW/TheProject.html"]
+    tab = Tab(700)
+    tab.load(_BookmarksURL(lambda: bookmarks))
+    eq(tab.title, "Bookmarks", "bookmarks title")
+    text = "".join(n.text for n in tree_to_list(tab.nodes, []) if isinstance(n, Text))
+    assert "Saved pages" in text
+    assert "https://example.com" in text
+
+
+def test_bookmarks_html_escapes():
+    page = bookmarks_html(['https://x.test/?q=<script>alert(1)</script>'])
+    assert "<script>" not in page
+    assert "&lt;script&gt;" in page
+
+
+def test_about_page_can_resolve_bookmarks():
+    about = _AboutURL(lambda: ["https://example.com"])
+    dest = about.resolve("about:bookmarks")
+    assert isinstance(dest, _BookmarksURL)
+    _h, body, _c = dest.request()
+    assert "https://example.com" in body
 
 
 def test_error_page_fallback():

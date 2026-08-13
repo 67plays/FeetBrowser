@@ -17,7 +17,7 @@ wrap Chromium, WebKit, Gecko, or any HTTP library — it implements its own:
   bullets, and `<hr>`, producing a display list of paint commands.
 - **Browser UI** — a hand-drawn chrome on a Tk canvas: tabs, an address bar
   with search fallback, back / forward / reload, hover + clickable links,
-  scrolling, a scrollbar, and a status bar.
+  scrolling, a scrollbar, bookmark toggling, and a status bar.
 
 Tk is used **only as the pixel surface** (a canvas to draw text and rectangles
 on) and for font metrics — the browser engine itself is all in this repo.
@@ -41,6 +41,7 @@ and then `python3 -m feetbrowser <url>`.
 |-----|--------|-----|--------|
 | `Ctrl-L` | focus address bar | `Ctrl-T` | new tab |
 | `Ctrl-W` | close tab | `Ctrl-R` | reload |
+| `Ctrl-D` | toggle bookmark | `about:bookmarks` | open bookmarks page |
 | `Alt-←` / `Alt-→` | back / forward | `↑` `↓` / wheel | scroll |
 
 Type a URL in the address bar and press Enter, or type words to search

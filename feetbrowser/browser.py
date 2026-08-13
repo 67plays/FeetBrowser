@@ -10,6 +10,8 @@ second canvas so the whole browser really is "from scratch".
 
 import os
 import sys
+import json
+import html
 import tkinter
 
 from .net import URL
@@ -20,6 +22,7 @@ from .layout import DocumentLayout, paint_tree, get_font
 WIDTH, HEIGHT = 1000, 720
 SCROLL_STEP = 80
 CHROME_HEIGHT = 80  # tabs + address bar
+BOOKMARKS_FILE = os.path.expanduser("~/.feetbrowser_bookmarks.json")
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 with open(os.path.join(HERE, "ua.css")) as f:
@@ -242,6 +245,7 @@ class Browser:
         self.active_tab = None
         self.focus = None  # "address" or None
         self.address_text = ""
+        self.bookmarks = self._load_bookmarks()
         self._resize_after = None
         self._last_size = (WIDTH, HEIGHT)
 
@@ -276,6 +280,7 @@ class Browser:
         w.bind("<Control-t>", lambda e: self.new_tab("about:blank"))
         w.bind("<Control-w>", lambda e: self.close_tab())
         w.bind("<Control-r>", lambda e: self._reload())
+        w.bind("<Control-d>", lambda e: self._toggle_bookmark())
         w.bind("<Alt-Left>", lambda e: self._back())
         w.bind("<Alt-Right>", lambda e: self._forward())
 
@@ -289,11 +294,12 @@ class Browser:
 
     def new_tab(self, url):
         tab = Tab(self.tab_height())
-        if url == "about:blank":
-            tab.load(_AboutURL())  # routes welcome page through the full pipeline
+        page = self._coerce_url(url)
+        if isinstance(page, _AboutURL):
+            tab.load(page)  # routes welcome page through the full pipeline
             tab.status = "Type a URL and press Enter"
         else:
-            tab.load(url)
+            tab.load(page)
         self.tabs.append(tab)
         self.active_tab = tab
         self.draw()
@@ -392,8 +398,11 @@ class Browser:
         if 72 <= x < 98 and 48 <= y < 72:
             self._reload()
             return
+        if 104 <= x < 130 and 48 <= y < 72:
+            self._toggle_bookmark()
+            return
         # Address bar.
-        if x >= 104:
+        if x >= 136:
             self.focus = "address"
             self.address_text = str(self.active_tab.url) if \
                 (self.active_tab and self.active_tab.url and
@@ -436,7 +445,7 @@ class Browser:
                     ("file:", "data:", "view-source:", "about:")):
                 query = "https://" + query
             if self.active_tab:
-                self.active_tab.load(query)
+                self.active_tab.load(self._coerce_url(query))
             self.draw()
 
     @staticmethod
@@ -453,6 +462,76 @@ class Browser:
         self.address_text = str(self.active_tab.url) if \
             (self.active_tab and self.active_tab.url) else ""
         self.draw()
+
+    @staticmethod
+    def _bookmark_key(url):
+        if not url or isinstance(url, (_AboutURL, _BookmarksURL)):
+            return None
+        return str(url)
+
+    def _is_bookmarked(self, url):
+        key = self._bookmark_key(url)
+        return bool(key and key in self.bookmarks)
+
+    def _toggle_bookmark(self):
+        if not self.active_tab:
+            return
+        key = self._bookmark_key(self.active_tab.url)
+        if not key:
+            self.active_tab.status = "This page can't be bookmarked"
+            self.draw()
+            return
+        if key in self.bookmarks:
+            self.bookmarks.remove(key)
+            self.active_tab.status = "Bookmark removed"
+        else:
+            self.bookmarks.append(key)
+            self.active_tab.status = "Bookmarked"
+        self._save_bookmarks()
+        self.draw()
+
+    def _coerce_url(self, raw):
+        if not isinstance(raw, str):
+            return raw
+        text = raw.strip().lower()
+        if text in ("about:blank", "about:newtab"):
+            return _AboutURL(lambda: list(self.bookmarks))
+        if text == "about:bookmarks":
+            return _BookmarksURL(lambda: list(self.bookmarks))
+        return raw
+
+    @staticmethod
+    def _sanitize_bookmarks(values):
+        if not isinstance(values, list):
+            return []
+        out = []
+        seen = set()
+        for item in values:
+            if not isinstance(item, str):
+                continue
+            value = item.strip()
+            if not value or value.startswith("about:"):
+                continue
+            if value in seen:
+                continue
+            seen.add(value)
+            out.append(value)
+        return out
+
+    def _load_bookmarks(self):
+        try:
+            with open(BOOKMARKS_FILE, "r", encoding="utf8") as f:
+                data = json.load(f)
+            return self._sanitize_bookmarks(data)
+        except (OSError, json.JSONDecodeError):
+            return []
+
+    def _save_bookmarks(self):
+        try:
+            with open(BOOKMARKS_FILE, "w", encoding="utf8") as f:
+                json.dump(self.bookmarks, f, indent=2)
+        except OSError:
+            pass
 
     def _back(self):
         if self.active_tab:
@@ -521,22 +600,24 @@ class Browser:
         btn(8, "‹", bool(tab and tab.history))
         btn(40, "›", bool(tab and tab.future))
         btn(72, "⟳", bool(tab))
+        marked = bool(tab and self._is_bookmarked(tab.url))
+        btn(104, "★" if marked else "☆", bool(tab))
 
         # Address bar.
-        c.create_rectangle(104, 48, c.winfo_width() - 8, 72,
+        c.create_rectangle(136, 48, c.winfo_width() - 8, 72,
                            outline="#3b82f6" if self.focus == "address" else "#999",
                            fill="white", width=2 if self.focus == "address" else 1)
         if self.focus == "address":
             text = self.address_text
-            c.create_text(114, 60, text=text, anchor="w",
+            c.create_text(146, 60, text=text, anchor="w",
                           font=self.chrome_font, fill="#111")
             w = self.chrome_font.measure(text)
-            c.create_line(116 + w, 52, 116 + w, 68, fill="#111")
+            c.create_line(148 + w, 52, 148 + w, 68, fill="#111")
         else:
             url = ""
             if tab and tab.url and not isinstance(tab.url, _AboutURL):
                 url = str(tab.url)
-            c.create_text(114, 60, text=url, anchor="w",
+            c.create_text(146, 60, text=url, anchor="w",
                           font=self.chrome_font, fill="#111")
 
     def _draw_status(self):
@@ -581,7 +662,14 @@ class _AboutURL:
     view_source = False
     fragment = ""
 
+    def __init__(self, bookmarks_provider=None):
+        self.bookmarks_provider = bookmarks_provider
+
     def resolve(self, url):
+        if url == "about:blank":
+            return _AboutURL(self.bookmarks_provider)
+        if url == "about:bookmarks":
+            return _BookmarksURL(self.bookmarks_provider)
         return URL(url) if "://" in url else URL("https://" + url)
 
     def request(self, payload=None):
@@ -589,6 +677,52 @@ class _AboutURL:
 
     def __str__(self):
         return "about:blank"
+
+
+class _BookmarksURL:
+    """Internal URL for the bookmarks page."""
+    view_source = False
+    fragment = ""
+
+    def __init__(self, bookmarks_provider=None):
+        self.bookmarks_provider = bookmarks_provider or (lambda: [])
+
+    def resolve(self, url):
+        if url == "about:blank":
+            return _AboutURL(self.bookmarks_provider)
+        if url == "about:bookmarks":
+            return _BookmarksURL(self.bookmarks_provider)
+        return URL(url) if "://" in url else URL("https://" + url)
+
+    def request(self, payload=None):
+        return {}, bookmarks_html(self.bookmarks_provider()), "text/html"
+
+    def __str__(self):
+        return "about:bookmarks"
+
+
+def bookmarks_html(bookmarks):
+    items = []
+    for entry in bookmarks:
+        safe = html.escape(entry, quote=True)
+        items.append(f'<li><a href="{safe}">{safe}</a></li>')
+    listing = "\n".join(items) if items else "<li>No bookmarks yet.</li>"
+    return f"""
+<!doctype html>
+<html><head><title>Bookmarks</title>
+<style>
+  body {{ font-family: Helvetica; margin: 60px; color: #222; }}
+  h1 {{ font-size: 40px; color: #1a73e8; }}
+  .sub {{ color: #666; font-size: 18px; }}
+  li {{ margin-top: 8px; }}
+  a {{ color: #1a73e8; word-break: break-all; }}
+</style></head>
+<body>
+  <h1>Bookmarks</h1>
+  <p class="sub">Saved pages from Ctrl-D or the star button.</p>
+  <ul>{listing}</ul>
+</body></html>
+"""
 
 
 WELCOME_HTML = """
@@ -613,6 +747,7 @@ WELCOME_HTML = """
     <li><a href="https://info.cern.ch/hypertext/WWW/TheProject.html">the first web page ever</a></li>
     <li><a href="https://news.ycombinator.com">Hacker News</a></li>
     <li><a href="https://en.wikipedia.org/wiki/Web_browser">Wikipedia: Web browser</a></li>
+    <li><a href="about:bookmarks">about:bookmarks</a> — your saved pages</li>
     <li><a href="view-source:https://example.com">view-source:example.com</a></li>
   </ul>
   <h3>Shortcuts</h3>
@@ -620,7 +755,7 @@ WELCOME_HTML = """
     <li><b>Ctrl-L</b> focus address bar &nbsp; <b>Ctrl-T</b> new tab &nbsp;
         <b>Ctrl-W</b> close tab</li>
     <li><b>Ctrl-R</b> reload &nbsp; <b>Alt-Left/Right</b> back / forward &nbsp;
-        <b>↑ ↓ / wheel</b> scroll</li>
+        <b>Ctrl-D</b> bookmark page &nbsp; <b>↑ ↓ / wheel</b> scroll</li>
   </ul>
   <p class="sub">Type a URL or a search term in the address bar to begin.</p>
 </body></html>
