@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Run the FeetBrowser test suite. Uses nix-shell for Tk on NixOS.
+# Is NixOS even good?
 set -euo pipefail
 cd "$(dirname "$0")"
 
