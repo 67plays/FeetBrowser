@@ -5,6 +5,8 @@ grouped selectors (a, b), a property/value declaration parser, specificity,
 inheritance of inherited properties, and inline style="" attributes.
 """
 
+import re
+
 from .htmlparser import Element
 
 INHERITED_PROPERTIES = {
@@ -70,6 +72,21 @@ class DescendantSelector:
     def matches(self, node):
         if not self.descendant.matches(node):
             return False
+        # Fast path: when the style pass has primed the node's ancestor
+        # features (it walks the tree top-down), a tag/class/id ancestor can
+        # be decided with a set membership test instead of walking up the
+        # parent chain again for every rule.
+        a = self.ancestor
+        anc_tags = getattr(node, "_anc_tags", None)
+        if anc_tags is not None:
+            if isinstance(a, TagSelector) and a.tag != "*":
+                return a.tag in anc_tags
+            if isinstance(a, ClassSelector):
+                return a.cls in getattr(node, "_anc_classes", ())
+            if isinstance(a, IdSelector):
+                return a.id in getattr(node, "_anc_ids", ())
+            if not _ancestor_possible(a, node):
+                return False
         parent = node.parent
         while parent:
             if self.ancestor.matches(parent):
@@ -78,25 +95,85 @@ class DescendantSelector:
         return False
 
 
+class RootSelector:
+    """Matches the document root element (`:root`), i.e. the node with no
+    parent. Typical target for custom-property (`--x`) declarations."""
+
+    def __init__(self):
+        self.priority = (0, 0, 1)
+
+    def matches(self, node):
+        return isinstance(node, Element) and node.parent is None
+
+
+def _ancestor_possible(selector, node):
+    """Cheap necessary condition for `selector` to match some ancestor of
+    `node`, using the ancestor-feature sets primed by style(). Only used as a
+    quick-reject; a True result still requires the real ancestor walk."""
+    tags = node._anc_tags
+    classes = node._anc_classes
+    ids = node._anc_ids
+    if isinstance(selector, TagSelector):
+        return selector.tag == "*" or selector.tag in tags
+    if isinstance(selector, ClassSelector):
+        return selector.cls in classes
+    if isinstance(selector, IdSelector):
+        return selector.id in ids
+    if isinstance(selector, CompoundSelector):
+        # Must hold for every part, though not necessarily the same ancestor.
+        return all(_ancestor_possible(p, node) for p in selector.parts)
+    if isinstance(selector, DescendantSelector):
+        # The chain is A (X) (descendant of) B...: B must be reachable.
+        return _ancestor_possible(selector.descendant, node)
+    return True
+
+
+_IDENT_RE = re.compile(r"^[A-Za-z*][-_A-Za-z0-9]*$")
+
+
+def _strip_pseudo(text):
+    """Remove pseudo-classes/-elements (:hover, ::before, :not(.x), ...);
+    `:root` is translated to a marker for the root-element selector."""
+    out = []
+    i = 0
+    n = len(text)
+    while i < n:
+        if text[i] != ":":
+            out.append(text[i])
+            i += 1
+            continue
+        start = i
+        while i < n and text[i] not in " \t\r\n>+~":
+            if text[i] == "(":
+                depth = 1
+                i += 1
+                while i < n and depth:
+                    if text[i] == "(":
+                        depth += 1
+                    elif text[i] == ")":
+                        depth -= 1
+                    i += 1
+                continue
+            i += 1
+        if text[start:i] in (":root", "::root"):
+            out.append(":root")
+    return "".join(out)
+
+
 class CSSParser:
     def __init__(self, s):
         self.s = s
         self.i = 0
 
-    def whitespace(self):
-        while self.i < len(self.s) and self.s[self.i] in " \t\r\n\f":
-            self.i += 1
-
-    def comments(self):
-        while self.s[self.i:self.i + 2] == "/*":
-            end = self.s.find("*/", self.i)
-            self.i = len(self.s) if end == -1 else end + 2
-            self.whitespace()
-
     def skip_ws(self):
-        self.whitespace()
-        self.comments()
-        self.whitespace()
+        while self.i < len(self.s):
+            if self.s[self.i] in " \t\r\n\f":
+                self.i += 1
+            elif self.s[self.i:self.i + 2] == "/*":
+                end = self.s.find("*/", self.i)
+                self.i = len(self.s) if end == -1 else end + 2
+            else:
+                break
 
     def literal(self, ch):
         if self.i < len(self.s) and self.s[self.i] == ch:
@@ -107,16 +184,36 @@ class CSSParser:
     def pair(self):
         # property : value
         start = self.i
-        while self.i < len(self.s) and self.s[self.i] not in ":;}":
+        while self.i < len(self.s) and self.s[self.i] not in ":;}{":
             self.i += 1
         prop = self.s[start:self.i].strip().lower()
         if not self.literal(":"):
             return None
+        # Values may contain ; } inside url(...), data: URIs or quoted strings,
+        # so track brace/bracket/paren depth.
         vstart = self.i
-        while self.i < len(self.s) and self.s[self.i] not in ";}":
+        depth = 0
+        in_quote = None
+        while self.i < len(self.s):
+            c = self.s[self.i]
+            if in_quote:
+                if c == in_quote:
+                    in_quote = None
+            elif c in "\"'":
+                in_quote = c
+            elif c in "([":
+                depth += 1
+            elif c in ")]":
+                depth = max(0, depth - 1)
+            elif depth == 0 and c in ";}":
+                break
             self.i += 1
         value = self.s[vstart:self.i].strip()
-        return (prop, value) if prop and value else None
+        if not value or not prop:
+            return None
+        if value.endswith("!important"):
+            value = value[:-len("!important")].rstrip()
+        return (prop, value)
 
     def body(self):
         """Parse a declaration block { ... } already positioned after '{'."""
@@ -130,34 +227,30 @@ class CSSParser:
                 pairs[p[0]] = p[1]
             self.skip_ws()
             self.literal(";")
-            self.skip_ws()
         return pairs
 
     def simple_selector(self, text):
-        # e.g. div.note#id  or  .cls  or  #id  or  *
-        parts = []
-        token = ""
-        i = 0
-        while i < len(text):
-            c = text[i]
-            if c in ".#" and token:
-                parts.append(token)
-                token = c
-            elif c in ".#":
-                token = c
-            else:
-                token += c
-            i += 1
-        if token:
-            parts.append(token)
+        # e.g. div.note#id  or  .cls  or  #id  or  *  or  :root
+        text = _strip_pseudo(text).strip()
+        if not text:
+            return None
+        if text == ":root":
+            return RootSelector()
+        parts = [p for p in re.split(r"(?=[.#])", text) if p]
 
         simples = []
         for part in parts:
-            if part.startswith("#"):
-                simples.append(IdSelector(part[1:]))
-            elif part.startswith("."):
-                simples.append(ClassSelector(part[1:]))
+            if part.startswith(("#", ".")):
+                ident = part[1:]
+                if not ident or not _IDENT_RE.match(ident):
+                    return None
+                simples.append(IdSelector(ident) if part[0] == "#"
+                               else ClassSelector(ident))
             else:
+                # Attribute selectors (input[type=x]) etc. are not supported;
+                # skip the rule rather than match nothing forever.
+                if not _IDENT_RE.match(part):
+                    return None
                 simples.append(TagSelector(part.lower()))
         if len(simples) == 1:
             return simples[0]
@@ -165,13 +258,20 @@ class CSSParser:
 
     def selector(self, text):
         # Handle descendant combinators (whitespace between simple selectors).
+        # >, + and ~ are approximated as descendant relationships; unsupported
+        # tokens are dropped rather than left to crash the rule.
         tokens = text.split()
-        tokens = [t for t in tokens if t and t != ">"]  # treat > as descendant
+        tokens = [t for t in tokens if t not in (">", "+", "~")]
         if not tokens:
             return None
         result = self.simple_selector(tokens[0])
+        if result is None:
+            return None
         for tok in tokens[1:]:
-            result = DescendantSelector(result, self.simple_selector(tok))
+            simple = self.simple_selector(tok)
+            if simple is None:
+                return None
+            result = DescendantSelector(result, simple)
         return result
 
     def parse(self):
@@ -208,7 +308,8 @@ class CSSParser:
         while self.i < len(self.s) and self.s[self.i] not in "{;":
             self.i += 1
         prelude = self.s[start:self.i]
-        keyword = prelude.split()[0].lower() if prelude.split() else ""
+        words = prelude.split()
+        keyword = words[0].lower() if words else ""
         if self.i < len(self.s) and self.s[self.i] == ";":
             self.i += 1  # @import/@charset etc.
             return
@@ -244,45 +345,145 @@ def parse_inline(style_text):
 
 
 def cascade_priority(rule):
-    selector, _body = rule
-    return selector.priority
+    return rule[0].priority
 
 
-def style(node, rules, _sorted_rules=None):
+def _selector_hint(selector):
+    """Terminal-part hint used to bucket rules. Returns a tuple that must match
+    the node (tag name, class, id) for the rule to have any chance of matching,
+    so style() only walks candidates instead of every rule."""
+    if isinstance(selector, TagSelector):
+        return ("tag", selector.tag) if selector.tag != "*" else ("any", None)
+    if isinstance(selector, ClassSelector):
+        return ("class", selector.cls)
+    if isinstance(selector, IdSelector):
+        return ("id", selector.id)
+    if isinstance(selector, RootSelector):
+        return ("root", None)
+    if isinstance(selector, CompoundSelector):
+        return _selector_hint(selector.parts[-1])
+    if isinstance(selector, DescendantSelector):
+        return _selector_hint(selector.descendant)
+    return ("any", None)
+
+
+_RULE_KEY = lambda item: (item[0], item[1])
+
+
+def _build_rule_index(rules):
+    """Bucket rules by terminal-selector hint. Buckets keep cascade order:
+    within a bucket rules are stable-sorted by (priority, original index), and
+    merging buckets on the same key never reorders equal priorities."""
+    index = {}
+    for i, (selector, body) in enumerate(rules):
+        hint = _selector_hint(selector)
+        index.setdefault(hint, []).append((selector.priority, i, selector, body))
+    for bucket in index.values():
+        bucket.sort(key=_RULE_KEY)
+    return index
+
+
+def style(node, rules):
     """Compute the `.style` dict for `node` and its subtree.
 
-    Rules are sorted by cascade priority exactly once (at the root call) and
-    reused for every node, rather than re-sorting per node.
+    Rules are bucketed by selector hint so each node only considers rules that
+    could possibly match it instead of scanning the whole rule list (a
+    text-heavy page has thousands of rules but a node only ever matches a
+    handful). The tree walk is iterative so deeply nested documents cannot
+    blow the recursion limit.
     """
-    if _sorted_rules is None:
-        _sorted_rules = sorted(rules, key=cascade_priority)
+    index = _build_rule_index(rules)
 
-    node.style = {}
+    stack = [(node, None)]
+    while stack:
+        node, parent = stack.pop()
 
-    # 1. Inherited properties from parent (or defaults at root).
-    for prop, default in INHERITED_PROPERTIES.items():
-        if node.parent and prop in node.parent.style:
-            node.style[prop] = node.parent.style[prop]
+        node.style = {}
+
+        # Prime ancestor feature sets for descendant-selector fast paths. The
+        # child's ancestors = parent's ancestors + the parent itself.
+        if parent is None:
+            node._anc_tags = node._anc_classes = node._anc_ids = frozenset()
         else:
-            node.style[prop] = default
+            node._anc_tags = getattr(parent, "_anc_tags", frozenset()) | (
+                {parent.tag} if isinstance(parent, Element) else frozenset())
+            node._anc_classes = getattr(parent, "_anc_classes", frozenset()) | (
+                frozenset(parent.attributes.get("class", "").split())
+                if isinstance(parent, Element) else frozenset())
+            node._anc_ids = getattr(parent, "_anc_ids", frozenset()) | (
+                {parent.attributes.get("id")}
+                if isinstance(parent, Element)
+                and parent.attributes.get("id") else frozenset())
 
-    # 2. Author + UA rules, in cascade order.
-    for selector, body in _sorted_rules:
-        if not selector.matches(node):
-            continue
-        for prop, value in body.items():
-            node.style[prop] = value
+        # 1. Inherited properties from parent (or defaults at root).
+        parent_style = parent.style if parent else {}
+        node.style.update(
+            {p: parent_style.get(p, d) for p, d in INHERITED_PROPERTIES.items()})
 
-    # 3. Inline style attribute (highest, aside from !important which we ignore).
-    if isinstance(node, Element) and "style" in node.attributes:
-        for prop, value in parse_inline(node.attributes["style"]).items():
-            node.style[prop] = value
+        # 2. Author + UA rules, in cascade order. Only rules whose terminal
+        #    selector could match this node's tag / classes / id are walked.
+        hints = [("any", None)]
+        if isinstance(node, Element):
+            hints.append(("tag", node.tag))
+            hints.append(("id", node.attributes.get("id")))
+            if node.parent is None:
+                hints.append(("root", None))
+            for cls in node.attributes.get("class", "").split():
+                hints.append(("class", cls))
+        candidates = [r for hint in hints for r in index.get(hint, ())]
+        candidates.sort(key=_RULE_KEY)
+        for _prio, _i, selector, body in candidates:
+            if not selector.matches(node):
+                continue
+            for prop, value in body.items():
+                node.style[prop] = value
 
-    # 4. Resolve relative font sizes (percent / em) against the parent.
-    _resolve_font_size(node)
+        # 3. Inline style attribute (highest, aside from !important we ignore).
+        if isinstance(node, Element) and "style" in node.attributes:
+            for prop, value in parse_inline(node.attributes["style"]).items():
+                node.style[prop] = value
 
-    for child in node.children:
-        style(child, rules, _sorted_rules)
+        # 3b. Resolve var(--custom, fallback) references. Custom properties
+        # inherit, so lookups walk up the parent chain.
+        for prop, value in list(node.style.items()):
+            if "var(" in value:
+                node.style[prop] = _resolve_var(value, node)
+
+        # 4. Resolve relative font sizes (percent / em) against the parent.
+        _resolve_font_size(node)
+
+        for child in reversed(node.children):
+            stack.append((child, node))
+
+
+_VAR_RE = re.compile(
+    r"var\(\s*(--[A-Za-z0-9_-]+)\s*(?:,\s*([^()]*))?\)")
+
+
+def _resolve_var(value, node):
+    """Substitute every `var(--name, fallback)` in `value`, walking the
+    ancestor chain for the custom property. Runs to a fixed point so nested
+    fallbacks (e.g. `var(--a, var(--b, #fff))`) also resolve."""
+    for _ in range(10):
+        resolved = value
+        for match in _VAR_RE.finditer(value):
+            custom_name = match.group(1)
+            fallback = match.group(2)
+            current = node
+            replacement = None
+            while current is not None:
+                if isinstance(current, Element) \
+                        and custom_name in current.style:
+                    replacement = current.style[custom_name]
+                    break
+                current = current.parent
+            if replacement is None:
+                replacement = fallback.strip() if fallback is not None else ""
+            resolved = resolved.replace(match.group(0), replacement, 1)
+        if resolved == value:
+            break
+        value = resolved
+    return value
 
 
 def _resolve_font_size(node):
@@ -298,16 +499,17 @@ def _resolve_font_size(node):
             except ValueError:
                 pass
     if value.endswith("%"):
-        try:
-            node.style["font-size"] = f"{parent_size * float(value[:-1]) / 100:.1f}px"
-        except ValueError:
-            node.style["font-size"] = f"{parent_size}px"
+        def factor(v):
+            return parent_size * float(v[:-1]) / 100
     elif value.endswith("em"):
-        try:
-            node.style["font-size"] = f"{parent_size * float(value[:-2]):.1f}px"
-        except ValueError:
-            node.style["font-size"] = f"{parent_size}px"
-    elif value in ("smaller",):
-        node.style["font-size"] = f"{parent_size * 0.8:.1f}px"
-    elif value in ("larger",):
-        node.style["font-size"] = f"{parent_size * 1.2:.1f}px"
+        def factor(v):
+            return parent_size * float(v[:-2])
+    elif value in ("smaller", "larger"):
+        def factor(v):
+            return parent_size * (0.8 if v == "smaller" else 1.2)
+    else:
+        return
+    try:
+        node.style["font-size"] = f"{factor(value):.1f}px"
+    except ValueError:
+        node.style["font-size"] = f"{parent_size}px"
