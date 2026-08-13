@@ -42,6 +42,8 @@ and then `python3 -m feetbrowser <url>`.
 | `Ctrl-L` | focus address bar | `Ctrl-T` | new tab |
 | `Ctrl-W` | close tab | `Ctrl-R` | reload |
 | `Ctrl-D` | toggle bookmark | `about:bookmarks` | open bookmarks page |
+| `Ctrl-H` | open `about:history` | `Ctrl-Tab` / `Ctrl-Shift-Tab` | next / previous tab |
+| `PgUp` / `PgDn` / `Home` / `End` | page scroll controls | `about:history` | open history timeline |
 | `Alt-←` / `Alt-→` | back / forward | `↑` `↓` / wheel | scroll |
 
 Type a URL in the address bar and press Enter, or type words to search
@@ -70,7 +72,7 @@ tests/
 history, show page source.
 
 **Doesn't (yet):** run JavaScript, decode images (drawn as placeholders),
-float/flex/grid/table layout, or form submission wiring. These are the
+float/flex/grid/table layout, or full form submission wiring. These are the
 natural next milestones — the architecture has clean seams for each.
 
 ## Tests
