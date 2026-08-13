@@ -30,6 +30,10 @@ wrap Chromium, WebKit, Gecko, or any HTTP library — it implements its own:
   with search fallback, back / forward / reload / home buttons,
   hover + clickable links, middle-click / ctrl-click to open in a new tab,
   scrolling, a scrollbar, and a status bar.
+- **Extensions (Toes)** — a from-scratch hooking system. A toe is a plain
+  Python module dropped into `toes/` that can rewrite pages, inject CSS,
+  take over navigations (custom schemes like `toe://`), draw on the canvas,
+  add chrome bands (toolbars), and open popup windows. See `toes/README.md`.
 - **JavaScript engine** — a from-scratch interpreter (hand-written lexer +
   parser + tree-walking evaluator): closures, `var`/`let`/`const`, objects,
   arrays (with index growth, `length` truncation, `push`/`pop`/`join`),
@@ -93,11 +97,20 @@ feetbrowser/
   jsdom.py       JavaScript <-> DOM bridge (document/element/style)
   layout.py      block/inline layout -> display list, painting
   browser.py     Tk window, chrome, tabs, history, event loop
+  toes.py        extension hooking (Toes): discovery + dispatch
   ua.css         default user-agent stylesheet
+toes/
+  word-count/    sample toe: page word count (on_load + extra_css)
+  toe-scheme/    sample toe: the toe:// scheme (handle)
+  sock-detective/ sample toe: foot-themed devtools (sniff mode + toe://sock reports)
+  toe-bar/       sample toe: a 2003-style toolbar (chrome bands + popups)
 tests/
   test_units.py  offline unit tests (URL, HTML, CSS, layout, internal pages)
   test_js.py     offline tests for the JS engine + DOM bridge
   test_nav.py    click-to-navigate, history, view-source
+  test_toes.py   toe engine + sample toe tests
+  test_sock.py   sock-detective toe tests
+  test_toebar.py toe-bar + chrome-band/popup framework tests
   smoke.py       end-to-end pipeline on real pages
 ```
 
@@ -106,8 +119,10 @@ tests/
 **Does:** fetch and render real websites over HTTPS, apply their CSS
 (text styling, colors, backgrounds, layout), follow links, keep per-tab
 history, submit forms (GET/POST), show page source, open links in new tabs,
-and run JavaScript (scripts on load, DOM reads/writes, click handlers, with
-`console.log` surfaced in the page's log buffer).
+run JavaScript (scripts on load, DOM reads/writes, click handlers, with
+`console.log` surfaced in the page's log buffer), and run extensions
+("toes") that can rewrite pages, inject CSS, register custom schemes, draw
+chrome bands, and open popups.
 
 **Doesn't (yet):** flexbox wrapping, `<textarea>`/`<select>` selection (beyond
 read-only), or the full ECMAScript feature set (no `async`, no `Promise`, no
@@ -117,7 +132,7 @@ has clean seams for each.
 ## Tests
 
 ```bash
-./test.sh          # pyflakes + unit + navigation + live smoke tests
+./test.sh          # pyflakes + unit + navigation + toe + live smoke tests
 ```
 
 `test_units.py` and `test_nav.py` are deterministic; `smoke.py` fetches a few

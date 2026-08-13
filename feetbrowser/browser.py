@@ -21,6 +21,7 @@ from .cssparser import CSSParser, style, parse_inline
 from .layout import DocumentLayout, paint_tree, get_font
 from .jsdom import JSDocument
 from .jsengine import Interpreter, JSException
+from . import toes as toes
 
 WIDTH, HEIGHT = 1000, 720
 SCROLL_STEP = 80
@@ -111,12 +112,13 @@ class FormAction:
 class Tab:
     """One document: its DOM, layout, scroll position and history."""
 
-    def __init__(self, tab_height):
+    def __init__(self, tab_height, browser=None):
         self.history = []
         self.future = []
         self.url = None
         self.scroll = 0
         self.tab_height = tab_height
+        self.browser = browser
         self.display_list = []
         self.document = None
         self.nodes = None
@@ -154,7 +156,14 @@ class Tab:
         self.focused_input = None
         self.form_values = {}
         try:
-            _headers, body, ctype = url.request(payload=payload)
+            handled = None
+            if self.browser:
+                handled = toes.first(self.browser.toe_contexts, "handle",
+                                     url, self)
+            if handled is not None:
+                _headers, body, ctype = handled
+            else:
+                _headers, body, ctype = url.request(payload=payload)
         except Exception as e:  # noqa: BLE001 - surface any network error in-page
             body = f"<h1>Could not load page</h1><pre>{type(e).__name__}: {e}</pre>"
             ctype = "text/html"
@@ -197,6 +206,9 @@ class Tab:
             body = (f"<h1>Image</h1><p>[img: {ctype}]</p>"
                     f"<p><code>{body[:80]}</code></p>")
 
+        if self.browser:
+            body = toes.rewrite(self.browser.toe_contexts, url, body)
+
         self.nodes = HTMLParser(body).parse()
         self.title = get_title(self.nodes) or str(url)
 
@@ -205,8 +217,15 @@ class Tab:
         self.base_url = url.resolve(base_href) if base_href else url
         resolve_from = self.base_url
 
-        # Gather stylesheets: UA + <style> + <link rel=stylesheet>.
+        # Gather stylesheets: UA + toe-injected + <style> + <link rel=stylesheet>.
         rules = list(DEFAULT_STYLE_SHEET)
+        if self.browser:
+            injected = toes.extra_css(self.browser.toe_contexts, url)
+            if injected:
+                try:
+                    rules.extend(CSSParser(injected).parse())
+                except Exception:  # noqa: BLE001 - a broken sheet shouldn't stop the page
+                    pass
         for sheet in inline_styles(self.nodes, []):
             try:
                 rules.extend(CSSParser(sheet).parse())
@@ -720,6 +739,14 @@ class Browser:
         self._resize_after = None
         self._last_size = (WIDTH, HEIGHT)
 
+        # Toes: one Context per loaded toe, all optional hooks.
+        self.toes = toes.discover_toes()
+        self.toe_contexts = [toes.Context(self, toe.module) for toe in self.toes]
+        self.toe_handlers = {}
+        for ctx in self.toe_contexts:
+            for btn in (ctx.call("buttons") or []):
+                self.toe_handlers[btn.id] = ctx
+
         self.window = tkinter.Tk()
         self.window.title("FeetBrowser")
         self.window.geometry(f"{WIDTH}x{HEIGHT}")
@@ -768,14 +795,22 @@ class Browser:
 
     # -- tab management --------------------------------------------------
 
+    def chrome_bands(self):
+        """Chrome bands declared by toes, as [(id, height, y), ...]."""
+        return toes.compute_bands(self.toe_contexts)
+
+    def chrome_height(self):
+        """Total chrome height: the fixed chrome plus any toe bands."""
+        return CHROME_HEIGHT + toes.band_height(self.chrome_bands())
+
     def tab_height(self):
         h = self.canvas.winfo_height()
         if h <= 1:  # window not mapped yet
             h = HEIGHT
-        return max(50, h - CHROME_HEIGHT)
+        return max(50, h - self.chrome_height())
 
     def new_tab(self, url):
-        tab = Tab(self.tab_height())
+        tab = Tab(self.tab_height(), self)
         if url == "about:blank":
             tab.load(_AboutURL())  # routes welcome page through the full pipeline
             tab.status = "Type a URL and press Enter"
@@ -783,6 +818,7 @@ class Browser:
             tab.load(url)
         self.tabs.append(tab)
         self.active_tab = tab
+        toes.dispatch(self.toe_contexts, "on_new_tab")
         tab.load_images(self.window, done=self.draw)
         self.draw()
 
@@ -851,13 +887,13 @@ class Browser:
 
     def _on_click(self, e):
         self.focus = None
-        if e.y < CHROME_HEIGHT:
+        if e.y < self.chrome_height():
             self._chrome_click(e.x, e.y)
             return
         if not self.active_tab:
             return
         ctrl = bool(getattr(e, "state", 0) & 0x4)
-        dest = self.active_tab.click(e.x, e.y - CHROME_HEIGHT)
+        dest = self.active_tab.click(e.x, e.y - self.chrome_height())
         if isinstance(dest, FormAction):
             self._navigate(self.active_tab, dest.url, payload=dest.payload)
         elif dest and ctrl:
@@ -867,17 +903,24 @@ class Browser:
         self.draw()
 
     def _on_middle_click(self, e):
-        if not self.active_tab or e.y < CHROME_HEIGHT:
+        if not self.active_tab or e.y < self.chrome_height():
             return
-        dest = self.active_tab.click(e.x, e.y - CHROME_HEIGHT)
+        dest = self.active_tab.click(e.x, e.y - self.chrome_height())
         if isinstance(dest, FormAction):
             self._navigate(self.active_tab, dest.url, payload=dest.payload)
         elif dest:
             self.new_tab(str(dest))
 
     def _chrome_click(self, x, y):
+        # Toe chrome bands (above the tabs).
+        bands = self.chrome_bands()
+        band_h = toes.band_height(bands)
+        if band_h and y < band_h:
+            if toes.dispatch(self.toe_contexts, "on_chrome_click",
+                             x, y, bands):
+                return
         # Tab bar (top 40px).
-        if y < 40:
+        if y < band_h + 40:
             # New-tab button.
             if x < 34:
                 self.new_tab("about:blank")
@@ -895,20 +938,30 @@ class Browser:
                     return
             return
         # Toolbar (40..80).
-        if 8 <= x < 34 and 48 <= y < 72:
+        if 8 <= x < 34 and band_h + 48 <= y < band_h + 72:
             self._back()
             return
-        if 40 <= x < 66 and 48 <= y < 72:
+        if 40 <= x < 66 and band_h + 48 <= y < band_h + 72:
             self._forward()
             return
-        if 72 <= x < 98 and 48 <= y < 72:
+        if 72 <= x < 98 and band_h + 48 <= y < band_h + 72:
             self._reload()
             return
-        if 104 <= x < 130 and 48 <= y < 72:
+        if 104 <= x < 130 and band_h + 48 <= y < band_h + 72:
             self._home()
             return
+        # Toe toolbar buttons.
+        bx = 136
+        for btn in self._toe_buttons():
+            if bx <= x < bx + 26 and band_h + 48 <= y < band_h + 72:
+                ctx = self.toe_handlers.get(btn.id)
+                if ctx:
+                    ctx.call("on_click", btn.id)
+                self.draw()
+                return
+            bx += 30
         # Address bar.
-        if x >= 136:
+        if x >= 136 + self._toe_buttons_offset():
             self.focus = "address"
             self.address_text = str(self.active_tab.url) if \
                 (self.active_tab and self.active_tab.url and
@@ -918,8 +971,10 @@ class Browser:
     def _on_motion(self, e):
         if not self.active_tab:
             return
-        if e.y >= CHROME_HEIGHT:
-            href = self.active_tab.link_at(e.x, e.y - CHROME_HEIGHT)
+        if e.y >= self.chrome_height():
+            doc_x, doc_y = e.x, e.y - self.chrome_height()
+            toes.dispatch(self.toe_contexts, "on_motion", doc_x, doc_y)
+            href = self.active_tab.link_at(doc_x, doc_y)
             self.canvas.config(cursor="hand2" if href else "")
             new_status = href or str(self.active_tab.url or "")
             if new_status != self.active_tab.status:
@@ -933,6 +988,9 @@ class Browser:
             if len(e.char) == 1 and ord(e.char) >= 32 and e.char.isprintable():
                 self.address_text += e.char
                 self.draw()
+            return
+        # Toes get first crack at keys when no address bar has focus.
+        if toes.dispatch(self.toe_contexts, "on_keypress", e):
             return
         # Typing into a focused form field.
         if self.active_tab and self.active_tab.focused_input and \
@@ -1053,14 +1111,22 @@ class Browser:
 
     def draw(self):
         self.canvas.delete("all")
+        chrome = self.chrome_height()
         if self.active_tab:
             self.active_tab.tab_height = self.tab_height()
-            self.active_tab.draw(self.canvas, CHROME_HEIGHT)
+            self.active_tab.draw(self.canvas, chrome)
+        toes.dispatch(self.toe_contexts, "on_draw", self.canvas, chrome)
         # Chrome background covers page content that scrolled up under it.
         self.canvas.create_rectangle(0, 0, self.canvas.winfo_width(),
-                                     CHROME_HEIGHT, fill="#e8e8e8", width=0)
+                                     chrome, fill="#e8e8e8", width=0)
+        # Toe chrome bands paint on top of the chrome background.
+        bands = self.chrome_bands()
+        if bands:
+            toes.dispatch(self.toe_contexts, "on_chrome_draw",
+                          self.canvas, bands)
         self._draw_tabs()
         self._draw_toolbar()
+        self._draw_toe_buttons()
         self._draw_status()
         self._draw_scrollbar()
         self.window.title(
@@ -1069,32 +1135,36 @@ class Browser:
 
     def _draw_tabs(self):
         c = self.canvas
-        c.create_rectangle(0, 0, c.winfo_width(), 40, fill="#d0d0d0", width=0)
+        top = toes.band_height(self.chrome_bands())
+        c.create_rectangle(0, top, c.winfo_width(), top + 40, fill="#d0d0d0",
+                           width=0)
         # New-tab button.
-        c.create_text(17, 20, text="+", font=self.bold_font, fill="#333")
+        c.create_text(17, top + 20, text="+", font=self.bold_font, fill="#333")
         for i, tab in enumerate(self.tabs):
             x0 = 40 + i * 160
             active = tab is self.active_tab
-            c.create_rectangle(x0, 4, x0 + 158, 40,
+            c.create_rectangle(x0, top + 4, x0 + 158, top + 40,
                                fill="white" if active else "#c4c4c4",
                                width=0)
             title = tab.title or "New Tab"
             if len(title) > 18:
                 title = title[:17] + "…"
-            c.create_text(x0 + 10, 20, text=title, anchor="w",
+            c.create_text(x0 + 10, top + 20, text=title, anchor="w",
                           font=self.chrome_font, fill="#222")
-            c.create_text(x0 + 148, 20, text="×", font=self.bold_font, fill="#666")
+            c.create_text(x0 + 148, top + 20, text="×", font=self.bold_font,
+                          fill="#666")
 
     def _draw_toolbar(self):
         c = self.canvas
 
         def btn(x, glyph, enabled):
-            c.create_rectangle(x, 48, x + 26, 72, outline="#999",
+            c.create_rectangle(x, top + 48, x + 26, top + 72, outline="#999",
                                fill="#f4f4f4", width=1)
-            c.create_text(x + 13, 60, text=glyph,
+            c.create_text(x + 13, top + 60, text=glyph,
                           fill="#333" if enabled else "#bbb",
                           font=self.bold_font)
 
+        top = toes.band_height(self.chrome_bands())
         tab = self.active_tab
         btn(8, "‹", bool(tab and tab.history))
         btn(40, "›", bool(tab and tab.future))
@@ -1102,25 +1172,45 @@ class Browser:
         btn(104, "⌂", bool(tab))
 
         # Address bar.
-        c.create_rectangle(136, 48, c.winfo_width() - 8, 72,
+        addr_x = 136 + self._toe_buttons_offset()
+        c.create_rectangle(addr_x, top + 48, c.winfo_width() - 8, top + 72,
                            outline="#3b82f6" if self.focus == "address" else "#999",
                            fill="white", width=2 if self.focus == "address" else 1)
         if self.focus == "address":
             text = self.address_text
-            c.create_text(146, 60, text=text, anchor="w",
+            c.create_text(addr_x + 10, top + 60, text=text, anchor="w",
                           font=self.chrome_font, fill="#111")
             w = self.chrome_font.measure(text)
-            c.create_line(148 + w, 52, 148 + w, 68, fill="#111")
+            c.create_line(addr_x + 12 + w, top + 52, addr_x + 12 + w,
+                          top + 68, fill="#111")
             ph = "Type a URL or search term…" if not text else ""
             if ph:
-                c.create_text(148, 60, text=ph, anchor="w",
+                c.create_text(addr_x + 12, top + 60, text=ph, anchor="w",
                               font=self.chrome_font, fill="#aaa")
         else:
             url = ""
             if tab and tab.url and not isinstance(tab.url, _AboutURL):
                 url = str(tab.url)
-            c.create_text(146, 60, text=url, anchor="w",
+            c.create_text(addr_x + 10, top + 60, text=url, anchor="w",
                           font=self.chrome_font, fill="#111")
+
+    def _toe_buttons(self):
+        return [btn for ctx in self.toe_contexts
+                for btn in (ctx.call("buttons") or [])]
+
+    def _toe_buttons_offset(self):
+        return len(self._toe_buttons()) * 30
+
+    def _draw_toe_buttons(self):
+        c = self.canvas
+        top = toes.band_height(self.chrome_bands())
+        x = 136
+        for btn in self._toe_buttons():
+            c.create_rectangle(x, top + 48, x + 26, top + 72, outline="#999",
+                               fill="#fdf6e3", width=1)
+            c.create_text(x + 13, top + 60, text=btn.glyph[:2], fill="#333",
+                          font=self.bold_font)
+            x += 30
 
     def _draw_status(self):
         c = self.canvas
@@ -1143,7 +1233,7 @@ class Browser:
             return
         c = self.canvas
         track_x = c.winfo_width() - 10
-        track_top = CHROME_HEIGHT
+        track_top = self.chrome_height()
         track_h = view
         frac = view / total
         thumb_h = max(30, track_h * frac)
@@ -1166,6 +1256,115 @@ class Browser:
         for tab in self.tabs:
             tab._drain_images()
         self.window.after(150, self._poll_images)
+
+
+class PopupWindow:
+    """A real popup window (a separate Tk Toplevel), not a redirect.
+
+    Each popup is a mini-browser: its own canvas, a hand-drawn title bar
+    with a close button, a Tab rendering the URL through the full pipeline,
+    wheel scrolling, and a scrollbar. Popups share the browser's toe
+    contexts, so toe:// pages, the detective's paper trail, and link
+    navigation all work inside them.
+
+    Special links a page can use:
+        popup:close            close this popup
+        popup:spawn:<url>      open another popup (the classic adware chain)
+    """
+
+    TITLE_BAR = 22
+
+    def __init__(self, browser, url, width=320, height=240):
+        self.browser = browser
+        self.width = width
+        self.height = height
+        self.window = tkinter.Toplevel(browser.window)
+        self.window.title("")
+        self.window.geometry(f"{width}x{height}")
+        self.canvas = tkinter.Canvas(
+            self.window, width=width, height=height,
+            bg="white", highlightthickness=0)
+        self.canvas.pack(fill="both", expand=True)
+        self.tab = Tab(height - self.TITLE_BAR, browser)
+        self.tab.load(URL(str(url)) if isinstance(url, str) else url)
+        self._bind()
+        self.draw()
+
+    def _bind(self):
+        self.window.bind("<MouseWheel>", self._on_wheel)
+        self.window.bind("<Button-4>", lambda e: self._scroll(-SCROLL_STEP))
+        self.window.bind("<Button-5>", lambda e: self._scroll(SCROLL_STEP))
+        self.window.bind("<Button-1>", self._on_click)
+
+    def _on_wheel(self, e):
+        self._scroll(-e.delta if abs(e.delta) < 30
+                     else -int(e.delta / 30) * SCROLL_STEP)
+
+    def _scroll(self, delta):
+        self.tab.scroll_by(delta)
+        self.draw()
+
+    def _on_click(self, e):
+        if e.y < self.TITLE_BAR:
+            if e.x >= self.width - 20:
+                self.window.destroy()
+            return
+        dest = self.tab.click(e.x, e.y - self.TITLE_BAR)
+        if dest:
+            self._navigate(dest)
+        self.draw()
+
+    def _navigate(self, dest):
+        if isinstance(dest, FormAction):
+            s = str(dest.url)
+            if s == "popup:close":
+                self.window.destroy()
+                return
+            if s.startswith("popup:spawn:"):
+                for ctx in self.browser.toe_contexts:
+                    if hasattr(ctx, "popup"):
+                        ctx.popup(s[len("popup:spawn:"):])
+                return
+            self.tab.load(dest.url, payload=dest.payload)
+        else:
+            s = str(dest)
+            if s == "popup:close":
+                self.window.destroy()
+                return
+            if s.startswith("popup:spawn:"):
+                for ctx in self.browser.toe_contexts:
+                    if hasattr(ctx, "popup"):
+                        ctx.popup(s[len("popup:spawn:"):])
+                return
+            self.tab.load(dest)
+        self.draw()
+
+    def draw(self):
+        c = self.canvas
+        c.delete("all")
+        self.tab.tab_height = self.height - self.TITLE_BAR
+        self.tab.draw(c, self.TITLE_BAR)
+        c.create_rectangle(0, 0, self.width, self.TITLE_BAR,
+                           fill="#d0d0d0", width=0)
+        c.create_line(0, self.TITLE_BAR, self.width, self.TITLE_BAR,
+                      fill="#999")
+        c.create_text(6, self.TITLE_BAR // 2, text=str(self.tab.url)[:40],
+                      anchor="w", font=get_font(10, "normal", "roman",
+                                                "Helvetica"), fill="#333")
+        c.create_text(self.width - 10, self.TITLE_BAR // 2, text="×",
+                      font=get_font(12, "bold", "roman", "Helvetica"),
+                      fill="#333")
+        # Scrollbar.
+        view = self.height - self.TITLE_BAR
+        total = self.tab.content_height()
+        if total > view:
+            frac = view / total
+            thumb_h = max(20, view * frac)
+            thumb_top = self.TITLE_BAR + (view - thumb_h) * (
+                self.tab.scroll / (total - view))
+            c.create_rectangle(self.width - 6, thumb_top,
+                               self.width - 2, thumb_top + thumb_h,
+                               fill="#9aa0a6", width=0)
 
 
 class _AboutURL:
@@ -1206,6 +1405,12 @@ WELCOME_HTML = """
     <li><a href="https://news.ycombinator.com">Hacker News</a></li>
     <li><a href="https://en.wikipedia.org/wiki/Web_browser">Wikipedia: Web browser</a></li>
     <li><a href="view-source:https://example.com">view-source:example.com</a></li>
+  </ul>
+  <h3>Your toes</h3>
+  <ul>
+    <li><a href="toe://toebar">toe://toebar</a> — the Toe Bar settings</li>
+    <li><a href="toe://gallery">toe://gallery</a> — every installed toe</li>
+    <li><a href="toe://sock">toe://sock</a> — the Sock Detective's case file</li>
   </ul>
   <h3>Shortcuts</h3>
   <ul>
