@@ -20,7 +20,7 @@ import time
 _CACHE = {}
 
 DEFAULT_HEADERS = {
-    "User-Agent": "user-agents are irrelevent (i prob mispelled that)",
+    "User-Agent": "FeetBrowser/0.1.1 (https://github.com/JuiceyDew/FeetBrowser)",
     "Accept": "text/html,application/xhtml+xml,text/css,*/*;q=0.8",
     "Accept-Encoding": "gzip, deflate",
 }
