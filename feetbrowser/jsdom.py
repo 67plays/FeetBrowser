@@ -1,0 +1,335 @@
+"""A small JavaScript DOM bridge over the raw htmlparser DOM tree.
+
+Every wrapper here is a "host object" for the jsengine interpreter: it
+implements js_get/js_set so member reads, writes and native method calls
+resolve against the underlying htmlparser nodes. Nothing in this module may
+import from browser (that would be a circular import); the Tab wires the
+bridge into the interpreter in browser.py.
+"""
+
+import re
+
+from .htmlparser import HTMLParser, Text, Element
+from .jsengine import UNDEFINED
+
+# Tags serialized as self-closing voids by the innerHTML serializer.
+VOID_TAGS = {"br", "img", "hr", "input", "meta", "link", "base"}
+
+
+def _walk(node):
+    """Yield `node` then its descendants in document order."""
+    stack = [node]
+    while stack:
+        n = stack.pop()
+        yield n
+        for child in reversed(n.children):
+            stack.append(child)
+
+
+def _iter_elements(node):
+    """Yield the Element nodes under `node` in document order."""
+    for n in _walk(node):
+        if isinstance(n, Element):
+            yield n
+
+
+def _escape_text(text):
+    return (text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+
+
+def _escape_attr(value):
+    return _escape_text(value).replace('"', "&quot;")
+
+
+def serialize_element(el):
+    attrs = "".join(f' {name}="{_escape_attr(value)}"'
+                    for name, value in el.attributes.items())
+    if el.tag in VOID_TAGS:
+        return f"<{el.tag}{attrs}>"
+    return f"<{el.tag}{attrs}>{serialize(el.children)}</{el.tag}>"
+
+
+def serialize(children):
+    """Serialize a list of raw nodes to an HTML string."""
+    return "".join(_escape_text(c.text) if isinstance(c, Text)
+                   else serialize_element(c) for c in children
+                   if isinstance(c, (Text, Element)))
+
+
+def _camel_to_kebab(name):
+    return re.sub(r"(?<!^)([A-Z])", r"-\1", name).lower()
+
+
+def _parse_selector(sel):
+    """Parse a simple selector: tag, #id, .class, or combinations.
+
+    Returns (tag_or_None, {classes}, {ids}) or None if unsupported.
+    """
+    parts = re.split(r"(?=[#.])", sel.strip())
+    tag = None
+    classes = set()
+    ids = set()
+    for part in parts:
+        if part.startswith("#"):
+            ids.add(part[1:])
+        elif part.startswith("."):
+            classes.add(part[1:])
+        elif part:
+            if not re.fullmatch(r"[a-zA-Z][\w-]*", part):
+                return None
+            tag = part.lower()
+    return tag, classes, ids
+
+
+class JSDocument:
+    """Bridge for the document global: the root of the DOM."""
+
+    def __init__(self, root_node, base_url=None, mark_dirty=None):
+        self.root = root_node
+        self.base_url = base_url
+        self.mark_dirty = mark_dirty
+        # Shared mutable flag: JS mutations set it; the Tab checks it after
+        # running scripts to decide whether a restyle+rerender is needed.
+        self._flag = {"dirty": False}
+        self._methods = {
+            "getElementById": self._get_element_by_id,
+            "querySelector": self._query_selector,
+            "getElementsByTagName": self._get_elements_by_tag_name,
+            "createElement": self._create_element,
+        }
+
+    def js_get(self, name):
+        if name in self._methods:
+            return self._methods[name]
+        if name == "body":
+            return self._find(lambda n: n.tag == "body")
+        if name == "title":
+            return self._get_title()
+        if name == "documentElement":
+            return JSElement(self.root, self._flag)
+        return UNDEFINED
+
+    def js_set(self, name, value):
+        if name == "title":
+            self._set_title(value)
+            self._flag["dirty"] = True
+
+    def _find(self, pred):
+        for n in _iter_elements(self.root):
+            if pred(n):
+                return JSElement(n, self._flag)
+        return UNDEFINED
+
+    def _get_element_by_id(self, element_id):
+        return self._find(lambda n: n.attributes.get("id") == element_id)
+
+    def _query_selector(self, sel):
+        parsed = _parse_selector(sel)
+        if parsed is None:
+            return UNDEFINED
+        tag, classes, ids = parsed
+        return self._find(lambda n: isinstance(n, Element)
+                          and (not tag or n.tag == tag)
+                          and (not ids or n.attributes.get("id") in ids)
+                          and (not classes or classes.issubset(
+                              set(n.attributes.get("class", "").split()))))
+
+    def _get_elements_by_tag_name(self, tag):
+        tag = tag.lower()
+        return JSNodeList([JSElement(n, self._flag)
+                           for n in _iter_elements(self.root) if n.tag == tag])
+
+    def _create_element(self, tag):
+        return JSElement(Element(tag, {}, None), self._flag)
+
+    def _get_title(self):
+        for n in _iter_elements(self.root):
+            if n.tag == "title":
+                text = "".join(c.text for c in n.children
+                               if isinstance(c, Text)).strip()
+                if text:
+                    return text
+        return ""
+
+    def _set_title(self, value):
+        if value is None or value is UNDEFINED:
+            value = ""
+        for n in _iter_elements(self.root):
+            if n.tag == "title":
+                n.children = [Text(str(value), n)]
+                return
+        head = next((c for c in self.root.children
+                     if isinstance(c, Element) and c.tag == "head"), None)
+        title = Element("title", {}, head if head is not None else self.root)
+        title.children = [Text(str(value), title)]
+        if head is not None:
+            head.children.append(title)
+        else:
+            self.root.children.insert(0, title)
+
+
+class JSElement:
+    """Bridge for one Element node."""
+
+    def __init__(self, node, _flag=None):
+        self.node = node
+        self._flag = _flag or {"dirty": False}
+        self._methods = {
+            "setAttribute": self._set_attribute,
+            "getAttribute": self._get_attribute,
+            "appendChild": self._append_child,
+            "removeChild": self._remove_child,
+            "addEventListener": self._add_event_listener,
+        }
+
+    def js_get(self, name):
+        if name in self._methods:
+            return self._methods[name]
+        if name == "textContent":
+            return "".join(n.text for n in _walk(self.node)
+                           if isinstance(n, Text))
+        if name == "innerHTML":
+            return serialize(self.node.children)
+        if name == "tagName":
+            return self.node.tag.upper()
+        if name == "tag":
+            return self.node.tag
+        if name == "children":
+            return JSNodeList([JSElement(c, self._flag) for c in self.node.children
+                               if isinstance(c, Element)])
+        if name == "parentNode":
+            return JSElement(self.node.parent, self._flag) if self.node.parent else UNDEFINED
+        if name == "id":
+            return self.node.attributes.get("id", "")
+        if name == "className":
+            return self.node.attributes.get("class", "")
+        if name == "style":
+            return JSElementStyle(self.node, self._flag)
+        if isinstance(name, str) and name in self.node.attributes:
+            return self.node.attributes[name]
+        return UNDEFINED
+
+    def js_set(self, name, value):
+        if name == "textContent":
+            self._set_text_content(value)
+        elif name == "innerHTML":
+            self._set_inner_html(value)
+        # style writes are no-ops; mutations go through JSElementStyle.
+
+    # -- native methods -------------------------------------------------
+
+    def _set_attribute(self, name, value):
+        self.node.attributes[str(name)] = str(value)
+        self._flag["dirty"] = True
+        return UNDEFINED
+
+    def _get_attribute(self, name):
+        return self.node.attributes.get(str(name))
+
+    def _append_child(self, child):
+        if not isinstance(child, JSElement):
+            return UNDEFINED
+        raw = child.node
+        raw.parent = self.node
+        self.node.children.append(raw)
+        self._flag["dirty"] = True
+        return child
+
+    def _remove_child(self, child):
+        if not isinstance(child, JSElement):
+            return UNDEFINED
+        raw = child.node
+        try:
+            self.node.children.remove(raw)
+        except ValueError:
+            return UNDEFINED
+        raw.parent = None
+        self._flag["dirty"] = True
+        return child
+
+    def _add_event_listener(self, event_type, fn):
+        handlers = getattr(self.node, "_js_handlers", None)
+        if handlers is None:
+            handlers = {}
+            self.node._js_handlers = handlers
+        handlers.setdefault(str(event_type), []).append(fn)
+        return UNDEFINED
+
+    # -- property setters / getters ------------------------------------
+
+    def _set_text_content(self, value):
+        if value is None or value is UNDEFINED:
+            value = ""
+        self.node.children = [Text(str(value), self.node)]
+        self._flag["dirty"] = True
+
+    def _set_inner_html(self, value):
+        value = "" if value is None or value is UNDEFINED else str(value)
+        root = HTMLParser(value).parse()
+        source = next((n.children for n in _iter_elements(root)
+                       if n.tag == "body"), root.children)
+        for child in source:
+            child.parent = self.node
+        self.node.children = list(source)
+        self._flag["dirty"] = True
+
+
+class JSNodeList:
+    """Array-like view over a list of JSElements."""
+
+    def __init__(self, items):
+        self._items = items
+
+    def js_get(self, name):
+        if isinstance(name, int):
+            if 0 <= name < len(self._items):
+                return self._items[name]
+            return UNDEFINED
+        if name == "length":
+            return len(self._items)
+        return UNDEFINED
+
+
+class JSElementStyle:
+    """Bridge for an element's style dict with camelCase -> kebab mapping.
+
+    `style()` reassigns node.style on every restyle, so JS-driven writes are
+    also kept on the node in `_js_style_overrides` and re-applied by the Tab's
+    `_js_mutated` after it re-cascades the stylesheet. Overrides always win
+    (inline JS beats author rules).
+    """
+
+    def __init__(self, node, _flag=None):
+        self.node = node
+        self._flag = _flag or {"dirty": False}
+
+    def _overrides(self):
+        overrides = getattr(self.node, "_js_style_overrides", None)
+        if overrides is None:
+            overrides = {}
+            self.node._js_style_overrides = overrides
+        return overrides
+
+    def js_get(self, name):
+        if name == "getPropertyValue":
+            return self._get_property_value
+        if name == "setProperty":
+            return self._set_property
+        kebab = _camel_to_kebab(name)
+        return self._overrides().get(kebab, self.node.style.get(kebab, ""))
+
+    def js_set(self, name, value):
+        self._write(_camel_to_kebab(name), value)
+
+    def _write(self, name, value):
+        self._overrides()[name] = str(value)
+        self.node.style[name] = str(value)
+        self._flag["dirty"] = True
+
+    def _get_property_value(self, name):
+        name = str(name)
+        return self._overrides().get(name, self.node.style.get(name, ""))
+
+    def _set_property(self, name, value):
+        self._write(str(name), value)
+        return UNDEFINED
