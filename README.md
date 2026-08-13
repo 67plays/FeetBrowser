@@ -1,5 +1,5 @@
 # 🦶 FeetBrowser
-
+(this is made by claude i think)
 A **functional web browser written from scratch** in pure Python. It does not
 wrap Chromium, WebKit, Gecko, or any HTTP library — it implements its own:
 

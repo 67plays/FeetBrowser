@@ -21,7 +21,7 @@ _CACHE = {}
 CACHE_MAX_SIZE = 1000
 
 DEFAULT_HEADERS = {
-    "User-Agent": "FeetBrowser/0.1 (from-scratch; +https://example.invalid)",
+    "User-Agent": "FeetBrowser/0.1.1 (https://github.com/JuiceyDew/FeetBrowser)",
     "Accept": "text/html,application/xhtml+xml,text/css,*/*;q=0.8",
     "Accept-Encoding": "gzip, deflate",
 }
