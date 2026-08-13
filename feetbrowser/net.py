@@ -153,6 +153,22 @@ class URL:
         port = "" if (self.port in (80, 443, None)) else f":{self.port}"
         return f"{host}{port}"
 
+    def _adopt(self, other):
+        """Make `self` look like `other`. Used to follow HTTP redirects in
+        place so a URL object reports the location it actually fetched
+        content from. Callers resolve relative URLs against the page URL and
+        must not keep the pre-redirect host, or every relative resource
+        (images, stylesheets, scripts) is fetched from the wrong server."""
+        self.scheme = other.scheme
+        self.host = other.host
+        self.port = other.port
+        self.path = other.path
+        self.fragment = other.fragment
+        self.view_source = other.view_source
+        self.raw = other.raw
+        if hasattr(other, "data_payload"):
+            self.data_payload = other.data_payload
+
     def __str__(self):
         prefix = "view-source:" if self.view_source else ""
         if self.scheme in ("http", "https"):
@@ -261,6 +277,16 @@ class URL:
             location = resp_headers["location"]
             new_url = self.resolve(location)
             follow_payload = payload if status in (307, 308) else None
+            if new_url.scheme in ("http", "https"):
+                # Follow in place so `self` reflects the URL we actually got
+                # content from (see _adopt); callers resolve relative URLs
+                # (img/style/script src) against the page URL, so a bare
+                # `google.com` that redirects to `www.google.com` must report
+                # the final host or its image URLs resolve to a host that
+                # serves HTML instead of the image.
+                self._adopt(new_url)
+                return self._request_http(redirects_left - 1, follow_payload,
+                                          raw=raw)
             return new_url.request(redirects_left - 1, follow_payload, raw=raw)
 
         # Decode transfer-encoding and content-encoding.

@@ -8,6 +8,7 @@ weight / style, colors, backgrounds, list bullets, and horizontal rules.
 Coordinates are in CSS px == canvas px. Fonts are Tk fonts, cached.
 """
 
+import re
 import tkinter.font
 
 from .htmlparser import Text, Element
@@ -177,9 +178,14 @@ class DrawText:
         return self.left <= x < self.right and self.top <= y < self.bottom
 
     def execute(self, scroll, canvas):
-        canvas.create_text(
-            self.left, self.top - scroll, text=self.text,
-            font=self.font, fill=self.color, anchor="nw")
+        try:
+            canvas.create_text(
+                self.left, self.top - scroll, text=self.text,
+                font=self.font, fill=self.color or "black", anchor="nw")
+        except tkinter.TclError:
+            canvas.create_text(
+                self.left, self.top - scroll, text=self.text,
+                font=self.font, fill="black", anchor="nw")
 
 
 class _DrawShape:
@@ -193,23 +199,38 @@ class _DrawShape:
 
 class DrawRect(_DrawShape):
     def execute(self, scroll, canvas):
-        canvas.create_rectangle(
-            self.left, self.top - scroll, self.right, self.bottom - scroll,
-            width=0, fill=self.color)
+        try:
+            canvas.create_rectangle(
+                self.left, self.top - scroll, self.right, self.bottom - scroll,
+                width=0, fill=self.color)
+        except tkinter.TclError:
+            canvas.create_rectangle(
+                self.left, self.top - scroll, self.right, self.bottom - scroll,
+                width=0, fill="black")
 
 
 class DrawLine(_DrawShape):
     def execute(self, scroll, canvas):
-        canvas.create_line(
-            self.left, self.top - scroll, self.right, self.bottom - scroll,
-            fill=self.color, width=self.thickness)
+        try:
+            canvas.create_line(
+                self.left, self.top - scroll, self.right, self.bottom - scroll,
+                fill=self.color, width=self.thickness)
+        except tkinter.TclError:
+            canvas.create_line(
+                self.left, self.top - scroll, self.right, self.bottom - scroll,
+                fill="black", width=self.thickness)
 
 
 class DrawOutline(_DrawShape):
     def execute(self, scroll, canvas):
-        canvas.create_rectangle(
-            self.left, self.top - scroll, self.right, self.bottom - scroll,
-            width=self.thickness, outline=self.color)
+        try:
+            canvas.create_rectangle(
+                self.left, self.top - scroll, self.right, self.bottom - scroll,
+                width=self.thickness, outline=self.color)
+        except tkinter.TclError:
+            canvas.create_rectangle(
+                self.left, self.top - scroll, self.right, self.bottom - scroll,
+                width=self.thickness, outline="black")
 
 
 class DrawImage:
@@ -261,12 +282,114 @@ def _padding_box(style):
     return top, right, bottom, left
 
 
+_COLOR_FUNC_RE = re.compile(r"^(rgba?|hsla?)\((.*)\)$", re.DOTALL)
+
+
+def _color_channels(name):
+    """Split the inside of rgb()/rgba()/hsl()/hsla() into channel strings,
+    accepting both comma and modern space/slash syntax."""
+    m = _COLOR_FUNC_RE.match(name)
+    if not m:
+        return None
+    inner = re.sub(r"[,/]", " ", m.group(2)).strip()
+    parts = [p for p in inner.split() if p]
+    if len(parts) not in (3, 4):
+        return None
+    return m.group(1), parts
+
+
+def _color_channel(v):
+    """Convert a CSS channel value (0-255 or percentage) to an int 0-255."""
+    v = v.strip()
+    try:
+        if v.endswith("%"):
+            val = float(v[:-1]) / 100.0 * 255.0
+        else:
+            val = float(v)
+    except ValueError:
+        return 0
+    return max(0, min(255, int(round(val))))
+
+
+def _color_alpha(v):
+    """Convert a CSS alpha value (0-1 or percentage) to a float."""
+    if v is None:
+        return 1.0
+    v = v.strip()
+    try:
+        if v.endswith("%"):
+            return max(0.0, min(1.0, float(v[:-1]) / 100.0))
+        return max(0.0, min(1.0, float(v)))
+    except ValueError:
+        return 1.0
+
+
+def _hsl_to_rgb(h, s, l):
+    h = (h % 360) / 360.0
+    s = max(0.0, min(1.0, s))
+    l = max(0.0, min(1.0, l))
+    if s == 0:
+        return l, l, l
+    q = l * (1 + s) if l < 0.5 else l + s - l * s
+    p = 2 * l - q
+    def hue(t):
+        if t < 0:
+            t += 1
+        if t > 1:
+            t -= 1
+        if t < 1 / 6:
+            return p + (q - p) * 6 * t
+        if t < 1 / 2:
+            return q
+        if t < 2 / 3:
+            return p + (q - p) * (2 / 3 - t) * 6
+        return p
+    return hue(h + 1 / 3), hue(h), hue(h - 1 / 3)
+
+
+def _parse_hue(v):
+    v = v.strip().lower()
+    if v.endswith("%"):
+        return float(v[:-1]) / 100.0 * 360.0
+    for unit, factor in (("rad", 180 / 3.141592653589793),
+                         ("grad", 0.9), ("turn", 360.0), ("deg", 1.0)):
+        if v.endswith(unit):
+            return float(v[:-len(unit)]) * factor
+    return float(v)
+
+
 def resolve_color(name):
     if not name:
         return None
     name = name.strip().lower()
     if name in ("transparent", "none", "currentcolor", "inherit", "initial"):
         return None
+    parsed = _color_channels(name)
+    if parsed:
+        kind, parts = parsed
+        a = parts[3] if len(parts) == 4 else None
+        if _color_alpha(a) <= 0:
+            return None
+        if kind.startswith("rgb"):
+            r, g, b = parts[:3]
+            return "#%02x%02x%02x" % (
+                _color_channel(r), _color_channel(g), _color_channel(b))
+        h, s, l = parts[:3]
+        sval = float(s.rstrip("%")) / 100.0 if s.endswith("%") else float(s)
+        lval = float(l.rstrip("%")) / 100.0 if l.endswith("%") else float(l)
+        r, g, b = _hsl_to_rgb(_parse_hue(h), sval, lval)
+        return "#%02x%02x%02x" % (
+            int(round(r * 255)), int(round(g * 255)), int(round(b * 255)))
+    # 3/4/6/8-digit hex: Tk only accepts #rgb and #rrggbb reliably, so expand.
+    if name.startswith("#") and len(name) in (4, 5):
+        n = "".join(c * 2 for c in name[1:])
+        if len(n) == 8 and n[6:] == "00":
+            return None  # alpha 0
+        return "#" + n[:6]
+    if len(name) == 9 and name.startswith("#"):
+        if name[7:] == "00":
+            return None  # #rrggbbaa with alpha 0
+        return name[:7]
     return name  # Tk understands names and #rrggbb
 
 
@@ -630,6 +753,7 @@ class BlockLayout(LayoutBox):
         """Approximate a cell's min (longest word) and preferred single-line
         content widths so the auto table layout can size its columns."""
         font = _node_font(el)
+        cache = self._image_cache()
         total, longest = 0.0, 0.0
         stack = [el]
         while stack:
@@ -641,7 +765,18 @@ class BlockLayout(LayoutBox):
                     longest = max(longest, w)
             elif isinstance(n, Element):
                 if n.tag == "img":
-                    v = _measure(font, "[img]") + 8
+                    # Size against the real pixels when the image has been
+                    # decoded, not the "[img]" placeholder, or the column is
+                    # drawn far too narrow and the image overlaps its
+                    # neighbours. Matches _inline_img's advance (w * 1.25).
+                    photo = None
+                    src = n.attributes.get("src")
+                    if src and cache:
+                        photo = cache.get(src)
+                    if photo is not None:
+                        v = float(photo.width()) * 1.25
+                    else:
+                        v = _measure(font, "[img]") + 8
                     total += v
                     longest = max(longest, v)
                 elif n.tag in ("input", "textarea", "button", "select"):
@@ -716,6 +851,12 @@ class BlockLayout(LayoutBox):
         box.x += dx
         box.y += dy
         for cmd in getattr(box, "display_list", ()):
+            self._shift_cmd(cmd, dx, dy)
+        # Table cells keep their flattened paint commands in `content`
+        # rather than display_list, so those must be translated too, or the
+        # cell's text/images stay pinned at the pre-move position and overlap
+        # the surrounding content.
+        for cmd in getattr(box, "content", ()):
             self._shift_cmd(cmd, dx, dy)
         for child in box.children:
             self._translate(child, dx, dy)
