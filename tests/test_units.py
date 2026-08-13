@@ -111,6 +111,59 @@ def test_error_page_fallback():
     assert tab.document is not None, "error page laid out"
 
 
+def _address_stub():
+    class Stub(Browser):
+        def __init__(self):
+            self.address_text = "https://example.com/"
+            self.address_caret = 0
+            self.address_sel = None
+            self.address_view = 0
+
+        def _address_ensure_visible(self):
+            pass
+    return Stub()
+
+
+def test_address_backspace_and_forward_delete():
+    stub = _address_stub()
+    stub.address_caret = len(stub.address_text)
+    Browser._address_backspace(stub)
+    assert stub.address_text == "https://example.com", "backspace removes last char"
+    Browser._address_forward_delete(stub)
+    assert stub.address_text == "https://example.com", "forward delete at end is a no-op"
+    stub.address_caret = 0
+    Browser._address_forward_delete(stub)
+    assert stub.address_text == "ttps://example.com", "forward delete removes first char"
+
+
+def test_address_select_all_and_insert():
+    stub = _address_stub()
+    Browser._address_select_all(stub)
+    assert stub.address_sel == (0, len("https://example.com/")), "ctrl-a selects all"
+    Browser._address_insert(stub, "zz")
+    assert stub.address_text == "zz", "typing replaces the selection"
+
+
+def test_address_caret_movement_and_selection():
+    stub = _address_stub()
+    stub.address_caret = 4
+    Browser._address_move_caret(stub, 2)
+    assert stub.address_caret == 6 and stub.address_sel is None, "arrow moves caret"
+    Browser._address_move_caret(stub, 1, extend=True)
+    assert stub.address_sel == (6, 7), "shift-arrow extends selection"
+    Browser._address_move_caret(stub, 1, extend=True)
+    assert stub.address_sel == (6, 8), "selection grows with anchor fixed"
+
+
+def test_address_paste_requires_clipboard():
+    stub = _address_stub()
+    stub.window = type("W", (), {})()
+    stub.window.clipboard_get = lambda: "new.example"
+    stub._address_paste()
+    assert stub.address_text == "new.examplehttps://example.com/", \
+        f"pasted at caret: {stub.address_text}"
+
+
 def test_url_bare_host_with_port():
     u = URL("example.com:8080")
     eq(u.scheme, "https"); eq(u.host, "example.com"); eq(u.port, 8080)
