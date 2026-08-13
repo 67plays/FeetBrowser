@@ -168,6 +168,22 @@ def test_pseudo_selector_stripped():
     eq(a.style["color"], "red", "a:hover matches an <a>")
 
 
+def test_pseudo_element_rule_dropped():
+    """A rule targeting ::before/::after creates a box the engine can't draw;
+    its declarations must NOT leak onto the parent element (e.g. a 1px
+    decorative ::after border must not shrink the element to 1px tall)."""
+    rules = CSSParser(
+        ".t { height: 100px } .t::after { content: ''; height: 1px }"
+    ).parse()
+    dom = HTMLParser('<div class="t">x</div>').parse()
+    style(dom, rules)
+    t = [n for n in tree_to_list(dom, [])
+         if isinstance(n, Element) and n.tag == "div"][0]
+    eq(t.style["height"], "100px", "::after height must not leak onto .t")
+    rules = CSSParser(".t::after { position: absolute; height: 1px }").parse()
+    eq(rules, [], "::after-only rule is dropped entirely")
+
+
 def test_combinators_do_not_crash_and_match():
     rules = CSSParser(
         "p + span { color: red } p ~ em { color: blue } "
@@ -311,6 +327,92 @@ def test_table_layout_rows_and_cells():
         assert r.height > 0, "rows have nonzero height"
         for c in r.children:
             assert c.width > 0 and c.height > 0, "cells have size"
+
+
+def test_table_in_flex_does_not_overlap():
+    """A table repositioned by flex layout must move its cell content with
+    it; otherwise the second table's cells draw on top of the first."""
+    from feetbrowser.layout import DocumentLayout, DrawText
+    css = "div { display: flex; }"
+    rules = CSSParser(css).parse()
+    html = ("<div><table><tr><td>alpha</td><td>beta</td></tr></table>"
+            "<table><tr><td>gamma</td><td>delta</td></tr></table></div>")
+    dom = HTMLParser(html).parse()
+    style(dom, rules)
+    doc = DocumentLayout(dom, 620)
+    doc.layout()
+    texts = {}
+    stack = [doc]
+    while stack:
+        b = stack.pop()
+        for c in b.paint():
+            if isinstance(c, DrawText):
+                texts.setdefault(c.text, []).append((c.left, c.top))
+        stack.extend(b.children)
+    ax = texts["alpha"][0][0]
+    gx = texts["gamma"][0][0]
+    assert gx > ax, f"second table must sit right of first, got {gx} <= {ax}"
+    bx = texts["beta"][0][0]
+    dx = texts["delta"][0][0]
+    assert dx > bx, "second table's cells must not overlap the first's"
+
+
+def test_image_in_table_cell_sizes_column():
+    """A decoded image must size its table column so it doesn't overlap the
+    text in the neighbouring cell."""
+    import tkinter
+    from feetbrowser.layout import DocumentLayout, DrawImage, DrawText
+    html = ("<table><tr><td><img src='https://example.com/img.png'></td>"
+            "<td>zzz</td></tr></table>")
+    dom = HTMLParser(html).parse()
+    style(dom, [])
+    photo = tkinter.PhotoImage(width=200, height=100)
+    cache = {"https://example.com/img.png": photo}
+    doc = DocumentLayout(dom, 620)
+    doc.image_cache = cache
+    doc.layout()
+    img, zx = None, None
+    stack = [doc]
+    while stack:
+        b = stack.pop()
+        for c in b.paint():
+            if isinstance(c, DrawImage):
+                img = c
+            elif isinstance(c, DrawText) and c.text == "zzz":
+                zx = c.left
+        stack.extend(b.children)
+    assert img is not None, "image painted"
+    assert zx is not None, "neighbour cell text painted"
+    assert zx > img.right, \
+        f"neighbour text ({zx}) overlaps the image (ends {img.right})"
+
+
+def test_url_redirect_adopt():
+    """Following an HTTP redirect in place must leave the URL pointing at the
+    final host, so relative image/style/script URLs resolve correctly."""
+    u = URL("https://google.com/")
+    u._adopt(URL("https://www.google.com/path?q=1"))
+    eq(str(u), "https://www.google.com/path?q=1", "adopted final URL")
+    eq(u.host, "www.google.com", "host updated")
+    # A non-redirected URL is untouched.
+    v = URL("https://example.com/a")
+    eq(str(v), "https://example.com/a")
+
+
+def test_webp_image_decode():
+    """WebP (used heavily by Google) must decode to a PhotoImage when Pillow
+    is available, instead of staying a placeholder."""
+    import io
+    try:
+        from PIL import Image as PILImage
+    except ImportError:
+        return  # Pillow is optional
+    im = PILImage.new("RGBA", (4, 4), (0, 0, 255, 255))
+    buf = io.BytesIO()
+    im.save(buf, format="WEBP")
+    photo = Tab._decode_image(buf.getvalue(), "image/webp")
+    assert photo is not None, "WebP should decode"
+    eq((photo.width(), photo.height()), (4, 4), "WebP dimensions preserved")
 
 
 def test_float_text_wraps_and_clears():
@@ -648,6 +750,22 @@ def test_charset_unknown_falls_back_to_utf8():
     eq(_URL._charset({"content-type": "text/html; charset=charset=X-IMAGINARY"}), "utf8")
     eq(_URL._charset({"content-type": 'text/html; charset="iso-8859-1"'}), "iso-8859-1")
     eq(_URL._charset({"content-type": "text/html"}), "utf8")
+
+
+def test_resolve_color_handles_css_color_functions():
+    from feetbrowser.layout import resolve_color
+    eq(resolve_color("rgba(0,0,0,0)"), None, "fully transparent -> no paint")
+    eq(resolve_color("rgba(0, 0, 0, 0)"), None, "spaced transparent rgba")
+    eq(resolve_color("rgb(255,0,0)"), "#ff0000", "rgb")
+    eq(resolve_color("rgba(0,128,255,0.5)"), "#0080ff", "rgba with alpha")
+    eq(resolve_color("rgb(255 0 0 / 0.25)"), "#ff0000", "modern space/slash rgb")
+    eq(resolve_color("rgb(100%, 50%, 0%)"), "#ff8000", "percentage rgb")
+    eq(resolve_color("hsl(120, 100%, 50%)"), "#00ff00", "hsl")
+    eq(resolve_color("hsla(0, 100%, 50%, 0)"), None, "transparent hsla")
+    eq(resolve_color("#fff"), "#ffffff", "3-digit hex expanded")
+    eq(resolve_color("#ff000000"), None, "8-digit hex with alpha 0")
+    eq(resolve_color("transparent"), None, "transparent keyword")
+    eq(resolve_color("red"), "red", "named color passes through")
 
 
 def main():

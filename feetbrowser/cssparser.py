@@ -131,9 +131,22 @@ def _ancestor_possible(selector, node):
 _IDENT_RE = re.compile(r"^[A-Za-z*][-_A-Za-z0-9]*$")
 
 
+_PSEUDO_ELEMENTS = {
+    "before", "after", "first-line", "first-letter", "selection",
+    "placeholder", "marker", "backdrop", "file-selector-button", "cue",
+    "cue-region", "grammar-error", "spelling-error", "highlight", "target-text",
+}
+
+_VENDOR_PREFIXES = ("-webkit-", "-moz-", "-ms-", "-o-", "-khtml-")
+
+
 def _strip_pseudo(text):
-    """Remove pseudo-classes/-elements (:hover, ::before, :not(.x), ...);
-    `:root` is translated to a marker for the root-element selector."""
+    """Strip pseudo-classes (:hover, :not(.x), ...); `:root` becomes a marker.
+
+    Pseudo-elements (::before, :after, ::first-line, ...) create a box the
+    engine does not render, so a rule that targets one must be dropped
+    entirely -- otherwise its declarations would leak onto the parent element
+    (e.g. `.x::after { height: 1px }` would shrink `.x` itself)."""
     out = []
     i = 0
     n = len(text)
@@ -155,8 +168,19 @@ def _strip_pseudo(text):
                     i += 1
                 continue
             i += 1
-        if text[start:i] in (":root", "::root"):
+        token = text[start:i]
+        if token in (":root", "::root"):
             out.append(":root")
+            continue
+        if token.startswith("::"):
+            return ""
+        name = token[1:]
+        for pref in _VENDOR_PREFIXES:
+            if name.startswith(pref):
+                name = name[len(pref):]
+                break
+        if name in _PSEUDO_ELEMENTS:
+            return ""
     return "".join(out)
 
 
