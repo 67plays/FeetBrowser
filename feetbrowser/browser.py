@@ -453,24 +453,57 @@ class Tab:
     @staticmethod
     def _decode_image(data, ctype):
         """Decode image bytes to a Tk PhotoImage. PNG/GIF/PNM are handled
-        natively by Tk; JPEG requires Pillow and returns None without it."""
+        natively by Tk; JPEG/WebP/BMP/ICO/TIFF are converted to PNG through
+        Pillow when it is installed; SVG is rasterized via cairosvg when
+        available (or handed to Tk on Tk 8.7+, which can rasterize it)."""
         ctype = (ctype or "").split(";")[0].strip().lower()
-        try:
-            if ctype in ("image/png", "image/gif", "image/x-xbitmap"):
+        # Formats Tk decodes natively.
+        if ctype in ("image/png", "image/gif", "image/x-xbitmap"):
+            try:
                 return tkinter.PhotoImage(data=data)
-            if ctype in ("image/jpeg", "image/jpg"):
-                try:
-                    from PIL import Image as PILImage
-                    import io
-                    pil = PILImage.open(io.BytesIO(data)).convert("RGBA")
-                    buf = io.BytesIO()
-                    pil.save(buf, format="PNG")
-                    return tkinter.PhotoImage(data=buf.getvalue())
-                except Exception:  # noqa: BLE001 - Pillow missing / bad data
-                    return None
-            # Unknown type: let Tk sniff the data (it may still decode).
+            except Exception:  # noqa: BLE001 - bad bytes; try Pillow below
+                pass
+        # Formats Pillow can convert to PNG (otherwise fall through to Tk
+        # sniffing, which may still decode).
+        if ctype in ("image/jpeg", "image/jpg", "image/webp", "image/bmp",
+                     "image/x-icon", "image/vnd.microsoft.icon", "image/tiff"):
+            photo = Tab._photo_from_pillow(data)
+            if photo is not None:
+                return photo
+        if ctype == "image/svg+xml":
+            photo = Tab._photo_from_svg(data)
+            if photo is not None:
+                return photo
+        # Unknown type: let Tk sniff the data (it may still decode).
+        try:
             return tkinter.PhotoImage(data=data)
         except Exception:  # noqa: BLE001 - undecodable data -> placeholder
+            return None
+
+    @staticmethod
+    def _photo_from_pillow(data):
+        """Convert image bytes to a Tk PhotoImage via Pillow. Returns None
+        if Pillow is missing or the data is undecodable."""
+        try:
+            from PIL import Image as PILImage
+            import io
+            pil = PILImage.open(io.BytesIO(data))
+            pil.load()
+            pil = pil.convert("RGBA")
+            buf = io.BytesIO()
+            pil.save(buf, format="PNG")
+            return tkinter.PhotoImage(data=buf.getvalue())
+        except Exception:  # noqa: BLE001 - Pillow missing / bad data
+            return None
+
+    @staticmethod
+    def _photo_from_svg(data):
+        """Rasterize SVG bytes to a Tk PhotoImage via cairosvg (optional)."""
+        try:
+            import cairosvg
+            png = cairosvg.svg2png(bytestring=data)
+            return tkinter.PhotoImage(data=png)
+        except Exception:  # noqa: BLE001 - cairosvg missing / bad data
             return None
 
     def content_height(self):
