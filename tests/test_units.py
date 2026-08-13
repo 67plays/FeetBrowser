@@ -163,9 +163,9 @@ def test_history_internal_page_loads():
     eq(tab.title, "History", "history title")
     links = [n for n in tree_to_list(tab.nodes, []) if isinstance(n, Element)
              and n.tag == "a"]
-    hrefs = [n.attributes.get("href", "") for n in links]
-    assert "https://example.org" in hrefs
-    assert "https://news.ycombinator.com" in hrefs
+    hrefs = {n.attributes.get("href", "") for n in links}
+    expected = {"https://example.org", "https://news.ycombinator.com"}
+    assert expected.issubset(hrefs)
 
 
 def test_browser_tab_cycle_wraps():
