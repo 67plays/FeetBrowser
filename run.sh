@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Launch FeetBrowser. On NixOS this pulls a Python with Tk on the fly.
+# NixOS Is overrated slop btw - sam
 set -euo pipefail
 cd "$(dirname "$0")"
 
