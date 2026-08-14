@@ -20,7 +20,7 @@ from collections import deque
 from .net import URL
 from .htmlparser import HTMLParser, Text, Element
 from .cssparser import CSSParser, style, parse_inline
-from .layout import DocumentLayout, paint_tree, get_font
+from .layout import DocumentLayout, paint_tree, get_font, DrawText, _measure
 from .jsdom import JSDocument
 from .jsengine import Interpreter, JSException, UNDEFINED
 from . import toes as toes
@@ -156,6 +156,9 @@ class Tab:
         self._load_gen = 0
         self._load_queue = deque()
         self._load_meta = None
+        # Page text selection: (ax, ay, ex, ey) in document coordinates, or
+        # None when nothing is selected. Used by drag-selection + Ctrl+C.
+        self.selection = None
 
     # -- navigation ------------------------------------------------------
 
@@ -172,6 +175,7 @@ class Tab:
             self.status = "Loading source..."
         self.focused_input = None
         self.form_values = {}
+        self.selection = None
 
         # Toe-handled (internal) URLs are cheap and stay synchronous. The
         # built-in ToeHub handles toehub:// and framework toe:// pages before
@@ -357,6 +361,7 @@ class Tab:
         self._run_scripts()
 
     def render(self):
+        self.selection = None
         self.document = DocumentLayout(self.nodes, WIDTH)
         self.document.image_cache = self.image_cache
         self.document.layout()
@@ -765,6 +770,88 @@ class Tab:
         """Return href under the cursor for hover feedback, else None."""
         return self._enclosing_link(self._node_at(x, y))
 
+    # -- text selection --------------------------------------------------
+
+    def _text_char_at(self, x, y):
+        """Return the DrawText command and char index under (x, y), or
+        (None, None) if no text is under the point."""
+        for cmd in self.display_list:
+            if isinstance(cmd, DrawText) and cmd.text and cmd.hit(x, y):
+                return cmd, self._char_at_x(cmd, x)
+        return None, None
+
+    @staticmethod
+    def _char_at_x(cmd, x):
+        """Index of the character whose left edge is nearest to x within a
+        DrawText command."""
+        i = 0
+        while i < len(cmd.text) and \
+                cmd.left + _measure(cmd.font, cmd.text[:i + 1]) <= x:
+            i += 1
+        return i
+
+    def start_selection(self, x, y):
+        """Begin (or reset) a selection anchored at document coords (x, y)."""
+        cmd, i = self._text_char_at(x, y)
+        if cmd:
+            x = cmd.left + _measure(cmd.font, cmd.text[:i])
+        self.selection = (x, y, x, y)
+
+    def extend_selection(self, x, y):
+        """Extend the selection to document coords (x, y)."""
+        if self.selection is None:
+            self.start_selection(x, y)
+            return
+        cmd, i = self._text_char_at(x, y)
+        if cmd:
+            x = cmd.left + _measure(cmd.font, cmd.text[:i])
+        self.selection = (self.selection[0], self.selection[1], x, y)
+
+    def _selection_spans(self):
+        """Selected character ranges as (cmd, start_char, end_char) tuples,
+        in document order, or [] when nothing is selected."""
+        if self.selection is None:
+            return []
+        ax, ay, ex, ey = self.selection
+        if ax == ex and ay == ey:
+            return []
+        spans = []
+        for cmd in self.display_list:
+            if not isinstance(cmd, DrawText) or not cmd.text:
+                continue
+            if cmd.bottom <= min(ay, ey) or cmd.top > max(ay, ey):
+                continue
+            s, e = 0, len(cmd.text)
+            on_anchor = cmd.top <= ay < cmd.bottom
+            on_end = cmd.top <= ey < cmd.bottom
+            forward = (ey, ex) >= (ay, ax)
+            if on_anchor:
+                if forward:
+                    s = max(s, self._char_at_x(cmd, ax))
+                else:
+                    e = min(e, self._char_at_x(cmd, ax))
+            if on_end:
+                if forward:
+                    e = min(e, self._char_at_x(cmd, ex))
+                else:
+                    s = max(s, self._char_at_x(cmd, ex))
+            if s < e:
+                spans.append((cmd, s, e))
+        return spans
+
+    def selected_text(self):
+        """The selected text, line-by-line, for clipboard copying."""
+        lines, cur, last_top = [], [], None
+        for cmd, s, e in self._selection_spans():
+            if last_top is not None and cmd.top != last_top:
+                lines.append(" ".join(cur))
+                cur = []
+            cur.append(cmd.text[s:e])
+            last_top = cmd.top
+        if cur:
+            lines.append(" ".join(cur))
+        return "\n".join(lines)
+
     # -- forms -----------------------------------------------------------
 
     @staticmethod
@@ -919,6 +1006,27 @@ class Tab:
             if cmd.bottom < self.scroll:
                 continue
             cmd.execute(self.scroll - offset, canvas)
+        self._draw_selection(canvas, offset)
+
+    def _draw_selection(self, canvas, offset):
+        """Paint the text-selection highlight (blue fill + white text) over
+        whatever was already drawn."""
+        for cmd, s, e in self._selection_spans():
+            x1 = cmd.left + _measure(cmd.font, cmd.text[:s])
+            x2 = cmd.left + _measure(cmd.font, cmd.text[:e])
+            y1, y2 = cmd.top, cmd.bottom
+            if y2 < self.scroll or y1 > self.scroll + self.tab_height:
+                continue
+            try:
+                canvas.create_rectangle(
+                    x1, y1 - self.scroll + offset,
+                    x2, y2 - self.scroll + offset,
+                    fill="#1a73e8", width=0)
+                canvas.create_text(
+                    x1, y1 - self.scroll + offset, text=cmd.text[s:e],
+                    font=cmd.font, fill="white", anchor="nw")
+            except tkinter.TclError:
+                pass
 
 
 class Browser:
@@ -931,6 +1039,7 @@ class Browser:
         self.address_caret = 0
         self.address_sel = None  # (start, end) while selecting, else None
         self.address_view = 0  # horizontal scroll offset in px
+        self._drag_moved = False  # a press+move (vs. a plain click) happened
         self._resize_after = None
         self._last_size = (WIDTH, HEIGHT)
         # Chrome-style loading spinner: current arc start angle (degrees).
@@ -975,6 +1084,7 @@ class Browser:
         w.bind("<Button-5>", lambda e: self._scroll(SCROLL_STEP))
         w.bind("<Button-1>", self._on_click)
         w.bind("<B1-Motion>", self._on_drag)
+        w.bind("<ButtonRelease-1>", self._on_release)
         w.bind("<Button-2>", self._on_middle_click)
         w.bind("<Motion>", self._on_motion)
         w.bind("<Key>", self._on_key)
@@ -984,7 +1094,8 @@ class Browser:
         w.bind("<Escape>", self._on_escape)
         w.bind("<Configure>", self._on_resize)
         w.bind("<Control-l>", lambda e: self._focus_address())
-        w.bind("<Control-t>", lambda e: self.new_tab("about:blank"))
+        w.bind("<Control-t>", lambda e: self.new_tab("about:blank",
+                                                     focus_address=True))
         w.bind("<Control-w>", lambda e: self.close_tab())
         w.bind("<Control-r>", lambda e: self._reload())
         w.bind("<Control-d>", lambda e: self._toggle_bookmark())
@@ -1027,7 +1138,7 @@ class Browser:
             h = HEIGHT
         return max(50, h - self.chrome_height())
 
-    def new_tab(self, url):
+    def new_tab(self, url, focus_address=False):
         tab = Tab(self.tab_height(), self)
         page = self._coerce_url(url)
         if isinstance(page, _AboutURL):
@@ -1039,6 +1150,8 @@ class Browser:
         self.active_tab = tab
         toes.dispatch(self.toe_contexts, "on_new_tab")
         self.draw()
+        if focus_address:
+            self._focus_address()
 
     def close_tab(self):
         if not self.active_tab:
@@ -1159,6 +1272,7 @@ class Browser:
     def _on_click(self, e):
         was_address = self.focus == "address"
         self.focus = None
+        self._drag_moved = False
         if e.y < self.chrome_height():
             self._chrome_click(e.x, e.y, was_address)
             return
@@ -1167,14 +1281,40 @@ class Browser:
         ctrl = bool(getattr(e, "state", 0) & 0x4)
         dest = self.active_tab.click(e.x, e.y - self.chrome_height())
         if isinstance(dest, FormAction):
+            self.active_tab.selection = None
             self._navigate(self.active_tab, dest.url, payload=dest.payload)
         elif dest and ctrl:
+            self.active_tab.selection = None
             self.new_tab(str(dest))
         elif dest:
+            self.active_tab.selection = None
             self._navigate(self.active_tab, dest)
+        else:
+            # Clicking plain text (or blank space) anchors a selection; it is
+            # cleared again by a plain click in `_on_release`.
+            node = self.active_tab._node_at(e.x, e.y - self.chrome_height())
+            if not self.active_tab._hit_control(node):
+                self.active_tab.start_selection(e.x, e.y - self.chrome_height())
         self.draw()
 
     def _on_middle_click(self, e):
+        band_h = toes.band_height(self.chrome_bands())
+        if e.y < band_h + 40:
+            # Tab bar: middle-click a tab to close it, empty space (or the
+            # "+" zone) to open a fresh one.
+            if e.x < 34:
+                self.new_tab("about:blank", focus_address=True)
+                self.draw()
+                return
+            for i, tab in enumerate(self.tabs):
+                x0 = 40 + i * 160
+                if x0 <= e.x < x0 + 158:
+                    self.active_tab = tab
+                    self.close_tab()
+                    return
+            self.new_tab("about:blank", focus_address=True)
+            self.draw()
+            return
         if not self.active_tab or e.y < self.chrome_height():
             return
         dest = self.active_tab.click(e.x, e.y - self.chrome_height())
@@ -1183,14 +1323,33 @@ class Browser:
         elif dest:
             self.new_tab(str(dest))
 
+    def _on_release(self, e):
+        if self.focus == "address":
+            return
+        tab = self.active_tab
+        if not tab or tab.selection is None:
+            return
+        if not self._drag_moved:
+            # A plain click (press + release, no drag) clears the selection.
+            tab.selection = None
+        self._drag_moved = False
+        self.draw()
+
     def _on_drag(self, e):
         if self.focus == "address" and e.x >= self._address_bar_x() - 10:
+            self._drag_moved = True
             if self.address_sel is None:
                 self.address_sel = (self.address_caret, self.address_caret)
             anchor = self.address_sel[0]
             self.address_caret = self._caret_from_x(e.x)
             self.address_sel = (anchor, self.address_caret)
             self._address_ensure_visible()
+            self.draw()
+            return
+        # Dragging on the page extends the text selection.
+        if self.active_tab and e.y >= self.chrome_height():
+            self._drag_moved = True
+            self.active_tab.extend_selection(e.x, e.y - self.chrome_height())
             self.draw()
 
     def _chrome_click(self, x, y, was_address=False):
@@ -1205,7 +1364,7 @@ class Browser:
         if y < band_h + 40:
             # New-tab button.
             if x < 34:
-                self.new_tab("about:blank")
+                self.new_tab("about:blank", focus_address=True)
                 return
             for i, tab in enumerate(self.tabs):
                 x0 = 40 + i * 160
@@ -1278,6 +1437,10 @@ class Browser:
         if self.focus == "address":
             self._address_key(e)
             return
+        ctrl = bool(getattr(e, "state", 0) & 0x4)
+        if ctrl and getattr(e, "keysym", "").lower() == "c":
+            self._copy_selection()
+            return
         # Toes get first crack at keys when no address bar has focus, but
         # only consume the key when a toe explicitly returns True (a False
         # return means "not handled").
@@ -1332,6 +1495,16 @@ class Browser:
         if len(e.char) == 1 and ord(e.char) >= 32 and e.char.isprintable():
             self._address_insert(e.char)
             self.draw()
+
+    def _copy_selection(self):
+        """Copy the active tab's selected text to the system clipboard."""
+        if not self.active_tab:
+            return
+        text = self.active_tab.selected_text()
+        if not text:
+            return
+        self.window.clipboard_clear()
+        self.window.clipboard_append(text)
 
     def _address_bar_x(self):
         """Canvas x where the address-bar text starts (after toe buttons
@@ -1692,8 +1865,15 @@ class Browser:
                                fill="white" if active else "#c4c4c4",
                                width=0)
             title = tab.title or "New Tab"
-            if len(title) > 18:
-                title = title[:17] + "…"
+            # Tabs are 158px wide; fit the title in the space before the
+            # close box (which starts at x0 + 148) so long page titles never
+            # spill out past the tab edge.
+            title_w = 128
+            if _measure(self.chrome_font, title) > title_w:
+                t = title
+                while t and _measure(self.chrome_font, t + "…") > title_w:
+                    t = t[:-1]
+                title = t + "…"
             c.create_text(x0 + 10, top + 20, text=title, anchor="w",
                           font=self.chrome_font, fill="#222")
             c.create_text(x0 + 148, top + 20, text="×", font=self.bold_font,
