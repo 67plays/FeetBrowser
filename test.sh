@@ -14,8 +14,14 @@ if [ ! -x .venv/bin/python ]; then
   python3 -m venv .venv
 fi
 
-# Ensure the Rust JS engine (feetbrowser_engine) is built in the local venv.
-if ! .venv/bin/python -c "import feetbrowser_engine" 2>/dev/null; then
+# Ensure the Rust JS engine (feetbrowser_engine) is built in the local venv,
+# and rebuilt whenever rust/ has moved on since. Importing it successfully is
+# not enough. An extension compiled from an older tree runs perfectly well and
+# fails the tests that the newer tree added, which reads as "your branch is
+# broken" when the truth is "your venv is old" -- and it is the tests of the
+# DOM bridge, whose Python and Rust halves have to agree, that go first.
+engine=$(.venv/bin/python -c "import feetbrowser_engine as e; print(e.__file__)" 2>/dev/null || true)
+if [ -z "$engine" ] || [ -n "$(find rust/src rust/Cargo.toml -newer "$engine" 2>/dev/null | head -1)" ]; then
   .venv/bin/pip install -q maturin
   .venv/bin/maturin develop --release --manifest-path rust/Cargo.toml
 fi

@@ -13,8 +13,23 @@ if python3 -c "import feetbrowser_engine" 2>/dev/null; then
 fi
 
 # Otherwise the venv is what runs the browser, so ask the venv -- and not the
-# system python -- whether the engine is there.
-if [ ! -x .venv/bin/python ] || ! .venv/bin/python -c "import feetbrowser_engine" 2>/dev/null; then
+# system python -- whether the engine is there, and whether it still matches
+# rust/. A stale extension starts up perfectly happily and then misbehaves in
+# ways that look like page bugs rather than build problems, so sources newer
+# than the engine count the same as no engine at all.
+engine=""
+if [ -x .venv/bin/python ]; then
+  engine=$(.venv/bin/python -c "import feetbrowser_engine as e; print(e.__file__)" 2>/dev/null || true)
+fi
+if [ -z "$engine" ]; then
+  building=first
+elif [ -n "$(find rust/src rust/Cargo.toml -newer "$engine" 2>/dev/null | head -1)" ]; then
+  building=again
+else
+  building=
+fi
+
+if [ -n "$building" ]; then
   # Say what is about to happen before it happens. Someone who typed ./run.sh
   # expecting a browser and got several minutes of cargo output has every
   # reason to think they are in the wrong repository.
@@ -37,7 +52,8 @@ run this script again.
 NORUST
     exit 1
   fi
-  cat <<'BUILDING'
+  if [ "$building" = first ]; then
+    cat <<'BUILDING'
 FeetBrowser: building the JavaScript engine before the first start.
 
 It is a Rust extension rather than Python, so it has to be compiled. maturin
@@ -46,6 +62,16 @@ on a slow machine or a cold cargo cache -- and only this once. Every later
 start skips straight past this.
 
 BUILDING
+  else
+    cat <<'REBUILDING'
+FeetBrowser: rebuilding the JavaScript engine, which is older than rust/.
+
+Something under rust/ has changed since the engine in this directory was
+compiled -- a git pull, most likely. Starting the old one would be quicker and
+would go wrong in ways that look like the page's fault, so it gets rebuilt.
+
+REBUILDING
+  fi
   python3 -m venv .venv
   .venv/bin/pip install -q maturin
   if ! .venv/bin/maturin develop --release --manifest-path rust/Cargo.toml; then
