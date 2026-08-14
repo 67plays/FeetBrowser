@@ -1,8 +1,9 @@
 """Image decoders: PNG, GIF and the Netpbm family, decoded to raw RGBA.
 
-These are the formats Tk's PhotoImage accepted natively, so decoding them
-ourselves is what lets the raster backend show the same images. JPEG is not
-here -- it stays on the optional Pillow path the browser already had.
+These three are the formats we decode ourselves, which is what lets the
+browser show an image without asking anything outside the project. JPEG is not
+here -- it stays on the optional Pillow path, and docs/dependencies.md scopes
+what writing our own would take.
 
 Thin shim: the decoders live in Rust, in the `feetbrowser_engine` extension.
 They are the part of the renderer that parses bytes a stranger sent us, and

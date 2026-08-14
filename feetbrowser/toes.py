@@ -142,8 +142,9 @@ class Context:
         on_draw(canvas, offset)     -> None
             Paint directly onto the canvas (after the page, before the
             chrome). `offset` is how much the page is shifted by the chrome.
-            The canvas answers to the Tk drawing API a toe written against
-            tkinter expects; see docs/toes.md for where that stops.
+            The canvas is the retained display list from canvas.py, whose
+            method names a toe from the published catalog already knows; see
+            docs/toes.md for where that compatibility stops.
 
         buttons()                   -> [ButtonDef]
             Extra toolbar buttons, drawn on the hand-rolled toolbar.

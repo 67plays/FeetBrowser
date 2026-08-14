@@ -19,7 +19,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from feetbrowser import browser as browsermod
-from feetbrowser import gui, raster, x11
+from feetbrowser import raster, x11
 
 import test_x11 as helpers   # noqa: E402 - the same live-server plumbing
 
@@ -136,8 +136,6 @@ def check(shot):
 def main():
     path = sys.argv[1] if len(sys.argv) > 1 else "x11-window.png"
     url = sys.argv[2] if len(sys.argv) > 2 else None
-    if gui.backend() != "raster":
-        sys.exit("x11_shot needs the raster backend (FEETBROWSER_BACKEND)")
     if not x11.available():
         sys.exit("no X11 display: %s" % (x11.unavailable_reason() or "?"))
 

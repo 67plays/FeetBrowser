@@ -2,7 +2,7 @@
 import sys, os, threading, http.server
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from feetbrowser import gui
+from feetbrowser.window import Tk
 
 from feetbrowser.browser import Tab, FormAction
 from feetbrowser.htmlparser import Element
@@ -138,7 +138,7 @@ def test_form_round_trip():
 
 
 def main():
-    root = gui.Tk(); root.withdraw()
+    root = Tk(); root.withdraw()
     tab = Tab(700)
     tab.load(SITE)
     assert tab.title == "Example Domain", tab.title

@@ -5,8 +5,8 @@ Pipeline per navigation:
     -> DocumentLayout -> display list -> paint on a canvas.
 
 Chrome (tabs, address bar, back/forward, scrollbar) is drawn by hand onto the
-same canvas, and the canvas itself comes from gui.py -- by default our own
-rasteriser -- so the whole browser really is "from scratch", pixels included.
+same canvas, and the canvas is our own rasteriser, so the whole browser
+really is "from scratch", pixels included.
 """
 
 import os
@@ -17,6 +17,8 @@ import json
 import html
 import threading
 from . import gui
+from .canvas import Canvas, CanvasError, PhotoImage
+from .window import Tk
 import urllib.parse
 from collections import deque
 
@@ -234,7 +236,7 @@ class Tab:
         self.base_url = None
         self.focused_input = None
         self.form_values = {}
-        # Absolute URL -> decoded gui.PhotoImage, shared with the layout
+        # Absolute URL -> decoded PhotoImage, shared with the layout
         # so <img> elements render their actual pixels.
         self.image_cache = {}
         self._image_queue = []
@@ -376,7 +378,7 @@ class Tab:
 
     def _start_async_load(self, url, payload, push, refresh, pending_scroll):
         """Fetch the page body on a background thread; the UI thread applies
-        it in `_poll_async` so Tk/DOM work never leaves the main loop."""
+        it in `_poll_async` so canvas and DOM work never leaves the main loop."""
         self.loading = True
         self._load_gen += 1
         gen = self._load_gen
@@ -603,7 +605,7 @@ class Tab:
         self._js_interp.globals["parent"] = self._js_interp.globals["window"]
         self._js_interp.globals["self"] = self._js_interp.globals["window"]
         self._js_interp.globals["top"] = self._js_interp.globals["window"]
-        # Browser-provided host APIs (network + nothing Tk).
+        # Browser-provided host APIs (network, and nothing that draws).
         self._js_interp.globals["fetch"] = self._js_fetch
         self._js_interp.globals["XMLHttpRequest"] = self._js_xhr_ctor()
         # Rendering/event APIs. rAF rides the existing virtual-clock timer
@@ -944,7 +946,7 @@ class Tab:
         self._image_done = done
         self._image_queue = []
         # Background threads stash raw bytes here; the UI thread drains the
-        # deque on a timer so Tk (Photos, canvas) is only ever touched on the
+        # deque on a timer so the canvas and its photos are only ever touched on the
         # main thread. deque append/popleft are atomic under the GIL.
         self._image_results = deque()
         seen = set()
@@ -998,7 +1000,7 @@ class Tab:
 
     def _fetch_image(self, key, url):
         """Background thread: fetch bytes, hand them back to the UI thread via
-        the results queue. Never touches Tk directly. The semaphore bounds
+        the results queue. Never touches the canvas directly. The semaphore bounds
         how many image fetches run at once browser-wide."""
         try:
             with _image_fetch_sem:
@@ -1047,19 +1049,20 @@ class Tab:
 
     @staticmethod
     def _decode_image(data, ctype):
-        """Decode image bytes to a Tk PhotoImage. PNG/GIF/PNM are handled
-        natively by Tk; JPEG/WebP/BMP/ICO/TIFF are converted to PNG through
-        Pillow when it is installed; SVG is rasterized via cairosvg when
-        available (or handed to Tk on Tk 8.7+, which can rasterize it)."""
+        """Decode image bytes to a PhotoImage. PNG, GIF and the Netpbm family
+        are decoded by our own codecs in `imagecodec`; JPEG/WebP/BMP/ICO/TIFF
+        are converted to PNG through Pillow when it is installed; SVG is
+        rasterized via cairosvg when it is installed. Anything we cannot
+        decode returns None and the caller draws the placeholder."""
         ctype = (ctype or "").split(";")[0].strip().lower()
-        # Formats Tk decodes natively.
+        # Formats our own decoders handle.
         if ctype in ("image/png", "image/gif", "image/x-xbitmap"):
             try:
-                return gui.PhotoImage(data=data)
+                return PhotoImage(data=data)
             except Exception:  # noqa: BLE001 - bad bytes; try Pillow below
                 pass
-        # Formats Pillow can convert to PNG (otherwise fall through to Tk
-        # sniffing, which may still decode).
+        # Formats Pillow can convert to PNG (otherwise fall through to the
+        # sniffing decode below, which may still recognise the bytes).
         if ctype in ("image/jpeg", "image/jpg", "image/webp", "image/bmp",
                      "image/x-icon", "image/vnd.microsoft.icon", "image/tiff"):
             photo = Tab._photo_from_pillow(data)
@@ -1069,15 +1072,16 @@ class Tab:
             photo = Tab._photo_from_svg(data)
             if photo is not None:
                 return photo
-        # Unknown type: let Tk sniff the data (it may still decode).
+        # Unknown type: sniff the data; the signature may still name a format
+        # we decode.
         try:
-            return gui.PhotoImage(data=data)
+            return PhotoImage(data=data)
         except Exception:  # noqa: BLE001 - undecodable data -> placeholder
             return None
 
     @staticmethod
     def _photo_from_pillow(data):
-        """Convert image bytes to a Tk PhotoImage via Pillow. Returns None
+        """Convert image bytes to a PhotoImage via Pillow. Returns None
         if Pillow is missing or the data is undecodable."""
         try:
             from PIL import Image as PILImage
@@ -1091,17 +1095,17 @@ class Tab:
             pil = pil.convert("RGBA")
             buf = io.BytesIO()
             pil.save(buf, format="PNG")
-            return gui.PhotoImage(data=buf.getvalue())
+            return PhotoImage(data=buf.getvalue())
         except Exception:  # noqa: BLE001 - Pillow missing / bad data
             return None
 
     @staticmethod
     def _photo_from_svg(data):
-        """Rasterize SVG bytes to a Tk PhotoImage via cairosvg (optional)."""
+        """Rasterize SVG bytes to a PhotoImage via cairosvg (optional)."""
         try:
             import cairosvg
             png = cairosvg.svg2png(bytestring=data)
-            return gui.PhotoImage(data=png)
+            return PhotoImage(data=png)
         except Exception:  # noqa: BLE001 - cairosvg missing / bad data
             return None
 
@@ -1775,14 +1779,14 @@ class Tab:
                     x1, y1 - self.scroll + offset, text=cmd.text[s:e],
                     font=cmd.font, fill="white", anchor="nw",
                     tags=("selection",))
-            except gui.TclError:
+            except CanvasError:
                 pass
 
 
 class ContextMenu:
     """A hand-drawn context menu painted on the browser canvas.
 
-    Stays true to the "chrome is drawn by hand" design: no native Tk menu
+    Stays true to the "chrome is drawn by hand" design: no native menu
     widgets, just rectangles and text, so it looks and behaves like the rest
     of the UI. Items are None (a separator) or (label, callback, enabled).
 
@@ -2164,11 +2168,11 @@ class Browser:
 
         # A headless root by default, so tests and --screenshot never open
         # anything; main() passes a real one from gui.new_window().
-        self.window = window if window is not None else gui.Tk()
+        self.window = window if window is not None else Tk()
         self.window.title("FeetBrowser")
         self.window.geometry(f"{WIDTH}x{HEIGHT}")
         self.window.minsize(480, 320)
-        self.canvas = gui.Canvas(
+        self.canvas = Canvas(
             self.window, width=WIDTH, height=HEIGHT,
             bg="white", highlightthickness=0)
         self.canvas.pack(fill="both", expand=True)
@@ -2677,7 +2681,7 @@ class Browser:
         try:
             self.window.clipboard_clear()
             self.window.clipboard_append(text)
-        except gui.TclError:
+        except CanvasError:
             pass
 
     def _view_source(self):
@@ -3092,7 +3096,7 @@ class Browser:
         try:
             self.window.clipboard_clear()
             self.window.clipboard_append(self.address_text[s:e])
-        except gui.TclError:
+        except CanvasError:
             pass
 
     def _address_cut(self):
@@ -3107,7 +3111,7 @@ class Browser:
         flavour, and neither deserves a traceback in the user's face."""
         try:
             return self.window.clipboard_get()
-        except gui.TclError:
+        except CanvasError:
             return ""
 
     def _address_paste(self):
@@ -3775,7 +3779,7 @@ class Browser:
 
 
 class PopupWindow:
-    """A real popup window (a separate Tk Toplevel), not a redirect.
+    """A real popup window (a separate Toplevel), not a redirect.
 
     Each popup is a mini-browser: its own canvas, a hand-drawn title bar
     with a close button, a Tab rendering the URL through the full pipeline,
@@ -3797,7 +3801,7 @@ class PopupWindow:
         self.window = gui.Toplevel(browser.window)
         self.window.title("")
         self.window.geometry(f"{width}x{height}")
-        self.canvas = gui.Canvas(
+        self.canvas = Canvas(
             self.window, width=width, height=height,
             bg="white", highlightthickness=0)
         self.canvas.pack(fill="both", expand=True)
@@ -3895,7 +3899,7 @@ class PopupWindow:
         try:
             self.window.clipboard_clear()
             self.window.clipboard_append(text)
-        except gui.TclError:
+        except CanvasError:
             pass
 
     def _navigate(self, dest):
@@ -4495,18 +4499,11 @@ def shoes_html(theme, active):
 def screenshot(url, path, width=WIDTH, height=HEIGHT, settle=SETTLE_TIMEOUT):
     """Load `url` and write the rendered window to `path` as a PNG.
 
-    No display is opened. The raster backend draws into an ordinary buffer,
-    so a full render -- chrome, page, images, whatever scripts produced -- is
-    just a file write, which makes the renderer inspectable from a shell and
+    No display is opened. The canvas draws into an ordinary buffer, so a full
+    render -- chrome, page, images, whatever scripts produced -- is just a
+    file write, which makes the renderer inspectable from a shell and
     diffable in a test.
     """
-    if gui.backend() != "raster":
-        # Only our own canvas can hand back its pixels; a Tk one draws into a
-        # window we are not opening. Say so rather than failing on a missing
-        # method halfway through a page load.
-        raise RuntimeError(
-            "--screenshot needs the raster backend; this run is using "
-            "%r (set FEETBROWSER_BACKEND=raster)" % gui.backend())
     browser = Browser()
     browser.window.geometry("%dx%d" % (width, height))
     browser.canvas.resize(width, height)

@@ -4,7 +4,8 @@ import urllib.parse
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from feetbrowser import gui
+from feetbrowser.canvas import CanvasError, PhotoImage
+from feetbrowser.window import Tk
 
 from feetbrowser.net import URL
 from feetbrowser.htmlparser import HTMLParser, Element, Text
@@ -611,7 +612,7 @@ def test_image_in_table_cell_sizes_column():
             "<td>zzz</td></tr></table>")
     dom = HTMLParser(html).parse()
     style(dom, [])
-    photo = gui.PhotoImage(width=200, height=100)
+    photo = PhotoImage(width=200, height=100)
     cache = {"https://example.com/img.png": photo}
     doc = DocumentLayout(dom, 620)
     doc.image_cache = cache
@@ -1440,7 +1441,7 @@ def _key_stub(tab, clipboard=""):
     to be read the way the real one does when nothing text-shaped is on it."""
     def read():
         if clipboard is None:
-            raise gui.TclError("CLIPBOARD selection doesn't exist")
+            raise CanvasError("CLIPBOARD selection doesn't exist")
         return clipboard
 
     class Stub(Browser):
@@ -2107,7 +2108,7 @@ def test_async_load_in_gui_mode():
             pass
 
     srv = _start_server(H)
-    root = gui.Tk(); root.withdraw()
+    root = Tk(); root.withdraw()
     try:
         class FakeBrowser:
             window = root
@@ -2860,7 +2861,7 @@ def test_an_untouched_select_submits_its_fallback_choice():
 
 
 def main():
-    root = gui.Tk(); root.withdraw()
+    root = Tk(); root.withdraw()
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0
     for t in tests:

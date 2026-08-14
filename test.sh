@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Run the FeetBrowser test suite.
 #
-# The renderer draws into its own framebuffer, so no display, no Tk and no
-# toolkit is needed. The JavaScript engine is the Rust extension
+# The renderer draws into its own framebuffer, so no display and no toolkit is
+# needed. The JavaScript engine is the Rust extension
 # `feetbrowser_engine`, so the suite runs out of the local venv maturin builds
 # it into. Three suites step outside all that: test_cocoa.py and test_x11.py
 # open real windows wherever their platform has one and skip everywhere else,

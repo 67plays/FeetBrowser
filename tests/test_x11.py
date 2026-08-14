@@ -18,7 +18,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from feetbrowser import gui, x11
+from feetbrowser import x11
 from feetbrowser.window import STATE_ALT, STATE_CONTROL, STATE_SHIFT
 
 # The two formats every ordinary server hands out: a little-endian machine
@@ -248,8 +248,6 @@ def test_a_release_cannot_be_caught_by_a_typing_binding():
 # -- the live half ---------------------------------------------------------
 
 def _live_reason():
-    if gui.backend() != "raster":
-        return "needs FEETBROWSER_BACKEND=raster"
     if not x11.available():
         return x11.unavailable_reason() or "no X11 on this platform"
     return ""
