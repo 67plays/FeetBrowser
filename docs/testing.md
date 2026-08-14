@@ -1,13 +1,15 @@
 # Tests
 
 ```bash
-./test.sh          # builds the Rust engine, then pyflakes + unit + JS + pixels + navigation + toe + Go + live smoke
+./test.sh          # builds both JS engines, then pyflakes + unit + JS + pixels + navigation + toe + Go + live smoke
 ```
 
-`test.sh` builds the Rust JS engine (`feetbrowser_engine`) into the local
-`.venv` with `maturin develop --release` on first use, then runs every suite
-from that venv — so a first run needs the Rust toolchain (maturin is
-installed into the venv automatically).
+`test.sh` builds the Zig JS engine and runs its own tests — the VM suite, the
+parser suite and the regex suite, 500-odd cases that never cross into Python —
+then builds the Rust JS engine (`feetbrowser_engine`) into the local `.venv`
+with `maturin develop --release` on first use and runs every Python suite from
+that venv. A first run therefore needs both a Zig compiler and a Rust
+toolchain (maturin is installed into the venv automatically).
 
 Most suites run fully offline: `test_units.py`, `test_js.py` (which serves its
 `fetch`/`XMLHttpRequest` cases from a local HTTP server), and `test_toes.py`
@@ -27,7 +29,8 @@ tests/
   test_x11.py       the X11 window, driven by real X events (needs a server)
   x11_shot.py       photographs a real X11 window with XGetImage (CI artifact)
   test_units.py     offline unit tests (URL, HTML, CSS, layout, internal pages)
-  test_js.py        offline tests for the JS engine + DOM bridge
+  test_js.py        offline tests for the JS engine + DOM bridge (run twice,
+                    once per engine, via FEETBROWSER_JS)
   test_shoes.py     the Shoes theme manager
   test_e2e.py       a fixture page in, its pixels back out
   test_nav.py       click-to-navigate, history, view-source
@@ -82,3 +85,15 @@ through 3.14) and on macOS as well as Linux, so `test_cocoa.py` opens real
 NSWindows somewhere rather than only proving its skip is clean. Pillow and
 cairosvg stay optional: one job installs them to cover the JPEG/WebP/SVG
 branches, and every other job runs without them.
+
+The Linux jobs build both engines and run `test_js.py` twice, once against
+each, because the point of having two is that they answer the same questions.
+The macOS lines run the Rust engine only: Zig 0.14 on that runner image
+cannot find the SDK it needs to link against libSystem and fails before it
+compiles anything of ours. Locally `test.sh` builds both on macOS perfectly
+well, so this is a gap in CI rather than in the engine.
+
+The Zig engine's own tests are a job of their own. They never cross into
+Python, so running them once says as much as running them on all eight
+interpreters would, which is the same reason the Rust and Go toolchains have
+a job each.
