@@ -289,7 +289,11 @@ class Font:
         if gid in self._glyph_cache:
             return self._glyph_cache[gid]
         contours = self._parse_glyph(gid, depth)
-        self._glyph_cache[gid] = contours
+        # A composite nested deeper than the recursion limit comes back
+        # empty. Caching that under the glyph id alone would blank the glyph
+        # for good, including for the top-level request that draws it.
+        if contours or depth == 0:
+            self._glyph_cache[gid] = contours
         return contours
 
     def _parse_glyph(self, gid, depth):

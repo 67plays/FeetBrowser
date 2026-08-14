@@ -327,7 +327,9 @@ def _add_span(acc, x0, x1, unit, width):
 
 # -- glyph cache ----------------------------------------------------------
 
-_GLYPHS = {}
+# Rasterised glyphs are cached on the font that produced them, so the cache
+# lives and dies with the face. Keying on id(font) instead would let a
+# collected font hand its address -- and its glyph shapes -- to the next one.
 _GLYPH_CACHE_MAX = 20000
 
 
@@ -338,8 +340,11 @@ def glyph_bitmap(font, size, gid):
     bitmap's top-left corner, so callers place it without re-reading the
     outline.
     """
-    key = (id(font), size, gid)
-    hit = _GLYPHS.get(key)
+    cache = getattr(font, "_bitmaps", None)
+    if cache is None:
+        cache = font._bitmaps = {}
+    key = (size, gid)
+    hit = cache.get(key)
     if hit is not None:
         return hit
 
@@ -360,8 +365,8 @@ def glyph_bitmap(font, size, gid):
             cov = rasterize(polys, w, h, -left, -top)
             result = (cov, w, h, left, top)
 
-    if len(_GLYPHS) < _GLYPH_CACHE_MAX:
-        _GLYPHS[key] = result
+    if len(cache) < _GLYPH_CACHE_MAX:
+        cache[key] = result
     return result
 
 
