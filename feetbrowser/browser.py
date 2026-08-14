@@ -3655,10 +3655,23 @@ def main():
         screenshot(url, out)
         print("wrote %s" % out)
         return
-    if not gui.has_display():
-        print("FeetBrowser: no window available on this platform; "
-              "use --screenshot <url> [out.png] to render to a file.",
-              file=sys.stderr)
+    try:
+        usable = gui.has_display()
+    except RuntimeError as exc:
+        # FEETBROWSER_DISPLAY named a backend that cannot run here. Asking for
+        # one by name and quietly getting a headless root is how you end up
+        # with a black screenshot and no idea why, so this is an error -- but
+        # a sentence, not a traceback.
+        print("FeetBrowser: %s." % exc, file=sys.stderr)
+        return 1
+    if not usable:
+        # Say why where we can. "No window available" on a Linux box that has
+        # a perfectly good X server two lines of setup away is a dead end;
+        # "$DISPLAY is not set" is a thing the user can act on.
+        problem = gui.display_problem()
+        print("FeetBrowser: no window available on this platform%s; "
+              "use --screenshot <url> [out.png] to render to a file."
+              % (" (%s)" % problem if problem else ""), file=sys.stderr)
         return 1
     browser = Browser(gui.new_window())
     start = args[0] if args else "about:blank"
