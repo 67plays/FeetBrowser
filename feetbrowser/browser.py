@@ -2,19 +2,21 @@
 
 Pipeline per navigation:
     URL.request -> HTMLParser -> collect stylesheets -> CSSParser + cascade
-    -> DocumentLayout -> display list -> paint on a Tk canvas.
+    -> DocumentLayout -> display list -> paint on a canvas.
 
-Chrome (tabs, address bar, back/forward, scrollbar) is drawn by hand on a
-second canvas so the whole browser really is "from scratch".
+Chrome (tabs, address bar, back/forward, scrollbar) is drawn by hand onto the
+same canvas, and the canvas itself comes from gui.py -- by default our own
+rasteriser -- so the whole browser really is "from scratch", pixels included.
 """
 
 import os
 import re
 import sys
+import time
 import json
 import html
 import threading
-import tkinter
+from . import gui
 import urllib.parse
 from collections import deque
 
@@ -205,7 +207,7 @@ class Tab:
         self.base_url = None
         self.focused_input = None
         self.form_values = {}
-        # Absolute URL -> decoded tkinter.PhotoImage, shared with the layout
+        # Absolute URL -> decoded gui.PhotoImage, shared with the layout
         # so <img> elements render their actual pixels.
         self.image_cache = {}
         self._image_queue = []
@@ -815,7 +817,7 @@ class Tab:
         # Formats Tk decodes natively.
         if ctype in ("image/png", "image/gif", "image/x-xbitmap"):
             try:
-                return tkinter.PhotoImage(data=data)
+                return gui.PhotoImage(data=data)
             except Exception:  # noqa: BLE001 - bad bytes; try Pillow below
                 pass
         # Formats Pillow can convert to PNG (otherwise fall through to Tk
@@ -831,7 +833,7 @@ class Tab:
                 return photo
         # Unknown type: let Tk sniff the data (it may still decode).
         try:
-            return tkinter.PhotoImage(data=data)
+            return gui.PhotoImage(data=data)
         except Exception:  # noqa: BLE001 - undecodable data -> placeholder
             return None
 
@@ -851,7 +853,7 @@ class Tab:
             pil = pil.convert("RGBA")
             buf = io.BytesIO()
             pil.save(buf, format="PNG")
-            return tkinter.PhotoImage(data=buf.getvalue())
+            return gui.PhotoImage(data=buf.getvalue())
         except Exception:  # noqa: BLE001 - Pillow missing / bad data
             return None
 
@@ -861,7 +863,7 @@ class Tab:
         try:
             import cairosvg
             png = cairosvg.svg2png(bytestring=data)
-            return tkinter.PhotoImage(data=png)
+            return gui.PhotoImage(data=png)
         except Exception:  # noqa: BLE001 - cairosvg missing / bad data
             return None
 
@@ -1249,7 +1251,7 @@ class Tab:
                     x1, y1 - self.scroll + offset, text=cmd.text[s:e],
                     font=cmd.font, fill="white", anchor="nw",
                     tags=("selection",))
-            except tkinter.TclError:
+            except gui.TclError:
                 pass
 
 
@@ -1406,11 +1408,11 @@ class Browser:
             for btn in (ctx.call("buttons") or []):
                 self.toe_handlers[btn.id] = ctx
 
-        self.window = tkinter.Tk()
+        self.window = gui.Tk()
         self.window.title("FeetBrowser")
         self.window.geometry(f"{WIDTH}x{HEIGHT}")
         self.window.minsize(480, 320)
-        self.canvas = tkinter.Canvas(
+        self.canvas = gui.Canvas(
             self.window, width=WIDTH, height=HEIGHT,
             bg="white", highlightthickness=0)
         self.canvas.pack(fill="both", expand=True)
@@ -1865,7 +1867,7 @@ class Browser:
         try:
             self.window.clipboard_clear()
             self.window.clipboard_append(text)
-        except tkinter.TclError:
+        except gui.TclError:
             pass
 
     def _view_source(self):
@@ -2126,7 +2128,7 @@ class Browser:
         try:
             self.window.clipboard_clear()
             self.window.clipboard_append(self.address_text[s:e])
-        except tkinter.TclError:
+        except gui.TclError:
             pass
 
     def _address_cut(self):
@@ -2138,7 +2140,7 @@ class Browser:
     def _address_paste(self):
         try:
             data = self.window.clipboard_get()
-        except tkinter.TclError:
+        except gui.TclError:
             return
         if data:
             self._address_insert(data)
@@ -2717,10 +2719,10 @@ class PopupWindow:
         self.browser = browser
         self.width = width
         self.height = height
-        self.window = tkinter.Toplevel(browser.window)
+        self.window = gui.Toplevel(browser.window)
         self.window.title("")
         self.window.geometry(f"{width}x{height}")
-        self.canvas = tkinter.Canvas(
+        self.canvas = gui.Canvas(
             self.window, width=width, height=height,
             bg="white", highlightthickness=0)
         self.canvas.pack(fill="both", expand=True)
@@ -2818,7 +2820,7 @@ class PopupWindow:
         try:
             self.window.clipboard_clear()
             self.window.clipboard_append(text)
-        except tkinter.TclError:
+        except gui.TclError:
             pass
 
     def _navigate(self, dest):
@@ -3212,9 +3214,43 @@ def welcome_html():
 """
 
 
-def main():
+def screenshot(url, path, width=WIDTH, height=HEIGHT, settle=3.0):
+    """Load `url` and write the rendered window to `path` as a PNG.
+
+    No display is opened. The raster backend draws into an ordinary buffer,
+    so a full render -- chrome, page, images, whatever scripts produced -- is
+    just a file write, which makes the renderer inspectable from a shell and
+    diffable in a test.
+    """
     browser = Browser()
-    start = sys.argv[1] if len(sys.argv) > 1 else "about:blank"
+    browser.window.geometry("%dx%d" % (width, height))
+    browser.canvas.resize(width, height)
+    browser.new_tab(url)
+    # Images and deferred scripts land on the timer queue; give them a
+    # bounded window to arrive before the frame is captured.
+    browser._poll_images()
+    deadline = time.time() + settle
+    while time.time() < deadline:
+        browser.window.flush_timers()
+        if not any(tab.loading for tab in browser.tabs):
+            break
+        time.sleep(0.02)
+    browser.window.flush_timers()  # final drain of decoded images
+    browser.draw()
+    browser.canvas.render().save_png(path)
+    return browser
+
+
+def main():
+    args = [a for a in sys.argv[1:] if a != "--screenshot"]
+    if "--screenshot" in sys.argv:
+        url = args[0] if args else "about:blank"
+        out = args[1] if len(args) > 1 else "feetbrowser.png"
+        screenshot(url, out)
+        print("wrote %s" % out)
+        return
+    browser = Browser()
+    start = args[0] if args else "about:blank"
     browser.new_tab(start)
     browser.run()
 

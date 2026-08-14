@@ -1,9 +1,10 @@
 """Headless smoke test: exercise the whole pipeline without the GUI loop."""
 import sys
 import os
-import tkinter
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from feetbrowser import gui
 
 from feetbrowser.net import URL
 from feetbrowser.htmlparser import HTMLParser
@@ -55,7 +56,7 @@ def run(url_str):
 
 
 if __name__ == "__main__":
-    root = tkinter.Tk()
+    root = gui.Tk()
     root.withdraw()
     targets = sys.argv[1:] or [
         "data:text/html,<h1>Hi</h1><p>Hello <b>bold</b> and <i>italic</i> and "

@@ -1,7 +1,9 @@
 """Fast, offline unit tests for URL parsing, HTML, CSS, and internal pages."""
 import http.server
-import sys, os, tkinter
+import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from feetbrowser import gui
 
 from feetbrowser.net import URL
 from feetbrowser.htmlparser import HTMLParser, Element, Text
@@ -465,10 +467,14 @@ def test_double_br_advances_line():
 def test_image_does_not_overlap_following_text():
     tab = Tab(700)
     # A wide image pushes the following word onto the next line, which must
-    # start below the image's line box rather than overlapping it.
+    # start below the image's line box rather than overlapping it. The alt
+    # text sizes the placeholder, so its length is computed from the font's
+    # actual advance to guarantee an overflow whatever face is in use.
+    label_font = get_font(12, "normal", "roman")
+    fill = "x" * (int(1600 / _measure(label_font, "x")) + 1)
     tab._build(
         URL("https://example.com"),
-        '<p>one<img src=x alt="' + "x" * 140 + '">two</p>',
+        '<p>one<img src=x alt="' + fill + '">two</p>',
         "text/html")
     tops = {c.text: (c.top, c.bottom) for c in tab.display_list
             if isinstance(c, DrawText)}
@@ -537,13 +543,12 @@ def test_table_in_flex_does_not_overlap():
 def test_image_in_table_cell_sizes_column():
     """A decoded image must size its table column so it doesn't overlap the
     text in the neighbouring cell."""
-    import tkinter
     from feetbrowser.layout import DocumentLayout, DrawImage, DrawText
     html = ("<table><tr><td><img src='https://example.com/img.png'></td>"
             "<td>zzz</td></tr></table>")
     dom = HTMLParser(html).parse()
     style(dom, [])
-    photo = tkinter.PhotoImage(width=200, height=100)
+    photo = gui.PhotoImage(width=200, height=100)
     cache = {"https://example.com/img.png": photo}
     doc = DocumentLayout(dom, 620)
     doc.image_cache = cache
@@ -758,8 +763,12 @@ def test_flex_column_stacks_vertically():
     items = [b for b in tree_to_list(doc, []) if b.node.tag == "div"
              and b.node.attributes.get("class") != "f"]
     ys = sorted(b.y for b in items)
-    assert ys[1] - ys[0] >= 27, "second item starts below first (gap)"
-    assert ys[2] - ys[1] >= 27, "third item starts below second (gap)"
+    # One line of text plus the 5px gap. Derived from the font rather than
+    # hard-coded, because line height depends on whichever face the GUI
+    # backend resolved for the default family.
+    step = get_font(16, "normal", "roman").metrics("linespace") + 5
+    assert ys[1] - ys[0] >= step, "second item starts below first (gap)"
+    assert ys[2] - ys[1] >= step, "third item starts below second (gap)"
     # All column items span the full container width (stretch).
     for b in items:
         assert b.width == 604, f"column item width {b.width}"
@@ -1292,7 +1301,7 @@ def test_async_load_in_gui_mode():
             pass
 
     srv = _start_server(H)
-    root = tkinter.Tk(); root.withdraw()
+    root = gui.Tk(); root.withdraw()
     try:
         class FakeBrowser:
             window = root
@@ -1319,7 +1328,7 @@ def test_async_load_in_gui_mode():
 
 
 def main():
-    root = tkinter.Tk(); root.withdraw()
+    root = gui.Tk(); root.withdraw()
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0
     for t in tests:

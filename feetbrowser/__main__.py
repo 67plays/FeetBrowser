@@ -11,6 +11,9 @@ FeetBrowser — a functional web browser built from scratch.
 options:
   -h, --help       show this help message and exit
   -v, --version    print the version and exit
+  --screenshot <url> [out.png]
+                   render <url> headlessly and write a PNG, then exit
+                   (default: feetbrowser.png)
   --toes           list installed toes and their status
   --toe-search <term>      search the ToeHub catalog
   --toe-install <name>     install a toe from the catalog

@@ -2,8 +2,10 @@
 integration (script execution, console, click handlers).
 """
 import http.server
-import sys, os, threading, time, tkinter
+import sys, os, threading, time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from feetbrowser import gui
 
 from feetbrowser.net import URL
 from feetbrowser.browser import Tab
@@ -571,7 +573,7 @@ def _make_tab(body, url="https://example.com/page"):
 
 
 def main():
-    root = tkinter.Tk(); root.withdraw()
+    root = gui.Tk(); root.withdraw()
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0
     for t in tests:

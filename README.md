@@ -2,7 +2,9 @@
 
 A web browser written **from scratch in pure Python**. No Chromium, no
 WebKit, no borrowed libraries — it does its own networking, HTML parsing,
-CSS, layout, JavaScript, and drawing. Tk is only the surface it paints on.
+CSS, layout, JavaScript, fonts, and pixels. No GUI toolkit either: the
+TrueType parser, the antialiased rasteriser and the image decoders are all in
+this repo, standard library only.
 
 ## STRIDE — how code is judged
 
@@ -23,8 +25,12 @@ Code in this repo is evaluated on six principles:
 ./run.sh https://example.com
 ```
 
-Need Tk? On Debian/Ubuntu: `sudo apt install python3-tk` (other distros:
-`python3-tkinter` on Fedora, `tk` on Arch). Then `python3 -m feetbrowser <url>`.
+Nothing to install — just Python 3 and a system font. To render a page to a
+PNG without opening a window:
+
+```bash
+python3 -m feetbrowser --screenshot https://example.com page.png
+```
 
 ## What you can do
 
@@ -38,6 +44,7 @@ Need Tk? On Debian/Ubuntu: `sudo apt install python3-tk` (other distros:
 
 - [Usage & shortcuts](docs/usage.md)
 - [Architecture — how the engine works](docs/architecture.md)
+- [The rendering engine — fonts, rasteriser, pixels](docs/rendering.md)
 - [Extensions (Toes & ToeHub)](docs/toes.md)
 - [What it does and doesn't do](docs/limitations.md)
 - [Running the tests](docs/testing.md)

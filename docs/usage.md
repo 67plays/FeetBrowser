@@ -8,10 +8,19 @@
 ./run.sh view-source:https://example.com
 ```
 
-`run.sh` uses your system Python if it has Tkinter; on NixOS it fetches one
-on the fly via `nix-shell`. On other distros install Tk first
-(`python3-tk` on Debian/Ubuntu, `python3-tkinter` on Fedora, `tk` on Arch)
-and then `python3 -m feetbrowser <url>`.
+`run.sh` is a one-line wrapper around `python3 -m feetbrowser`. There is
+nothing to install: the renderer is ours (see
+[the rendering engine](rendering.md)), so no GUI toolkit is needed — only
+Python 3 and at least one system font.
+
+To render a page without opening a window:
+
+```bash
+python3 -m feetbrowser --screenshot https://example.com page.png
+```
+
+This runs the whole browser — chrome, tabs, toolbar, page, scrollbar — waits
+for images to load, and writes a PNG.
 
 ## Keyboard shortcuts
 

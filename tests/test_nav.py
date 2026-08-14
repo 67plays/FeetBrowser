@@ -1,6 +1,8 @@
 """Headless test of click-to-navigate, history, and forms plumbing."""
-import sys, os, tkinter
+import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from feetbrowser import gui
 
 from feetbrowser.browser import Tab
 from feetbrowser.layout import DrawText
@@ -15,7 +17,7 @@ def find_link_point(tab, needle):
 
 
 def main():
-    root = tkinter.Tk(); root.withdraw()
+    root = gui.Tk(); root.withdraw()
     tab = Tab(700)
     tab.load("https://example.com")
     assert tab.title == "Example Domain", tab.title

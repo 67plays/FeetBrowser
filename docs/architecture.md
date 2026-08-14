@@ -27,7 +27,12 @@ its own:
   natively, JPEG via Pillow, fetched off the UI thread), plus form controls
   (text fields, checkboxes, submit/reset buttons, `<select>`), producing a
   display list of paint commands.
-- **Browser UI** — a hand-drawn chrome on a Tk canvas: tabs, an address bar
+- **Rendering engine** — our own pixels, no GUI toolkit: a TrueType parser
+  (`cmap`/`glyf`/`hmtx`/…, composite glyphs, real metrics), an antialiased
+  scanline rasteriser writing into a `bytearray` framebuffer, PNG/GIF/PNM
+  decoders, a retained scene graph, and an event loop. See
+  [docs/rendering.md](rendering.md).
+- **Browser UI** — a hand-drawn chrome on that canvas: tabs, an address bar
   with search fallback, back / forward / reload / home buttons,
   hover + clickable links, middle-click / ctrl-click to open in a new tab,
   scrolling, a scrollbar, bookmark toggling, and a status bar. Repainting is
@@ -49,8 +54,11 @@ its own:
   `style`, `addEventListener`) lets scripts mutate the page and wire up
   click handlers, which re-cascade the stylesheet and re-render.
 
-Tk is used **only as the pixel surface** (a canvas to draw text and rectangles
-on) and for font metrics — the browser engine itself is all in this repo.
+Nothing outside the standard library is used, and that now includes the pixels:
+there is no Tk, Qt, GTK, SDL, Cairo, FreeType or Pillow in the import graph.
+The only thing the renderer asks of the operating system is a font file to
+parse. The old Tk path is still selectable with `FEETBROWSER_BACKEND=tk` for
+side-by-side comparison.
 
 ## Layout of the code
 
@@ -62,12 +70,19 @@ feetbrowser/
   jsengine.py    JavaScript lexer, parser, interpreter
   jsdom.py       JavaScript <-> DOM bridge (document/element/style)
   layout.py      block/inline layout -> display list, painting
-  browser.py     Tk window, chrome, tabs, history, event loop, layered repaint
+  fontengine.py  TrueType parsing: tables, cmap, metrics, glyph outlines
+  raster.py      antialiased software rasteriser, glyph cache, PNG output
+  imagecodec.py  PNG / GIF / PNM decoders -> RGBA
+  canvas.py      retained scene graph, fonts, colors, images (Tk semantics)
+  window.py      windows, Tk-shaped events, after() timers, main loop
+  gui.py         backend facade (raster by default, tk still selectable)
+  browser.py     window, chrome, tabs, history, event loop, layered repaint
   toes.py        extension hooking (Toes): discovery, dispatch, CLI
   toehub.py      the ToeHub: catalog fetch, install/uninstall/toggle
   ua.css         default user-agent stylesheet
 toes/            user-installed toes (gitignored; empty on a fresh checkout)
 tests/
+  test_render.py offline tests for fonts, rasteriser, image codecs, canvas
   test_units.py  offline unit tests (URL, HTML, CSS, layout, internal pages)
   test_js.py     offline tests for the JS engine + DOM bridge
   test_nav.py    click-to-navigate, history, view-source

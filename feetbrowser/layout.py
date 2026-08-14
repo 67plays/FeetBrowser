@@ -5,12 +5,13 @@ commands. Implements block-and-inline flow: block boxes stack vertically,
 inline content flows into lines with word wrapping. Supports font size /
 weight / style, colors, backgrounds, list bullets, and horizontal rules.
 
-Coordinates are in CSS px == canvas px. Fonts are Tk fonts, cached.
+Coordinates are in CSS px == canvas px. Fonts come from the GUI
+backend (see gui.py) and are cached.
 """
 
 import copy
 import re
-import tkinter.font
+from . import gui
 
 from .htmlparser import Text, Element
 
@@ -45,7 +46,7 @@ def get_font(size, weight, style, family=""):
     key = (size, weight, style, family)
     if key not in _FONT_CACHE:
         fam = family if family else "Times"
-        font = tkinter.font.Font(size=size, weight=weight, slant=style, family=fam)
+        font = gui.Font(size=size, weight=weight, slant=style, family=fam)
         font._ftbs_key = key  # stable cache identity for memo tables
         _FONT_CACHE[key] = font
     return _FONT_CACHE[key]
@@ -222,7 +223,7 @@ class DrawText:
                 self.left, self.top - scroll, text=self.text,
                 font=self.font, fill=self.color or "black", anchor="nw",
                 tags=tags)
-        except tkinter.TclError:
+        except gui.TclError:
             canvas.create_text(
                 self.left, self.top - scroll, text=self.text,
                 font=self.font, fill="black", anchor="nw", tags=tags)
@@ -243,7 +244,7 @@ class DrawRect(_DrawShape):
             canvas.create_rectangle(
                 self.left, self.top - scroll, self.right, self.bottom - scroll,
                 width=0, fill=self.color, tags=tags)
-        except tkinter.TclError:
+        except gui.TclError:
             canvas.create_rectangle(
                 self.left, self.top - scroll, self.right, self.bottom - scroll,
                 width=0, fill="black", tags=tags)
@@ -255,7 +256,7 @@ class DrawLine(_DrawShape):
             canvas.create_line(
                 self.left, self.top - scroll, self.right, self.bottom - scroll,
                 fill=self.color, width=self.thickness, tags=tags)
-        except tkinter.TclError:
+        except gui.TclError:
             canvas.create_line(
                 self.left, self.top - scroll, self.right, self.bottom - scroll,
                 fill="black", width=self.thickness, tags=tags)
@@ -267,7 +268,7 @@ class DrawOutline(_DrawShape):
             canvas.create_rectangle(
                 self.left, self.top - scroll, self.right, self.bottom - scroll,
                 width=self.thickness, outline=self.color, tags=tags)
-        except tkinter.TclError:
+        except gui.TclError:
             canvas.create_rectangle(
                 self.left, self.top - scroll, self.right, self.bottom - scroll,
                 width=self.thickness, outline="black", tags=tags)
@@ -281,7 +282,7 @@ class DrawShadow(_DrawShape):
             canvas.create_rectangle(
                 self.left, self.top - scroll, self.right, self.bottom - scroll,
                 width=0, fill=self.color, stipple="gray50", tags=tags)
-        except tkinter.TclError:
+        except gui.TclError:
             pass
 
 
@@ -2103,7 +2104,7 @@ class BlockLayout(LayoutBox):
 
     def _image_cache(self):
         """Walk up the layout tree to find the tab's image cache (a dict of
-        absolute URL -> tkinter.PhotoImage), if any was attached."""
+        absolute URL -> decoded image), if any was attached."""
         box = self
         while box is not None:
             cache = getattr(box, "image_cache", None)
