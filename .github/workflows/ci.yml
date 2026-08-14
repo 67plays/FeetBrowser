@@ -16,23 +16,23 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install Tk and pyflakes
+      - name: Install Tk, Xvfb, and pyflakes
         run: |
           sudo apt-get update
-          sudo apt-get install -y python3-tk
+          sudo apt-get install -y python3-tk xvfb
           python -m pip install pyflakes
 
       - name: Lint (pyflakes)
         run: python -m pyflakes feetbrowser tests
 
       - name: Unit tests
-        run: python tests/test_units.py
+        run: xvfb-run -a python tests/test_units.py
 
       - name: JS engine tests
-        run: python tests/test_js.py
+        run: xvfb-run -a python tests/test_js.py
 
       - name: Toe engine tests
-        run: python tests/test_toes.py
+        run: xvfb-run -a python tests/test_toes.py
 
       - name: Pseudo-toe (gh-scroll) tests
-        run: python tests/test_gh_scroll.py
+        run: xvfb-run -a python tests/test_gh_scroll.py
