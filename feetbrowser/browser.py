@@ -160,7 +160,7 @@ class Tab:
         self.form_values = {}
         try:
             handled = None
-            if self.browser:
+            if self.browser and isinstance(url, URL):
                 handled = toes.first(self.browser.toe_contexts, "handle",
                                      url, self)
             if handled is not None:
@@ -1081,8 +1081,10 @@ class Browser:
             self.focus = "address"
             if not was_address:
                 self._address_reset_from_tab()
-            self._set_address_caret_from_x(x)
-            self.address_sel = None
+                self._address_select_all()
+            else:
+                self._set_address_caret_from_x(x)
+                self.address_sel = None
             self._address_ensure_visible()
             self.draw()
 
@@ -1339,6 +1341,7 @@ class Browser:
         if self.active_tab:
             self.active_tab.blur_input()
         self._address_reset_from_tab()
+        self._address_select_all()
         self.draw()
 
     @staticmethod
