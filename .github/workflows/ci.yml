@@ -16,16 +16,15 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install Tk, Xvfb, and pyflakes
+      - name: Install Tk and Xvfb
         run: |
           sudo apt-get update
           sudo apt-get install -y python3-tk xvfb
-          python -m pip install pyflakes maturin
 
       - name: Build the Rust JS engine
         run: |
           python -m venv .venv
-          .venv/bin/pip install maturin
+          .venv/bin/pip install maturin pyflakes
           .venv/bin/maturin develop --release --manifest-path rust/Cargo.toml
 
       - name: Lint (pyflakes)
