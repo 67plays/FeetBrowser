@@ -797,6 +797,28 @@ def _control_box(tab, **attrs):
     return None
 
 
+def test_load_errors_are_collected():
+    html_body = (
+        '<html><head>'
+        '<link rel="stylesheet" href="http://127.0.0.1:1/x.css">'
+        '<script src="http://127.0.0.1:1/y.js"></script>'
+        '</head><body><p>hi</p></body></html>')
+    with open("/tmp/opencode/_units_netfail.html", "w") as f:
+        f.write(html_body)
+    tab = Tab(700)
+    tab.load("file:///tmp/opencode/_units_netfail.html")
+    kinds = [e.split()[0] for e in tab.net_errors]
+    assert "CSS" in kinds, f"CSS failure logged, got {kinds}"
+    assert "JS" in kinds, f"JS failure logged, got {kinds}"
+
+
+def test_doc_error_is_collected():
+    tab = Tab(700)
+    tab.load("http://127.0.0.1:1/")
+    assert tab.net_errors and tab.net_errors[0].startswith("DOC"), \
+        tab.net_errors
+
+
 def test_form_submit_get():
     tab = _make_tab(
         '<form action="/submit"><input name="q" value="hello world">'

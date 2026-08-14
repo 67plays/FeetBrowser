@@ -223,16 +223,22 @@ class HTMLParser:
             self.close_tag("p")
 
     def implicit_tags(self, tag):
-        # Insert <html>, <head>, <body> as needed.
+        # Insert <html>, <head>, <body> as needed. Checks the stack by
+        # length/name directly instead of materializing an open-tag list on
+        # every call (this runs for every tag and every text run, so the list
+        # allocation dominated parse time on text-heavy documents).
+        stack = self.unfinished
         while True:
-            open_tags = [n.tag for n in self.unfinished]
-            if open_tags == [] and tag != "html":
-                self.unfinished.append(Element("html", {}, None))
-            elif open_tags == ["html"] and tag not in ("head", "body", "/html"):
-                self.unfinished.append(Element(
-                    "head" if tag in HEAD_TAGS else "body", {},
-                    self.unfinished[-1]))
-            elif open_tags == ["html", "head"] and tag != "/head" \
+            if not stack:
+                if tag == "html":
+                    break
+                stack.append(Element("html", {}, None))
+            elif len(stack) == 1 and stack[0].tag == "html" \
+                    and tag not in ("head", "body", "/html"):
+                stack.append(Element(
+                    "head" if tag in HEAD_TAGS else "body", {}, stack[0]))
+            elif len(stack) == 2 and stack[0].tag == "html" \
+                    and stack[1].tag == "head" and tag != "/head" \
                     and tag not in HEAD_TAGS:
                 self.close_tag("head")
             else:

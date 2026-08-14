@@ -9,6 +9,56 @@ import re
 
 from .htmlparser import Element
 
+# The media-query viewport. Real browsers only apply the rules inside an
+# @media block when its query matches the current window size; the default
+# 1000x720 matches the browser's default WIDTH/HEIGHT and is updated on resize.
+_VIEWPORT = (1000.0, 720.0)
+
+
+def set_viewport(width, height):
+    global _VIEWPORT
+    _VIEWPORT = (float(width), float(height))
+
+
+def media_matches(prelude, width, height):
+    """Evaluate a media-query prelude against a viewport. Handles `and`,
+    comma-OR lists, media types (all/screen/print) and the common
+    (min/max-width/height) features; unknown features are assumed to match so
+    rules aren't silently dropped."""
+    if not prelude or not prelude.strip():
+        return True
+    for alt in re.split(r"\s*,\s*", prelude):
+        if not alt:
+            continue
+        negated = bool(re.search(r"(?:^|\s)not\s", alt))
+        cond = True
+        for feat in re.findall(r"\(([^()]*)\)", alt):
+            if ":" not in feat:
+                continue
+            prop, val = feat.split(":", 1)
+            prop = prop.strip().lower()
+            val = val.strip().lower()
+            if prop in ("min-width", "max-width", "min-height", "max-height"):
+                m = re.match(r"([-.\d]+)", val)
+                if not m:
+                    continue
+                n = float(m.group(1))
+                if prop == "min-width" and width < n:
+                    cond = False
+                elif prop == "max-width" and width > n:
+                    cond = False
+                elif prop == "min-height" and height < n:
+                    cond = False
+                elif prop == "max-height" and height > n:
+                    cond = False
+        if re.search(r"(?:^|\s)print(?:\s|$)", alt):
+            cond = False
+        if negated:
+            cond = not cond
+        if cond:
+            return True
+    return False
+
 INHERITED_PROPERTIES = {
     "font-size": "16px",
     "font-style": "normal",
@@ -339,7 +389,14 @@ class CSSParser:
             return
         # It's a block at-rule.
         self.literal("{")
-        if keyword in ("@media", "@supports"):
+        if keyword == "@media":
+            width, height = _VIEWPORT
+            if media_matches(prelude, width, height):
+                inner = CSSParser(self._read_block())
+                rules.extend(inner.parse())
+            else:
+                self._read_block()
+        elif keyword == "@supports":
             # Naively include the inner rules regardless of the query.
             inner = CSSParser(self._read_block())
             rules.extend(inner.parse())
@@ -363,9 +420,23 @@ class CSSParser:
 
 
 def parse_inline(style_text):
+    cached = _INLINE_CACHE.get(style_text)
+    if cached is not None:
+        return cached
     parser = CSSParser("{" + style_text + "}")
     parser.literal("{")
-    return parser.body()
+    pairs = parser.body()
+    if len(_INLINE_CACHE) >= _INLINE_CACHE_MAX:
+        _INLINE_CACHE.clear()
+    _INLINE_CACHE[style_text] = pairs
+    return pairs
+
+
+# Inline `style=""` attributes repeat across a document (same class, same
+# styling). The parser round-trip is cheap but style() runs it for every
+# element on every cascade, and JS-driven re-cascades replay the whole tree.
+_INLINE_CACHE = {}
+_INLINE_CACHE_MAX = 2048
 
 
 def cascade_priority(rule):
@@ -393,17 +464,29 @@ def _selector_hint(selector):
 
 _RULE_KEY = lambda item: (item[0], item[1])
 
+# Rule-index cache keyed by the rules list's identity. A Tab re-cascades the
+# *same* `self._last_rules` list for every JS-driven DOM mutation, and the
+# index construction (sorting every bucket) is the most expensive part of a
+# restyle; keeping it around turns those re-cascades into a dict lookup. The
+# cache holds the list too so an id() can never be reused by a newer list.
+_RULE_INDEX_CACHE = {}
+_RULE_INDEX_CACHE_MAX = 32
+
 
 def _build_rule_index(rules):
-    """Bucket rules by terminal-selector hint. Buckets keep cascade order:
-    within a bucket rules are stable-sorted by (priority, original index), and
-    merging buckets on the same key never reorders equal priorities."""
+    key = id(rules)
+    cached = _RULE_INDEX_CACHE.get(key)
+    if cached is not None:
+        return cached[1]
     index = {}
     for i, (selector, body) in enumerate(rules):
         hint = _selector_hint(selector)
         index.setdefault(hint, []).append((selector.priority, i, selector, body))
     for bucket in index.values():
         bucket.sort(key=_RULE_KEY)
+    if len(_RULE_INDEX_CACHE) >= _RULE_INDEX_CACHE_MAX:
+        _RULE_INDEX_CACHE.clear()
+    _RULE_INDEX_CACHE[key] = (rules, index)
     return index
 
 
