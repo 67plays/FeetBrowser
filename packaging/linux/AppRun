@@ -1,0 +1,125 @@
+#!/bin/sh
+# The AppImage entry point: everything that has to be true before the browser
+# starts on a machine we know nothing about.
+#
+# POSIX sh on purpose. This runs before any of our own code does, on a distro
+# we did not choose, and bash is not guaranteed there.
+#
+# Deliberately NOT here: LD_LIBRARY_PATH. The private copies of libssl,
+# libcrypto and libffi that the interpreter needs are found through an RPATH
+# of $ORIGIN baked into the binaries at build time, so they are visible to
+# our interpreter and invisible to everything else. Putting them on
+# LD_LIBRARY_PATH would also put them in front of the host's libX11 and every
+# library that gets dlopened behind it, which is how a bundle ends up
+# crashing inside somebody else's graphics driver.
+set -eu
+
+HERE=$(dirname "$(readlink -f "$0")")
+export APPDIR="${APPDIR:-$HERE}"
+
+PYTHON="$HERE/usr/bin/python3"
+LAUNCHER="$HERE/usr/lib/feetbrowser/launcher.py"
+SHARE="$HERE/usr/share/feetbrowser"
+
+# The interpreter is ours, so the host's Python environment is noise at best
+# and a wrong sys.path at worst. PYTHONHOME is set rather than inferred
+# because a stray PYTHONHOME in the user's profile would otherwise point our
+# interpreter at their stdlib.
+export PYTHONHOME="$HERE/usr"
+export PYTHONDONTWRITEBYTECODE=1
+unset PYTHONPATH PYTHONSTARTUP PYTHONUSERBASE 2>/dev/null || true
+# Site-packages under the user's home would be another machine's extension
+# modules built for another interpreter.
+export PYTHONNOUSERSITE=1
+
+# -- certificates ----------------------------------------------------------
+#
+# The bundled OpenSSL was compiled inside AlmaLinux, so its built-in trust
+# store path is /etc/pki/tls -- which exists on exactly one family of distros
+# and not on the machine this is most likely to be run on. Without this the
+# browser loads http:// pages perfectly and every https:// page fails with a
+# certificate error, which is a long way from the actual cause.
+#
+# The host's store is preferred over the one we ship: it is the set of
+# authorities the user's administrator decided to trust, it gets security
+# updates, and it carries any internal CA their network needs. Ours is the
+# fallback for a system that has none at all -- a container, a minimal
+# install -- because "no certificates anywhere" has to fail soft.
+if [ -z "${SSL_CERT_FILE:-}" ]; then
+  for candidate in \
+    /etc/ssl/certs/ca-certificates.crt \
+    /etc/pki/tls/certs/ca-bundle.crt \
+    /etc/ssl/ca-bundle.pem \
+    /etc/pki/tls/cacert.pem \
+    /etc/ssl/cert.pem \
+    /usr/share/ssl/certs/ca-bundle.crt \
+    /usr/local/share/certs/ca-root-nss.crt \
+    "$SHARE/ca/cacert.pem"
+  do
+    if [ -r "$candidate" ]; then
+      SSL_CERT_FILE="$candidate"
+      export SSL_CERT_FILE
+      break
+    fi
+  done
+fi
+
+# -- desktop integration ---------------------------------------------------
+#
+# An AppImage is one file and nothing installs it, so on a desktop without
+# AppImageLauncher it never reaches the applications menu on its own. These
+# two flags are that step, done by hand, into the user's own directories --
+# no root, nothing outside $HOME, and the .desktop file points back at
+# whatever path this file is sitting at right now.
+DESKTOP_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+ICON_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor"
+DESKTOP_FILE="$DESKTOP_DIR/feetbrowser.desktop"
+
+install_desktop() {
+  # $APPIMAGE is set by the AppImage runtime and is the path of the file the
+  # user downloaded. Running from an extracted AppDir there is no such file,
+  # so fall back to this script.
+  target="${APPIMAGE:-$HERE/AppRun}"
+  mkdir -p "$DESKTOP_DIR"
+  sed "s|^Exec=.*|Exec=\"$target\" %u|; s|^TryExec=.*|TryExec=$target|" \
+    "$HERE/feetbrowser.desktop" > "$DESKTOP_FILE"
+  chmod 0644 "$DESKTOP_FILE"
+  for size in 256 128 64 48; do
+    src="$HERE/usr/share/icons/hicolor/${size}x${size}/apps/feetbrowser.png"
+    [ -r "$src" ] || continue
+    mkdir -p "$ICON_DIR/${size}x${size}/apps"
+    cp -f "$src" "$ICON_DIR/${size}x${size}/apps/feetbrowser.png"
+  done
+  # Best effort: these are how a running desktop notices, and their absence
+  # only means the menu updates at the next login instead of now.
+  update-desktop-database "$DESKTOP_DIR" >/dev/null 2>&1 || true
+  gtk-update-icon-cache -f -t "$ICON_DIR" >/dev/null 2>&1 || true
+  xdg-mime default feetbrowser.desktop \
+    x-scheme-handler/http x-scheme-handler/https >/dev/null 2>&1 || true
+  echo "Installed $DESKTOP_FILE"
+  echo "FeetBrowser is in the applications menu and offered for http/https links."
+}
+
+uninstall_desktop() {
+  rm -f "$DESKTOP_FILE"
+  for size in 256 128 64 48; do
+    rm -f "$ICON_DIR/${size}x${size}/apps/feetbrowser.png"
+  done
+  update-desktop-database "$DESKTOP_DIR" >/dev/null 2>&1 || true
+  gtk-update-icon-cache -f -t "$ICON_DIR" >/dev/null 2>&1 || true
+  echo "Removed $DESKTOP_FILE"
+  echo "Delete the AppImage itself to finish removing FeetBrowser."
+}
+
+case "${1:-}" in
+  --install)   install_desktop; exit 0 ;;
+  --uninstall) uninstall_desktop; exit 0 ;;
+  # Run a script against this bundle's interpreter, package, engine and
+  # fonts. It goes through the launcher rather than straight to python3
+  # precisely so that the fonts are set up: a script that draws anything
+  # without them dies inside the layout engine. The acceptance test uses this
+  # to run tests/x11_shot.py inside a container that has no Python.
+  --python)    shift; exec "$PYTHON" "$LAUNCHER" --run-script "$@" ;;
+esac
+
+exec "$PYTHON" "$LAUNCHER" "$@"
