@@ -48,6 +48,13 @@ _CONN_LOCK = threading.Lock()
 
 
 def _close_socket(s):
+    # None is allowed: the cleanup paths in _request_http run from `except`
+    # blocks that can be reached before a socket was ever opened -- a failed
+    # lookup or a refused connect leaves `s` unset. Closing it there used to
+    # raise AttributeError, which is not an OSError and so escaped the guard
+    # below, replacing the real network error with a confusing one.
+    if s is None:
+        return
     try:
         s.close()
     except OSError:

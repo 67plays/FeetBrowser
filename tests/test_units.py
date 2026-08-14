@@ -7,6 +7,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from feetbrowser.canvas import CanvasError, PhotoImage
 from feetbrowser.window import Tk
 
+from feetbrowser import net as net_mod
 from feetbrowser.net import URL
 from feetbrowser.htmlparser import HTMLParser, Element, Text
 from feetbrowser.cssparser import CSSParser, style
@@ -2858,6 +2859,15 @@ def test_an_untouched_select_submits_its_fallback_choice():
     act = tab.click(cx, cy)
     fields = urllib.parse.parse_qsl(act.payload, keep_blank_values=True)
     eq(fields, [("size", "M")], "the first choosable option, not the disabled one")
+
+
+def test_closing_a_socket_that_was_never_opened_is_harmless():
+    """_request_http cleans up from `except` blocks that can be reached
+    before any socket exists -- a lookup that fails leaves it unset. Closing
+    None raised AttributeError, which is not an OSError and so slipped past
+    the guard around it, and the caller saw that instead of the real
+    failure."""
+    net_mod._close_socket(None)
 
 
 def main():
