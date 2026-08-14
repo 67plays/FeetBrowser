@@ -33,3 +33,6 @@ jobs:
 
       - name: Toe engine tests
         run: python tests/test_toes.py
+
+      - name: Pseudo-toe (gh-scroll) tests
+        run: python tests/test_gh_scroll.py

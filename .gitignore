@@ -12,6 +12,11 @@ feetbrowser-run/
 # user-installed toes are never committed
 toes/*
 !toes/README.md
+# pseudo-toe ships with the repo (it powers the gh-scroll tests)
+!toes/pseudo-toe/
+!toes/pseudo-toe/toe.json
+!toes/pseudo-toe/toe.py
+!toes/pseudo-toe/manual.md
 
 # per-toe persisted settings
 toes/*/settings.json
