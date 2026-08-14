@@ -26,11 +26,13 @@ from .net import URL
 from .htmlparser import HTMLParser, Text, Element
 from .cssparser import CSSParser, style, parse_inline, set_viewport, \
     media_matches, get_viewport
-from .layout import DocumentLayout, paint_tree, get_font, DrawText, _measure, \
+from .layout import DocumentLayout, paint_tree, get_font, _measure, \
     field_value, field_checked, \
     select_options, selected_options, option_value, \
     select_rows, listbox_rows, listbox_scroll, listbox_active, \
     LISTBOX_ROW_H, LISTBOX_PAD
+from .selection import Index as SelectionIndex, Selection, \
+    contrasting_text_color
 from . import shoes as shoes
 from .jsdom import JSDocument, JSLocation, _JSStaticProps, _JSComputedStyle
 from .jsengine import Interpreter, JSException, UNDEFINED
@@ -60,6 +62,19 @@ MAX_CACHED_IMAGES = 300
 # at once; a small pool keeps memory and file-descriptor use flat while
 # still fetching far faster than the layout can paint.
 MAX_CONCURRENT_IMAGE_FETCHES = 6
+# Two presses this close together, in seconds and in pixels, are one gesture.
+# 0.5s is the macOS default double-click interval and the slop is what a hand
+# moves between clicks it means as one.
+MULTI_CLICK_SECONDS = 0.5
+MULTI_CLICK_SLOP = 4
+# How wide a strip down the right-hand edge of the page belongs to the
+# scrollbar rather than to the text under it -- derived from the bar's own
+# grab region rather than restated, so the strip that refuses a selection is
+# exactly the strip that answers a press.
+SCROLLBAR_GUTTER_W = SCROLLBAR_RIGHT + SCROLLBAR_GRAB_PAD
+# What each click of a multi-click selects. Double-click takes the word and
+# triple-click the line, which is the convention on both platforms we run on.
+_CLICK_GRANULARITY = {2: "word", 3: "line"}
 _image_fetch_sem = threading.Semaphore(MAX_CONCURRENT_IMAGE_FETCHES)
 # How long Browser.settle() waits for a page to stop having work outstanding.
 # It is a ceiling, not a delay: settling returns the moment the last image is
@@ -283,9 +298,13 @@ class Tab:
         self._load_gen = 0
         self._load_queue = deque()
         self._load_meta = None
-        # Page text selection: (ax, ay, ex, ey) in document coordinates, or
-        # None when nothing is selected. Used by drag-selection + Ctrl+C.
+        # Page text selection: a selection.Selection (an anchor and a focus,
+        # each a DOM text node plus a character offset), or None when nothing
+        # is selected. Used by drag-selection + Ctrl+C.
         self.selection = None
+        # The selectable text of the current display list, rebuilt lazily
+        # because repaint() throws the display list away on every scroll.
+        self._sel_index = None
 
     # -- navigation ------------------------------------------------------
 
@@ -565,13 +584,18 @@ class Tab:
         self._run_scripts()
 
     def render(self):
-        self.selection = None
         self._sync_selects()
         self.document = DocumentLayout(self.nodes, WIDTH)
         self.document.image_cache = self.image_cache
         self.document.layout()
         self.document.input_boxes = self.document.collect_inputs([])
         self.repaint()
+        # A relayout that only rewrapped (a resize, an image arriving) leaves
+        # every node and offset meaningful, so the highlight stays on the
+        # words it was on; one that replaced the text does not, and dropping
+        # it here is what stops a stale highlight sitting over whatever moved
+        # into those pixels.
+        self.selection = self.selection_index().revalidate(self.selection)
         # Content changed: flag the repaint loop so the canvas is redrawn even
         # when no event handler happens to call draw() directly (e.g. JS DOM
         # mutations and background image completion funnel through here).
@@ -586,6 +610,7 @@ class Tab:
         if not self.document:
             return
         self.display_list = []
+        self._sel_index = None
         paint_tree(self.document, self.display_list, scroll=self.scroll)
 
     # -- scripting ------------------------------------------------------
@@ -1184,85 +1209,62 @@ class Tab:
 
     # -- text selection --------------------------------------------------
 
-    def _text_char_at(self, x, y):
-        """Return the DrawText command and char index under (x, y), or
-        (None, None) if no text is under the point."""
-        for cmd in self.display_list:
-            if isinstance(cmd, DrawText) and cmd.text and cmd.hit(x, y):
-                return cmd, self._char_at_x(cmd, x)
-        return None, None
+    def selection_index(self):
+        """The selectable text of the current display list, in document order.
+
+        Rebuilt whenever the display list is (see `repaint`), which is what
+        keeps the highlight glued to the words rather than to the screen: the
+        positions in `self.selection` are node offsets, and each rebuild
+        resolves them against wherever those words have just been painted.
+        """
+        if self._sel_index is None:
+            self._sel_index = SelectionIndex(self.display_list)
+        return self._sel_index
+
+    def start_selection(self, x, y, granularity="char"):
+        """Begin (or reset) a selection at viewport coords (x, y).
+
+        `granularity` is "char" for a press, "word" for a double-click and
+        "line" for a triple-click; a drag after a multi-click keeps extending
+        in the same unit.
+        """
+        index = self.selection_index()
+        doc_y = y + self.scroll
+        if granularity == "word":
+            self.selection = index.word_around(x, doc_y) or \
+                self._collapsed_at(index, x, doc_y)
+            return
+        if granularity == "line":
+            self.selection = index.line_around(x, doc_y) or \
+                self._collapsed_at(index, x, doc_y)
+            return
+        self.selection = self._collapsed_at(index, x, doc_y)
 
     @staticmethod
-    def _char_at_x(cmd, x):
-        """Index of the character whose left edge is nearest to x within a
-        DrawText command."""
-        i = 0
-        while i < len(cmd.text) and \
-                cmd.left + _measure(cmd.font, cmd.text[:i + 1]) <= x:
-            i += 1
-        return i
-
-    def start_selection(self, x, y):
-        """Begin (or reset) a selection anchored at document coords (x, y)."""
-        cmd, i = self._text_char_at(x, y)
-        if cmd:
-            x = cmd.left + _measure(cmd.font, cmd.text[:i])
-        self.selection = (x, y, x, y)
+    def _collapsed_at(index, x, doc_y):
+        point = index.point_at(x, doc_y)
+        return Selection(point) if point is not None else None
 
     def extend_selection(self, x, y):
-        """Extend the selection to document coords (x, y)."""
+        """Extend the selection to viewport coords (x, y)."""
         if self.selection is None:
             self.start_selection(x, y)
             return
-        cmd, i = self._text_char_at(x, y)
-        if cmd:
-            x = cmd.left + _measure(cmd.font, cmd.text[:i])
-        self.selection = (self.selection[0], self.selection[1], x, y)
+        self.selection = self.selection_index().extend(
+            self.selection, x, y + self.scroll)
 
     def _selection_spans(self):
-        """Selected character ranges as (cmd, start_char, end_char) tuples,
+        """Selected character ranges as (run, start_char, end_char) tuples,
         in document order, or [] when nothing is selected."""
         if self.selection is None:
             return []
-        ax, ay, ex, ey = self.selection
-        if ax == ex and ay == ey:
-            return []
-        spans = []
-        for cmd in self.display_list:
-            if not isinstance(cmd, DrawText) or not cmd.text:
-                continue
-            if cmd.bottom <= min(ay, ey) or cmd.top > max(ay, ey):
-                continue
-            s, e = 0, len(cmd.text)
-            on_anchor = cmd.top <= ay < cmd.bottom
-            on_end = cmd.top <= ey < cmd.bottom
-            forward = (ey, ex) >= (ay, ax)
-            if on_anchor:
-                if forward:
-                    s = max(s, self._char_at_x(cmd, ax))
-                else:
-                    e = min(e, self._char_at_x(cmd, ax))
-            if on_end:
-                if forward:
-                    e = min(e, self._char_at_x(cmd, ex))
-                else:
-                    s = max(s, self._char_at_x(cmd, ex))
-            if s < e:
-                spans.append((cmd, s, e))
-        return spans
+        return self.selection_index().spans(self.selection)
 
     def selected_text(self):
-        """The selected text, line-by-line, for clipboard copying."""
-        lines, cur, last_top = [], [], None
-        for cmd, s, e in self._selection_spans():
-            if last_top is not None and cmd.top != last_top:
-                lines.append(" ".join(cur))
-                cur = []
-            cur.append(cmd.text[s:e])
-            last_top = cmd.top
-        if cur:
-            lines.append(" ".join(cur))
-        return "\n".join(lines)
+        """The selected text, as drawn, for clipboard copying."""
+        if self.selection is None:
+            return ""
+        return self.selection_index().text(self.selection)
 
     # -- forms -----------------------------------------------------------
 
@@ -1723,27 +1725,59 @@ class Tab:
                             (f"c{id(cmd)}", "page"))
         self._draw_selection(canvas, offset)
 
+    def selection_colors(self):
+        """(highlight fill, text on top of it) for the active shoe.
+
+        The fill is the shoe's `accent`, which is the role the palette
+        already names "selection / spinner / focus highlight", so the
+        highlight changes with the theme like the rest of the chrome. The
+        text is whichever of black or white stays readable on it -- the pale
+        shoes and the near-black ones both have accents that one fixed
+        foreground would disappear into.
+        """
+        fill = self.browser.c("accent") if self.browser is not None \
+            else shoes.SHOES[shoes.DEFAULT_SHOE]["accent"]
+        return fill, contrasting_text_color(fill)
+
     def _draw_selection(self, canvas, offset):
-        """Paint the text-selection highlight (blue fill + white text) over
-        whatever was already drawn."""
+        """Paint the text-selection highlight over whatever was drawn.
+
+        A run the selection only partly covers is split here rather than
+        highlighted whole: the fill starts and stops at the measured x of the
+        selected characters, and only those characters are repainted on top.
+        """
         canvas.delete("selection")
-        for cmd, s, e in self._selection_spans():
-            x1 = cmd.left + _measure(cmd.font, cmd.text[:s])
-            x2 = cmd.left + _measure(cmd.font, cmd.text[:e])
-            y1, y2 = cmd.top, cmd.bottom
-            if y2 < self.scroll or y1 > self.scroll + self.tab_height:
-                continue
+        fill, ink = self.selection_colors()
+        dy = offset - self.scroll
+        previous = None
+        for run, s, e in self._selection_spans():
+            y1, y2 = run.top, run.bottom
+            visible = not (y2 < self.scroll
+                           or y1 > self.scroll + self.tab_height)
+            x1, x2 = run.x_at(s), run.x_at(e)
             try:
-                canvas.create_rectangle(
-                    x1, y1 - self.scroll + offset,
-                    x2, y2 - self.scroll + offset,
-                    fill="#1a73e8", width=0, tags=("selection",))
-                canvas.create_text(
-                    x1, y1 - self.scroll + offset, text=cmd.text[s:e],
-                    font=cmd.font, fill="white", anchor="nw",
-                    tags=("selection",))
+                if previous is not None and visible:
+                    # The space between two words is not drawn by anything, so
+                    # without this the highlight comes out as a row of
+                    # separate boxes instead of the continuous band every
+                    # other browser paints.
+                    gap_run, gap_end = previous
+                    if gap_run.line == run.line and gap_end == len(gap_run.text) \
+                            and s == 0 and gap_run.right < x1:
+                        canvas.create_rectangle(
+                            gap_run.right, min(gap_run.top, y1) + dy,
+                            x1, max(gap_run.bottom, y2) + dy,
+                            fill=fill, width=0, tags=("selection",))
+                if visible:
+                    canvas.create_rectangle(x1, y1 + dy, x2, y2 + dy,
+                                            fill=fill, width=0,
+                                            tags=("selection",))
+                    canvas.create_text(x1, y1 + dy, text=run.text[s:e],
+                                       font=run.font, fill=ink, anchor="nw",
+                                       tags=("selection",))
             except CanvasError:
                 pass
+            previous = (run, e)
 
 
 class ContextMenu:
@@ -2112,6 +2146,13 @@ class Browser:
         self._scroll_grab = None
         self._resize_after = None
         self._last_size = (WIDTH, HEIGHT)
+        # Multi-click tracking for word/line selection. No platform backend
+        # reports a click count, so it is counted here: presses close enough
+        # in time and in space are one gesture, and the count cycles 1-2-3 so
+        # a fourth click starts over the way it does elsewhere.
+        self._click_count = 0
+        self._click_time = 0.0
+        self._click_pos = (0, 0)
         # Chrome-style loading spinner: current arc start angle (degrees).
         self._loading_angle = 0
         # Dirty flag for the repaint loop: set by render() whenever page
@@ -2453,10 +2494,54 @@ class Browser:
             # highlight grows during the drag), so no full canvas wipe is
             # needed here — that wipe is what blanked the page on heavy pages.
             self.canvas.delete("selection")
-            self.active_tab.start_selection(e.x, e.y - self.chrome_height())
+            self.active_tab.selection = None
+            if self._in_scrollbar_gutter(e.x):
+                # The strip the scrollbar lives in belongs to the chrome, not
+                # to the page: a press there is aimed at the bar, and hit
+                # testing that resolves any point to the nearest line would
+                # otherwise turn a grab at the scrollbar into a selection of
+                # whatever text happens to end nearest it. _scrollbar_press
+                # has already claimed the presses it wants; this covers the
+                # rest of the strip, above and below the track, so the whole
+                # column behaves like one thing.
+                if was_address:
+                    self._draw_chrome()
+                return
+            self._count_click(e.x, e.y)
+            self.active_tab.start_selection(
+                e.x, e.y - self.chrome_height(),
+                _CLICK_GRANULARITY.get(self._click_count, "char"))
+            if self._click_count > 1:
+                # A double- or triple-click has selected something already,
+                # so it has to show without waiting for a drag.
+                self._repaint_selection()
             if was_address:
                 # Dropping the address-bar focus ring is a chrome-only change.
                 self._draw_chrome()
+
+    def _in_scrollbar_gutter(self, x):
+        """Whether `x` lands in the strip the scrollbar occupies.
+
+        Only when there is a bar to occupy it: on a page that fits, the strip
+        is ordinary page and the last word on a line is selectable like any
+        other.
+        """
+        tab = self.active_tab
+        if not tab or tab.content_height() <= self.tab_height():
+            return False
+        return x >= self.canvas.winfo_width() - SCROLLBAR_GUTTER_W
+
+    def _count_click(self, x, y):
+        """Update the multi-click counter for a press at (x, y)."""
+        now = time.monotonic()
+        near = abs(x - self._click_pos[0]) <= MULTI_CLICK_SLOP \
+            and abs(y - self._click_pos[1]) <= MULTI_CLICK_SLOP
+        if near and now - self._click_time <= MULTI_CLICK_SECONDS:
+            self._click_count = self._click_count % 3 + 1
+        else:
+            self._click_count = 1
+        self._click_time = now
+        self._click_pos = (x, y)
 
     def _on_middle_click(self, e):
         if self.context_menu.open_:
@@ -2501,8 +2586,10 @@ class Browser:
         tab = self.active_tab
         if not tab or tab.selection is None:
             return
-        if not self._drag_moved:
+        if not self._drag_moved and self._click_count < 2:
             # A plain click (press + release, no drag) clears the selection.
+            # A double- or triple-click is a click too, and it selected on the
+            # way down, so it is exempt.
             tab.selection = None
         self._drag_moved = False
         # Refresh only the highlight layer; a full canvas wipe here would
@@ -2511,6 +2598,7 @@ class Browser:
         c.delete("selection")
         if tab.selection is not None:
             tab._draw_selection(c, self.chrome_height())
+            self._publish_primary(tab.selected_text())
 
     def _on_drag(self, e):
         if self._scroll_grab is not None:
@@ -2534,6 +2622,11 @@ class Browser:
         if self.select_popup.open_:
             return
         if self.active_tab and e.y >= self.chrome_height():
+            if self.active_tab.selection is None:
+                # Nothing was anchored on the way down -- the press went to a
+                # link, a form control or the scrollbar gutter -- so this drag
+                # is not a selection and must not become one halfway through.
+                return
             self._drag_moved = True
             self.active_tab.extend_selection(e.x, e.y - self.chrome_height())
             self._repaint_selection()
@@ -2838,6 +2931,9 @@ class Browser:
         href = tab._enclosing_link(node)
         img_src = self._enclosing_image(node)
         items = []
+        if tab.selected_text():
+            items.append(("Copy", self._copy_selection, True))
+            items.append(None)
         if href:
             try:
                 resolved = tab.base_url.resolve(href) if tab.base_url \
@@ -2985,6 +3081,23 @@ class Browser:
             return
         self.window.clipboard_clear()
         self.window.clipboard_append(text)
+
+    def _publish_primary(self, text):
+        """Offer a finished mouse selection as X11's PRIMARY selection.
+
+        On X, selecting with the mouse is itself a copy -- middle-click
+        pastes it -- and that is a separate selection from the CLIPBOARD an
+        explicit Ctrl+C claims, so a page selection must not overwrite what
+        was copied earlier. Every other platform ignores this: the base
+        window's hook does nothing and macOS does not override it, because a
+        NSPasteboard only changes when the user asks it to.
+        """
+        if not text:
+            return
+        try:
+            self.window.on_primary_set(text)
+        except Exception as exc:  # noqa: BLE001 - a clipboard is not the page
+            self.window.on_callback_error("primary selection", exc)
 
     def _address_bar_x(self):
         """Canvas x where the address-bar text starts (after toe buttons
@@ -3460,7 +3573,7 @@ class Browser:
         commands (the old approach) only slowed the drag and could blank the
         canvas on heavy pages."""
         tab = self.active_tab
-        if not tab or not tab.selection:
+        if not tab or tab.selection is None:
             self._draw_page()
             return
         c = self.canvas

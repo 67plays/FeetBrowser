@@ -1493,6 +1493,341 @@ def test_a_page_that_fits_has_no_scrollbar_to_drag():
     assert tab.scroll == 0, "a page that fits scrolled to %r" % tab.scroll
 
 
+# -- selecting page text ---------------------------------------------------
+#
+# Every test below drives the same path a mouse does -- a press, some drags,
+# a release, at pixel coordinates worked out from where the text actually
+# landed -- and asserts on the string the selection spells, because that
+# string is what a user gets when they press Ctrl+C. Asserting on the
+# internal ranges instead would pass just as happily with the offsets one
+# character out.
+
+
+def _selection_tab(html, height=600):
+    """A laid-out page in a Tab, with no browser and no window."""
+    from feetbrowser.browser import Tab
+    tab = Tab(height)
+    tab._build(None, html)
+    return tab
+
+
+def _runs(tab):
+    """The page's text runs by the word they drew, in document order."""
+    from feetbrowser.layout import DrawText
+    out = {}
+    for cmd in tab.display_list:
+        if isinstance(cmd, DrawText) and cmd.text:
+            out.setdefault(cmd.text, cmd)
+    return out
+
+
+def _x_of(run, offset):
+    """Pixel x of the boundary before character `offset` of `run`."""
+    from feetbrowser.layout import _measure
+    return run.left + _measure(run.font, run.text[:offset])
+
+
+def _drag(tab, start, end):
+    """Press at `start`, drag through and release at `end`; both (x, y)."""
+    tab.start_selection(*start)
+    tab.extend_selection(*end)
+    return tab.selected_text()
+
+
+def test_selection_hit_testing_uses_per_character_advances():
+    """A pixel maps to a character offset, in a proportional face.
+
+    "Illustration" in a serif face is the case that catches an implementation
+    assuming every character is the same width: an `l` is a fraction of an
+    `I`, so dividing the run's width by its length puts every offset past the
+    first one in the wrong place.
+    """
+    tab = _selection_tab("<p>Illustration</p>")
+    run = _runs(tab)["Illustration"]
+    index = tab.selection_index()
+    widths = [_x_of(run, i + 1) - _x_of(run, i) for i in range(len(run.text))]
+    assert max(widths) - min(widths) > 1.0, \
+        "this face is monospaced, so the test proves nothing"
+    for offset in range(len(run.text) + 1):
+        # Aim a hair to the right of the boundary, as a pointer would.
+        hit_run, hit = index.hit(_x_of(run, offset) + 0.4, run.top + 2)
+        assert (hit_run.text, hit) == (run.text, offset), \
+            f"x of offset {offset} resolved to {hit}"
+
+
+def test_selection_click_past_the_end_of_a_line_lands_at_the_line_end():
+    """Dragging out into the margin selects to the end of the line, which is
+    where the pointer is pointing -- not nothing, which is what a hit test
+    requiring the point to be inside a glyph returns."""
+    tab = _selection_tab("<p>Alpha beta gamma</p><p>Delta</p>")
+    runs = _runs(tab)
+    alpha, gamma = runs["Alpha"], runs["gamma"]
+    assert _drag(tab, (alpha.left, alpha.top + 2),
+                 (gamma.right + 400, gamma.top + 2)) == "Alpha beta gamma"
+    # And to the left of the first word, which is the same question mirrored.
+    assert _drag(tab, (gamma.right, gamma.top + 2),
+                 (alpha.left - 40, alpha.top + 2)) == "Alpha beta gamma"
+
+
+def test_selection_spans_three_paragraphs_in_both_directions():
+    """The case a pixel-pair model gets wrong: the selection covers whole
+    lines in the middle, partial runs at each end, and reads the same however
+    the drag ran."""
+    tab = _selection_tab("<p>Alpha beta gamma</p>"
+                         "<p>Delta epsilon</p>"
+                         "<p>Zeta eta theta</p>")
+    runs = _runs(tab)
+    start = (_x_of(runs["beta"], 2), runs["beta"].top + 2)
+    end = (_x_of(runs["eta"], 1), runs["eta"].top + 2)
+    forwards = _drag(tab, start, end)
+    assert forwards == "ta gamma\nDelta epsilon\nZeta e", repr(forwards)
+    backwards = _drag(tab, end, start)
+    assert backwards == forwards, repr(backwards)
+
+
+def test_selection_of_a_partial_run_paints_only_the_selected_characters():
+    """A run the selection stops inside must be split, in the ranges the
+    painter uses as well as in the text that gets copied."""
+    tab = _selection_tab("<p>Alpha beta gamma</p>")
+    runs = _runs(tab)
+    beta = runs["beta"]
+    text = _drag(tab, (_x_of(beta, 1), beta.top + 2),
+                 (_x_of(beta, 3), beta.top + 2))
+    assert text == "et", repr(text)
+    spans = tab._selection_spans()
+    assert len(spans) == 1, spans
+    run, s, e = spans[0]
+    assert (run.text, s, e) == ("beta", 1, 3)
+    assert abs(run.x_at(s) - _x_of(beta, 1)) < 0.01
+    assert run.x_at(e) < beta.right, "a partial run must not paint to its end"
+
+
+def test_double_click_selects_a_word_and_triple_click_the_line():
+    """The convention on both platforms we run on: two clicks take the word
+    under the pointer, three take the whole laid-out line."""
+    tab = _selection_tab("<p>Alpha beta-gamma, delta.</p>")
+    runs = _runs(tab)
+    run = runs["beta-gamma,"]
+    # Inside "gamma", which is a word bounded by a hyphen and a comma.
+    tab.start_selection(_x_of(run, 7), run.top + 2, "word")
+    assert tab.selected_text() == "gamma", repr(tab.selected_text())
+    # Inside "beta".
+    tab.start_selection(_x_of(run, 2), run.top + 2, "word")
+    assert tab.selected_text() == "beta", repr(tab.selected_text())
+    # On the punctuation between them: browsers take the punctuation run.
+    tab.start_selection(_x_of(run, 4) + 0.5, run.top + 2, "word")
+    assert tab.selected_text() == "-", repr(tab.selected_text())
+    tab.start_selection(_x_of(run, 2), run.top + 2, "line")
+    assert tab.selected_text() == "Alpha beta-gamma, delta."
+
+
+def test_double_click_then_drag_keeps_extending_by_whole_words():
+    tab = _selection_tab("<p>Alpha beta gamma delta</p>")
+    runs = _runs(tab)
+    tab.start_selection(_x_of(runs["beta"], 2), runs["beta"].top + 2, "word")
+    tab.extend_selection(_x_of(runs["gamma"], 2), runs["gamma"].top + 2)
+    assert tab.selected_text() == "beta gamma", repr(tab.selected_text())
+    # Dragging back past where it started keeps the word it started on.
+    tab.extend_selection(_x_of(runs["Alpha"], 2), runs["Alpha"].top + 2)
+    assert tab.selected_text() == "Alpha beta", repr(tab.selected_text())
+
+
+def test_selection_stays_on_its_words_when_the_page_scrolls():
+    """The highlight is attached to the text, not to the screen.
+
+    repaint() rebuilds the display list on every scroll tick, so a selection
+    remembering paint commands or y coordinates is pointing at nothing one
+    wheel click later. The positions are node offsets, so they survive -- and
+    a press after the scroll has to be read in the same coordinates.
+    """
+    tab = _selection_tab("".join("<p>Para %d alpha beta gamma</p>" % i
+                                 for i in range(60)))
+    runs = _runs(tab)
+    before = _drag(tab, (runs["alpha"].left, runs["alpha"].top + 2),
+                   (runs["gamma"].right, runs["gamma"].top + 2))
+    assert before == "alpha beta gamma"
+    top_before = tab._selection_spans()[0][0].top
+    tab.set_scroll(300)
+    tab.repaint()
+    assert tab.scroll == 300, "the page has to be scrollable for this to test"
+    assert tab.selected_text() == before, "the selection moved off its words"
+    assert tab._selection_spans()[0][0].top == top_before, \
+        "the highlight is in document space, so its y must not move"
+    # A fresh press is given viewport coordinates and must land on the word
+    # actually under the pointer.
+    from feetbrowser.layout import DrawText
+    visible = next(c for c in tab.display_list
+                   if isinstance(c, DrawText) and c.text
+                   and c.top > tab.scroll + 40)
+    text = _drag(tab, (visible.left, visible.top - tab.scroll + 2),
+                 (visible.right, visible.top - tab.scroll + 2))
+    assert text == visible.text, repr(text)
+
+
+def test_selection_survives_a_rewrap_but_not_a_new_document():
+    """A relayout that only moved the words keeps the highlight on them; one
+    that replaced them drops it, rather than leaving a highlight sitting over
+    whatever moved into those pixels."""
+    tab = _selection_tab("<p>Alpha beta gamma delta epsilon zeta</p>")
+    runs = _runs(tab)
+    before = _drag(tab, (runs["beta"].left, runs["beta"].top + 2),
+                   (runs["delta"].right, runs["delta"].top + 2))
+    assert before == "beta gamma delta"
+    tab.document.width = 120        # force the paragraph to rewrap narrower
+    tab.render()
+    assert tab.selected_text() == before, "a rewrap must not move the selection"
+    tab._build(None, "<p>Something else entirely</p>")
+    assert tab.selection is None, "a new document must drop the selection"
+    assert tab.selected_text() == ""
+
+
+def test_selection_ignores_text_a_stacking_context_lifted():
+    """Document order comes from the DOM, not from paint order: a z-index
+    lifts a paragraph's paint above its neighbours without moving its text in
+    the document, and a selection ordered by the display list would copy the
+    paragraphs back to front."""
+    tab = _selection_tab(
+        "<p>First one</p><p style='position:relative;z-index:5'>Second one"
+        "</p><p>Third one</p>")
+    runs = _runs(tab)
+    lifted = [c.text for c in tab.display_list
+              if getattr(c, "text", None) == "Second"]
+    assert lifted, "the middle paragraph still has to be painted"
+    text = _drag(tab, (runs["First"].left, runs["First"].top + 2),
+                 (runs["Third"].right, runs["Third"].top + 2))
+    assert text == "First one\nSecond one\nThird", repr(text)
+
+
+def _selection_browser(html, tmpdir):
+    """A real Browser on a real canvas, showing `html` from a file."""
+    from feetbrowser.browser import Browser
+    path = os.path.join(tmpdir, "page.html")
+    with open(path, "w") as handle:
+        handle.write(html)
+    browser = Browser()
+    browser.new_tab("file://" + path)
+    browser.draw()
+    return browser
+
+
+def test_selection_paints_a_themed_highlight_with_legible_text():
+    """Press, drag and release through the browser's own handlers, then look
+    at the pixels: the highlight is the shoe's accent, it lies where the
+    selected characters are and nowhere else, and there is contrasting text
+    on top of it rather than a solid slab."""
+    import shutil
+    import tempfile
+    from feetbrowser.canvas import color
+    from feetbrowser.window import Event
+
+    work = tempfile.mkdtemp(prefix="fb-selection-")
+    try:
+        browser = _selection_browser(
+            "<!doctype html><body style='font-size:20px'>"
+            "<p>Alpha beta gamma delta</p><p>Second paragraph</p>", work)
+        tab = browser.tabs[0]
+        accent = color(browser.c("accent"))
+        assert _count_pixels(browser.canvas.render(), accent) == 0, \
+            "nothing should be accent-coloured before anything is selected"
+        runs = _runs(tab)
+        alpha, gamma = runs["Alpha"], runs["gamma"]
+        chrome = browser.chrome_height()
+        browser._on_click(Event(x=alpha.left, y=alpha.top + chrome + 2))
+        browser._on_drag(Event(x=gamma.right, y=gamma.top + chrome + 2))
+        browser._on_release(Event(x=gamma.right, y=gamma.top + chrome + 2))
+        assert tab.selected_text() == "Alpha beta gamma"
+
+        surface = browser.canvas.render()
+        painted = _count_pixels(surface, accent)
+        assert painted > 500, f"no highlight painted ({painted} px)"
+        # All of it inside the band the selected characters occupy, so a
+        # partially selected line is not filled to the window edge.
+        x0, x1 = int(alpha.left), int(gamma.right) + 1
+        y0, y1 = int(alpha.top + chrome), int(alpha.bottom + chrome) + 1
+        inside = sum(1 for y in range(y0, y1) for x in range(x0, x1)
+                     if _pixel(surface, x, y) == accent)
+        assert inside == painted, \
+            f"{painted - inside} highlight pixels outside the selection"
+        ink = color(tab.selection_colors()[1])
+        legible = sum(1 for y in range(y0, y1) for x in range(x0, x1)
+                      if _pixel(surface, x, y) == ink)
+        assert legible > 100, \
+            f"the highlighted text is not being drawn on top ({legible} px)"
+        # "delta" is not selected, so its glyphs stay the page's own colour.
+        delta = runs["delta"]
+        assert _pixel(surface, int(delta.left + 2),
+                      int(delta.top + chrome + 10)) != accent
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def test_a_plain_click_clears_the_selection_and_copy_puts_it_on_the_clipboard():
+    import shutil
+    import tempfile
+    from feetbrowser.window import Event
+
+    work = tempfile.mkdtemp(prefix="fb-selection-")
+    try:
+        browser = _selection_browser(
+            "<!doctype html><p>Alpha beta gamma delta</p>", work)
+        tab = browser.tabs[0]
+        runs = _runs(tab)
+        alpha, gamma = runs["Alpha"], runs["gamma"]
+        chrome = browser.chrome_height()
+        browser._on_click(Event(x=alpha.left, y=alpha.top + chrome + 2))
+        browser._on_drag(Event(x=gamma.right, y=gamma.top + chrome + 2))
+        browser._on_release(Event(x=gamma.right, y=gamma.top + chrome + 2))
+        browser._copy_selection()
+        assert browser.window.clipboard_get() == "Alpha beta gamma"
+        assert any(item and item[0] == "Copy" for item
+                   in browser._context_items(alpha.left, alpha.top + chrome)), \
+            "a selection should offer Copy in the context menu"
+        # A press and release with no drag in between, somewhere else on the
+        # page, is a plain click.
+        delta = runs["delta"]
+        browser._on_click(Event(x=delta.right, y=delta.top + chrome + 2))
+        browser._on_release(Event(x=delta.right, y=delta.top + chrome + 2))
+        assert tab.selection is None
+        assert tab.selected_text() == ""
+        surface = browser.canvas.render()
+        from feetbrowser.canvas import color
+        assert _count_pixels(surface, color(browser.c("accent"))) == 0, \
+            "the highlight outlived the selection"
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def test_a_press_in_the_scrollbar_gutter_starts_no_selection():
+    """The strip the scrollbar lives in belongs to the bar, not to the text.
+
+    Hit testing resolves any point to the nearest line, so without this a
+    grab at the scrollbar -- and the drag down that follows it -- selects
+    whatever text happens to end nearest the right-hand edge instead of
+    scrolling.
+    """
+    import shutil
+    import tempfile
+    from feetbrowser.window import Event
+
+    work = tempfile.mkdtemp(prefix="fb-selection-")
+    try:
+        browser = _selection_browser(
+            "<!doctype html>" + "".join("<p>Para %d alpha beta</p>" % i
+                                        for i in range(80)), work)
+        tab = browser.tabs[0]
+        assert tab.content_height() > browser.tab_height(), \
+            "the page has to overflow for there to be a scrollbar"
+        chrome = browser.chrome_height()
+        x = browser.canvas.winfo_width() - 5
+        browser._on_click(Event(x=x, y=chrome + 100))
+        assert tab.selection is None, "a scrollbar press anchored a selection"
+        browser._on_drag(Event(x=x, y=chrome + 400))
+        assert tab.selected_text() == "", \
+            "dragging the scrollbar selected page text"
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

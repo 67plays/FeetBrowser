@@ -339,6 +339,16 @@ class Window:
     def on_clipboard_set(self, text):
         """Platform windows push to the system clipboard here."""
 
+    def on_primary_set(self, text):
+        """Offer `text` as the mouse selection, where the platform has one.
+
+        X11 does: selecting with the mouse claims PRIMARY, which middle-click
+        pastes, and it is a different selection from the CLIPBOARD that Ctrl+C
+        claims. Nowhere else has the concept, so this does nothing by default
+        rather than quietly overwriting the clipboard on the platforms that
+        would only be surprised by it.
+        """
+
     def on_clipboard_get(self):
         return self._clipboard
 
