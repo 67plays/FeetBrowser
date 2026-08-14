@@ -75,7 +75,14 @@ class URL:
             # Unknown scheme: parse it anyway so extensions can intercept it
             # through the toes handle hook. Fetching it still fails loudly.
             if rest.startswith("//"):
-                self._parse_http(rest)
+                if len(rest) > 2:
+                    self._parse_http(rest)
+                else:
+                    # Empty host (e.g. toehub://): keep host empty so an
+                    # extension scheme can still route on it.
+                    self.host = ""
+                    self.path = "/"
+                    self.port = None
             else:
                 self.host = ""
                 self.path = rest or "/"

@@ -30,10 +30,14 @@ wrap Chromium, WebKit, Gecko, or any HTTP library — it implements its own:
   with search fallback, back / forward / reload / home buttons,
   hover + clickable links, middle-click / ctrl-click to open in a new tab,
   scrolling, a scrollbar, bookmark toggling, and a status bar.
-- **Extensions (Toes)** — a from-scratch hooking system. A toe is a plain
-  Python module dropped into `toes/` that can rewrite pages, inject CSS,
-  take over navigations (custom schemes like `toe://`), draw on the canvas,
-  add chrome bands (toolbars), and open popup windows. See `toes/README.md`.
+- **Extensions (Toes)** — a from-scratch hooking system. The framework ships
+  **bare**: toes are opt-in, installed from the built-in **ToeHub**
+  (`toe://hub`) which pulls a catalog from
+  [xplosivex/feetbrowser-toes](https://github.com/xplosivex/feetbrowser-toes).
+  A toe is a plain Python module that can rewrite pages, inject CSS, take
+  over navigations (custom schemes like `toe://`), draw on the canvas, add
+  chrome bands (toolbars), and open popup windows. Install / uninstall /
+  enable / disable from the hub or the CLI. See `toes/README.md`.
 - **JavaScript engine** — a from-scratch interpreter (hand-written lexer +
   parser + tree-walking evaluator): closures, `var`/`let`/`const`, objects,
   arrays (with index growth, `length` truncation, `push`/`pop`/`join`),
@@ -98,22 +102,37 @@ feetbrowser/
   jsdom.py       JavaScript <-> DOM bridge (document/element/style)
   layout.py      block/inline layout -> display list, painting
   browser.py     Tk window, chrome, tabs, history, event loop
-  toes.py        extension hooking (Toes): discovery + dispatch
+  toes.py        extension hooking (Toes): discovery, dispatch, CLI
+  toehub.py      the ToeHub: catalog fetch, install/uninstall/toggle
   ua.css         default user-agent stylesheet
-toes/
-  word-count/    sample toe: page word count (on_load + extra_css)
-  toe-scheme/    sample toe: the toe:// scheme (handle)
-  sock-detective/ sample toe: foot-themed devtools (sniff mode + toe://sock reports)
-  toe-bar/       sample toe: a 2003-style toolbar (chrome bands + popups)
+toes/            user-installed toes (gitignored; empty on a fresh checkout)
 tests/
   test_units.py  offline unit tests (URL, HTML, CSS, layout, internal pages)
   test_js.py     offline tests for the JS engine + DOM bridge
   test_nav.py    click-to-navigate, history, view-source
-  test_toes.py   toe engine + sample toe tests
-  test_sock.py   sock-detective toe tests
-  test_toebar.py toe-bar + chrome-band/popup framework tests
+  test_toes.py   toe engine + ToeHub tests (install/uninstall/toggle)
   smoke.py       end-to-end pipeline on real pages
 ```
+
+## The ToeHub
+
+Extensions are opt-in. Open **`toe://hub`** in the browser to browse the
+catalog from [xplosivex/feetbrowser-toes](https://github.com/xplosivex/feetbrowser-toes)
+and install / uninstall / enable / disable toes live — no restart. Or use the
+CLI:
+
+```bash
+python3 -m feetbrowser --toes                 # installed toes + status
+python3 -m feetbrowser --toe-search <term>    # search the catalog
+python3 -m feetbrowser --toe-install <name>   # install a toe
+python3 -m feetbrowser --toe-uninstall <name> # uninstall a toe
+python3 -m feetbrowser --toe-enable <name>    # enable a disabled toe
+python3 -m feetbrowser --toe-disable <name>   # disable an installed toe
+```
+
+`toe://gallery` shows installed toes; `toe://hello` is the "no toes yet"
+placeholder. Installed toes and the enabled/disabled config live under
+`toes/` and are never committed.
 
 ## What it does and doesn't do
 
@@ -121,9 +140,9 @@ tests/
 (text styling, colors, backgrounds, layout), follow links, keep per-tab
 history, submit forms (GET/POST), show page source, open links in new tabs,
 run JavaScript (scripts on load, DOM reads/writes, click handlers, with
-`console.log` surfaced in the page's log buffer), and run extensions
-("toes") that can rewrite pages, inject CSS, register custom schemes, draw
-chrome bands, and open popups.
+`console.log` surfaced in the page's log buffer), and manage extensions
+("toes") from the built-in ToeHub — install, uninstall, enable, and disable
+them without a restart.
 
 **Doesn't (yet):** flexbox wrapping, `<textarea>`/`<select>` selection (beyond
 read-only), or the full ECMAScript feature set (no `async`, no `Promise`, no

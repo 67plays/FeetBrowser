@@ -29,6 +29,45 @@ from .net import URL
 TOES_DIR = "toes"
 
 
+def _config_path():
+    """Path to the shared ToeHub/toes config file."""
+    return os.path.join(repo_root(), TOES_DIR, "config.json")
+
+
+def _load_config():
+    try:
+        with open(_config_path()) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_config(cfg):
+    try:
+        os.makedirs(os.path.dirname(_config_path()), exist_ok=True)
+        with open(_config_path(), "w") as f:
+            json.dump(cfg, f, indent=2)
+    except OSError:
+        pass
+
+
+def disabled_toes():
+    """Set of toe names currently disabled (persisted in config.json)."""
+    return set(_load_config().get("disabled", []))
+
+
+def set_toe_enabled(name, enabled):
+    """Enable or disable a toe, persisted in the shared config."""
+    cfg = _load_config()
+    disabled = set(cfg.get("disabled", []))
+    if enabled:
+        disabled.discard(name)
+    else:
+        disabled.add(name)
+    cfg["disabled"] = sorted(disabled)
+    _save_config(cfg)
+
+
 class ButtonDef:
     """A toolbar button the chrome should draw for a toe.
 
@@ -110,6 +149,7 @@ class Context:
         self.toe = toe
         self._callbacks = {}
         self._settings = None
+        self.enabled = self.toe_name() not in disabled_toes()
         if hasattr(toe, "activate"):
             toe.activate(self)
 
@@ -185,6 +225,8 @@ class Context:
     # -- dispatch ---------------------------------------------------------
 
     def call(self, event, *args, **kwargs):
+        if not self.enabled:
+            return None
         cb = self._callbacks.get(event)
         if cb is None:
             return None
@@ -322,14 +364,72 @@ def band_height(bands):
 
 
 def list_toes():
-    """Print a table of installed toes and their load status."""
+    """Print a table of installed toes and their status."""
     found = discover_toes()
     if not found:
-        print("No toes installed. Drop a folder with toe.json into toes/.")
+        print("No toes installed. Open toe://hub in the browser to install "
+              "some, or use --toe-install <name>.")
         return
+    disabled = disabled_toes()
     width = max(len(t.name) for t in found)
     for t in found:
-        print(f"{t.name:<{width}}  v{t.version}  {t.description}")
+        state = "disabled" if t.name in disabled else "enabled "
+        print(f"{t.name:<{width}}  v{t.version}  [{state}]  {t.description}")
+
+
+def search_toes(term):
+    """Search the toe catalog by name/description."""
+    from .toehub import fetch_catalog
+    catalog, repo = fetch_catalog()
+    term = term.lower()
+    hits = [t for t in catalog
+            if term in t.get("name", "").lower()
+            or term in t.get("description", "").lower()]
+    if not hits:
+        print(f"No toes in the catalog match '{term}'.")
+        return
+    for t in hits:
+        print(f"{t.get('name'):<20}  v{t.get('version')}  "
+              f"{t.get('description')}")
+
+
+def install_toe(name):
+    """Install a toe by name from the catalog."""
+    from .toehub import fetch_catalog, install_toe as _install
+    catalog, _repo = fetch_catalog()
+    msg = _install(name, catalog)
+    _print_html_msg(msg)
+
+
+def uninstall_toe(name):
+    """Uninstall an installed toe."""
+    from .toehub import uninstall_toe as _uninstall
+    _print_html_msg(_uninstall(name))
+
+
+def set_enabled(name, enable):
+    """Enable or disable an installed toe."""
+    found = discover_toes()
+    if name not in {t.name for t in found}:
+        print(f"error: {name} is not installed.")
+        return 1
+    set_toe_enabled(name, enable)
+    print(f"{name} is now {'enabled' if enable else 'disabled'}.")
+    return 0
+
+
+def _print_html_msg(html):
+    import re
+    text = re.sub(r"<style[^>]*>.*?</style>", " ", html,
+                  flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r"<h1[^>]*>.*?</h1>", " ", text,
+                  flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r"<a[^>]*>.*?</a>", " ", text,
+                  flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"\s([.,;:])", r"\1", text).strip()
+    print(text)
 
 
 def new_toe(name):
