@@ -1,4 +1,5 @@
 """Fast, offline unit tests for URL parsing, HTML, CSS, and internal pages."""
+import http.server
 import sys, os, tkinter
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -917,6 +918,97 @@ def test_resolve_color_handles_css_color_functions():
     eq(resolve_color("#ff000000"), None, "8-digit hex with alpha 0")
     eq(resolve_color("transparent"), None, "transparent keyword")
     eq(resolve_color("red"), "red", "named color passes through")
+
+
+def _start_server(handler, **kw):
+    """Serve `handler` on an ephemeral port in a background thread."""
+    import http.server
+    import threading
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler, **kw)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
+
+
+def test_reload_bypasses_cache():
+    # The response cache serves cached bodies for max-age'd pages; a reload
+    # must bypass it and actually re-fetch.
+    from feetbrowser.net import URL, _CACHE
+    hits = {"n": 0}
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            hits["n"] += 1
+            body = f"<h1>hit {hits['n']}</h1>".encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Cache-Control", "max-age=9999")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    srv = _start_server(H)
+    try:
+        u = URL(f"http://127.0.0.1:{srv.server_address[1]}/page")
+        _h, first, _c = u.request()
+        eq(hits["n"], 1, "first fetch")
+        _h, second, _c = u.request()
+        eq(hits["n"], 1, "second fetch served from cache")
+        eq(first, second)
+        _h, third, _c = u.request(refresh=True)
+        eq(hits["n"], 2, "refresh re-fetches")
+        assert third != first or "hit 2" in third
+        _CACHE.clear()
+    finally:
+        srv.shutdown()
+
+
+def test_async_load_in_gui_mode():
+    # With a window present, http(s) loads happen off the UI thread so the
+    # spinner can spin; loading stays True until the body arrives.
+    import time
+    from feetbrowser.net import URL
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            time.sleep(0.2)
+            body = b"<h1>async</h1>"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    srv = _start_server(H)
+    root = tkinter.Tk(); root.withdraw()
+    try:
+        class FakeBrowser:
+            window = root
+            toe_contexts = []
+
+            def draw(self):
+                pass
+
+        tab = Tab(700, FakeBrowser())
+        url = URL(f"http://127.0.0.1:{srv.server_address[1]}/slow")
+        tab.load(url)
+        assert tab.loading is True, "GUI-mode http load should be async"
+        deadline = time.time() + 5
+        while tab.loading and time.time() < deadline:
+            tab._drain_async_load()
+            time.sleep(0.02)
+        assert not tab.loading, "async load should complete"
+        assert str(tab.url) == str(url)
+        texts = "".join(getattr(c, "text", "") for c in tab.display_list)
+        assert "async" in texts, f"page body rendered, got: {texts!r}"
+    finally:
+        srv.shutdown()
+        root.destroy()
 
 
 def main():
