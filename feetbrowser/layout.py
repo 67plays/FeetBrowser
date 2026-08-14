@@ -1010,9 +1010,9 @@ class LayoutBox:
         # coordinates and the side they occupy. Consulted by inline layout to
         # wrap text and by `clear` to push content below floats.
         self.float_regions = []
-        # Vertical cursor for each float side within this block so floats
-        # stack without overlapping (keyed "left" / "right").
-        self._float_cursor = {"left": 0.0, "right": 0.0}
+        # A float may never sit higher than one that came before it, whichever
+        # side either is on (CSS 2.1 rule 5). Relative to this block's top.
+        self._float_min_top = 0.0
 
 
 class _LineItem:
@@ -1250,8 +1250,8 @@ class BlockLayout(LayoutBox):
         """Position a `float: left/right` box out of flow, shrink-to-fit its
         width, and record its region so inline content wraps around it."""
         side = el.style.get("float")
-        ml = parse_px(el.style.get("margin-left", "0"))
-        mr = parse_px(el.style.get("margin-right", "0"))
+        ml = _resolve_len(el.style.get("margin-left", "0"), self.width)
+        mr = _resolve_len(el.style.get("margin-right", "0"), self.width)
         mb = parse_px(el.style.get("margin-bottom", "0"))
         mt = parse_px(el.style.get("margin-top", "0"))
         avail = max(0.0, self.width - ml - mr)
@@ -1260,12 +1260,30 @@ class BlockLayout(LayoutBox):
         css_w = el.style.get("width")
         if css_w and css_w.strip().lower() not in (
                 "auto", "fit-content", "min-content", "max-content"):
-            w = max(1.0, min(avail, parse_px(css_w, avail)))
+            # A percentage is of the containing block, not of what fits --
+            # `width: 16.6667%` is how a six-across nav bar was built before
+            # anyone had flexbox.
+            w = max(1.0, min(avail, _resolve_len(css_w, self.width, avail)))
 
         clear = el.style.get("clear")
-        top = self._cleared(clear, self._float_cursor[side])
-        y = self.y + mt + top
-        x = self.x + ml if side == "left" else self.x + self.width - w - mr
+        top = max(self._cleared(clear, 0.0), self._float_min_top)
+        # The slot is for the margin box; the border box starts ml inside it.
+        if self.float_regions:
+            # Which floats this one must sit beside or below depends on how
+            # tall it is, and its height depends only on its width -- so
+            # measure it first, in a box we then throw away.
+            probe = BlockLayout(el, self, None)
+            probe._float_pos = (self.x, self.y, w)
+            probe.layout()
+            probe_h = max(probe.height,
+                          parse_px(el.style.get("height", ""), 0.0))
+            x, y = self._float_slot(side, w + ml + mr, top, mt, probe_h + mb)
+        else:
+            y = self.y + mt + top
+            x = self.x if side == "left" \
+                else self.x + self.width - w - ml - mr
+        x += ml
+        self._float_min_top = y - self.y - mt
 
         box = BlockLayout(el, self, None)
         box._float_pos = (x, y, w)
@@ -1275,11 +1293,39 @@ class BlockLayout(LayoutBox):
         if css_h:
             h = max(h, parse_px(css_h, h))
             box.height = h
-        self._float_cursor[side] = top + h + mb
         self.float_regions.append({
             "side": side, "top": y, "bottom": y + h + mb,
             "left": x, "right": x + w, "box": box})
         return box
+
+    def _float_slot(self, side, outer_w, top, mt, outer_h):
+        """Where a float goes: as high as it is allowed, then as far to its
+        own side as the floats already there leave room for.
+
+        Floats run along a line and only drop to the next one when they stop
+        fitting -- that is the whole reason a page built in 2012 has columns.
+        """
+        # Every float bottom is somewhere the next one might newly fit.
+        candidates = [top] + sorted(
+            f["bottom"] - self.y for f in self.float_regions
+            if f["bottom"] - self.y > top)
+        for i, candidate in enumerate(candidates):
+            y = self.y + mt + candidate
+            left, right = self.x, self.x + self.width
+            for f in self.float_regions:
+                if f["bottom"] <= y or f["top"] >= y + outer_h:
+                    continue
+                if f["side"] == "left":
+                    left = max(left, f["right"])
+                else:
+                    right = min(right, f["left"])
+            # Half a pixel of slack, because `width: 16.6667%` six times over
+            # is 100.0002% and the sixth item is meant to stay on the line.
+            # The last candidate is below everything, so it always wins --
+            # a float wider than the block sticks out rather than vanishing.
+            if right - left >= outer_w - 0.5 or i == len(candidates) - 1:
+                return (left if side == "left" else right - outer_w), y
+        return self.x, self.y + mt + top
 
     def _clear_bottom(self, side):
         bottom = 0.0

@@ -658,6 +658,60 @@ def test_float_text_wraps_and_clears():
     assert tops["below"] >= tops["FLOATBOX"] + 20, "clear pushed paragraph below float"
 
 
+def _boxes(html, css, width=620, tag="div"):
+    """(x, y, width, height) for every box of `tag`, in document order."""
+    from feetbrowser.layout import DocumentLayout
+    dom = HTMLParser(html).parse()
+    style(dom, CSSParser(css).parse())
+    doc = DocumentLayout(dom, width)
+    doc.layout()
+    found, stack = [], [doc]
+    while stack:
+        box = stack.pop()
+        node = getattr(box, "node", None)
+        if getattr(node, "tag", None) == tag:
+            found.append((box.x, box.y, box.width, box.height))
+        stack.extend(box.children)
+    return sorted(found, key=lambda b: (b[1], b[0]))
+
+
+def test_floats_run_along_a_line_before_dropping():
+    """Floats are only interesting because they sit beside each other. Ours
+    stacked vertically, which turned every 2012 nav bar into a column."""
+    boxes = _boxes("<section><div>A</div><div>B</div><div>C</div></section>",
+                   "div { float: left; width: 100px; }")
+    eq([round(b[0]) for b in boxes], [8, 108, 208], "side by side")
+    eq(len({round(b[1]) for b in boxes}), 1, "all on one line")
+
+
+def test_floats_wrap_when_the_line_runs_out():
+    boxes = _boxes(
+        "<section><div>A</div><div>B</div><div>C</div></section>",
+        "div { float: left; width: 250px; }", width=616)
+    tops = [round(b[1]) for b in boxes]
+    eq([round(b[0]) for b in boxes], [8, 258, 8], "two fit, the third drops")
+    assert tops[0] == tops[1] < tops[2], tops
+
+
+def test_a_right_float_hugs_the_right_edge():
+    boxes = _boxes(
+        "<section><div id=l>A</div><div id=r>B</div></section>",
+        "#l { float: left; width: 100px } #r { float: right; width: 100px }")
+    eq([round(b[0]) for b in boxes], [8, 512], "one each side")
+    eq(len({round(b[1]) for b in boxes}), 1, "and both on the top line")
+
+
+def test_percentage_widths_on_floats_come_from_the_container():
+    """`width: 16.6667%` six times over is how a six-across nav bar was
+    built before flexbox, and it has to stay on one line."""
+    items = "".join("<li>%d</li>" % i for i in range(6))
+    boxes = _boxes("<ul>" + items + "</ul>",
+                   "li { float: left; width: 16.6667%; list-style: none }"
+                   "ul { margin: 0; padding: 0 }", width=1016, tag="li")
+    eq(len({round(b[1]) for b in boxes}), 1, "all six on one line")
+    eq([round(b[2]) for b in boxes], [167] * 6, "each a sixth of 1000px")
+
+
 def test_clear_left_only_clears_left_floats():
     from feetbrowser.layout import DrawText, DocumentLayout
     from feetbrowser.cssparser import CSSParser, style as apply_style
