@@ -11,6 +11,9 @@ Every decoder returns ``(width, height, rgba)`` where rgba is a bytearray of
 """
 import struct
 import zlib
+import ctypes
+
+from . import asmops
 
 
 class ImageError(Exception):
@@ -23,6 +26,11 @@ class ImageError(Exception):
 # optional Pillow path already applies.
 MAX_PIXELS = 20_000_000
 MAX_INFLATED = 256 << 20
+
+# When the raw x86-64 kernels in feetbrowser/asm/pixelops.S are compiled in,
+# every per-pixel loop below hands the whole buffer to assembly; otherwise
+# the identical Python loop runs. Computed once at import.
+_ASM_PIXELS = asmops.using_assembly()
 
 
 def _check_size(width, height):
@@ -169,29 +177,53 @@ def _unfilter(raw, width, height, channels, depth):
         if len(line) < stride:
             line.extend(b"\x00" * (stride - len(line)))
         if ftype == 1:      # Sub
-            for i in range(bpp, stride):
-                line[i] = (line[i] + line[i - bpp]) & 0xFF
+            if _ASM_PIXELS:
+                line_view = (ctypes.c_ubyte * stride).from_buffer(line)
+                prev_view = (ctypes.c_ubyte * stride).from_buffer(prev)
+                asmops.unfilter_line(line_view, prev_view, stride, bpp, ftype)
+                del line_view, prev_view
+            else:
+                for i in range(bpp, stride):
+                    line[i] = (line[i] + line[i - bpp]) & 0xFF
         elif ftype == 2:    # Up
-            for i in range(stride):
-                line[i] = (line[i] + prev[i]) & 0xFF
+            if _ASM_PIXELS:
+                line_view = (ctypes.c_ubyte * stride).from_buffer(line)
+                prev_view = (ctypes.c_ubyte * stride).from_buffer(prev)
+                asmops.unfilter_line(line_view, prev_view, stride, bpp, ftype)
+                del line_view, prev_view
+            else:
+                for i in range(stride):
+                    line[i] = (line[i] + prev[i]) & 0xFF
         elif ftype == 3:    # Average
-            for i in range(stride):
-                left = line[i - bpp] if i >= bpp else 0
-                line[i] = (line[i] + ((left + prev[i]) >> 1)) & 0xFF
+            if _ASM_PIXELS:
+                line_view = (ctypes.c_ubyte * stride).from_buffer(line)
+                prev_view = (ctypes.c_ubyte * stride).from_buffer(prev)
+                asmops.unfilter_line(line_view, prev_view, stride, bpp, ftype)
+                del line_view, prev_view
+            else:
+                for i in range(stride):
+                    left = line[i - bpp] if i >= bpp else 0
+                    line[i] = (line[i] + ((left + prev[i]) >> 1)) & 0xFF
         elif ftype == 4:    # Paeth
-            for i in range(stride):
-                a = line[i - bpp] if i >= bpp else 0
-                b = prev[i]
-                c = prev[i - bpp] if i >= bpp else 0
-                p = a + b - c
-                pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
-                if pa <= pb and pa <= pc:
-                    pred = a
-                elif pb <= pc:
-                    pred = b
-                else:
-                    pred = c
-                line[i] = (line[i] + pred) & 0xFF
+            if _ASM_PIXELS:
+                line_view = (ctypes.c_ubyte * stride).from_buffer(line)
+                prev_view = (ctypes.c_ubyte * stride).from_buffer(prev)
+                asmops.unfilter_line(line_view, prev_view, stride, bpp, ftype)
+                del line_view, prev_view
+            else:
+                for i in range(stride):
+                    a = line[i - bpp] if i >= bpp else 0
+                    b = prev[i]
+                    c = prev[i - bpp] if i >= bpp else 0
+                    p = a + b - c
+                    pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
+                    if pa <= pb and pa <= pc:
+                        pred = a
+                    elif pb <= pc:
+                        pred = b
+                    else:
+                        pred = c
+                    line[i] = (line[i] + pred) & 0xFF
         elif ftype != 0:
             raise ImageError("bad PNG filter type %d" % ftype)
         out[y * stride:(y + 1) * stride] = line
@@ -237,30 +269,53 @@ def _to_rgba(samples, width, height, color, palette, trns, depth):
         if not palette:
             raise ImageError("indexed PNG without a palette")
         alpha = trns or b""
-        for i in range(n):
-            idx = samples[i]
-            o = idx * 3
-            d = i * 4
-            if o + 2 < len(palette):
-                rgba[d] = palette[o]
-                rgba[d + 1] = palette[o + 1]
-                rgba[d + 2] = palette[o + 2]
-            rgba[d + 3] = alpha[idx] if idx < len(alpha) else 255
+        if _ASM_PIXELS:
+            rgba_view = (ctypes.c_ubyte * (n * 4)).from_buffer(rgba)
+            samples_view = (ctypes.c_ubyte * n).from_buffer(samples)
+            pal_view = (ctypes.c_ubyte * len(palette)).from_buffer_copy(palette)
+            alpha_view = (ctypes.c_ubyte * len(alpha)).from_buffer_copy(alpha)
+            asmops.palette_expand(rgba_view, samples_view, n, pal_view,
+                                  len(palette), alpha_view, len(alpha))
+            del rgba_view, samples_view, pal_view, alpha_view
+        else:
+            for i in range(n):
+                idx = samples[i]
+                o = idx * 3
+                d = i * 4
+                if o + 2 < len(palette):
+                    rgba[d] = palette[o]
+                    rgba[d + 1] = palette[o + 1]
+                    rgba[d + 2] = palette[o + 2]
+                rgba[d + 3] = alpha[idx] if idx < len(alpha) else 255
     elif color == 0:
         key = None
         if trns and len(trns) >= 2:
             key = struct.unpack(">H", trns[:2])[0] >> (8 if depth == 16 else 0)
-        for i in range(n):
-            v = samples[i] * scale
-            d = i * 4
-            rgba[d] = rgba[d + 1] = rgba[d + 2] = v
-            rgba[d + 3] = 0 if (key is not None and samples[i] == key) else 255
+        if _ASM_PIXELS:
+            rgba_view = (ctypes.c_ubyte * (n * 4)).from_buffer(rgba)
+            samples_view = (ctypes.c_ubyte * n).from_buffer(samples)
+            asmops.grey_expand(rgba_view, samples_view, n, scale,
+                               key if key is not None else 0,
+                               1 if key is not None else 0)
+            del rgba_view, samples_view
+        else:
+            for i in range(n):
+                v = samples[i] * scale
+                d = i * 4
+                rgba[d] = rgba[d + 1] = rgba[d + 2] = v
+                rgba[d + 3] = 0 if (key is not None and samples[i] == key) else 255
     elif color == 4:
-        for i in range(n):
-            s, d = i * 2, i * 4
-            v = samples[s]
-            rgba[d] = rgba[d + 1] = rgba[d + 2] = v
-            rgba[d + 3] = samples[s + 1]
+        if _ASM_PIXELS:
+            rgba_view = (ctypes.c_ubyte * (n * 4)).from_buffer(rgba)
+            samples_view = (ctypes.c_ubyte * (n * 2)).from_buffer(samples)
+            asmops.grey_alpha_expand(rgba_view, samples_view, n)
+            del rgba_view, samples_view
+        else:
+            for i in range(n):
+                s, d = i * 2, i * 4
+                v = samples[s]
+                rgba[d] = rgba[d + 1] = rgba[d + 2] = v
+                rgba[d + 3] = samples[s + 1]
     elif color == 2:
         key = None
         if trns and len(trns) >= 6:
@@ -268,11 +323,19 @@ def _to_rgba(samples, width, height, color, palette, trns, depth):
             if depth == 16:
                 r, g, b = r >> 8, g >> 8, b >> 8
             key = (r, g, b)
-        for i in range(n):
-            s, d = i * 3, i * 4
-            r, g, b = samples[s], samples[s + 1], samples[s + 2]
-            rgba[d], rgba[d + 1], rgba[d + 2] = r, g, b
-            rgba[d + 3] = 0 if key == (r, g, b) else 255
+        if _ASM_PIXELS:
+            rgba_view = (ctypes.c_ubyte * (n * 4)).from_buffer(rgba)
+            samples_view = (ctypes.c_ubyte * (n * 3)).from_buffer(samples)
+            kr, kg, kb = key if key is not None else (0, 0, 0)
+            asmops.rgb_expand(rgba_view, samples_view, n, kr, kg, kb,
+                              1 if key is not None else 0)
+            del rgba_view, samples_view
+        else:
+            for i in range(n):
+                s, d = i * 3, i * 4
+                r, g, b = samples[s], samples[s + 1], samples[s + 2]
+                rgba[d], rgba[d + 1], rgba[d + 2] = r, g, b
+                rgba[d + 3] = 0 if key == (r, g, b) else 255
     else:  # color == 6
         rgba[:] = samples[:n * 4]
     return rgba
@@ -494,11 +557,22 @@ def resize(rgba, width, height, new_width, new_height):
     out = bytearray(new_width * new_height * 4)
     xmap = [min(width - 1, x * width // new_width) * 4
             for x in range(new_width)]
-    for y in range(new_height):
-        src_row = min(height - 1, y * height // new_height) * width * 4
-        d = y * new_width * 4
-        for sx in xmap:
-            s = src_row + sx
-            out[d:d + 4] = rgba[s:s + 4]
-            d += 4
+    if _ASM_PIXELS:
+        xmap_arr = (ctypes.c_uint32 * new_width)(*xmap)
+        for y in range(new_height):
+            src_row = min(height - 1, y * height // new_height) * width * 4
+            dst_view = (ctypes.c_ubyte * (new_width * 4)).from_buffer(
+                out, y * new_width * 4)
+            src_view = (ctypes.c_ubyte * (len(rgba) - src_row)).from_buffer(
+                rgba, src_row)
+            asmops.resize_row(dst_view, src_view, xmap_arr, new_width)
+            del dst_view, src_view
+    else:
+        for y in range(new_height):
+            src_row = min(height - 1, y * height // new_height) * width * 4
+            d = y * new_width * 4
+            for sx in xmap:
+                s = src_row + sx
+                out[d:d + 4] = rgba[s:s + 4]
+                d += 4
     return out

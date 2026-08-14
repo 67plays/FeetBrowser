@@ -172,6 +172,26 @@ class Surface:
         px = self.pixels
         r, g, b = color
         stride = self.stride
+        if _ASM_SPANS:
+            # One call per clipped row: the kernel does the a==0 / a==255 /
+            # (c*a + dst*inv) >> 8 arithmetic the Python loop below does, in
+            # raw machine code over the whole RGB run.
+            for row in range(sy0, sy1):
+                n = sx1 - sx0
+                if n > 0:
+                    dst_offset = (y + row) * stride + (x + sx0) * 3
+                    dst = (ctypes.c_ubyte * (n * 3)).from_buffer(px, dst_offset)
+                    src_offset = row * cw
+                    if isinstance(cov, bytearray):
+                        cov_view = (ctypes.c_ubyte * n).from_buffer(cov,
+                                                                    src_offset)
+                    else:
+                        cov_view = (ctypes.c_ubyte * n).from_buffer_copy(
+                            cov[src_offset:src_offset + n])
+                    asmblend.blit_cov(dst, cov_view, n, r, g, b)
+                    del dst, cov_view  # release the views; a bytearray cannot
+                    # resize while a ctypes view over it is alive
+            return
         for row in range(sy0, sy1):
             src = row * cw
             dst = (y + row) * stride + (x + sx0) * 3
@@ -214,6 +234,25 @@ class Surface:
                 del line[3::4]
                 dst = (y + row) * self.stride + (x + sx0) * 3
                 px[dst:dst + count * 3] = line
+            return
+        if _ASM_SPANS:
+            # The non-opaque case done by the kernel: alpha-per-pixel over the
+            # clipped RGB run, a==0 skipped, a==255 copied, else >>8 blend.
+            for row in range(sy0, sy1):
+                n = sx1 - sx0
+                if n > 0:
+                    dst_offset = (y + row) * self.stride + (x + sx0) * 3
+                    dst = (ctypes.c_ubyte * (n * 3)).from_buffer(px, dst_offset)
+                    src_offset = (row * iw + sx0) * 4
+                    if isinstance(data, bytearray):
+                        src = (ctypes.c_ubyte * (n * 4)).from_buffer(data,
+                                                                      src_offset)
+                    else:
+                        src = (ctypes.c_ubyte * (n * 4)).from_buffer_copy(
+                            data[src_offset:src_offset + n * 4])
+                    asmblend.blend_rgba(dst, src, n)
+                    del dst, src  # release the views; a bytearray cannot
+                    # resize while a ctypes view over it is alive
             return
         for row in range(sy0, sy1):
             src = (row * iw + sx0) * 4
