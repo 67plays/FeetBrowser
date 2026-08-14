@@ -33,5 +33,5 @@ fi
 .venv/bin/python tests/test_shoes.py
 .venv/bin/python tests/test_nav.py
 .venv/bin/python tests/test_toes.py
-.venv/bin/python tests/test_gh_scroll.py
+.venv/bin/python tests/test_asmblend.py  # raw assembly on Linux/x86-64, Python elsewhere
 .venv/bin/python tests/smoke.py

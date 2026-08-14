@@ -61,8 +61,10 @@ jobs:
       - name: Toe engine tests
         run: .venv/bin/python tests/test_toes.py
 
-      - name: Pseudo-toe (gh-scroll) tests
-        run: .venv/bin/python tests/test_gh_scroll.py
+      # Linux/x86-64 assembles and runs the real kernels here; everywhere
+      # else the module's pure-Python fallback is what gets checked.
+      - name: Assembly span kernels
+        run: .venv/bin/python tests/test_asmblend.py
 
       - name: Screenshot a page end to end
         run: |
@@ -123,3 +125,4 @@ jobs:
           name: x11-window
           path: artifacts/x11-window.png
           if-no-files-found: error
+

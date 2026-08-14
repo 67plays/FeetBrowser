@@ -11,14 +11,22 @@ glyph coverage bitmaps are rasterised once and cached per (face, size, glyph)
 -- drawing a character the second time is a blend of an existing bitmap, never
 a re-run of the scanline fill.
 """
+import ctypes
 import struct
 import zlib
 
+from . import asmblend
 from . import fontengine
 
 # Vertical subsamples per pixel row when rasterising outlines. Horizontal
 # coverage is computed analytically, so 4 rows is enough to look smooth.
 SUBSAMPLES = 4
+
+# Whether the raw span kernels are real machine code on this host. Only then
+# is a translucent row worth handing to asmblend: the module's own fallback
+# is a per-byte Python loop, which is exactly what the translate tables below
+# exist to avoid. Read once here so a test can flip it either way.
+_ASM_SPANS = asmblend.using_assembly()
 
 
 _BLEND_TABLES = {}
@@ -86,12 +94,25 @@ class Surface:
                 o = y * self.stride + x0 * 3
                 self.pixels[o:o + span] = row
             return
-        # Translucent fill. Blending each pixel in Python costs milliseconds
+        px = self.pixels
+        if _ASM_SPANS:
+            # Where the raw kernels exist, a row is one call: the assembly
+            # does the arithmetic the tables were standing in for, over the
+            # whole RGB run, with no strides and no tables at all. It rounds
+            # by >>8 where the tables round by /255, so a channel can land
+            # one level darker at the very top of the range.
+            row = (ctypes.c_ubyte * span).from_buffer_copy(bytes(color) * w)
+            for y in range(y0, y1):
+                o = y * self.stride + x0 * 3
+                dst = (ctypes.c_ubyte * span).from_buffer(px, o)
+                asmblend.blend_rgb(dst, row, span, alpha)
+                del dst  # release the view; a bytearray cannot resize under one
+            return
+        # No assembly here. Blending each pixel in Python costs milliseconds
         # on a full-page shadow, so instead each channel gets a 256-entry
         # translate table and is blended as a strided slice -- three C-level
         # passes per row rather than three Python operations per pixel.
         tr, tg, tb = _blend_tables(color, alpha)
-        px = self.pixels
         for y in range(y0, y1):
             o = y * self.stride + x0 * 3
             end = o + span
