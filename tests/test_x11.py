@@ -919,6 +919,85 @@ def live_a_real_page_reaches_the_screen():
             "the window is one flat colour; nothing was drawn"
 
 
+def motion_event(win, x, y, state=0):
+    event = x11.XEvent()
+    event.xmotion.type = x11.MOTION_NOTIFY
+    event.xmotion.display = win._display
+    event.xmotion.window = win._window
+    event.xmotion.root = x11._state["root"]
+    event.xmotion.x, event.xmotion.y = x, y
+    event.xmotion.state = state
+    event.xmotion.same_screen = True
+    return event
+
+
+def drag_to(win, x, y):
+    """A pointer move with Button 1 held, which is X11's way of saying drag:
+    one event type for moving and dragging, told apart by the state mask."""
+    send(win, motion_event(win, x, y, 1 << 8), x11.POINTER_MOTION_MASK)
+
+
+def _tall_page(br):
+    """Load a page far taller than the window and return its tab."""
+    br.new_tab("data:text/html," + "".join("<p>line %d</p>" % i
+                                           for i in range(300)))
+    br.draw()
+    tab = br.active_tab
+    assert tab.content_height() > br.tab_height(), "the page is not tall"
+    return tab
+
+
+def live_dragging_the_scrollbar_scrolls_the_page():
+    """ButtonPress, then MotionNotify with Button1Mask, then ButtonRelease --
+    the three the scrollbar is dragged with. The middle one is the event
+    nothing used to be listening for on the bar."""
+    with _Browser() as br:
+        tab = _tall_page(br)
+        # An unscrolled page puts the thumb at the very top of the track.
+        thumb_top = int(br.chrome_height())
+        x = br.canvas.winfo_width() - 7
+        send(br.window, button_event(br.window, 1, x, thumb_top + 5),
+             x11.BUTTON_PRESS_MASK)
+        pump(br.window)
+        eq(tab.scroll, 0, "pressing the thumb jumped the page")
+        drag_to(br.window, x, thumb_top + 105)
+        pump(br.window)
+        assert tab.scroll > 0, "dragging the thumb did not scroll the page"
+        send(br.window, button_event(br.window, 1, x, thumb_top + 105,
+                                     press=False), x11.BUTTON_RELEASE_MASK)
+        pump(br.window)
+        settled = tab.scroll
+        drag_to(br.window, x, thumb_top + 300)
+        pump(br.window)
+        eq(tab.scroll, settled, "the drag survived the button coming up")
+
+
+def live_a_drag_that_leaves_the_window_still_scrolls():
+    """The press grabs the pointer, so X keeps reporting the drag to this
+    window with coordinates outside it -- and dragging past the end of the
+    document has to stop exactly where the wheel stops."""
+    with _Browser() as br:
+        tab = _tall_page(br)
+        tab.scroll_by(10 ** 9)
+        bottom = tab.scroll
+        tab.set_scroll(0)
+        br.draw()
+        thumb_top = int(br.chrome_height())
+        x = br.canvas.winfo_width() - 7
+        send(br.window, button_event(br.window, 1, x, thumb_top + 5),
+             x11.BUTTON_PRESS_MASK)
+        pump(br.window)
+        drag_to(br.window, x, br.window.height + 4000)
+        pump(br.window)
+        eq(tab.scroll, bottom, "dragging off the bottom missed the end")
+        drag_to(br.window, x, -4000)
+        pump(br.window)
+        eq(tab.scroll, 0, "dragging off the top missed the start")
+        send(br.window, button_event(br.window, 1, x, -4000, press=False),
+             x11.BUTTON_RELEASE_MASK)
+        pump(br.window)
+
+
 def main():
     everything = sorted(globals().items())
     pure = [v for k, v in everything if k.startswith("test_")]
