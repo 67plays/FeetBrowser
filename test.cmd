@@ -46,6 +46,8 @@ if errorlevel 1 (
 )
 
 "%PY%" -m pyflakes feetbrowser tests || exit /b 1
+rem Every suite below, and nothing missing.
+"%PY%" tests\test_suites.py || exit /b 1
 "%PY%" tests\test_render.py || exit /b 1
 rem test_win32.py opens real windows here; the other two skip, and it is the
 rem one that skips everywhere else.
@@ -55,8 +57,24 @@ rem one that skips everywhere else.
 "%PY%" tests\test_units.py || exit /b 1
 "%PY%" tests\test_js.py || exit /b 1
 "%PY%" tests\test_shoes.py || exit /b 1
+rem A fixture page in, its pixels back out.
+"%PY%" tests\test_e2e.py || exit /b 1
 "%PY%" tests\test_nav.py || exit /b 1
 "%PY%" tests\test_toes.py || exit /b 1
 rem No assembler here, so this checks the pure-Python fallback.
 "%PY%" tests\test_asmblend.py || exit /b 1
 "%PY%" tests\smoke.py || exit /b 1
+
+rem The Go port of the transport layer (net/) is a separate toolchain, so it is
+rem run where one is installed and skipped where there is not, the same way the
+rem window suites treat their platforms. Written with goto rather than an
+rem if/else block because `||` inside parentheses is parsed before the block
+rem runs, and binds to something other than what it looks like it binds to.
+where /q go
+if errorlevel 1 goto :nogo
+go vet ./... || exit /b 1
+go test ./... || exit /b 1
+goto :done
+:nogo
+echo skipping the Go net tests: no go toolchain on PATH
+:done
