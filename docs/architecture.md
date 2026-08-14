@@ -28,13 +28,13 @@ WebKit, Gecko, or any HTTP library — it implements its own:
   subset (`flex-direction` row/column, `gap`, `flex-grow`, `flex-basis`,
   `justify-content`, `align-items`), a **CSS grid** subset
   (`grid-template-columns` px/%/fr/auto, auto row placement,
-  `grid-column`/`grid-row` spans, `gap`), and **`<img>` rendering** (PNG/GIF
-  natively, JPEG via Pillow if it happens to be installed, fetched off the UI
+  `grid-column`/`grid-row` spans, `gap`), and **`<img>` rendering** (PNG, GIF,
+  JPEG and Netpbm, all decoded by us, fetched off the UI
   thread), plus form controls (text fields, checkboxes, submit/reset buttons,
   `<select>`), producing a display list of paint commands.
 - **Rendering engine** — our own pixels, no GUI toolkit: a TrueType parser
   (`cmap`/`glyf`/`hmtx`/…, composite glyphs, real metrics), an antialiased
-  scanline rasteriser owning its own framebuffer, PNG/GIF/PNM decoders, a
+  scanline rasteriser owning its own framebuffer, PNG/GIF/JPEG/PNM decoders, a
   retained scene graph, and an event loop. The three layers that touch every
   pixel — the surface, the font parser and the image decoders — are in the
   same Rust extension as the JS engine; the scene graph, the event loop and
@@ -81,12 +81,14 @@ WebKit, Gecko, or any HTTP library — it implements its own:
   to the Rust functions.
 
 Beyond the engine extension, which is our own code in another language, no
-Python package is *required*, and that now includes the pixels: there is no
-Tk, Qt, GTK, SDL, Cairo or FreeType anywhere, and the only thing the renderer
-asks of the operating system is a font file to parse. Two
-optional imports are tried and shrugged off when absent — Pillow for JPEG and
-cairosvg for SVG, formats `imagecodec.py` does not decode itself. Without them
-those images simply do not appear; everything else is unaffected.
+Python package is used at all, and that now includes the pixels: there is no
+Tk, Qt, GTK, SDL, Cairo, FreeType or Pillow anywhere, and the only thing the
+renderer asks of the operating system is a font file to parse. Nothing is
+imported conditionally and nothing is shrugged off when absent, so what the
+browser can draw does not depend on what else the machine happens to have
+installed. SVG is the format that costs: it used to render wherever cairosvg
+was present, and now renders as alt text everywhere. docs/dependencies.md
+says why that is the right trade and not a regression waiting to be fixed.
 
 ## Layout of the code
 
@@ -100,7 +102,7 @@ feetbrowser/
   layout.py      block/inline layout -> display list, painting
   fontengine.py  font discovery and the family index; parsing is Rust
   raster.py      thin shim over the Rust surface, glyph cache and PNG output
-  imagecodec.py  thin shim over the Rust PNG / GIF / PNM decoders
+  imagecodec.py  thin shim over the Rust PNG / GIF / JPEG / PNM decoders
   canvas.py      retained scene graph, fonts, colors, images
   window.py      windows, event bindings, after() timers, main loop
   cocoa.py       the macOS window: AppKit through ctypes, no PyObjC

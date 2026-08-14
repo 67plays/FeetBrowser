@@ -1,9 +1,10 @@
-"""Image decoders: PNG, GIF and the Netpbm family, decoded to raw RGBA.
+"""Image decoders: PNG, GIF, JPEG and the Netpbm family, decoded to raw RGBA.
 
-These three are the formats we decode ourselves, which is what lets the
-browser show an image without asking anything outside the project. JPEG is not
-here -- it stays on the optional Pillow path, and docs/dependencies.md scopes
-what writing our own would take.
+These are the formats we decode ourselves, which is what lets the browser show
+an image without asking anything outside the project. JPEG is one of them now,
+so a photograph draws as a photograph on a machine with nothing installed on
+it; what the decoder will not take is listed in docs/rendering.md, and each of
+those files draws as its alt text rather than as a wrong picture.
 
 Thin shim: the decoders live in Rust, in the `feetbrowser_engine` extension.
 They are the part of the renderer that parses bytes a stranger sent us, and
@@ -16,8 +17,8 @@ pixel, which is what raster.Surface.blit_rgba consumes.
 """
 
 from feetbrowser_engine import (MAX_INFLATED, MAX_PIXELS, ImageError, decode,
-                                decode_gif, decode_png, decode_pnm, resize,
-                                sniff)
+                                decode_gif, decode_jpeg, decode_png,
+                                decode_pnm, resize, sniff)
 
 __all__ = ["ImageError", "MAX_PIXELS", "MAX_INFLATED", "decode", "decode_png",
-           "decode_gif", "decode_pnm", "sniff", "resize"]
+           "decode_gif", "decode_jpeg", "decode_pnm", "sniff", "resize"]

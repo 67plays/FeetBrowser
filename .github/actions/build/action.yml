@@ -10,9 +10,9 @@ inputs:
     required: true
   extras:
     description: >
-      Extra packages for the venv. Pillow and cairosvg are optional
-      dependencies of the browser and belong only to the job that exists to
-      cover them.
+      Extra packages for the venv. The browser needs none; the one job that
+      passes anything here installs Pillow and cairosvg precisely so it can
+      prove the browser never imports them.
     required: false
     default: ''
   xvfb:
