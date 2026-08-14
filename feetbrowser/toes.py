@@ -84,6 +84,39 @@ class ButtonDef:
         return f"ButtonDef({self.id!r}, {self.glyph!r})"
 
 
+class ConfigOption:
+    """A configurable option a toe exposes to the ToeHub.
+
+    `kind` is one of "bool", "int", "str", or "choice". Choices carry an
+    `options` list of (value, label) pairs. `default` is used when the
+    setting is unset. `help` is shown in the config page.
+    """
+
+    def __init__(self, key, label, kind="str", default=None, options=None,
+                 help=""):
+        self.key = key
+        self.label = label
+        self.kind = kind
+        self.default = default
+        self.options = options or []
+        self.help = help
+
+    def coerce(self, value):
+        """Coerce a raw string (from the URL) to this option's type."""
+        if self.kind == "bool":
+            return str(value).lower() in ("1", "true", "yes", "on")
+        if self.kind == "int":
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return self.default
+        return str(value)
+
+    def render(self, value):
+        """Render the current value for the config page."""
+        return f"{value}"
+
+
 class Context:
     """The only thing a toe gets to hold. It wraps the browser and the
     active tab and dispatches calls out to the toe's hook handlers.
@@ -142,6 +175,12 @@ class Context:
             A click landed inside the chrome band region. `bands` is the
             same list as on_chrome_draw. Return True if the click was
             consumed, False to let the normal chrome handle it.
+
+    Configurable options (for the ToeHub's config page):
+
+        ctx.define_config(ConfigOption(...), ...)
+            Declare configurable options. Values live in the toe's
+            persisted settings and are editable from `toehub://config/<name>`.
     """
 
     def __init__(self, browser, toe):
@@ -149,9 +188,40 @@ class Context:
         self.toe = toe
         self._callbacks = {}
         self._settings = None
+        self._config = {}
         self.enabled = self.toe_name() not in disabled_toes()
         if hasattr(toe, "activate"):
             toe.activate(self)
+
+    # -- configurable options ---------------------------------------------
+
+    def define_config(self, *options):
+        """Declare this toe's configurable options. Each arg is a
+        ConfigOption. Values are stored in settings (persisted) and seeded
+        with each option's default when unset."""
+        for opt in options:
+            self._config[opt.key] = opt
+            if opt.key not in self.settings:
+                self.settings[opt.key] = opt.default
+
+    def config_options(self):
+        """List of (key, ConfigOption) declared by this toe, sorted by key."""
+        return sorted(self._config.items())
+
+    def config_value(self, key):
+        """Current value of a declared config option (coerced)."""
+        opt = self._config.get(key)
+        if opt is None:
+            return self.settings.get(key)
+        return opt.coerce(self.settings.get(key, opt.default))
+
+    def set_config(self, key, value):
+        """Coerce and store a config option value, then persist."""
+        opt = self._config.get(key)
+        if opt is not None:
+            value = opt.coerce(value)
+        self.settings[key] = value
+        self.save_settings()
 
     # -- helpers the toe can call -----------------------------------------
 
