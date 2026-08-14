@@ -122,6 +122,8 @@ and install / uninstall / enable / disable toes live — no restart. Or use the
 CLI:
 
 ```bash
+python3 -m feetbrowser --help             # full CLI reference
+python3 -m feetbrowser --version          # print the version
 python3 -m feetbrowser --toes                 # installed toes + status
 python3 -m feetbrowser --toe-search <term>    # search the catalog
 python3 -m feetbrowser --toe-install <name>   # install a toe
