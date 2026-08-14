@@ -1,8 +1,13 @@
 # Tests
 
 ```bash
-./test.sh          # pyflakes + unit + JS + navigation + toe + pseudo-toe + live smoke
+./test.sh          # builds the Rust engine, then pyflakes + unit + JS + navigation + toe + pseudo-toe + live smoke
 ```
+
+`test.sh` builds the Rust JS engine (`feetbrowser_engine`) into the local
+`.venv` with `maturin develop --release` on first use, then runs every suite
+from that venv — so a first run needs the Rust toolchain (maturin is
+installed into the venv automatically).
 
 Most suites run fully offline: `test_units.py`, `test_js.py` (which serves its
 `fetch`/`XMLHttpRequest` cases from a local HTTP server), `test_toes.py` (which

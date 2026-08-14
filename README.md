@@ -1,11 +1,13 @@
 # 🦶 FeetBrowser
 *See the web from a new ankle*
 
-A web browser written **from scratch in pure Python**. No Chromium, no
-WebKit, no borrowed libraries — it does its own networking, HTML parsing,
-CSS, layout, JavaScript, fonts, and pixels. No GUI toolkit either: the
-TrueType parser, the antialiased rasteriser and the image decoders are all in
-this repo, standard library only.
+A web browser written **from scratch**. No Chromium, no WebKit, no borrowed
+libraries — it does its own networking, HTML parsing, CSS, layout, JavaScript,
+fonts, and pixels. No GUI toolkit either: the TrueType parser, the antialiased
+rasteriser and the image decoders are all in this repo. The JavaScript engine
+and DOM bridge are compiled to a native Rust extension; everything else
+(networking, parsing, layout, rendering, chrome) is Python, standard library
+only.
 
 ## STRIDE — how code is judged
 
@@ -26,11 +28,18 @@ Code in this repo is evaluated on six principles:
 ./run.sh https://example.com
 ```
 
-Nothing to install — just Python 3 and a system font. To render a page to a
-PNG without opening a window:
+No GUI toolkit to install — just Python 3 and a system font. The one thing
+that does get built is the JavaScript engine: `run.sh` compiles the Rust
+extension (`feetbrowser_engine`) into a local `.venv` when it isn't
+importable, so a first run needs the Rust toolchain (the script installs
+`maturin` into the venv for you). Once the extension is built and installed
+for the interpreter you're invoking, `python3 -m feetbrowser <url>` works
+directly.
+
+To render a page to a PNG without opening a window:
 
 ```bash
-python3 -m feetbrowser --screenshot https://example.com page.png
+./run.sh --screenshot https://example.com page.png
 ```
 
 ## What you can do
@@ -38,6 +47,8 @@ python3 -m feetbrowser --screenshot https://example.com page.png
 - Open tabs, back/forward, reload, bookmarks, history, and page source
 - Fill in forms, follow links, search from the address bar
 - Add extensions ("toes") — open **`toe://hub`** in the browser
+- Restyle the browser with **Shoes** themes — open **`about:shoes`**
+  (`Ctrl+Shift+S`)
 - Keyboard shortcuts: `Ctrl-T` new tab, `Ctrl-L` focus address bar,
   `Ctrl-W` close tab, and more
 
