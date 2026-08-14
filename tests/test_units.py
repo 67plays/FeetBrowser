@@ -1503,6 +1503,89 @@ def test_media_query_answers_the_preference_features():
         "features we cannot answer still match, so no rule is lost"
 
 
+def test_at_layer_rules_are_not_thrown_away():
+    """A modern stylesheet puts everything inside @layer. Skipping the block
+    left such a page with nothing but the UA sheet."""
+    rules = CSSParser(
+        "@layer base, components;"
+        "@layer base { p { color: red; } }"
+        "@layer components { .card { color: blue; } }"
+        "@supports (display: grid) { div { color: green; } }"
+        "@keyframes spin { from { color: pink; } }").parse()
+    colors = sorted(body.get("color") for _sel, body in rules)
+    eq(colors, ["blue", "green", "red"],
+       "layers and @supports come through, keyframes do not")
+
+
+def test_viewport_and_font_relative_units():
+    from feetbrowser.layout import parse_px
+    from feetbrowser.cssparser import set_viewport, get_viewport
+    before = get_viewport()
+    try:
+        set_viewport(1000, 800)
+        eq(parse_px("60vw"), 600.0)
+        eq(parse_px("15vh"), 120.0)
+        eq(parse_px("10vmin"), 80.0)
+        eq(parse_px("10vmax"), 100.0)
+    finally:
+        set_viewport(*before)
+    eq(parse_px("2em"), 32.0, "em falls back to the root size")
+    eq(parse_px("12pt"), 16.0, "points are 4/3 of a pixel")
+    eq(parse_px("nonsense", 7.0), 7.0, "and junk still takes the default")
+
+
+def test_overflow_hidden_clips_what_leaves_the_box():
+    from feetbrowser.layout import DocumentLayout, DrawRect, paint_tree
+    html = ('<div style="overflow:hidden;height:20px;width:200px">'
+            '<div style="background:#ff0000;height:400px"></div></div>')
+    dom = HTMLParser(html).parse()
+    style(dom, [])
+    doc = DocumentLayout(dom, 620)
+    doc.layout()
+    cmds = []
+    paint_tree(doc, cmds)
+    fill = [c for c in cmds if isinstance(c, DrawRect) and c.color == "#ff0000"]
+    eq(len(fill), 1, "the overflowing block still paints")
+    eq(fill[0].bottom - fill[0].top, 20, "but only as far as the box goes")
+
+
+def test_screen_reader_only_text_does_not_show():
+    """The visually-hidden recipe -- a 1px box with the content clipped away
+    -- is on nearly every accessible site, and its skip links were piling up
+    at the top of every page."""
+    from feetbrowser.layout import DocumentLayout, DrawText, paint_tree
+    html = ('<p>visible</p>'
+            '<span style="clip-path:inset(50%);width:1px;height:1px;'
+            'overflow:hidden;display:inline-block">skip to content</span>')
+    dom = HTMLParser(html).parse()
+    style(dom, [])
+    doc = DocumentLayout(dom, 620)
+    doc.layout()
+    cmds = []
+    paint_tree(doc, cmds)
+    words = {c.text for c in cmds if isinstance(c, DrawText)}
+    assert "visible" in words, words
+    assert "skip" not in words and "content" not in words, words
+
+
+def test_the_older_clip_property_hides_it_too():
+    """`clip: rect(1px,1px,1px,1px)` is the spelling `clip-path` replaced,
+    and half the sites using one still ship the other alongside it."""
+    from feetbrowser.layout import DocumentLayout, DrawText, paint_tree
+    html = ('<p>visible</p>'
+            '<span style="clip:rect(1px,1px,1px,1px);width:1px;height:1px;'
+            'overflow:hidden;display:inline-block">skip to content</span>')
+    dom = HTMLParser(html).parse()
+    style(dom, [])
+    doc = DocumentLayout(dom, 620)
+    doc.layout()
+    cmds = []
+    paint_tree(doc, cmds)
+    words = {c.text for c in cmds if isinstance(c, DrawText)}
+    assert "visible" in words, words
+    assert "skip" not in words, words
+
+
 def test_hidden_attribute_hides_the_element():
     from feetbrowser.layout import DrawText
     cmds = _paint_all('<p>shown</p><p hidden>gone</p>', ua=True)

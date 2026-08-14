@@ -678,8 +678,13 @@ class CSSParser:
                 rules.extend(inner.parse())
             else:
                 self._read_block()
-        elif keyword == "@supports":
-            # Naively include the inner rules regardless of the query.
+        elif keyword in ("@supports", "@layer", "@container", "@scope"):
+            # Grouping at-rules whose condition we cannot evaluate, but whose
+            # contents are ordinary rules. Including them naively is much
+            # closer to right than dropping them: a modern site puts its
+            # entire stylesheet inside `@layer`, and skipping the block left
+            # such a page with nothing but the UA sheet. Layer ordering is
+            # not modelled -- everything lands in one flat cascade.
             inner = CSSParser(self._read_block())
             rules.extend(inner.parse())
         else:

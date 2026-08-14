@@ -12,6 +12,7 @@ backend (see gui.py) and are cached.
 import copy
 import re
 from . import gui
+from . import cssparser
 
 from .htmlparser import Text, Element
 
@@ -327,6 +328,20 @@ def parse_px(value, default=0.0):
             return float(value[:-2])
         if value.endswith("rem"):
             return float(value[:-3]) * 16.0
+        if value.endswith("em"):
+            # No element context here, so this is the root size. Where the
+            # element's own font matters -- font-size itself -- the cascade
+            # has already resolved it against the parent.
+            return float(value[:-2]) * 16.0
+        if value.endswith("pt"):
+            return float(value[:-2]) * 4.0 / 3.0
+        for unit in ("vw", "vh", "vmin", "vmax"):
+            if value.endswith(unit):
+                width, height = cssparser.get_viewport()
+                extent = {"vw": width, "vh": height,
+                          "vmin": min(width, height),
+                          "vmax": max(width, height)}[unit]
+                return float(value[:-len(unit)]) / 100.0 * extent
         if value.endswith("%"):
             return default
         return float(value)
@@ -1113,13 +1128,23 @@ class BlockLayout(LayoutBox):
             self.x, self.y, self.width = self._absolute_pos
         _dispatch_layout(self)
         # CSS 2.1 §10.6: explicit `height` and `min-height` act as a floor on
-        # the content height computed by the dispatcher (no overflow handling
-        # means content that would overflow simply grows the box instead).
+        # the content height computed by the dispatcher. Growing past a stated
+        # height rather than spilling is a deliberate cheat -- it keeps a box
+        # whose contents we measured slightly too large from swallowing them.
         css_h = _resolve_len(style.get("height", ""), 0, 0)
         min_h = _resolve_len(style.get("min-height", ""), 0, 0)
         floor = max(css_h, min_h)
         if floor:
             self.height = max(self.height, floor)
+        # ... but where the page says what to do with the spill, the stated
+        # height is the real one. A box that clips is asking to be exactly
+        # this tall, and honouring that is what makes `overflow: hidden` mean
+        # anything at all.
+        if css_h and _clips(style):
+            self.height = css_h
+        max_h = _resolve_len(style.get("max-height", ""), 0, 0)
+        if max_h and _clips(style) and self.height > max_h:
+            self.height = max_h
 
     def layout_mode(self):
         node = self.node
@@ -2811,7 +2836,108 @@ def _shift_cmd(cmd, dy):
     return cmd
 
 
-def _collect_paint(box, items, hidden, scroll, dy, z):
+_CLIPPING_OVERFLOW = ("hidden", "clip")
+_EMPTY_CLIP = (0.0, 0.0, -1.0, -1.0)
+
+
+def _clips(style):
+    """Whether this box cuts off what does not fit inside it.
+
+    `scroll` and `auto` clip too, in a real browser -- but only because the
+    part you cannot see is a scroll away. We have no scrollable sub-boxes, so
+    treating them as clipping would lose the content for good.
+    """
+    return any(style.get(prop) in _CLIPPING_OVERFLOW
+               for prop in ("overflow", "overflow-x", "overflow-y"))
+
+
+def _clip_rect(box, node, dy):
+    """The rectangle this box confines its contents to, or None.
+
+    `overflow: hidden` is the common one, and the two clipping properties are
+    here for one specific reason: they are how nearly every site hides the
+    "skip to content" links that only screen readers are meant to reach.
+    Without them those links pile up at the top of the page. `clip-path:
+    inset(50%)` is today's spelling and `clip: rect(1px,1px,1px,1px)` is the
+    one it replaced -- both are still in the wild, often in the same rule.
+    """
+    style = node.style
+    left, top = box.x, box.y + dy
+    right, bottom = left + box.width, top + box.height
+    clip = None
+    if _clips(style):
+        clip = (left, top, right, bottom)
+
+    path = (style.get("clip-path") or "").strip().lower()
+    if path.startswith("inset("):
+        insets = _four_sides(path[len("inset("):].split(")")[0])
+        if insets:
+            def edge(token, extent):
+                return parse_px(token, 0.0) if not token.endswith("%") \
+                    else extent * float(token[:-1]) / 100.0
+            rect = (left + edge(insets["left"], box.width),
+                    top + edge(insets["top"], box.height),
+                    right - edge(insets["right"], box.width),
+                    bottom - edge(insets["bottom"], box.height))
+            if rect[0] >= rect[2] or rect[1] >= rect[3]:
+                return _EMPTY_CLIP
+            clip = _intersect_clip(clip, rect)
+
+    legacy = (style.get("clip") or "").strip().lower()
+    if legacy.startswith("rect("):
+        # The old property measures every side from the box's top-left
+        # corner, not inwards from each edge -- so `rect(1px,1px,1px,1px)`
+        # is a one-pixel corner, which is the whole point of it.
+        sides = _four_sides(legacy[len("rect("):].split(")")[0].replace(",", " "))
+        if sides:
+            def side(token, base, fallback):
+                return fallback if token == "auto" else base + parse_px(token, 0.0)
+            rect = (side(sides["left"], left, left),
+                    side(sides["top"], top, top),
+                    side(sides["right"], left, right),
+                    side(sides["bottom"], top, bottom))
+            if rect[0] >= rect[2] or rect[1] >= rect[3]:
+                return _EMPTY_CLIP
+            clip = _intersect_clip(clip, rect)
+    return clip
+
+
+def _intersect_clip(a, b):
+    if a is None:
+        return b
+    if b is None:
+        return a
+    return (max(a[0], b[0]), max(a[1], b[1]),
+            min(a[2], b[2]), min(a[3], b[3]))
+
+
+def _clipped(cmd, clip):
+    """Crop `cmd` to `clip`, or drop it when nothing of it would show."""
+    if clip is None:
+        return cmd
+    left = getattr(cmd, "left", None)
+    if left is None:
+        return cmd
+    cl, ct, cr, cb = clip
+    x0, y0 = max(left, cl), max(cmd.top, ct)
+    x1, y1 = min(cmd.right, cr), min(cmd.bottom, cb)
+    if x0 > x1 or y0 > y1:
+        return None
+    if isinstance(cmd, (DrawText, DrawImage)):
+        # Glyphs and bitmaps are not cut in half at this layer, so the test is
+        # whether most of the command survives: a line of text spilling out of
+        # a banner stays whole, and a paragraph stuffed into the 1x1 box of a
+        # screen-reader-only link disappears, which is the intent both times.
+        area = (cmd.right - left) * (cmd.bottom - cmd.top)
+        if area > 0 and (x1 - x0) * (y1 - y0) / area < 0.5:
+            return None
+        return cmd
+    cmd = copy.copy(cmd)
+    cmd.left, cmd.top, cmd.right, cmd.bottom = x0, y0, x1, y1
+    return cmd
+
+
+def _collect_paint(box, items, hidden, scroll, dy, z, clip=None):
     node = getattr(box, "node", None)
     if isinstance(node, Element):
         vis = node.style.get("visibility")
@@ -2836,8 +2962,12 @@ def _collect_paint(box, items, hidden, scroll, dy, z):
                 z = int(zs)
             except ValueError:
                 pass
+    if isinstance(node, Element):
+        clip = _intersect_clip(clip, _clip_rect(box, node, own_dy))
     if not hidden:
         for cmd in box.paint():
-            items.append((z, _shift_cmd(cmd, own_dy)))
+            cmd = _clipped(_shift_cmd(cmd, own_dy), clip)
+            if cmd is not None:
+                items.append((z, cmd))
     for child in box.children:
-        _collect_paint(child, items, hidden, scroll, own_dy, z)
+        _collect_paint(child, items, hidden, scroll, own_dy, z, clip)
