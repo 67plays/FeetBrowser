@@ -196,7 +196,16 @@ impl JsGlobals {
 
 // -- a JS value handed across the boundary ---------------------------------
 
-#[pyclass(module = "feetbrowser_engine", name = "JSValue", unsendable)]
+// `from_py_object` is asked for rather than inherited: pyo3 derives it for a
+// Clone pyclass today but is making that opt-in, and py_to_js does extract
+// one of these -- it is how a JS value that went out to Python and came back
+// is recognised as itself instead of being rebuilt from its repr.
+#[pyclass(
+    module = "feetbrowser_engine",
+    name = "JSValue",
+    unsendable,
+    from_py_object
+)]
 #[derive(Clone)]
 pub struct PyJsValue {
     pub inner: Rc<Interpreter>,
@@ -255,6 +264,17 @@ impl PyJsValue {
 
     fn js_repr(&self) -> String {
         self.inner.repr(&self.value)
+    }
+
+    /// Return the raw Python object a Host value wraps (JSElement,
+    /// JSNodeList, ...) so browser-provided host functions can get at it
+    /// directly; non-Host values come back unchanged.
+    fn js_unwrap(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        if let JsValue::Host(h) = &self.value {
+            Ok(h.clone_ref(py))
+        } else {
+            Ok(Py::new(py, self.clone())?.into_any())
+        }
     }
 
     fn resolve(&self, py: Python<'_>, value: &Bound<'_, PyAny>) {

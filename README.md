@@ -36,6 +36,12 @@ importable, so a first run needs the Rust toolchain (the script installs
 for the interpreter you're invoking, `python3 -m feetbrowser <url>` works
 directly.
 
+The window itself is ours too. macOS gets one through AppKit and Linux gets
+one through Xlib — both by ctypes, so there is nothing to install for either,
+and X11 covers Wayland desktops through XWayland. Anywhere else, and anywhere
+with no display, the browser still renders: `--screenshot` writes the page to
+a PNG without opening anything.
+
 To render a page to a PNG without opening a window:
 
 ```bash

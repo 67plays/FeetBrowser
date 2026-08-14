@@ -159,7 +159,7 @@ impl Parser {
             {
                 self.pos += 1;
                 self.pos += 1;
-                let name = self.expect_ident()?;
+                let _name = self.expect_ident()?;
                 let f = self.function_rest(true)?;
                 return Ok(rc(FunctionDecl(f)));
             }
@@ -264,7 +264,7 @@ impl Parser {
     }
 
     fn parse_stmts_until(&mut self, closing: Option<&str>) -> Result<Vec<Rc<Node>>, JsError> {
-        if let Some(c) = closing {
+        if let Some(_c) = closing {
             self.expect_punct("{")?;
         }
         let mut stmts = Vec::new();
@@ -555,27 +555,6 @@ impl Parser {
             self.expect_punct(",")?;
         }
         Ok(())
-    }
-
-    fn list_trailing(
-        &mut self,
-        opener: &str,
-        closer: &str,
-        mut item: impl FnMut(&mut Parser) -> Result<Rc<Node>, JsError>,
-    ) -> Result<Vec<Rc<Node>>, JsError> {
-        self.expect_punct(opener)?;
-        let mut out = Vec::new();
-        loop {
-            if self.match_punct(closer) {
-                break;
-            }
-            out.push(item(self)?);
-            if self.match_punct(closer) {
-                break;
-            }
-            self.expect_punct(",")?;
-        }
-        Ok(out)
     }
 
     fn if_statement(&mut self) -> PResult {
@@ -1176,7 +1155,6 @@ impl Parser {
                         _ => {}
                     }
                 }
-                _ => {}
             }
         }
         self.syntax("unexpected token")

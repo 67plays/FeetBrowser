@@ -389,6 +389,33 @@ def test_fill_rect_alpha_blends_halfway():
         f"half-alpha blend gave {(r, g, b)}"
 
 
+def test_fill_rect_alpha_lands_in_the_right_rows_and_nowhere_else():
+    """This is what is left of the span-kernel test after the fill moved to
+    Rust. The row-at-a-time asmblend path is gone -- the Rust fill covers the
+    whole rectangle in one crossing instead of one per row -- so what is worth
+    checking is the same thing that test checked underneath the plumbing: the
+    blend is exact, it covers every pixel of the rectangle, and it touches
+    nothing outside it. The kernels themselves are still exercised, directly
+    against their Python references, in tests/test_asmblend.py.
+
+    Note the arithmetic: `// 255`, as the translate tables did. The assembly
+    rounded by `>> 8`, which is one level darker at the top of the range.
+    """
+    s = raster.Surface(6, 4, (40, 40, 40))
+    s.fill_rect(1, 1, 5, 3, (200, 100, 50), 128)
+    inv = 255 - 128
+    expect = tuple((c * 128 + 40 * inv) // 255 for c in (200, 100, 50))
+    assert _pixel(s, 1, 1) == expect, (_pixel(s, 1, 1), expect)
+    assert _pixel(s, 4, 2) == expect, "the last covered pixel blended too"
+    assert _pixel(s, 0, 1) == (40, 40, 40), "the blend escaped to the left"
+    assert _pixel(s, 5, 1) == (40, 40, 40), "the blend escaped to the right"
+    assert _pixel(s, 1, 0) == (40, 40, 40), "the blend escaped upwards"
+    assert _pixel(s, 1, 3) == (40, 40, 40), "the blend escaped downwards"
+
+    s.fill_all((1, 2, 3))
+    assert _pixel(s, 0, 0) == (1, 2, 3), "the surface still refills afterwards"
+
+
 def test_clip_confines_drawing():
     s = raster.Surface(20, 20, (0, 0, 0))
     saved = s.set_clip(5, 5, 10, 10)

@@ -2,6 +2,12 @@
 
 Uses a temporary toes/ dir and a local catalog served via file:// so the
 tests are deterministic and offline.
+
+The last section is a different kind of test. Toes in the wild were written
+against tkinter, and the raster backend only *imitates* Tk; SURFACE_TOE below
+is a fixture that makes exactly the calls the published catalog toes make, so
+that the day one of those calls stops behaving like Tk's, this file says so
+rather than a user's toolbar quietly going blank.
 """
 import json
 import os
@@ -428,6 +434,260 @@ def _strip(html):
     import re
     text = re.sub(r"<[^>]+>", " ", html)
     return re.sub(r"\s+", " ", text).strip()
+
+
+# -- the Tk surface toes draw against -------------------------------------
+
+# One fixture toe making every Tk call the published catalog toes make
+# between them: winfo_width, create_rectangle/line/text with Tk's option
+# spellings, a layout font it measures with, and an attribute stashed on the
+# context. Written out longhand instead of pointing at an installed toe
+# because toes/ is empty on a fresh checkout, and a contract test that only
+# runs on the author's machine is not a contract test.
+SURFACE_TOE = '''
+from feetbrowser import toes
+from feetbrowser.layout import get_font
+
+BAND = "surface-band"
+
+# The glyphs the catalog toolbars label their buttons with. None of them are
+# ASCII and none of them are in the browser's default face.
+GLYPHS = "\\u2039\\u203a\\u27f3\\u2302\\u2605\\u2606\\u2190\\u2192"
+
+
+def activate(ctx):
+    ctx.on("chrome_bands", lambda: [(BAND, 30)])
+    ctx.on("on_chrome_draw", lambda canvas, bands: draw_band(ctx, canvas,
+                                                             bands))
+    ctx.on("on_draw", lambda canvas, offset: overlay(ctx, canvas, offset))
+    ctx.on("on_keypress", lambda e: key(ctx, e))
+    ctx.on("buttons", lambda: [toes.ButtonDef("surface", "S")])
+
+
+def draw_band(ctx, canvas, bands):
+    band = next((b for b in bands if b[0] == BAND), None)
+    if band is None:
+        return
+    _id, height, y = band
+    width = canvas.winfo_width()
+    canvas.create_rectangle(0, y, width, y + height, fill="#c0c0c0", width=0)
+    canvas.create_line(0, y + height - 1, width, y + height - 1,
+                       fill="#808080")
+    canvas.create_text(8, y + height // 2, text=GLYPHS * 6, anchor="w",
+                       fill="#00ff00",
+                       font=get_font(9, "bold", "roman", "Helvetica"))
+    # Painted after the text it overlaps, so it has to cover it.
+    canvas.create_rectangle(4, y + 2, 68, y + height - 2,
+                            fill="#ffff00", outline="#000")
+    ctx.band_width = width
+
+
+def overlay(ctx, canvas, offset):
+    font = get_font(10, "bold", "roman", "Helvetica")
+    label = "div#main"
+    canvas.create_rectangle(20, offset + 10, 120, offset + 60,
+                            outline="#ff0000", width=2)
+    canvas.create_rectangle(20, offset + 6, 20 + font.measure(label) + 4,
+                            offset + 10, fill="#ff0000", outline="#ff0000")
+    canvas.create_text(22, offset + 8, text=label, anchor="w",
+                       fill="#ffffff", font=font)
+
+
+def key(ctx, e):
+    ctx.seen = (getattr(e, "char", ""), getattr(e, "keysym", ""))
+    return e.keysym == "Escape"
+'''
+
+BAND_HEIGHT = 30
+CHROME = 60
+
+
+def _write_toe(folder, source, name="surface"):
+    os.makedirs(folder, exist_ok=True)
+    with open(os.path.join(folder, "toe.json"), "w") as f:
+        f.write('{"name": "%s", "version": "1.0", "entry": "toe.py"}' % name)
+    with open(os.path.join(folder, "toe.py"), "w") as f:
+        f.write(source)
+
+
+def _surface_ctx(tmp, warnings):
+    """Discover the fixture toe from `tmp` and return its live Context.
+
+    Discovery skips a toe it cannot import with a warning to stderr, and a
+    browser that starts clean with a toe missing is the failure mode this
+    whole section exists to catch -- so the warnings are collected, not
+    trusted to be absent.
+    """
+    _write_toe(os.path.join(tmp, "surface"), SURFACE_TOE)
+    found = _capture(warnings, toes.discover_toes, tmp)
+    assert [t.name for t in found] == ["surface"], found
+    return StubBrowser(found).toe_contexts[0]
+
+
+def _capture(sink, func, *args):
+    """Run `func`, appending anything it writes to stderr to `sink`."""
+    import io
+    real, sys.stderr = sys.stderr, io.StringIO()
+    try:
+        return func(*args)
+    finally:
+        text, sys.stderr = sys.stderr.getvalue(), real
+        if text.strip():
+            sink.append(text.strip())
+
+
+def _canvas(width=800, height=200):
+    return gui.Canvas(width=width, height=height, bg="white")
+
+
+def _scan(canvas, y0, y1, predicate):
+    """Count pixels in a horizontal strip that satisfy `predicate`.
+
+    Returns None on a backend that does not hand out its pixels -- Tk keeps
+    them inside Tcl, so there the item-level assertions are all we get.
+    """
+    if not hasattr(canvas, "render"):
+        return None
+    surface = canvas.render()
+    hits = 0
+    for y in range(max(0, y0), min(surface.height, y1)):
+        row = y * surface.stride
+        for x in range(0, surface.width):
+            i = row + x * 3
+            if predicate(surface.pixels[i], surface.pixels[i + 1],
+                         surface.pixels[i + 2]):
+                hits += 1
+    return hits
+
+
+def _greenish(r, g, b):
+    return g > 140 and r < 140 and b < 140
+
+
+def _reddish(r, g, b):
+    return r > 150 and g < 90 and b < 90
+
+
+def test_toe_chrome_band_paints_inside_its_own_band():
+    warnings = []
+    with tempfile.TemporaryDirectory() as tmp:
+        ctx = _surface_ctx(tmp, warnings)
+        bands = toes.compute_bands([ctx])
+        assert bands == [("surface-band", BAND_HEIGHT, 0)], bands
+        canvas = _canvas()
+        before = len(canvas.find_all())
+        _capture(warnings, toes.dispatch, [ctx], "on_chrome_draw", canvas,
+                 bands)
+        assert not warnings, warnings
+        # Four items: background, separator, glyph run, the covering button.
+        assert len(canvas.find_all()) - before == 4, canvas.find_all()
+        assert ctx.band_width == canvas.winfo_width(), ctx.band_width
+
+        inside = _scan(canvas, 0, BAND_HEIGHT, _greenish)
+        if inside is not None:
+            # winfo_width has to report the canvas width, or a band that
+            # sizes itself to the window draws a zero-width strip and
+            # vanishes. Real Tk answers 1 until the canvas is mapped, so
+            # this half of the contract is only assertable on our own.
+            assert ctx.band_width == 800, ctx.band_width
+            assert inside > 50, inside
+            below = _scan(canvas, BAND_HEIGHT, 200, _greenish)
+            assert below == 0, below
+
+
+def test_toe_band_items_stack_in_creation_order():
+    """The 2003-toolbar toes rely on a later rectangle hiding earlier text.
+
+    Tk's canvas has no z-index: what you draw last wins. A backend that
+    sorted by anything else would leave the marquee showing through every
+    button on the bar.
+    """
+    warnings = []
+    with tempfile.TemporaryDirectory() as tmp:
+        ctx = _surface_ctx(tmp, warnings)
+        canvas = _canvas()
+        toes.dispatch([ctx], "on_chrome_draw", canvas,
+                      toes.compute_bands([ctx]))
+        if not hasattr(canvas, "render"):
+            return
+        surface = canvas.render()
+        # (8, 15) is under the glyph run and under the yellow button that
+        # was drawn over it.
+        i = 15 * surface.stride + 8 * 3
+        pixel = (surface.pixels[i], surface.pixels[i + 1],
+                 surface.pixels[i + 2])
+        assert pixel == (255, 255, 0), pixel
+
+
+def test_toe_overlay_draws_over_the_page_at_the_chrome_offset():
+    warnings = []
+    with tempfile.TemporaryDirectory() as tmp:
+        ctx = _surface_ctx(tmp, warnings)
+        canvas = _canvas()
+        _capture(warnings, toes.dispatch, [ctx], "on_draw", canvas, CHROME)
+        assert not warnings, warnings
+        assert len(canvas.find_all()) == 3, canvas.find_all()
+        painted = _scan(canvas, CHROME, 200, _reddish)
+        if painted is not None:
+            assert painted > 50, painted
+            assert _scan(canvas, 0, CHROME, _reddish) == 0
+
+
+def test_toolbar_glyphs_have_real_widths():
+    """Toolbars label their buttons with arrows, stars and a house.
+
+    A face that lacks them measures them at zero and paints nothing, so the
+    whole bar comes out blank with no error anywhere.
+    """
+    from feetbrowser.layout import get_font
+    font = get_font(11, "bold", "roman", "Helvetica")
+    for glyph in "‹›⟳⌂★☆←→":
+        assert font.measure(glyph) > 0.5, (glyph, font.measure(glyph))
+
+
+def test_toe_keypress_sees_char_and_keysym():
+    warnings = []
+    with tempfile.TemporaryDirectory() as tmp:
+        ctx = _surface_ctx(tmp, warnings)
+        window = gui.Tk()
+        if not hasattr(window, "dispatch"):
+            return  # tkinter delivers its own events; nothing to synthesise
+        from feetbrowser.window import Event
+        seen = []
+        window.bind("<Key>", lambda e: seen.append(
+            ctx.call("on_keypress", e)))
+        window.dispatch("<Key>", Event(char="j", keysym="j", type="<Key>"))
+        window.dispatch("<Key>", Event(char="\x1b", keysym="Escape",
+                                       type="<Key>"))
+        assert seen == [False, True], seen
+        assert ctx.seen == ("\x1b", "Escape"), ctx.seen
+
+
+def test_toe_after_timer_fires():
+    """Bars that animate schedule their next frame with window.after."""
+    window = gui.Tk()
+    ticks = []
+    window.after(0, lambda: ticks.append(1))
+    # update(), not update_idletasks(): our window treats them alike, but real
+    # Tk flushes only idle callbacks from the latter, and an after() timer is
+    # not one -- so the idletasks spelling passes here and fails under
+    # FEETBROWSER_BACKEND=tk, which is the one thing this test exists to
+    # rule out.
+    window.update()
+    assert ticks == [1], ticks
+
+
+def test_toe_context_accepts_stashed_attributes():
+    """Toes keep their per-session state on the context object itself
+    (sniff mode, hover boxes, redraw-scheduled flags). Nothing declares
+    those up front, so the Context must stay a plain attribute bag."""
+    warnings = []
+    with tempfile.TemporaryDirectory() as tmp:
+        ctx = _surface_ctx(tmp, warnings)
+        ctx.sniffing = True
+        ctx._redraw_scheduled = False
+        assert ctx.sniffing is True
+        assert getattr(ctx, "nothing_set_this", None) is None
 
 
 def main():

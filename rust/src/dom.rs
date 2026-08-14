@@ -17,6 +17,9 @@ use pyo3::types::{PyDict, PyList, PyTuple};
 use std::collections::BTreeSet;
 use std::sync::OnceLock;
 
+use crate::pybind::PyJsValue;
+use crate::value::JsValue;
+
 // Tags serialized as self-closing voids by the innerHTML serializer
 // (matches the VOID_TAGS set in jsdom.py).
 const VOID_TAGS: &[&str] = &["br", "img", "hr", "input", "meta", "link", "base"];
@@ -69,6 +72,26 @@ fn str_arg(py: Python<'_>, args: &[Py<PyAny>], i: usize) -> String {
 /// The Python `int(name)` helper for classList indexing.
 fn int_index(name: &str) -> Option<i64> {
     name.parse::<i64>().ok()
+}
+
+/// Extract the i-th argument as an integer: floats (JS numbers cross the
+/// boundary as Python floats) are truncated, plain strings are parsed.
+fn arg_i64(py: Python<'_>, args: &[Py<PyAny>], i: usize) -> i64 {
+    match args.get(i) {
+        Some(a) => {
+            let b = a.bind(py);
+            if let Ok(n) = b.extract::<f64>() {
+                return n as i64;
+            }
+            if let Ok(s) = b.extract::<String>() {
+                if let Ok(n) = s.parse::<f64>() {
+                    return n as i64;
+                }
+            }
+            -1
+        }
+        None => -1,
+    }
 }
 
 // -- node helpers -----------------------------------------------------------
@@ -185,11 +208,12 @@ fn wrap_element(py: Python<'_>, node: &Bound<'_, PyAny>, flag: &Bound<'_, PyAny>
     Ok(cls.call(tuple, None)?.unbind())
 }
 
-fn wrap_nodelist(py: Python<'_>, items: Vec<Py<PyAny>>) -> PyResult<Py<PyAny>> {
+fn wrap_nodelist(py: Python<'_>, items: Vec<Py<PyAny>>, flag: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
     let jsdom = py.import("feetbrowser.jsdom")?;
     let cls = jsdom.getattr("JSNodeList")?;
     let list = PyList::new(py, items)?;
-    let tuple = PyTuple::new(py, vec![list.unbind()])?;
+    let items: Vec<Py<PyAny>> = vec![list.into_any().unbind(), flag.clone().unbind()];
+    let tuple = PyTuple::new(py, items)?;
     Ok(cls.call(tuple, None)?.unbind())
 }
 
@@ -203,6 +227,22 @@ fn is_jsdom_instance(py: Python<'_>, obj: &Py<PyAny>, cls_name: &str) -> bool {
         Err(_) => return false,
     };
     obj.bind(py).is_instance(&cls).unwrap_or(false)
+}
+
+/// Unwrap a `PyJsValue` back to the Python object it wraps when that value is
+/// a JS host object (JSElement/JSNodeList/...). JS-to-Python conversions
+/// (js_to_py) wrap Host values in PyJsValue, so DOM method args that JS passes
+/// arrive here as PyJsValue rather than the raw JSElement; peeling them lets
+/// appendChild(createElement(...)) & co. see the actual element.
+fn unwrap_host(py: Python<'_>, a: &Py<PyAny>) -> Py<PyAny> {
+    let b = a.bind(py);
+    match b.extract::<PyJsValue>() {
+        Ok(jv) => match &jv.value {
+            JsValue::Host(h) => h.clone_ref(py),
+            _ => a.clone_ref(py),
+        },
+        Err(_) => a.clone_ref(py),
+    }
 }
 
 // -- serialization ----------------------------------------------------------
@@ -391,6 +431,71 @@ fn class_attr_contains(node: &Bound<'_, PyAny>, cls: &str) -> bool {
         Some(c) => c.split_whitespace().any(|w| w == cls),
         None => false,
     }
+}
+
+/// Find an element-typed relative of `node`: its first/last element child or
+/// its next/previous element sibling (whichever `name` names).
+fn sibling_element(
+    py: Python<'_>,
+    node: &Bound<'_, PyAny>,
+    name: &str,
+    flag: &Bound<'_, PyAny>,
+) -> PyResult<Py<PyAny>> {
+    if name == "firstElementChild" || name == "lastElementChild" {
+        let children = match node.getattr("children") {
+            Ok(c) => c.cast_into::<PyList>()?,
+            Err(_) => return undefined_py(py),
+        };
+        let elements: Vec<_> = children.iter().filter(|c| c.getattr("tag").is_ok()).collect();
+        let target = if name == "firstElementChild" {
+            elements.first()
+        } else {
+            elements.last()
+        };
+        return match target {
+            Some(t) => wrap_element(py, t, flag),
+            None => undefined_py(py),
+        };
+    }
+    let parent = match node.getattr("parent") {
+        Ok(p) if !p.is_none() => p,
+        _ => return undefined_py(py),
+    };
+    let children = match parent.getattr("children") {
+        Ok(c) => c.cast_into::<PyList>()?,
+        Err(_) => return undefined_py(py),
+    };
+    let elements: Vec<_> = children
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.getattr("tag").is_ok())
+        .map(|(i, c)| (i, c))
+        .collect();
+    let mut pos = None;
+    for (i, c) in children.iter().enumerate() {
+        if c.is(node) {
+            pos = Some(i);
+            break;
+        }
+    }
+    let pos = match pos {
+        Some(p) => p,
+        None => return undefined_py(py),
+    };
+    if name == "nextElementSibling" {
+        for (i, c) in elements {
+            if i > pos {
+                return wrap_element(py, &c, flag);
+            }
+        }
+    } else {
+        for (i, c) in elements.iter().rev() {
+            if *i < pos {
+                return wrap_element(py, c, flag);
+            }
+        }
+    }
+    undefined_py(py)
 }
 
 // -- style helpers ----------------------------------------------------------
@@ -722,6 +827,10 @@ fn document_get(py: Python<'_>, doc: &Bound<'_, PyAny>, name: &str) -> PyResult<
             | "getElementsByTagName"
             | "getElementsByClassName"
             | "createElement"
+            | "createTextNode"
+            | "createDocumentFragment"
+            | "addEventListener"
+            | "removeEventListener"
     ) {
         return method(py, "document", doc, name);
     }
@@ -771,7 +880,7 @@ fn document_get(py: Python<'_>, doc: &Bound<'_, PyAny>, name: &str) -> PyResult<
             for n in iter_elements(py, &root)? {
                 out.push(wrap_element(py, n.bind(py), &flag)?);
             }
-            wrap_nodelist(py, out)
+            wrap_nodelist(py, out, &flag)
         }
         "scripts" | "images" => {
             let tag = if name == "scripts" { "script" } else { "img" };
@@ -781,7 +890,7 @@ fn document_get(py: Python<'_>, doc: &Bound<'_, PyAny>, name: &str) -> PyResult<
                     out.push(wrap_element(py, n.bind(py), &flag)?);
                 }
             }
-            wrap_nodelist(py, out)
+            wrap_nodelist(py, out, &flag)
         }
         _ => undefined_py(py),
     }
@@ -842,7 +951,7 @@ fn document_call(
         "querySelectorAll" => {
             let sel = str_arg(py, args, 0);
             match parse_selector(&sel) {
-                None => wrap_nodelist(py, Vec::new()),
+                None => wrap_nodelist(py, Vec::new(), &flag),
                 Some((tag, classes, ids)) => {
                     let mut out = Vec::new();
                     for n in iter_elements(py, &root)? {
@@ -850,7 +959,7 @@ fn document_call(
                             out.push(wrap_element(py, n.bind(py), &flag)?);
                         }
                     }
-                    wrap_nodelist(py, out)
+                    wrap_nodelist(py, out, &flag)
                 }
             }
         }
@@ -862,7 +971,7 @@ fn document_call(
                     out.push(wrap_element(py, n.bind(py), &flag)?);
                 }
             }
-            wrap_nodelist(py, out)
+            wrap_nodelist(py, out, &flag)
         }
         "getElementsByClassName" => {
             let cls = str_arg(py, args, 0);
@@ -872,13 +981,27 @@ fn document_call(
                     out.push(wrap_element(py, n.bind(py), &flag)?);
                 }
             }
-            wrap_nodelist(py, out)
+            wrap_nodelist(py, out, &flag)
         }
         "createElement" => {
             let tag = str_arg(py, args, 0);
             let el = make_element(py, &tag, py.None().bind(py))?;
             wrap_element(py, &el, &flag)
         }
+        "createTextNode" => {
+            let text = str_arg(py, args, 0);
+            let tn = make_text(py, &text, py.None().bind(py))?;
+            wrap_element(py, &tn, &flag)
+        }
+        "createDocumentFragment" => {
+            // A lightweight container with its own child list; appending it
+            // to an element moves the children over (see appendChild below).
+            let jsdom = py.import("feetbrowser.jsdom")?;
+            let cls = jsdom.getattr("JSFragment")?;
+            let tuple = PyTuple::new(py, vec![flag.unbind()])?;
+            Ok(cls.call(tuple, None)?.unbind())
+        }
+        "addEventListener" | "removeEventListener" => undefined_py(py),
         _ => undefined_py(py),
     }
 }
@@ -895,9 +1018,15 @@ fn element_get(py: Python<'_>, el: &Bound<'_, PyAny>, name: &str) -> PyResult<Py
             | "appendChild"
             | "removeChild"
             | "addEventListener"
+            | "removeEventListener"
             | "querySelector"
             | "querySelectorAll"
             | "getElementsByClassName"
+            | "getElementsByTagName"
+            | "matches"
+            | "closest"
+            | "remove"
+            | "contains"
     ) {
         return method(py, "element", el, name);
     }
@@ -909,6 +1038,7 @@ fn element_get(py: Python<'_>, el: &Bound<'_, PyAny>, name: &str) -> PyResult<Py
             let children = node.getattr("children")?.cast_into::<PyList>()?;
             Ok(serialize_children(py, &children)?.into_py_any(py)?)
         }
+        "outerHTML" => Ok(serialize_element(py, &node)?.into_py_any(py)?),
         "tagName" => Ok(node_tag(&node).to_uppercase().into_py_any(py)?),
         "tag" => Ok(node_tag(&node).into_py_any(py)?),
         "children" => {
@@ -919,7 +1049,19 @@ fn element_get(py: Python<'_>, el: &Bound<'_, PyAny>, name: &str) -> PyResult<Py
                     out.push(wrap_element(py, &c, &flag)?);
                 }
             }
-            wrap_nodelist(py, out)
+            wrap_nodelist(py, out, &flag)
+        }
+        "firstElementChild" | "lastElementChild" | "nextElementSibling"
+        | "previousElementSibling" => {
+            sibling_element(py, &node, name, &flag)
+        }
+        "childElementCount" => {
+            let children = node.getattr("children")?.cast_into::<PyList>()?;
+            let count = children
+                .iter()
+                .filter(|c| c.getattr("tag").is_ok())
+                .count();
+            Ok((count as u64).into_py_any(py)?)
         }
         "parentNode" => match node.getattr("parent") {
             Ok(p) if !p.is_none() => wrap_element(py, &p, &flag),
@@ -961,6 +1103,15 @@ fn element_set(
     match name {
         "textContent" => set_text_content(py, &node, &flag, value)?,
         "innerHTML" => set_inner_html(py, &node, &flag, value)?,
+        // `element.value` reads out of the attribute dictionary (the fallback
+        // arm of element_get), so writing it has to put it back in the same
+        // place -- otherwise `select.value = "b"` or `input.value = ""` would
+        // read back the old value and change nothing on screen.
+        "value" => {
+            let attrs = node_attributes(&node)?;
+            attrs.set_item("value", str_of(py, value)?)?;
+            mark_dirty(&flag);
+        }
         _ => {}
     }
     Ok(())
@@ -1024,7 +1175,7 @@ fn element_call(
         "querySelectorAll" => {
             let sel = str_arg(py, args, 0);
             match parse_selector(&sel) {
-                None => wrap_nodelist(py, Vec::new()),
+                None => wrap_nodelist(py, Vec::new(), &flag),
                 Some((tag, classes, ids)) => {
                     let mut out = Vec::new();
                     for n in iter_elements(py, &node)? {
@@ -1036,7 +1187,7 @@ fn element_call(
                             out.push(wrap_element(py, nb, &flag)?);
                         }
                     }
-                    wrap_nodelist(py, out)
+                    wrap_nodelist(py, out, &flag)
                 }
             }
         }
@@ -1052,7 +1203,77 @@ fn element_call(
                     out.push(wrap_element(py, nb, &flag)?);
                 }
             }
-            wrap_nodelist(py, out)
+            wrap_nodelist(py, out, &flag)
+        }
+        "getElementsByTagName" => {
+            let tag = str_arg(py, args, 0).to_lowercase();
+            let mut out = Vec::new();
+            for n in iter_elements(py, &node)? {
+                let nb = n.bind(py);
+                if nb.is(&node) {
+                    continue;
+                }
+                if node_tag(nb) == tag {
+                    out.push(wrap_element(py, nb, &flag)?);
+                }
+            }
+            wrap_nodelist(py, out, &flag)
+        }
+        "matches" => {
+            let sel = str_arg(py, args, 0);
+            let matched = match parse_selector(&sel) {
+                Some((tag, classes, ids)) => selector_matches(&node, &tag, &classes, &ids),
+                None => false,
+            };
+            Ok(matched.into_py_any(py)?)
+        }
+        "closest" => {
+            let sel = str_arg(py, args, 0);
+            let spec = parse_selector(&sel);
+            let mut cur = Some(node.clone().unbind());
+            loop {
+                let Some(c) = cur.take() else {
+                    return undefined_py(py);
+                };
+                let cb = c.bind(py);
+                let hit = match &spec {
+                    Some((tag, classes, ids)) => selector_matches(cb, tag, classes, ids),
+                    None => false,
+                };
+                if hit {
+                    return wrap_element(py, cb, &flag);
+                }
+                match cb.getattr("parent") {
+                    Ok(p) if !p.is_none() => cur = Some(p.unbind()),
+                    _ => return undefined_py(py),
+                }
+            }
+        }
+        "contains" => {
+            let Some(other) = args.first() else {
+                return Ok(false.into_py_any(py)?);
+            };
+            if !is_jsdom_instance(py, other, "JSElement") {
+                return Ok(false.into_py_any(py)?);
+            }
+            let other_node = other.bind(py).getattr("node")?;
+            for n in iter_elements(py, &node)? {
+                if n.is(&other_node) {
+                    return Ok(true.into_py_any(py)?);
+                }
+            }
+            Ok(false.into_py_any(py)?)
+        }
+        "remove" => {
+            let parent = match node.getattr("parent") {
+                Ok(p) if !p.is_none() => p,
+                _ => return undefined_py(py),
+            };
+            let children = parent.getattr("children")?.cast_into::<PyList>()?;
+            let _ = children.call_method1("remove", (node.clone(),));
+            node.setattr("parent", py.None())?;
+            mark_dirty(&flag);
+            undefined_py(py)
         }
         "appendChild" => {
             if let Some(child) = args.first() {
@@ -1061,6 +1282,21 @@ fn element_call(
                     child_node.setattr("parent", &node)?;
                     let children = node.getattr("children")?.cast_into::<PyList>()?;
                     children.append(child_node)?;
+                    mark_dirty(&flag);
+                    return Ok(child.clone_ref(py));
+                }
+                if is_jsdom_instance(py, child, "JSFragment") {
+                    // Move the fragment's children into the target and empty
+                    // the fragment, like a real DocumentFragment append.
+                    let items = child.bind(py).getattr("_items")?.cast_into::<PyList>()?;
+                    let children = node.getattr("children")?.cast_into::<PyList>()?;
+                    for item in items.iter() {
+                        if let Ok(n) = item.getattr("node") {
+                            n.setattr("parent", &node)?;
+                            children.append(n)?;
+                        }
+                    }
+                    let _ = items.call_method0("clear");
                     mark_dirty(&flag);
                     return Ok(child.clone_ref(py));
                 }
@@ -1114,11 +1350,62 @@ fn element_call(
 // -- node list / classList / style / fonts ---------------------------------
 
 fn nodelist_get(py: Python<'_>, nl: &Bound<'_, PyAny>, name: &str) -> PyResult<Py<PyAny>> {
+    let items = nl.getattr("_items")?.cast_into::<PyList>()?;
     if name == "length" {
-        let items = nl.getattr("_items")?.cast_into::<PyList>()?;
         Ok((items.len() as u64).into_py_any(py)?)
+    } else if name == "item" || name == "forEach" {
+        method(py, "nodelist", nl, name)
+    } else if let Some(idx) = int_index(name) {
+        if idx >= 0 && (idx as usize) < items.len() {
+            Ok(items.get_item(idx as usize)?.unbind())
+        } else {
+            undefined_py(py)
+        }
     } else {
         undefined_py(py)
+    }
+}
+
+fn nodelist_call(
+    py: Python<'_>,
+    nl: &Bound<'_, PyAny>,
+    name: &str,
+    args: &[Py<PyAny>],
+) -> PyResult<Py<PyAny>> {
+    let items = nl.getattr("_items")?.cast_into::<PyList>()?;
+    match name {
+        "item" => {
+            let idx = arg_i64(py, args, 0);
+            if idx >= 0 && (idx as usize) < items.len() {
+                Ok(items.get_item(idx as usize)?.unbind())
+            } else {
+                undefined_py(py)
+            }
+        }
+        "forEach" => {
+            let Some(fn_) = args.first() else {
+                return undefined_py(py);
+            };
+            let flag = nl.getattr("_flag")?;
+            let interp = flag.cast::<PyDict>()?.get_item("interp")?;
+            let interp = match interp {
+                Some(i) if !i.is_none() => i,
+                _ => return undefined_py(py),
+            };
+            let n = items.len();
+            for (i, item) in items.iter().enumerate() {
+                let args = PyTuple::new(py, vec![
+                    fn_.clone_ref(py),
+                    item.unbind(),
+                    (i as u64).into_py_any(py)?,
+                    nl.clone().unbind(),
+                ])?;
+                interp.call_method("call", args, None)?;
+            }
+            let _ = n;
+            undefined_py(py)
+        }
+        _ => undefined_py(py),
     }
 }
 
@@ -1297,12 +1584,14 @@ fn call_dispatch(
     name: &str,
     args: &[Py<PyAny>],
 ) -> PyResult<Py<PyAny>> {
+    let args: Vec<Py<PyAny>> = args.iter().map(|a| unwrap_host(py, a)).collect();
     match kind {
-        "document" => document_call(py, target, name, args),
-        "element" => element_call(py, target, name, args),
-        "classlist" => classlist_call(py, target, name, args),
-        "style" => style_call(py, target, name, args),
-        "fonts" => fonts_call(py, target, name, args),
+        "document" => document_call(py, target, name, &args),
+        "element" => element_call(py, target, name, &args),
+        "nodelist" => nodelist_call(py, target, name, &args),
+        "classlist" => classlist_call(py, target, name, &args),
+        "style" => style_call(py, target, name, &args),
+        "fonts" => fonts_call(py, target, name, &args),
         _ => undefined_py(py),
     }
 }

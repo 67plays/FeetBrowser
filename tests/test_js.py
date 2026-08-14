@@ -8,8 +8,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from feetbrowser import gui
 
 from feetbrowser.net import URL
-from feetbrowser.browser import Tab
-from feetbrowser.layout import DrawText
+from feetbrowser.browser import Tab, tree_to_list
+from feetbrowser.htmlparser import Element
+from feetbrowser.layout import DrawText, LISTBOX_ROW_H, LISTBOX_PAD
 from feetbrowser.jsengine import Interpreter, JSException, UNDEFINED
 
 
@@ -890,6 +891,114 @@ def test_js_source_is_read_as_utf8_not_bytes():
         assert "'×'" in str(e), f"names the character it choked on: {e}"
     else:
         raise AssertionError("a stray character should not tokenize")
+def test_js_dom_nodelist_and_traversal():
+    """NodeList length/item/index/forEach, element traversal and geometry."""
+    tab = _make_tab(
+        '<div id="a" class="x"><span class="y">hi</span>'
+        '<span class="y">there</span></div>'
+        '<script>'
+        'var a = document.getElementById("a");'
+        'var ys = document.querySelectorAll(".y");'
+        'var acc = [];'
+        'ys.forEach(function(e, i) { acc.push(e.textContent + i); });'
+        'var out = {'
+        ' len: ys.length,'
+        ' first: a.firstElementChild.tagName,'
+        ' last: a.lastElementChild.textContent,'
+        ' nxt: ys[0].nextElementSibling.textContent,'
+        ' prv: ys[1].previousElementSibling.textContent,'
+        ' item: ys.item(1).textContent,'
+        ' idx: ys[0].textContent,'
+        ' fe: acc.join("|"),'
+        ' contains: a.contains(ys[0]),'
+        ' matches: a.matches(".x"),'
+        ' closest: ys[0].closest("#a").id,'
+        ' ohtml: a.outerHTML.slice(0, 12),'
+        ' cec: a.childElementCount,'
+        ' ecount: document.getElementsByTagName("span").length,'
+        ' ctn: document.createTextNode("zz").textContent,'
+        '};'
+        'window.__out = out;'
+        '</script>')
+    eq(tab.js_logs, [], "no js errors")
+    g = tab._js_interp.globals["__out"]
+    eq(g["len"], 2, "NodeList.length")
+    eq(g["first"], "SPAN", "firstElementChild")
+    eq(g["last"], "there", "lastElementChild")
+    eq(g["nxt"], "there", "nextElementSibling")
+    eq(g["prv"], "hi", "previousElementSibling")
+    eq(g["item"], "there", "NodeList.item(1)")
+    eq(g["idx"], "hi", "NodeList[0]")
+    eq(g["fe"], "hi0|there1", "NodeList.forEach indexes")
+    eq(g["contains"], True, "element.contains")
+    eq(g["matches"], True, "element.matches")
+    eq(g["closest"], "a", "element.closest")
+    eq(g["ohtml"], '<div id="a" ', "element.outerHTML")
+    eq(g["cec"], 2, "childElementCount")
+    eq(g["ecount"], 2, "getElementsByTagName")
+    eq(g["ctn"], "zz", "createTextNode")
+
+
+def test_js_window_environment_and_mutation():
+    """getComputedStyle (live), window/navigator globals, createElement +
+    appendChild, and element.remove()."""
+    tab = _make_tab(
+        '<div id="a"><span class="y">hi</span></div>'
+        '<script>'
+        'var s = document.querySelector(".y").style;'
+        's.color = "blue";'
+        'var cs = getComputedStyle(document.querySelector(".y"));'
+        'var e = document.createElement("em");'
+        'e.textContent = "NEW";'
+        'document.getElementById("a").appendChild(e);'
+        'var span = document.querySelector(".y");'
+        'span.remove();'
+        'var out = {'
+        ' color: cs.color,'
+        ' prop: cs.getPropertyValue("font-size"),'
+        ' app: document.getElementById("a").lastElementChild.textContent,'
+        ' removed: document.querySelectorAll(".y").length,'
+        ' ua: navigator.userAgent.indexOf("FeetBrowser") >= 0,'
+        ' raf: typeof requestAnimationFrame,'
+        ' caf: typeof cancelAnimationFrame,'
+        ' me: typeof matchMedia,'
+        ' wad: typeof addEventListener,'
+        ' dpr: devicePixelRatio,'
+        ' iw: innerWidth,'
+        '};'
+        'window.__out = out;'
+        '</script>')
+    eq(tab.js_logs, [], "no js errors")
+    g = tab._js_interp.globals["__out"]
+    eq(g["color"], "blue", "getComputedStyle reflects live style")
+    eq(g["prop"], "16px", "getPropertyValue resolves font-size")
+    eq(g["app"], "NEW", "createElement + appendChild")
+    eq(g["removed"], 0, "element.remove removes from DOM")
+    eq(g["ua"], True, "navigator.userAgent")
+    eq(g["raf"], "function", "requestAnimationFrame global")
+    eq(g["caf"], "function", "cancelAnimationFrame global")
+    eq(g["me"], "function", "matchMedia global")
+    eq(g["wad"], "function", "window.addEventListener global")
+    eq(g["dpr"], 1, "devicePixelRatio")
+    eq(g["iw"], 1000, "innerWidth matches browser WIDTH")
+
+
+def test_js_document_fragment():
+    tab = _make_tab(
+        '<div id="a"></div>'
+        '<script>'
+        'var frag = document.createDocumentFragment();'
+        'var e1 = document.createElement("b"); e1.textContent = "ONE";'
+        'var e2 = document.createElement("i"); e2.textContent = "TWO";'
+        'frag.appendChild(e1);'
+        'frag.appendChild(e2);'
+        'document.getElementById("a").appendChild(frag);'
+        'window.__n = document.getElementById("a").childElementCount;'
+        'window.__t = document.getElementById("a").textContent;'
+        '</script>')
+    eq(tab.js_logs, [], "no js errors")
+    eq(tab._js_interp.globals["__n"], 2, "fragment children land in body")
+    eq(tab._js_interp.globals["__t"], "ONETWO", "fragment text lands")
 
 
 def _walk_all(node):
@@ -904,6 +1013,108 @@ def _make_tab(body, url="https://example.com/page"):
     tab.url = u
     tab._build(u, body, "text/html")
     return tab
+
+
+# -- <select> and the DOM ---------------------------------------------------
+
+_SELECT = (
+    '<select id="s">'
+    '<option value="a">Apple</option>'
+    '<option value="b" selected>Banana</option>'
+    '<option value="c">Cherry</option>'
+    '</select>'
+)
+
+
+def _option(tab, value):
+    return next(n for n in tree_to_list(tab.nodes, [])
+                if isinstance(n, Element) and n.tag == "option"
+                and n.attributes.get("value") == value)
+
+
+def _select(tab):
+    return next(n for n in tree_to_list(tab.nodes, [])
+                if isinstance(n, Element) and n.tag == "select")
+
+
+def test_select_value_reads_the_selected_option():
+    tab = _make_tab(
+        _SELECT +
+        '<script>window.got = document.getElementById("s").value;</script>')
+    eq(tab._js_interp.globals["got"], "b",
+       "select.value must read the `selected` option")
+
+
+def test_choosing_an_option_fires_change():
+    tab = _make_tab(
+        _SELECT +
+        '<script>window.seen = "";'
+        'document.getElementById("s").addEventListener("change", function(){'
+        '  window.seen = document.getElementById("s").value; });</script>')
+    tab.choose_option(_select(tab), _option(tab, "c"))
+    eq(tab._js_interp.globals["seen"], "c",
+       "a change listener must run, and see the new value")
+
+
+def test_the_onchange_attribute_fires_too():
+    tab = _make_tab(
+        '<select id="s" onchange="window.hit = 1">'
+        '<option value="a">Apple</option><option value="b">Banana</option>'
+        '</select><script>window.hit = 0;</script>')
+    tab.choose_option(_select(tab), _option(tab, "b"))
+    eq(tab._js_interp.globals["hit"], 1, "the onchange attribute must run")
+
+
+def test_change_does_not_fire_when_the_choice_did_not_move():
+    tab = _make_tab(
+        _SELECT +
+        '<script>window.n = 0;'
+        'document.getElementById("s").addEventListener("change", function(){'
+        '  window.n = window.n + 1; });</script>')
+    tab.choose_option(_select(tab), _option(tab, "b"))  # already selected
+    eq(tab._js_interp.globals["n"], 0,
+       "re-picking the current option is not a change")
+
+
+def test_writing_select_value_moves_the_selection():
+    tab = _make_tab(
+        _SELECT +
+        '<script>document.getElementById("s").value = "c";</script>')
+    tab.render()
+    assert "selected" in _option(tab, "c").attributes, \
+        "a script writing .value must move the selection"
+    assert "selected" not in _option(tab, "b").attributes, \
+        "and take it off the option that had it"
+    assert "Cherry" in _texts(tab), \
+        f"the closed control must repaint with the new label: {_texts(tab)}"
+
+
+def test_clicking_a_listbox_row_fires_change():
+    tab = _make_tab(
+        '<select id="s" size="3">'
+        '<option value="a" selected>Apple</option>'
+        '<option value="b">Banana</option>'
+        '</select>'
+        '<script>window.seen = "";'
+        'document.getElementById("s").addEventListener("change", function(){'
+        '  window.seen = document.getElementById("s").value; });</script>')
+    node = _select(tab)
+    lx, ty, _rx, _by = tab._control_rect(node)
+    tab.click(lx + 6, ty + LISTBOX_PAD + 1.5 * LISTBOX_ROW_H - tab.scroll)
+    eq(tab._js_interp.globals["seen"], "b",
+       "a click inside an expanded select must reach a change listener")
+
+
+def test_a_multiple_listbox_reads_its_first_chosen_value():
+    tab = _make_tab(
+        '<select id="s" multiple>'
+        '<option value="a">Apple</option>'
+        '<option value="b" selected>Banana</option>'
+        '<option value="c" selected>Cherry</option>'
+        '</select>'
+        '<script>window.v = document.getElementById("s").value;</script>')
+    eq(tab._js_interp.globals["v"], "b",
+       ".value on a multi-choice select is its first chosen option")
 
 
 def main():
