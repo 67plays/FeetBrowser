@@ -45,6 +45,59 @@ Helpers on the context: `ctx.current_tab()`, `ctx.tabs()`, `ctx.set_status(msg)`
 `ctx.open(url)`, `ctx.popup(url, width, height)`, and
 `ctx.settings` / `ctx.save_settings()` (per-toe persisted settings).
 
+## Drawing: what the canvas is now
+
+`on_draw` and `on_chrome_draw` used to hand you a real `tkinter.Canvas`.
+FeetBrowser no longer uses Tk: it draws every pixel itself, and the object you
+get is `feetbrowser.canvas.Canvas`, which imitates the Tk canvas closely enough
+that every toe in the catalog runs on it unchanged. There is no shim in
+between — the imitation *is* the canvas — so there is nothing to opt into and
+nothing to pay for.
+
+**Provided**, with Tk's spellings and Tk's semantics:
+
+- `create_rectangle`, `create_line`, `create_text`, `create_image`,
+  `create_oval`, `create_arc`, `create_polygon`, taking `fill`, `outline`,
+  `width`, `anchor`, `font`, `text`, `image`, `stipple` and `tags`. A
+  rectangle still gets a black 1px border unless you say `width=0` or
+  `outline=""`, and items still stack in creation order.
+- `find_all`, `find_withtag`, `delete`, `itemconfigure`, `coords`, `bbox`,
+  `addtag_withtag`, plus `winfo_width` / `winfo_height` and
+  `config(cursor=…, bg=…)`.
+- Fonts from `feetbrowser.layout.get_font(size, weight, slant, family)` or
+  `gui.Font(...)`: `measure`, `metrics`, `actual`, `cget`. Characters the
+  requested face lacks are looked up in a fallback chain, so the arrows,
+  stars and houses toolbars label their buttons with measure and paint
+  properly rather than coming out as blank width.
+- `gui.PhotoImage`: `width()`, `height()`, `subsample()`, `zoom()`.
+- `gui.TclError`, still raised by a bad colour name.
+- On `ctx.browser.window`: `after`, `after_idle`, `after_cancel`, `bind` /
+  `unbind` with Tk sequence names, `title`, `geometry`, `clipboard_get` /
+  `clipboard_clear` / `clipboard_append`, `update_idletasks`, `destroy`.
+  Events carry `.x`, `.y`, `.char`, `.keysym`, `.delta`, `.num`, `.state`.
+
+**Not provided.** There is no widget toolkit behind any of this, so none of
+these exist and reaching for them raises `AttributeError` immediately rather
+than drawing nothing:
+
+- `ttk` anything, and the plain widgets — `Frame`, `Label`, `Button`,
+  `Entry`, `Text`, `Menu`, `Scrollbar` — along with `messagebox`,
+  `filedialog` and `simpledialog`.
+- `StringVar` / `IntVar` / `BooleanVar` and the rest of the variable classes.
+  Keep state on the context object; `ctx.settings` persists it.
+- `canvas.create_window()`, which exists to embed a widget.
+- `canvas.bind()` and `canvas.tag_bind()`. Input reaches a toe through
+  `on_click`, `on_chrome_click`, `on_keypress` and `on_motion`, which is the
+  same information with the hit-testing already done.
+- `tag_raise` / `tag_lower` / `itemcget` / `scan_mark` / `xview` /
+  `postscript`, and `PhotoImage.put()` / `.get()` / `.copy()`.
+
+**How to tell.** `from feetbrowser import gui; gui.backend()` returns
+`"raster"` or `"tk"`. Setting `FEETBROWSER_BACKEND=tk` still selects real
+tkinter, which is useful for comparing behaviour — but write against the
+`gui.*` names and `layout.get_font` rather than importing `tkinter` yourself,
+because a widget you build directly has no window to appear in.
+
 ## Managing toes
 
 **From the browser** — `toe://hub`:
