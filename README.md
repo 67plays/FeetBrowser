@@ -1,4 +1,5 @@
 # 🦶 FeetBrowser
+*See the web from a new ankle*
 
 A web browser written **from scratch in pure Python**. No Chromium, no
 WebKit, no borrowed libraries — it does its own networking, HTML parsing,
