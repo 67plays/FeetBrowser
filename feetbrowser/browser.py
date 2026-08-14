@@ -22,7 +22,7 @@ from .htmlparser import HTMLParser, Text, Element
 from .cssparser import CSSParser, style, parse_inline
 from .layout import DocumentLayout, paint_tree, get_font
 from .jsdom import JSDocument
-from .jsengine import Interpreter, JSException
+from .jsengine import Interpreter, JSException, UNDEFINED
 from . import toes as toes
 
 WIDTH, HEIGHT = 1000, 720
@@ -144,6 +144,11 @@ class Tab:
         # script runs and click-handler dispatch.
         self._last_rules = None
         self._js_interp = None
+        self._js_doc = None
+        # Background-thread results for JS `fetch()`/`XMLHttpRequest`,
+        # drained on the UI thread by `_drain_js`.
+        self._js_fetch_results = deque()
+        self._js_xhr_results = deque()
         # Async page loading (GUI mode): a generation counter discards stale
         # fetches if the user navigates again mid-load, and the result queue
         # hands bytes from the fetch thread back to the UI thread.
@@ -291,6 +296,9 @@ class Tab:
         self.form_values = {}
         self.js_logs = []
         self._js_interp = None
+        self._js_doc = None
+        self._js_fetch_results.clear()
+        self._js_xhr_results.clear()
 
         if ctype.startswith("image/"):
             # We can't decode images yet; render a labelled placeholder instead
@@ -368,8 +376,12 @@ class Tab:
         self._js_interp = Interpreter()
         doc = JSDocument(self.nodes, base_url=self.base_url,
                          mark_dirty=self._js_mutated)
+        self._js_doc = doc
         self._js_interp.globals["document"] = doc
         self._js_interp.globals["window"] = doc
+        # Browser-provided host APIs (network + nothing Tk).
+        self._js_interp.globals["fetch"] = self._js_fetch
+        self._js_interp.globals["XMLHttpRequest"] = self._js_xhr_ctor()
         for el in scripts:
             try:
                 code = None
@@ -389,6 +401,9 @@ class Tab:
             except JSException as e:
                 self._js_interp.logs.append(f"JS error: {e}")
         self.js_logs.extend(self._js_interp.logs)
+        # Run microtasks/timers the scripts scheduled (promise .then chains,
+        # setTimeout(0), ...) before deciding whether anything changed.
+        self._drain_js()
         # Only re-render when a script actually mutated the DOM. Most pages'
         # scripts run read-only (feature detection, counters) and forcing a
         # full restyle+layout for them dominates page-load time.
@@ -418,6 +433,60 @@ class Tab:
             self.title = fresh_title
         self.render()
 
+    # -- JS host APIs (fetch, XMLHttpRequest) ------------------------------
+
+    def _js_fetch(self, url, options=UNDEFINED):
+        """Host `fetch()`: resolve relative to the document, fetch on a
+        background thread, and settle the returned Promise on the UI thread."""
+        interp = self._js_interp
+        promise = interp.create_promise()
+        try:
+            target = self.base_url.resolve(str(url)) if self.base_url \
+                else URL(str(url))
+        except Exception as e:  # noqa: BLE001 - malformed URL
+            promise.reject(str(e))
+            return promise
+
+        def worker():
+            try:
+                headers, body, ctype = target.request()
+                err = None
+                status = 200
+            except Exception as e:  # noqa: BLE001 - network failure
+                headers, body, ctype, status, err = {}, "", "text/plain", 0, str(e)
+            self._js_fetch_results.append((promise, headers, body, ctype,
+                                           status, err))
+
+        threading.Thread(target=worker, daemon=True).start()
+        return promise
+
+    def _js_xhr_ctor(self):
+        return _JSXHRCtor(self)
+
+    def _drain_js(self):
+        """UI thread: settle JS network results and run pending microtasks /
+        due timers, re-rendering if any handler mutated the DOM."""
+        interp = self._js_interp
+        if interp is None:
+            return
+        while self._js_fetch_results:
+            promise, headers, body, ctype, status, err = \
+                self._js_fetch_results.popleft()
+            if err:
+                promise.reject(err)
+            else:
+                promise.resolve(JSResponse(interp, headers, body, ctype,
+                                           status))
+        while self._js_xhr_results:
+            xhr, headers, body, ctype, status, err = self._js_xhr_results.popleft()
+            xhr._finish(headers, body, status, err)
+        try:
+            interp.drain()
+        except JSException as e:
+            self.js_logs.append(f"JS error: {e}")
+        if self._js_doc is not None and self._js_doc._flag["dirty"]:
+            self._js_mutated()
+
     def _dispatch_js_click(self, node):
         """Run click handlers (addEventListener + onclick attrs) registered on
         `node` or any ancestor. Returns True if any handler attempted to run."""
@@ -446,6 +515,7 @@ class Tab:
             cur = cur.parent
         if handled:
             self.js_logs.extend(interp.logs)
+            self._drain_js()
             self._js_mutated()
             return True
         return False
@@ -1783,6 +1853,11 @@ class Browser:
         loading = False
         for tab in self.tabs:
             tab._drain_images()
+            if tab._js_interp is not None:
+                # Advance the JS virtual clock so setTimeout/setInterval fire
+                # on schedule, then run microtasks/timers/fetch settlements.
+                tab._js_interp.advance(60)
+                tab._drain_js()
             if tab.loading:
                 loading = True
         if loading:
@@ -1912,8 +1987,150 @@ class PopupWindow:
             thumb_top = self.TITLE_BAR + (view - thumb_h) * (
                 self.tab.scroll / (total - view))
             c.create_rectangle(self.width - 6, thumb_top,
-                               self.width - 2, thumb_top + thumb_h,
-                               fill="#9aa0a6", width=0)
+                                self.width - 2, thumb_top + thumb_h,
+                                fill="#9aa0a6", width=0)
+
+
+class JSResponse:
+    """Host `fetch()` Response: ok/status/statusText/headers, text(), json()."""
+
+    def __init__(self, interp, headers, body, ctype, status):
+        self._interp = interp
+        self._headers = {k: v for k, v in headers.items()}
+        self._body = body
+        self._ctype = ctype
+        self._status = status
+
+    def js_get(self, name):
+        if name == "ok":
+            return 200 <= self._status < 300
+        if name == "status":
+            return self._status
+        if name == "statusText":
+            return "OK" if 200 <= self._status < 300 else "error"
+        if name == "headers":
+            return dict(self._headers)
+        if name == "text":
+            return self._text
+        if name == "json":
+            return self._json
+        return UNDEFINED
+
+    def _text(self):
+        p = self._interp.create_promise()
+        p.resolve(self._body)
+        return p
+
+    def _json(self):
+        p = self._interp.create_promise()
+        try:
+            p.resolve(json.loads(self._body))
+        except Exception as e:  # noqa: BLE001 - bad JSON body
+            p.reject(str(e))
+        return p
+
+
+class _JSXHRCtor:
+    """The `XMLHttpRequest` global: a constructor object."""
+
+    def __init__(self, tab):
+        self._tab = tab
+
+    def js_new(self, *args):
+        return _JSXHR(self._tab)
+
+
+class _JSXHR:
+    """A minimal XMLHttpRequest: open/send, readyState/status/responseText,
+    and onreadystatechange/onload/onerror handlers."""
+
+    def __init__(self, tab):
+        self._tab = tab
+        self._method = "GET"
+        self._url = None
+        self._headers = {}
+        self._ready = 0
+        self._status = 0
+        self._text = ""
+        self.onreadystatechange = None
+        self.onload = None
+        self.onerror = None
+
+    def js_get(self, name):
+        if name == "open":
+            return self.open
+        if name == "send":
+            return self.send
+        if name == "setRequestHeader":
+            return self.set_request_header
+        if name == "readyState":
+            return self._ready
+        if name == "status":
+            return self._status
+        if name == "responseText":
+            return self._text
+        if name == "onreadystatechange":
+            return self.onreadystatechange
+        if name == "onload":
+            return self.onload
+        if name == "onerror":
+            return self.onerror
+        return UNDEFINED
+
+    def js_set(self, name, value):
+        if name in ("onreadystatechange", "onload", "onerror"):
+            setattr(self, name, value)
+
+    def open(self, method, url, async_=True):
+        self._method = str(method).upper()
+        try:
+            self._url = self._tab.base_url.resolve(str(url)) \
+                if self._tab.base_url else URL(str(url))
+        except Exception:  # noqa: BLE001 - keep the raw string for the error
+            self._url = str(url)
+        self._ready = 1
+
+    def set_request_header(self, name, value):
+        self._headers[str(name)] = str(value)
+
+    def send(self, body=None):
+        if self._ready < 1 or self._url is None:
+            return UNDEFINED
+        self._ready = 2
+        target = self._url
+        payload = None
+        if isinstance(body, str) and body:
+            payload = body
+        elif body is not None and not (body is True or body is False):
+            payload = self._tab._js_interp.repr(body) if body is not UNDEFINED \
+                else None
+
+        def worker():
+            try:
+                headers, resp, ctype = target.request(payload=payload)
+                err = None
+                status = 200
+            except Exception as e:  # noqa: BLE001 - network failure
+                headers, resp, ctype, status, err = {}, "", "text/plain", 0, str(e)
+            self._tab._js_xhr_results.append((self, headers, resp, ctype,
+                                              status, err))
+
+        threading.Thread(target=worker, daemon=True).start()
+        return UNDEFINED
+
+    def _finish(self, headers, body, status, err):
+        self._ready = 4
+        self._status = status if not err else 0
+        self._text = body
+        interp = self._tab._js_interp
+        for handler in (self.onreadystatechange, self.onload if not err
+                        else self.onerror):
+            if handler is not None and handler is not UNDEFINED:
+                try:
+                    interp.call(handler)
+                except JSException as e:
+                    if interp is not None:
+                        interp.logs.append(f"JS error: {e}")
 
 
 class _AboutURL:
