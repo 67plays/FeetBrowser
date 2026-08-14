@@ -1,8 +1,9 @@
 # Architecture
 
-FeetBrowser is a **functional web browser written from scratch** in pure Python.
-It does not wrap Chromium, WebKit, Gecko, or any HTTP library — it implements
-its own:
+FeetBrowser is a **functional web browser written from scratch** — the engine
+(JS interpreter + DOM bridge) is a native Rust extension, and the rest is pure
+Python. It does not wrap Chromium, WebKit, Gecko, or any HTTP library — it
+implements its own:
 
 - **Networking** — raw TCP sockets speaking HTTP/1.1, TLS for `https`,
   redirect following, `gzip`/`deflate` decoding, chunked transfer decoding,
@@ -41,22 +42,34 @@ its own:
   repaints the damaged region instead of the whole canvas.
 - **Extensions (Toes)** — a from-scratch hooking system. See
   [docs/toes.md](toes.md).
-- **JavaScript engine** — a from-scratch interpreter (hand-written lexer +
-  parser + tree-walking evaluator): closures, `var`/`let`/`const`, objects,
-  arrays (with index growth, `length` truncation, `push`/`pop`/`join`),
-  `if`/`while`/`for` with `break`/`continue`, operators with proper
-  precedence, JS coercion rules (`NaN`/`Infinity` globals, `NaN` falsiness,
-  `null + 1 === 1`, `[] + [] === ""`), and global builtins (`String`,
-  `Number`, `Boolean`, `parseInt`, `parseFloat`, `console.log`). Scripts in
-  `<script>` tags run on page load; errors are captured instead of crashing
-  the page. A small **DOM bridge**
-  (`document.getElementById/querySelector`, `textContent`, `innerHTML`,
-  `style`, `addEventListener`) lets scripts mutate the page and wire up
-  click handlers, which re-cascade the stylesheet and re-render.
+- **JavaScript engine** — a from-scratch interpreter compiled to a native
+  Rust extension (`feetbrowser_engine`, built with PyO3/maturin): a
+  hand-written lexer + recursive-descent parser + tree-walking evaluator in
+  `rust/`. It supports closures, `var`/`let`/`const`, objects, classes with
+  `extends`/`super`, arrays (index growth, `length` truncation,
+  `push`/`pop`/`map`/`reduce`/`join`), `if`/`while`/`for`/`for-of`/`for-in`
+  with `break`/`continue`, `try`/`catch`/`throw`, arrow functions (lexical
+  `this`), template literals, spread/rest, optional chaining, nullish
+  coalescing, `Promise` + microtasks, `async`/`await`, timers, and operators
+  with proper precedence and JS coercion rules (`NaN`/`Infinity` globals,
+  `NaN` falsiness, `null + 1 === 1`, `[] + [] === ""`). Global builtins:
+  `String`, `Number`, `Boolean`, `parseInt`, `parseFloat`, `Array`,
+  `Object`, `Map`, `Set`, `Date`, `RegExp`, `Math`, `JSON`, `console.log`,
+  `fetch`, `XMLHttpRequest`. Scripts in `<script>` tags run on page load;
+  errors are captured instead of crashing the page.
+- **DOM bridge** — a Rust DOM (`rust/src/dom.rs`): `getElementById`/
+  `querySelector`/`querySelectorAll`, `textContent`, `innerHTML`, `style`,
+  `classList`, attributes, and `addEventListener`, exposing `document`,
+  elements, node lists, and the `body`/`head`/`documentElement` shortcuts.
+  Scripts mutate the page and wire up click handlers, which re-cascade the
+  stylesheet and re-render. The DOM objects operate on the Python node tree
+  that layout renders; `feetbrowser/jsdom.py` is a thin shim that delegates
+  to the Rust functions.
 
-Nothing outside the standard library is *required*, and that now includes the
-pixels: there is no Tk, Qt, GTK, SDL, Cairo or FreeType anywhere, and the only
-thing the renderer asks of the operating system is a font file to parse. Two
+Beyond the engine extension, which is our own code in another language, no
+Python package is *required*, and that now includes the pixels: there is no
+Tk, Qt, GTK, SDL, Cairo or FreeType anywhere, and the only thing the renderer
+asks of the operating system is a font file to parse. Two
 optional imports are tried and shrugged off when absent — Pillow for JPEG and
 cairosvg for SVG, formats `imagecodec.py` does not decode itself. Without them
 those images simply do not appear; everything else is unaffected. The old Tk
@@ -70,8 +83,8 @@ feetbrowser/
   net.py         URL parsing + HTTP/HTTPS/data/file transport + connection pool
   htmlparser.py  HTML tokenizer + DOM tree builder
   cssparser.py   CSS parser, selectors, specificity, cascade
-  jsengine.py    JavaScript lexer, parser, interpreter
-  jsdom.py       JavaScript <-> DOM bridge (document/element/style)
+  jsengine.py    thin shim over the Rust `feetbrowser_engine` extension
+  jsdom.py       thin shim over the Rust DOM bridge (dom_get/dom_set/dom_call)
   layout.py      block/inline layout -> display list, painting
   fontengine.py  TrueType parsing: tables, cmap, metrics, glyph outlines
   raster.py      antialiased software rasteriser, glyph cache, PNG output
@@ -83,12 +96,26 @@ feetbrowser/
   toes.py        extension hooking (Toes): discovery, dispatch, CLI
   toehub.py      the ToeHub: catalog fetch, install/uninstall/toggle
   ua.css         default user-agent stylesheet
+rust/
+  lib.rs         PyO3 module wiring; exposes Interpreter, JSException, UNDEFINED
+  interp.rs      evaluator, host bridge, promises, microtasks, timers
+  parser.rs      recursive-descent parser + AST construction
+  token.rs       lexer
+  ast.rs         AST node types
+  value.rs       JsValue model, scopes, coercion, JsCallback
+  stdlib.rs      built-ins (Array/Object/Map/Set/Date/RegExp/Math/JSON/...)
+  dom.rs         DOM bridge (document/element/style/classList/...)
+  pybind.rs      Python-facing classes (Interpreter, JsGlobals, PyJsValue)
 toes/            user-installed toes (gitignored; empty on a fresh checkout)
 tests/
   test_render.py offline tests for fonts, rasteriser, image codecs, canvas
   test_units.py  offline unit tests (URL, HTML, CSS, layout, internal pages)
   test_js.py     offline tests for the JS engine + DOM bridge
   test_nav.py    click-to-navigate, history, view-source
+  test_shoes.py  Shoes theme manager tests
   test_toes.py   toe engine + ToeHub tests (install/uninstall/toggle)
   smoke.py       end-to-end pipeline on real pages
 ```
+
+The Rust engine is built with maturin into a local venv; `run.sh` and
+`test.sh` build it on first use (`maturin develop --release`).

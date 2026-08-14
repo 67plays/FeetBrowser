@@ -26,7 +26,7 @@ from .cssparser import CSSParser, style, parse_inline, set_viewport, \
     media_matches, get_viewport
 from .layout import DocumentLayout, paint_tree, get_font, DrawText, _measure
 from . import shoes as shoes
-from .jsdom import JSDocument
+from .jsdom import JSDocument, JSLocation
 from .jsengine import Interpreter, JSException, UNDEFINED
 from . import toes as toes
 
@@ -232,6 +232,11 @@ class Tab:
         self._last_rules = None
         self._js_interp = None
         self._js_doc = None
+        # Deferred JS/meta-refresh navigation, honored after the current
+        # script batch finishes (see _flush_pending_nav). Kept as a
+        # (URL, replace) tuple so location.assign/replace/href map to
+        # history push vs. replace semantics.
+        self._pending_nav = None
         # Background-thread results for JS `fetch()`/`XMLHttpRequest`,
         # drained on the UI thread by `_drain_js`.
         self._js_fetch_results = deque()
@@ -422,6 +427,14 @@ class Tab:
         if doc_error is not None:
             self._add_error(doc_error)
 
+        # A script or <meta http-equiv=refresh> may have asked to navigate
+        # away (e.g. DuckDuckGo's /l/ redirect page). Honor it before this
+        # intermediate document settles into view: the redirect target
+        # replaces the current entry rather than being pushed on top of it.
+        if self._pending_nav is not None:
+            self._flush_pending_nav()
+            return
+
         self.loading = False
         self.status = str(url)
         if getattr(url, "fragment", ""):
@@ -446,6 +459,7 @@ class Tab:
         self._js_log_cursor = 0
         self._js_interp = None
         self._js_doc = None
+        self._pending_nav = None
         self._js_fetch_results.clear()
         self._js_xhr_results.clear()
 
@@ -465,6 +479,10 @@ class Tab:
         base_href = find_base_href(self.nodes)
         self.base_url = url.resolve(base_href) if base_href else url
         resolve_from = self.base_url
+
+        # <meta http-equiv="refresh"> is a server-agnostic redirect: honor a
+        # zero-delay one before we bother styling/laying out this page.
+        self._check_meta_refresh()
 
         # Gather stylesheets: UA + toe-injected + <style> + <link rel=stylesheet>.
         rules = list(DEFAULT_STYLE_SHEET)
@@ -545,10 +563,18 @@ class Tab:
         if not scripts:
             return
         self._js_interp = Interpreter()
+        location = JSLocation(base_url=self.base_url, navigate=self._js_navigate)
         doc = JSDocument(self.nodes, base_url=self.base_url,
-                         mark_dirty=self._js_mutated)
+                         mark_dirty=self._js_mutated, location=location)
         self._js_doc = doc
         self._js_interp.globals["document"] = doc
+        # Location/navigation: the window, its aliases, and the document all
+        # share one location object so `window.parent.location.replace(...)`
+        # (DuckDuckGo redirects) and `location.href = ...` navigate the tab.
+        self._js_interp.globals["location"] = location
+        self._js_interp.globals["parent"] = self._js_interp.globals["window"]
+        self._js_interp.globals["self"] = self._js_interp.globals["window"]
+        self._js_interp.globals["top"] = self._js_interp.globals["window"]
         # Browser-provided host APIs (network + nothing Tk).
         self._js_interp.globals["fetch"] = self._js_fetch
         self._js_interp.globals["XMLHttpRequest"] = self._js_xhr_ctor()
@@ -597,6 +623,73 @@ class Tab:
             if line.startswith("JS error"):
                 msg = line[len("JS error: "):]
                 self._add_error(f"JS {msg}")
+
+    def _js_navigate(self, target, replace):
+        """Record a JS-initiated navigation (location.href/assign/replace).
+        Deferred so it runs after the current script batch, never mid-script
+        (which would clobber the live interpreter)."""
+        try:
+            url = self.base_url.resolve(str(target)) if self.base_url \
+                else URL(str(target))
+        except Exception:  # noqa: BLE001 - malformed URL: ignore the navigation
+            return
+        self._pending_nav = (url, replace)
+
+    def _flush_pending_nav(self):
+        """Navigate to the deferred target, if any. `replace` requests drop
+        the current history entry instead of pushing it (location.replace /
+        meta refresh / location.href assignment)."""
+        nav = self._pending_nav
+        if nav is None:
+            return False
+        self._pending_nav = None
+        url, replace = nav
+        self.load(url, push=not replace)
+        return True
+
+    def _check_meta_refresh(self):
+        """Honor a zero-delay <meta http-equiv="refresh" content="0;url=...">
+        redirect. Positive delays are left alone (they're scheduled auto-
+        refreshes, not redirects) so no timer machinery is needed here, and
+        anything inside <noscript> is ignored — scripting is enabled, so that
+        fallback is not the one a real browser would follow."""
+        for node in tree_to_list(self.nodes, []):
+            if not (isinstance(node, Element) and node.tag == "meta"):
+                continue
+            if (node.attributes.get("http-equiv", "").lower() != "refresh"):
+                continue
+            inside_noscript = False
+            parent = node.parent
+            while parent is not None:
+                if isinstance(parent, Element) and parent.tag == "noscript":
+                    inside_noscript = True
+                    break
+                parent = parent.parent
+            if inside_noscript:
+                continue
+            content = node.attributes.get("content", "")
+            delay, _, rest = content.partition(";")
+            try:
+                seconds = float(delay.strip())
+            except ValueError:
+                seconds = 0
+            if seconds > 0:
+                continue
+            rest = rest.strip()
+            if not rest.lower().startswith("url="):
+                continue
+            target = rest[4:].strip().strip("'\"")
+            if not target:
+                continue
+            try:
+                url = self.base_url.resolve(target) if self.base_url \
+                    else URL(target)
+            except Exception:  # noqa: BLE001 - malformed target: ignore
+                continue
+            # Replace, like an HTTP redirect: the refresh page isn't a
+            # meaningful history entry.
+            self._pending_nav = (url, True)
+            return
 
     def _js_mutated(self):
         """Re-style the tree with the stored rules and re-render after a
@@ -734,6 +827,7 @@ class Tab:
             self._capture_js_errors(interp.logs)
             self._drain_js()
             self._js_mutated()
+            self._flush_pending_nav()
             return True
         return False
 
@@ -2775,6 +2869,7 @@ class Browser:
                 # on schedule, then run microtasks/timers/fetch settlements.
                 tab._js_interp.advance(60)
                 tab._drain_js()
+            tab._flush_pending_nav()
             if tab.loading:
                 loading = True
         if loading:

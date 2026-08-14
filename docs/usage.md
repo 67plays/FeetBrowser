@@ -8,15 +8,20 @@
 ./run.sh view-source:https://example.com
 ```
 
-`run.sh` is a one-line wrapper around `python3 -m feetbrowser`. There is
-nothing to install: the renderer is ours (see
-[the rendering engine](rendering.md)), so no GUI toolkit is needed — only
-Python 3 and at least one system font.
+`run.sh` builds the Rust JS engine (`feetbrowser_engine`) into a local `.venv`
+with maturin if it isn't importable yet, then runs the browser from that venv
+(so a first run needs the Rust toolchain; maturin is installed into the venv
+automatically). Once the extension is built and installed for your
+interpreter, `python3 -m feetbrowser <url>` works directly.
+
+There is nothing else to install. The renderer is ours (see [the rendering
+engine](rendering.md)), so no GUI toolkit is needed — only Python 3 and at
+least one system font.
 
 To render a page without opening a window:
 
 ```bash
-python3 -m feetbrowser --screenshot https://example.com page.png
+./run.sh --screenshot https://example.com page.png
 ```
 
 This runs the whole browser — chrome, tabs, toolbar, page, scrollbar — waits

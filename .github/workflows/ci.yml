@@ -18,41 +18,46 @@ jobs:
 
       # No Tk and no Xvfb: rendering is our own and runs with no display.
       # The only outside requirement is a system font.
-      - name: Install fonts and pyflakes
+      - name: Install fonts
         run: |
           sudo apt-get update
           sudo apt-get install -y fonts-dejavu-core fonts-liberation
-          python -m pip install pyflakes
+
+      - name: Build the Rust JS engine
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install maturin pyflakes
+          .venv/bin/maturin develop --release --manifest-path rust/Cargo.toml
 
       - name: Lint (pyflakes)
-        run: python -m pyflakes feetbrowser tests
+        run: .venv/bin/python -m pyflakes feetbrowser tests
 
       - name: Renderer tests
-        run: python tests/test_render.py
+        run: .venv/bin/python tests/test_render.py
 
       # Skips itself off macOS; here to prove the skip stays clean.
       - name: Platform window tests
-        run: python tests/test_cocoa.py
+        run: .venv/bin/python tests/test_cocoa.py
 
       - name: Unit tests
-        run: python tests/test_units.py
+        run: .venv/bin/python tests/test_units.py
 
       - name: JS engine tests
-        run: python tests/test_js.py
+        run: .venv/bin/python tests/test_js.py
 
       - name: Shoes tests
-        run: python tests/test_shoes.py
+        run: .venv/bin/python tests/test_shoes.py
 
       - name: Toe engine tests
-        run: python tests/test_toes.py
+        run: .venv/bin/python tests/test_toes.py
 
       - name: Pseudo-toe (gh-scroll) tests
-        run: python tests/test_gh_scroll.py
+        run: .venv/bin/python tests/test_gh_scroll.py
 
       - name: Screenshot a page end to end
         run: |
-          python -m feetbrowser --screenshot about:blank /tmp/blank.png
-          python - <<'EOF'
+          .venv/bin/python -m feetbrowser --screenshot about:blank /tmp/blank.png
+          .venv/bin/python - <<'EOF'
           import os
           size = os.path.getsize("/tmp/blank.png")
           assert size > 2000, f"screenshot suspiciously small: {size} bytes"
