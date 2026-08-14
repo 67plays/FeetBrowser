@@ -72,7 +72,12 @@ would go wrong in ways that look like the page's fault, so it gets rebuilt.
 
 REBUILDING
   fi
-  python3 -m venv .venv
+  # --system-site-packages, because the venv exists to hold one compiled
+  # extension and must not hide anything else. JPEG and SVG decoding are
+  # optional and come from Pillow and cairosvg if the machine has them; a
+  # sealed venv silently takes them away, and the symptom is a page whose
+  # photographs are all "[img]".
+  python3 -m venv --system-site-packages .venv
   .venv/bin/pip install -q maturin
   if ! .venv/bin/maturin develop --release --manifest-path rust/Cargo.toml; then
     cat >&2 <<'FAILED'
