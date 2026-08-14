@@ -11,10 +11,10 @@ if python3 -c "import feetbrowser_engine" 2>/dev/null; then
   exec python3 -m feetbrowser "$@"
 fi
 
-if [ ! -x .venv/bin/python ]; then
+# Otherwise the venv is what runs the browser, so ask the venv -- and not the
+# system python -- whether the engine is there.
+if [ ! -x .venv/bin/python ] || ! .venv/bin/python -c "import feetbrowser_engine" 2>/dev/null; then
   python3 -m venv .venv
-fi
-if ! .venv/bin/python -c "import feetbrowser_engine" 2>/dev/null; then
   .venv/bin/pip install -q maturin
   .venv/bin/maturin develop --release --manifest-path rust/Cargo.toml
 fi
