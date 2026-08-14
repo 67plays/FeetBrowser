@@ -212,6 +212,163 @@ def test_buttons_hook_registered():
     assert stub.toe_contexts[0].call("buttons")[0].id == "fake-btn"
 
 
+def test_config_options_declared_and_coerced():
+    class FakeToe:
+        manifest = {"name": "fake", "version": "0", "description": ""}
+
+        def activate(self, ctx):
+            ctx.define_config(
+                toes.ConfigOption("dark", "Dark mode", "bool", default=True),
+                toes.ConfigOption("step", "Scroll step", "int", default=80),
+                toes.ConfigOption("theme", "Theme", "choice",
+                                  default="dark",
+                                  options=[("dark", "Dark"),
+                                           ("light", "Light")]),
+            )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        orig_root = toes.repo_root
+        toes.repo_root = lambda: tmp
+        try:
+            toe = toes.Toe("fake", "0", "", "", FakeToe())
+            stub = StubBrowser([toe])
+            ctx = stub.toe_contexts[0]
+            # Defaults seeded into settings.
+            assert ctx.settings.get("dark") is True
+            assert ctx.settings.get("step") == 80
+            assert ctx.config_value("dark") is True
+            assert ctx.config_value("step") == 80
+            assert ctx.config_value("theme") == "dark"
+            # Coercion on set.
+            ctx.set_config("dark", "false")
+            ctx.set_config("step", "120")
+            assert ctx.config_value("dark") is False
+            assert ctx.config_value("step") == 120
+            # config_options lists them sorted by key.
+            keys = [k for k, _o in ctx.config_options()]
+            assert keys == ["dark", "step", "theme"], keys
+        finally:
+            toes.repo_root = orig_root
+
+
+def test_config_page_renders_and_sets():
+    from feetbrowser import toehub
+    with tempfile.TemporaryDirectory() as tmp:
+        demo = os.path.join(tmp, "toes", "demo")
+        os.makedirs(demo)
+        with open(os.path.join(demo, "toe.json"), "w") as f:
+            f.write('{"name": "demo", "entry": "toe.py"}')
+        with open(os.path.join(demo, "toe.py"), "w") as f:
+            f.write('from feetbrowser import toes\n'
+                    'def activate(ctx):\n'
+                    '    ctx.define_config(toes.ConfigOption'
+                    '("size", "Size", "int", default=16))\n')
+        orig_root = toes.repo_root
+        toes.repo_root = lambda: tmp
+        try:
+            browser = StubBrowser()
+            # A real-ish context for _find_context.
+            toe = toes.Toe("demo", "0", "", demo, demo_mod())
+            browser.toe_contexts = [toes.Context(browser, toe.module)]
+            browser.toes = [toe]
+
+            from feetbrowser.net import URL
+            page = toehub._config_page(URL("toehub://config/demo"),
+                                       "demo", browser)
+            stripped = _strip(page[1])
+            assert "demo" in stripped
+            assert "Size" in stripped
+            # Set an option.
+            toehub._config_page(
+                URL("toehub://config/demo/set/size/24"), "demo", browser)
+            ctx = browser.toe_contexts[0]
+            assert ctx.config_value("size") == 24
+        finally:
+            toes.repo_root = orig_root
+
+
+def test_config_set_via_handle_route():
+    """The set route must apply through the real handle() path (regression:
+    toehub://config/<name>/set/<key>/<value> used to fail with '<path> is
+    not installed' because the whole path was treated as the toe name)."""
+    from feetbrowser import toehub
+    with tempfile.TemporaryDirectory() as tmp:
+        demo = os.path.join(tmp, "toes", "demo")
+        os.makedirs(demo)
+        with open(os.path.join(demo, "toe.json"), "w") as f:
+            f.write('{"name": "demo", "entry": "toe.py"}')
+        with open(os.path.join(demo, "toe.py"), "w") as f:
+            f.write('from feetbrowser import toes\n'
+                    'def activate(ctx):\n'
+                    '    ctx.define_config(toes.ConfigOption'
+                    '("size", "Size", "int", default=16))\n')
+        orig_root = toes.repo_root
+        toes.repo_root = lambda: tmp
+        try:
+            browser = StubBrowser()
+            toe = toes.Toe("demo", "0", "", demo, demo_mod())
+            browser.toe_contexts = [toes.Context(browser, toe.module)]
+            browser.toes = [toe]
+            tab = Tab(700, browser)
+            browser.active_tab = tab
+
+            resp = toehub.handle(
+                URL("toehub://config/demo/set/size/24"), tab)
+            assert resp is not None
+            ctx = browser.toe_contexts[0]
+            assert ctx.config_value("size") == 24, (
+                ctx.config_value("size"))
+            assert "is not installed" not in resp[1]
+        finally:
+            toes.repo_root = orig_root
+
+
+def test_config_set_via_query_param():
+    """The form submit (str/int inputs) must apply through the query param
+    route: toehub://config/<name>/set/<key>?value=<v>."""
+    from feetbrowser import toehub
+    with tempfile.TemporaryDirectory() as tmp:
+        demo = os.path.join(tmp, "toes", "demo")
+        os.makedirs(demo)
+        with open(os.path.join(demo, "toe.json"), "w") as f:
+            f.write('{"name": "demo", "entry": "toe.py"}')
+        with open(os.path.join(demo, "toe.py"), "w") as f:
+            f.write('from feetbrowser import toes\n'
+                    'def activate(ctx):\n'
+                    '    ctx.define_config(toes.ConfigOption'
+                    '("size", "Size", "int", default=16))\n')
+        orig_root = toes.repo_root
+        toes.repo_root = lambda: tmp
+        try:
+            browser = StubBrowser()
+            toe = toes.Toe("demo", "0", "", demo, demo_mod())
+            browser.toe_contexts = [toes.Context(browser, toe.module)]
+            browser.toes = [toe]
+            tab = Tab(700, browser)
+            browser.active_tab = tab
+
+            resp = toehub.handle(
+                URL("toehub://config/demo/set/size?value=32"), tab)
+            assert resp is not None
+            ctx = browser.toe_contexts[0]
+            assert ctx.config_value("size") == 32, ctx.config_value("size")
+        finally:
+            toes.repo_root = orig_root
+
+
+def demo_mod():
+    import types
+    m = types.ModuleType("toe_demo")
+    m.manifest = {"name": "demo"}
+    m.activate = demo_activate
+    return m
+
+
+def demo_activate(ctx):
+    from feetbrowser import toes as _toes
+    ctx.define_config(_toes.ConfigOption("size", "Size", "int", default=16))
+
+
 def test_manual_renders_for_installed_toe():
     from feetbrowser import toehub
     with tempfile.TemporaryDirectory() as tmp:

@@ -13,6 +13,8 @@ Pages served (via the built-in handle hook):
     toehub://enable/<name>     enable a disabled toe
     toehub://disable/<name>    disable an enabled toe (kept installed)
     toehub://manual/<name>     show an installed toe's manual page
+    toehub://config/<name>     configure an installed toe's options
+    toehub://config/<name>/set/<key>/<value>   set one option
     toehub://refresh           re-fetch the catalog
     toe://hub                  alias for toehub://
 
@@ -23,6 +25,7 @@ import json
 import os
 import shutil
 import sys
+import urllib.parse
 
 from . import toes as toes
 from .net import URL
@@ -256,9 +259,99 @@ def _handle_hub(url, browser):
         return {}, toggle_toe(name, False, browser), "text/html"
     if action == "manual" and name:
         return {}, manual_toe(name), "text/html"
+    if action == "config" and name:
+        return _config_page(url, name, browser)
     if action == "refresh" or action in ("hub", ""):
         return {}, _hub_page(), "text/html"
     return {}, _hub_page(), "text/html"
+
+
+def _config_page(url, name, browser):
+    """Render the config page for a toe, or apply a set action."""
+    # toehub://config/<name>[/set/<key>?value=<v>]
+    parts = [urllib.parse.unquote(p) for p in (url.path or "").split("/")
+             if p]
+    if not parts:
+        return {}, _msg("Missing toe name."), "text/html"
+    toe_name = parts[0]
+    ctx = _find_context(browser, toe_name)
+    if ctx is None:
+        return {}, _msg(f"<b>{toe_name}</b> is not installed."), "text/html"
+    if len(parts) >= 3 and parts[1] == "set":
+        key, _, query = parts[2].partition("?")
+        key = urllib.parse.unquote(key)
+        params = urllib.parse.parse_qs(query)
+        if "value" in params:
+            ctx.set_config(key, params["value"][0])
+        elif len(parts) >= 4:
+            # Backward-compatible path style: set/<key>/<value>
+            ctx.set_config(key, "/".join(parts[3:]))
+    options = ctx.config_options()
+    if not options:
+        return {}, _config_page_html(toe_name, "<div class='box'>This toe "
+            "has no configurable options.</div>"), "text/html"
+    rows = []
+    for key, opt in options:
+        value = ctx.config_value(key)
+        rows.append(_config_option_html(toe_name, key, opt, value))
+    return {}, _config_page_html(toe_name, "\n".join(rows)), "text/html"
+
+
+def _config_page_html(name, body):
+    return f"""<!doctype html>
+<html><head><title>{_esc(name)} config</title><style>{HUB_STYLE}</style>
+</head>
+<body>
+<h1>{_esc(name)}</h1>
+<p class="dim">CONFIGURATION · CUSTOMIZE THIS TOE</p>
+{body}
+<p class="dim"><a href="toehub://manual/{name}">manual</a> ·
+<a href="toehub://">back to the hub</a></p>
+</body></html>
+"""
+
+
+def _config_option_html(name, key, opt, value):
+    value_html = _esc(str(value))
+    key_esc = _esc(key)
+    if opt.kind == "bool":
+        toggle = "0" if value else "1"
+        label = "ON" if value else "OFF"
+        control = (f'<a href="toehub://config/{name}/set/{key_esc}'
+                   f'?value={toggle}">toggle to {label}</a>')
+    elif opt.kind == "choice":
+        choices = "".join(
+            f'<a href="toehub://config/{name}/set/{key_esc}'
+            f'?value={_url_escape(str(v))}">{_esc(l)}</a> '
+            for v, l in opt.options)
+        control = choices
+    else:
+        # str / int: a real text input + submit button, prefilled with the
+        # current value. GET submits value as a query param.
+        control = (
+            f'<form action="toehub://config/{name}/set/{key_esc}" '
+            f'method="get">'
+            f'<input type="text" name="value" value="{value_html}" '
+            f'size="24">'
+            f' <input type="submit" value="save"></form>')
+    help_html = f'<div class="dim">{_esc(opt.help)}</div>' if opt.help else ""
+    return (f'<div class="box"><b>{_esc(opt.label)}</b> '
+            f'<span class="v">= {value_html}</span><br>{control}'
+            f'<br>{help_html}</div>')
+
+
+def _find_context(browser, name):
+    if browser is None:
+        return None
+    for ctx in browser.toe_contexts:
+        if ctx.toe_name() == name:
+            return ctx
+    return None
+
+
+def _url_escape(s):
+    return (s.replace("%", "%25").replace("/", "%2F")
+            .replace("&", "%26").replace("?", "%3F"))
 
 
 def _hub_page():
@@ -303,6 +396,7 @@ def _hub_page():
             + (f' — <a href="toehub://enable/{n}">enable</a>'
                if n in disabled else
                f' — <a href="toehub://disable/{n}">disable</a>')
+            + f' · <a href="toehub://config/{n}">config</a>'
             + f' · <a href="toehub://manual/{n}">manual</a>'
             + f' · <a href="toehub://uninstall/{n}">uninstall</a></div>'
             for n in sorted(installed))
@@ -335,6 +429,7 @@ def _gallery_page():
             + (f' — <a href="toehub://enable/{n}">enable</a>'
                if n in disabled else
                f' — <a href="toehub://disable/{n}">disable</a>')
+            + f' · <a href="toehub://config/{n}">config</a>'
             + f' · <a href="toehub://manual/{n}">manual</a>'
             + f' · <a href="toehub://uninstall/{n}">uninstall</a></div>'
             for n in sorted(installed))
