@@ -25,7 +25,7 @@ def _skip(reason):
 
 if sys.platform != "darwin":
     _skip("not macOS")
-if gui.BACKEND != "raster":
+if gui.backend() != "raster":
     _skip("needs FEETBROWSER_BACKEND=raster")
 
 from feetbrowser import browser as browsermod  # noqa: E402

@@ -62,6 +62,7 @@ class Window:
         self._timer_seq = 0
         self._running = False
         self._destroyed = False
+        self._on_close = None
         self._clipboard = ""
         self.min_width = 0
         self.min_height = 0
@@ -110,6 +111,10 @@ class Window:
         self.visible = True
 
     def protocol(self, _name=None, func=None):
+        """Register the WM_DELETE_WINDOW callback, Tk's spelling of "the
+        window is going away". There is no window delegate, so the close
+        button is noticed by the window vanishing and destroy() is what runs
+        -- which makes destroy() the place to call this."""
         self._on_close = func
 
     def update_idletasks(self):
@@ -123,6 +128,13 @@ class Window:
             return
         self._destroyed = True
         self._running = False
+        if self._on_close is not None:
+            # Flag first: a handler that closes the window itself must not
+            # come back around through here.
+            try:
+                self._on_close()
+            except Exception as exc:  # noqa: BLE001 - teardown continues
+                self.on_callback_error("close", exc)
         for child in list(self.children):
             child.destroy()
         self.on_destroy()

@@ -740,7 +740,7 @@ def test_gui_backend_exports_everything_used():
     for name in ("Tk", "Toplevel", "Canvas", "PhotoImage", "TclError",
                  "Font"):
         assert getattr(gui, name, None) is not None, f"gui.{name} missing"
-    assert gui.BACKEND in ("raster", "tk")
+    assert gui.backend() in ("raster", "tk")
 
 
 def main():

@@ -179,7 +179,9 @@ close button, titlebar drag and live resize do not work.
 
 `gui.py` picks all of this up: `gui.Tk()` is always the headless root, so tests
 and `--screenshot` never open anything, and only `gui.new_window()` asks for a
-real one. `FEETBROWSER_DISPLAY=none` forces headless even on macOS.
+real one. `FEETBROWSER_DISPLAY=none` forces headless even on macOS -- it selects
+among *our* windows, so it has nothing to say to `FEETBROWSER_BACKEND=tk`, which
+opens whatever tkinter opens.
 
 ## Testing it
 

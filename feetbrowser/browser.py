@@ -3522,6 +3522,13 @@ def screenshot(url, path, width=WIDTH, height=HEIGHT, settle=3.0):
     just a file write, which makes the renderer inspectable from a shell and
     diffable in a test.
     """
+    if gui.backend() != "raster":
+        # Only our own canvas can hand back its pixels; a Tk one draws into a
+        # window we are not opening. Say so rather than failing on a missing
+        # method halfway through a page load.
+        raise RuntimeError(
+            "--screenshot needs the raster backend; this run is using "
+            "%r (set FEETBROWSER_BACKEND=raster)" % gui.backend())
     browser = Browser()
     browser.window.geometry("%dx%d" % (width, height))
     browser.canvas.resize(width, height)

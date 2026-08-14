@@ -75,13 +75,27 @@ def platform_root():
     if DISPLAY in ("", "cocoa"):
         try:
             from . import cocoa
-        except ImportError:
+        except ImportError as exc:
+            # Asking for Cocoa by name and silently getting a headless root
+            # is the kind of thing you discover from an empty screenshot.
+            if DISPLAY == "cocoa":
+                raise RuntimeError("no Cocoa window available here") from exc
             return None
         if cocoa.available():
             return cocoa.CocoaTk
         if DISPLAY == "cocoa":
             raise RuntimeError("no Cocoa window available here")
     return None
+
+
+def backend():
+    """The backend actually in use, resolving the choice if need be.
+
+    Read the module's BACKEND directly only to see what was *asked* for:
+    until something has been built, `auto` is still `auto`.
+    """
+    _resolve()
+    return BACKEND
 
 
 def new_window(**kwargs):
@@ -91,34 +105,50 @@ def new_window(**kwargs):
     faithfully, which is what tests and --screenshot rely on. It just has
     nowhere to put the pixels.
     """
-    if BACKEND == "raster":
+    if backend() == "raster":
         root = platform_root()
         if root is not None:
             return root(**kwargs)
-    return Tk(**kwargs)
+    return _resolve()["Tk"](**kwargs)
 
 
 def has_display():
     """True when new_window() would open something visible."""
-    if BACKEND != "raster":
+    if backend() != "raster":
         return True  # tkinter brings its own window
     return platform_root() is not None
 
 
-if BACKEND == "tk":
-    _impl = _use_tk()
-elif BACKEND == "auto":
-    try:
-        _impl = _use_raster()
-    except Exception:  # noqa: BLE001 - any failure means fall back to Tk
-        _impl = _use_tk()
-else:
-    _impl = _use_raster()
+_impl = None
 
-Tk = _impl["Tk"]
-Toplevel = _impl["Toplevel"]
-Canvas = _impl["Canvas"]
-PhotoImage = _impl["PhotoImage"]
-TclError = _impl["TclError"]
-Font = _impl["Font"]
-BACKEND = _impl["name"]
+_NAMES = ("Tk", "Toplevel", "Canvas", "PhotoImage", "TclError", "Font")
+
+
+def _resolve():
+    """Pick the backend, once, the first time anything asks for it.
+
+    Doing this at import time meant every `import feetbrowser.gui` -- and so
+    every import of the browser, for any reason at all -- walked the system
+    font directories first, and a machine with no usable fonts could not get
+    as far as importing a symbol to report that.
+    """
+    global _impl, BACKEND
+    if _impl is not None:
+        return _impl
+    if BACKEND == "tk":
+        _impl = _use_tk()
+    elif BACKEND == "auto":
+        try:
+            _impl = _use_raster()
+        except Exception:  # noqa: BLE001 - any failure means fall back to Tk
+            _impl = _use_tk()
+    else:
+        _impl = _use_raster()
+    BACKEND = _impl["name"]
+    return _impl
+
+
+def __getattr__(name):
+    if name in _NAMES:
+        return _resolve()[name]
+    raise AttributeError("module %r has no attribute %r" % (__name__, name))

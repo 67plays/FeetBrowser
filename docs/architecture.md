@@ -24,9 +24,9 @@ its own:
   `justify-content`, `align-items`), a **CSS grid** subset
   (`grid-template-columns` px/%/fr/auto, auto row placement,
   `grid-column`/`grid-row` spans, `gap`), and **`<img>` rendering** (PNG/GIF
-  natively, JPEG via Pillow, fetched off the UI thread), plus form controls
-  (text fields, checkboxes, submit/reset buttons, `<select>`), producing a
-  display list of paint commands.
+  natively, JPEG via Pillow if it happens to be installed, fetched off the UI
+  thread), plus form controls (text fields, checkboxes, submit/reset buttons,
+  `<select>`), producing a display list of paint commands.
 - **Rendering engine** — our own pixels, no GUI toolkit: a TrueType parser
   (`cmap`/`glyf`/`hmtx`/…, composite glyphs, real metrics), an antialiased
   scanline rasteriser writing into a `bytearray` framebuffer, PNG/GIF/PNM
@@ -54,11 +54,14 @@ its own:
   `style`, `addEventListener`) lets scripts mutate the page and wire up
   click handlers, which re-cascade the stylesheet and re-render.
 
-Nothing outside the standard library is used, and that now includes the pixels:
-there is no Tk, Qt, GTK, SDL, Cairo, FreeType or Pillow in the import graph.
-The only thing the renderer asks of the operating system is a font file to
-parse. The old Tk path is still selectable with `FEETBROWSER_BACKEND=tk` for
-side-by-side comparison.
+Nothing outside the standard library is *required*, and that now includes the
+pixels: there is no Tk, Qt, GTK, SDL, Cairo or FreeType anywhere, and the only
+thing the renderer asks of the operating system is a font file to parse. Two
+optional imports are tried and shrugged off when absent — Pillow for JPEG and
+cairosvg for SVG, formats `imagecodec.py` does not decode itself. Without them
+those images simply do not appear; everything else is unaffected. The old Tk
+path is still selectable with `FEETBROWSER_BACKEND=tk` for side-by-side
+comparison.
 
 ## Layout of the code
 

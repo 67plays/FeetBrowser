@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # Run the FeetBrowser test suite.
 #
-# Everything here is headless: the renderer draws into its own framebuffer, so
-# no display, no Tk, no toolkit. test_nav.py and smoke.py reach the network.
+# The renderer draws into its own framebuffer, so no display, no Tk and no
+# toolkit is needed. Two suites step outside that: test_cocoa.py opens real
+# windows on macOS (and skips everywhere else), and test_nav.py and smoke.py
+# reach the network.
 set -euo pipefail
 cd "$(dirname "$0")"
 
