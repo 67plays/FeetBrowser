@@ -2,8 +2,7 @@
 
 Xlib is a C library, so ctypes is all it takes to drive it: open the display,
 declare the signatures, call the functions. No python-xlib, no PyGObject, no
-compiled shim -- the same rule ``cocoa.py`` and ``win32.py`` follow, and for
-the same reason.
+compiled shim -- the same rule ``cocoa.py`` follows, and for the same reason.
 
 What this adds to ``window.Window`` is the two things a headless window cannot
 have: real input (``poll_events``) and somewhere to put the pixels
