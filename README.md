@@ -33,22 +33,29 @@ run.cmd                  :: Windows: the same script for cmd.exe
 run.cmd https://example.com
 ```
 
-No GUI toolkit to install — the window is ours too. macOS gets one through
-AppKit, Linux one through Xlib, and Windows one through user32/gdi32, all by
-ctypes, so there is nothing to install for any of them, and X11 covers
-Wayland desktops through XWayland. What you do need is Python 3, a system
-font, and a Rust toolchain — on Windows a C++ linker as well, which rustup
-does not bring with it ([usage.md](docs/usage.md) has the one download and
-the one checkbox) — because the engine is a compiled extension and there is
-no Python fallback for it: `run.sh` and `run.cmd`
-build `feetbrowser_engine` into a local `.venv` when it isn't importable
-(installing `maturin` into the venv for you). Once the extension is built and
-installed for the interpreter you're invoking, `python3 -m feetbrowser <url>`
-works directly.
+No GUI toolkit to install — just Python 3 and a system font. The one thing
+that does get built is the engine: `run.sh` and `run.cmd` compile the Rust
+extension (`feetbrowser_engine`) into a local `.venv` when it isn't
+importable, so a first run needs the Rust toolchain (the script installs
+`maturin` into the venv for you). On Windows it needs a C++ linker as well,
+which rustup does not bring with it — [usage.md](docs/usage.md) has the one
+download and the one checkbox. Once the extension is built and installed
+for the interpreter you're invoking, `python3 -m feetbrowser <url>` works
+directly.
 
-Anywhere else, and anywhere with no display, the browser still renders:
-`--screenshot` writes the page to a PNG without opening anything, and the
-whole test suite runs headless.
+There is a second JavaScript engine, written from scratch in Zig and loaded
+with `ctypes` rather than built into a venv. `FEETBROWSER_JS=zig ./run.sh`
+selects it; `rust` is the default. Both pass the same test suite, and the
+design of the Zig one is in [docs/jszig.md](docs/jszig.md). That variable and
+every other one the browser reads are documented in
+[docs/usage.md](docs/usage.md#environment-variables).
+
+The window itself is ours too. macOS gets one through AppKit, Linux one
+through Xlib, and Windows one through user32/gdi32 — all by ctypes, so there
+is nothing to install for any of them, and X11 covers Wayland desktops
+through XWayland. Anywhere else, and anywhere with no display, the browser
+still renders: `--screenshot` writes the page to a PNG without opening
+anything.
 
 To render a page to a PNG without opening a window:
 
@@ -71,6 +78,7 @@ To render a page to a PNG without opening a window:
 - [Usage & shortcuts](docs/usage.md)
 - [Architecture — how the engine works](docs/architecture.md)
 - [The rendering engine — fonts, rasteriser, pixels](docs/rendering.md)
+- [The Zig JavaScript engine](docs/jszig.md)
 - [Extensions (Toes & ToeHub)](docs/toes.md)
 - [What it does and doesn't do](docs/limitations.md)
 - [Running the tests](docs/testing.md)

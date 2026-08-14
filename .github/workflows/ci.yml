@@ -51,6 +51,27 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
 
+      # The opt-in engine, selected by FEETBROWSER_JS=zig. A dynamic library
+      # the browser loads with ctypes, so this one build serves every
+      # interpreter in the matrix: nothing about it is tied to a Python
+      # version the way the Rust extension is. Its own Zig-side tests are a
+      # separate job, for the same reason the Rust ones are.
+      #
+      # Linux only, and not by choice: Zig 0.14 on the macOS runner image
+      # cannot find the SDK it needs to link against libSystem, and fails
+      # building its own build runner before it reaches any of our code. The
+      # macOS lines here still cover the Rust engine, which is what the
+      # window backend they exist for actually runs on.
+      - name: Set up Zig
+        if: runner.os == 'Linux'
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.14.0
+
+      - name: Build the Zig JS engine
+        if: runner.os == 'Linux'
+        run: cd zig && zig build
+
       - name: Lint (pyflakes)
         run: $PY -m pyflakes feetbrowser tests
 
@@ -77,8 +98,15 @@ jobs:
       - name: Unit tests
         run: $PY tests/test_units.py
 
-      - name: JS engine tests
-        run: $PY tests/test_js.py
+      # Both engines answer to the same contract, so both take the same suite
+      # -- wherever both are built. See the Zig build step above for why that
+      # is Linux for now.
+      - name: JS engine tests (zig)
+        if: runner.os == 'Linux'
+        run: FEETBROWSER_JS=zig $PY tests/test_js.py
+
+      - name: JS engine tests (rust)
+        run: FEETBROWSER_JS=rust $PY tests/test_js.py
 
       - name: Shoes tests
         run: $PY tests/test_shoes.py
@@ -204,6 +232,26 @@ jobs:
         env:
           RUSTFLAGS: -D warnings
         run: cargo check --manifest-path rust/Cargo.toml --all-targets
+
+  # The Zig engine's own tests: the VM, the parser and the regex engine, none
+  # of which ever cross into Python. The matrix above builds the library and
+  # runs the Python-side JS suite against it on every interpreter, but these
+  # cases would be the same eight times over, so like the Rust job they run
+  # once and hold up nothing else.
+  zig:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v1
+        with:
+          version: 0.14.0
+
+      - name: Zig engine tests
+        run: |
+          cd zig
+          zig build
+          zig build test
 
   # The Go port of the transport layer arrived with 421 lines of its own
   # tests and nothing that ran them: no job, no line in test.sh, no mention

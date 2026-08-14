@@ -3,6 +3,10 @@ __pycache__/
 *.pyo
 .venv/
 
+# build output of the Zig JS engine
+zig/.zig-cache/
+zig/zig-out/
+
 # local session helper
 session
 
