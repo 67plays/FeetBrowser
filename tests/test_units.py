@@ -1772,6 +1772,41 @@ def test_has_still_takes_a_relative_selector():
              "p:has(> img) { color: red }"), ["with"])
 
 
+def test_a_container_query_stays_off():
+    """A container query is written to be off most of the time -- it is the
+    wide-column variant, not the rule. Flattening it made the variant
+    unconditional, and being later in the sheet it won."""
+    html = '<div><p id=p>x</p></div>'
+    css = ("p { color: green }"
+           "@container (min-width: 900px) { p { color: red } }")
+    eq(_reds(html, css), [], "the wide variant did not apply")
+    dom = HTMLParser(html).parse()
+    style(dom, CSSParser(css).parse())
+    eq(dom.children[0].children[0].children[0].style["color"], "green",
+       "and the unconditional rule still holds")
+    # @supports and @layer are still flattened: a page that wraps its whole
+    # stylesheet in a layer has to keep working.
+    eq(_reds(html, "@layer base { p { color: red } }"), ["p"], "@layer")
+    eq(_reds(html, "@supports (display: grid) { p { color: red } }"),
+       ["p"], "@supports")
+
+
+def test_a_rectangle_has_a_border_unless_told_otherwise():
+    """Tk draws create_rectangle with a black 1px outline by default, and
+    plugin code written against Tk relies on it. Declining is explicit."""
+    from feetbrowser import canvas as canvasmod
+    def corner(**opts):
+        c = canvasmod.Canvas(None, width=8, height=8, bg="white")
+        c.create_rectangle(1, 1, 7, 7, fill="white", **opts)
+        surface = c.render()
+        i = 1 * surface.stride + 1 * 3
+        return tuple(surface.pixels[i:i + 3])
+    eq(corner(), (0, 0, 0), "the default border is black")
+    eq(corner(outline=""), (255, 255, 255), 'outline="" declines it')
+    eq(corner(width=0), (255, 255, 255), "width=0 declines it")
+    eq(corner(outline="#ff0000"), (255, 0, 0), "and a colour is honoured")
+
+
 def test_a_closed_details_shows_only_its_summary():
     """Dropdowns and "read more" panels are <details>; without the rule that
     hides a closed one, every page spills them into the text."""

@@ -781,7 +781,16 @@ class CSSParser:
                 rules.extend(inner.parse())
             else:
                 self._read_block()
-        elif keyword in ("@supports", "@layer", "@container", "@scope"):
+        elif keyword == "@container":
+            # A container query is the one grouping at-rule whose contents are
+            # written *expecting* to be off most of the time -- it is how a
+            # card says "and when my column is wide, stack me differently".
+            # Flattening it makes that variant unconditional, and being later
+            # in the sheet it wins over the plain rule it was meant to
+            # override. Until container sizes are tracked, off is the honest
+            # answer.
+            self._read_block()
+        elif keyword in ("@supports", "@layer", "@scope"):
             # Grouping at-rules whose condition we cannot evaluate, but whose
             # contents are ordinary rules. Including them naively is much
             # closer to right than dropping them: a modern site puts its

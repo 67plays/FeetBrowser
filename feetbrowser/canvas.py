@@ -628,8 +628,12 @@ class Canvas:
             fill = color(opts.get("fill"))
             if fill:
                 surface.fill_rect(x0, y0, x1, y1, fill, alpha)
-            outline = color(opts.get("outline"))
-            width = int(opts.get("width", 1 if outline else 0))
+            # Tk draws a rectangle with a black 1px border unless told
+            # otherwise, and a caller that says nothing is asking for that.
+            # Saying `outline=""` or `width=0` is how you decline it -- which
+            # is why the absent case has to be told apart from the empty one.
+            outline = color(opts["outline"]) if "outline" in opts else (0, 0, 0)
+            width = int(opts.get("width", 1))
             if outline and width:
                 surface.outline_rect(x0, y0, x1, y1, outline, width, alpha)
         elif kind == "line":
