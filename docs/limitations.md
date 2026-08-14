@@ -11,8 +11,54 @@ enable, and disable them without a restart — and restyle the whole browser
 with **Shoes** color themes (`about:shoes`, or `Ctrl+Shift+S`).
 
 **Doesn't (yet):** flexbox wrapping, `<textarea>`/`<select>` selection (beyond
-read-only), or the full ECMAScript feature set (no getters/setters, no
-generators, no ES modules, no `Proxy`). Shoes themes are preset solid-color
-palettes only — there's no custom color editor, and page colors aren't themed
-(only the browser chrome and the built-in pages). These are natural next
-milestones — the architecture has clean seams for each.
+read-only), or the full ECMAScript feature set (see below). Shoes themes are
+preset solid-color palettes only — there's no custom color editor, and page
+colors aren't themed (only the browser chrome and the built-in pages). These
+are natural next milestones — the architecture has clean seams for each.
+
+## The JavaScript engine
+
+There are two, and `FEETBROWSER_JS` picks between them: `zig` (the default)
+and `rust`. They share the same Python-facing API and the same test suite.
+What follows is what the Zig engine leaves out; its design is written up in
+`docs/jszig.md`.
+
+**Syntax it will not parse.** ES modules — `import`/`export` are reported as
+"ES modules are not supported" rather than as a mystery syntax error, so a
+page whose scripts are `type="module"` runs none of them. Also `with`,
+generators (`function*`, `yield`), class static blocks, and `new.target`.
+
+**Semantics that are missing rather than wrong.** No `Symbol`, and therefore
+no `Symbol.iterator` protocol: `for...of` and spread work on arrays, strings,
+`Map`, `Set` and `arguments` because the engine knows about those types, not
+because an object can declare itself iterable. No `Proxy` and no `Reflect`.
+No `eval`, and `new Function(body)` throws — the `Function` global exists so
+that `instanceof` and prototype lookups work, but compiling text that arrives
+as page data is a bigger security question than a browser at this stage
+should be answering. `String.raw` and
+tagged-template raw strings are cooked-only.
+
+**Close but not exact.** `Date` is UTC throughout, so `getHours()` and
+`getUTCHours()` agree and `getTimezoneOffset()` is always 0. Regular
+expressions are a backtracking matcher over bytes: case-insensitive matching
+folds ASCII only, and there are no lookbehind, named groups, or unicode
+property escapes. `Number.prototype.toFixed` rounds the double it is given
+rather than the decimal a reader imagines, which is what most engines do but
+not all of them. Sorting is stable.
+
+**The DOM is smaller than the language.** The bridge exposes elements,
+attributes, `classList`, inline styles, `querySelector`/`querySelectorAll`
+(tag, class and id selectors only — no combinators), `getElementsBy*`,
+`innerHTML`, `textContent`, node insertion and removal, events, timers,
+`fetch`, `XMLHttpRequest`, `location`, and `localStorage`. Text nodes have no
+wrapper, so `childNodes` and `firstChild` see elements only; there is no
+`getComputedStyle`, no `Element`/`Node` constructor objects to hang polyfills
+on, and no CSSOM. jQuery 1.8 loads and runs against this; Modernizr and
+anything that measures a laid-out box do not.
+
+**Cycles across the boundary are not collected.** The engine's collector is a
+precise mark-and-sweep over its own heap, and Python's is a reference count
+plus its own cycle detector. A JS object that reaches a Python object that
+reaches back is kept alive by both until the interpreter is dropped. Within
+one page load that is a bounded amount of memory; it is why the interpreter
+is discarded per navigation rather than reused.

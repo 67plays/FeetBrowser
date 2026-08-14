@@ -23,6 +23,19 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y fonts-dejavu-core fonts-liberation
 
+      - name: Set up Zig
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.14.0
+
+      # The default engine. A dynamic library the browser loads with ctypes,
+      # so nothing here is tied to the Python version above.
+      - name: Build the Zig JS engine
+        run: |
+          cd zig
+          zig build
+          zig build test
+
       - name: Build the Rust JS engine
         run: |
           python -m venv .venv
@@ -42,8 +55,12 @@ jobs:
       - name: Unit tests
         run: .venv/bin/python tests/test_units.py
 
-      - name: JS engine tests
-        run: .venv/bin/python tests/test_js.py
+      # Both engines answer to the same contract, so both take the same suite.
+      - name: JS engine tests (zig)
+        run: FEETBROWSER_JS=zig .venv/bin/python tests/test_js.py
+
+      - name: JS engine tests (rust)
+        run: FEETBROWSER_JS=rust .venv/bin/python tests/test_js.py
 
       - name: Shoes tests
         run: .venv/bin/python tests/test_shoes.py
