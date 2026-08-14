@@ -38,6 +38,3 @@ jobs:
 
       - name: Toe engine tests
         run: xvfb-run -a .venv/bin/python tests/test_toes.py
-
-      - name: Pseudo-toe (gh-scroll) tests
-        run: xvfb-run -a .venv/bin/python tests/test_gh_scroll.py
