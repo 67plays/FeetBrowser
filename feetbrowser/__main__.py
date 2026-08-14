@@ -31,8 +31,7 @@ def main():
     args = sys.argv[1:]
     if not args:
         from .browser import main as browser_main
-        browser_main()
-        return
+        sys.exit(browser_main() or 0)
     flag = args[0]
     if flag == "-h" or flag == "--help":
         print(USAGE)
@@ -76,7 +75,7 @@ def main():
         return
     # Anything else is a URL passed to the browser.
     from .browser import main as browser_main
-    browser_main()
+    sys.exit(browser_main() or 0)
 
 
 if __name__ == "__main__":

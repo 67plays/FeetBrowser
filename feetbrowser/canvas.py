@@ -403,6 +403,9 @@ class Canvas:
         self._next_id = 1
         self.surface = raster.Surface(self._width, self._height,
                                       self.background)
+        # Set by every mutation, cleared by render(). A platform window reads
+        # it to skip presenting a frame nothing changed in.
+        self.dirty = True
 
     # -- geometry ----------------------------------------------------------
 
@@ -424,6 +427,7 @@ class Canvas:
             return
         self._width, self._height = width, height
         self.surface = raster.Surface(width, height, self.background)
+        self.dirty = True
 
     def pack(self, **_ignored):
         # Geometry management is a single canvas filling its window, so
@@ -462,6 +466,7 @@ class Canvas:
         item = _Item(self._next_id, kind, coords, opts, tags)
         self._next_id += 1
         self._items.append(item)
+        self.dirty = True
         for tag in tags:
             self._by_tag.setdefault(tag, []).append(item)
         return item.id
@@ -506,6 +511,7 @@ class Canvas:
         return [item.id for item in self._resolve(tag)]
 
     def delete(self, *tags):
+        self.dirty = True
         for tag in tags:
             if tag == "all":
                 self._items = []
@@ -531,6 +537,7 @@ class Canvas:
     def itemconfig(self, tag, **opts):
         for item in self._resolve(tag):
             item.opts.update(opts)
+            self.dirty = True
 
     itemconfigure = itemconfig
 
@@ -540,6 +547,7 @@ class Canvas:
             return list(items[0].coords) if items else []
         for item in items:
             item.coords = tuple(values)
+            self.dirty = True
 
     def bbox(self, tag=None):
         items = self._items if tag in (None, "all") else self._resolve(tag)
@@ -605,6 +613,7 @@ class Canvas:
             self._paint(surface, item)
         if saved is not None:
             surface.reset_clip(saved)
+        self.dirty = False
         return surface
 
     def _paint(self, surface, item):

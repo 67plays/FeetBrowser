@@ -28,6 +28,10 @@ jobs:
       - name: Renderer tests
         run: python tests/test_render.py
 
+      # Skips itself off macOS; here to prove the skip stays clean.
+      - name: Platform window tests
+        run: python tests/test_cocoa.py
+
       - name: Unit tests
         run: python tests/test_units.py
 

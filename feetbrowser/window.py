@@ -238,11 +238,24 @@ class Window:
         self._running = False
 
     def pump(self):
-        """One iteration: deliver input, run timers, present a frame."""
+        """One iteration: deliver input, run timers, present a frame.
+
+        Child windows are serviced from here rather than running loops of
+        their own, because that is how a popup lived under Tk's single
+        mainloop -- and on platforms with one event queue per application it
+        is the only arrangement that works.
+        """
         wait = self.flush_timers()
-        if not self.poll_events():
+        busy = self.poll_events()
+        for child in list(self.children):
+            if child.winfo_exists():
+                busy = child.poll_events() or busy
+        if not busy:
             time.sleep(min(wait, 0.01) if wait is not None else 0.01)
         self.present()
+        for child in list(self.children):
+            if child.winfo_exists():
+                child.present()
 
     # -- hooks for platform subclasses ------------------------------------
 
@@ -278,6 +291,12 @@ class Window:
         import traceback
         print("FeetBrowser: error in %s handler: %r" % (where, exc))
         traceback.print_exc()
+
+
+    # Set by platform subclasses to the matching Toplevel class, so a popup
+    # opened from a real window is real and one opened from a headless root
+    # stays headless. See gui.Toplevel.
+    toplevel_class = None
 
 
 class Tk(Window):

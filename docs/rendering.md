@@ -146,6 +146,41 @@ Platform windows subclass it and add two things: a source of real input
 (`poll_events()`) and somewhere to push the surface (`present()`). Everything
 above only ever sees the Tk-shaped API, so adding a platform is additive.
 
+## cocoa.py — a real window, still with no toolkit
+
+Objective-C is a C library with a message dispatcher, so ctypes is enough to
+drive AppKit: `objc_getClass`, `sel_registerName`, `objc_msgSend`. No PyObjC,
+no compiled shim. Two details are not optional. Every call needs its signature
+declared, because ctypes defaults a return type to `c_int` and silently
+truncates a 64-bit pointer to a wild one — that shipped once, as a segfault on
+the first frame. And a struct larger than 16 bytes comes back through
+`objc_msgSend_stret` on x86_64 but plain `objc_msgSend` on arm64, so `NSRect`
+returns pick the entry point by CPU.
+
+Presenting costs no conversion: our RGB framebuffer is already a valid 24-bit
+bitmap, so it goes straight into `CGImageCreate` through a data provider and
+on to an `NSImageView`. The last couple of frames stay referenced because
+AppKit draws asynchronously, and a frame whose canvas is not dirty is not
+uploaded at all.
+
+Input is the mirror image of that: Cocoa event types and virtual key codes
+become `<Button-1>`, `<Control-l>`, `<MouseWheel>`. Two pieces of Tk behaviour
+are reproduced deliberately, because the browser depends on both. A binding
+fires when its modifiers are a *subset* of the ones held, which is what lets
+`<Control-ISO_Left_Tab>` catch Control-Shift-Tab; and only the most specific
+binding fires, so a window that bound `<Up>` and `<Key>` sees one keypress
+once. Command maps to Tk's Control, because that is where a Mac user's muscle
+memory puts it.
+
+There is one event queue per *application*, not per window, so a module-level
+registry maps each `NSWindow` back to its Python window and the root's loop
+feeds any popups. `[NSApp sendEvent:]` runs before translation — without it the
+close button, titlebar drag and live resize do not work.
+
+`gui.py` picks all of this up: `gui.Tk()` is always the headless root, so tests
+and `--screenshot` never open anything, and only `gui.new_window()` asks for a
+real one. `FEETBROWSER_DISPLAY=none` forces headless even on macOS.
+
 ## Testing it
 
 `tests/test_render.py` covers the layers directly and offline: font metrics and

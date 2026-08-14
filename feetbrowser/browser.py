@@ -1380,7 +1380,7 @@ class ContextMenu:
 
 
 class Browser:
-    def __init__(self):
+    def __init__(self, window=None):
         self.tabs = []
         self.active_tab = None
         self.focus = None  # "address" or None
@@ -1408,7 +1408,9 @@ class Browser:
             for btn in (ctx.call("buttons") or []):
                 self.toe_handlers[btn.id] = ctx
 
-        self.window = gui.Tk()
+        # A headless root by default, so tests and --screenshot never open
+        # anything; main() passes a real one from gui.new_window().
+        self.window = window if window is not None else gui.Tk()
         self.window.title("FeetBrowser")
         self.window.geometry(f"{WIDTH}x{HEIGHT}")
         self.window.minsize(480, 320)
@@ -3249,10 +3251,16 @@ def main():
         screenshot(url, out)
         print("wrote %s" % out)
         return
-    browser = Browser()
+    if not gui.has_display():
+        print("FeetBrowser: no window available on this platform; "
+              "use --screenshot <url> [out.png] to render to a file.",
+              file=sys.stderr)
+        return 1
+    browser = Browser(gui.new_window())
     start = args[0] if args else "about:blank"
     browser.new_tab(start)
     browser.run()
+    return 0
 
 
 if __name__ == "__main__":
