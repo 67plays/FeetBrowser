@@ -35,6 +35,14 @@ findstr /i /c:"include-system-site-packages = false" ".venv\pyvenv.cfg" >nul 2>&
 if not errorlevel 1 python -m venv --system-site-packages .venv
 set PY=.venv\Scripts\python.exe
 
+rem Every suite below runs behind a deadline. Several of them start HTTP
+rem servers, open real windows or reach the network, and any of those can
+rem stop forever rather than fail -- at which point the run says nothing at
+rem all, which is exactly the report that is impossible to act on. The
+rem watchdog turns a hang into every thread's stack and a non-zero exit.
+rem See tests\watchdog.py; FEETBROWSER_TEST_TIMEOUT overrides the number.
+set RUN=%PY% tests\watchdog.py 900
+
 rem Ensure the Rust JS engine (feetbrowser_engine) is built in the local venv.
 "%PY%" -c "import feetbrowser_engine" >nul 2>&1
 if not errorlevel 1 goto built
@@ -52,29 +60,29 @@ if errorlevel 1 (
 
 "%PY%" -m pyflakes feetbrowser tests || exit /b 1
 rem Every suite below, and nothing missing.
-"%PY%" tests\test_suites.py || exit /b 1
-"%PY%" tests\test_render.py || exit /b 1
+%RUN% tests\test_suites.py || exit /b 1
+%RUN% tests\test_render.py || exit /b 1
 rem test_win32.py opens real windows here; the other two skip, and it is the
 rem one that skips everywhere else.
-"%PY%" tests\test_cocoa.py || exit /b 1
-"%PY%" tests\test_x11.py || exit /b 1
-"%PY%" tests\test_win32.py || exit /b 1
-"%PY%" tests\test_units.py || exit /b 1
+%RUN% tests\test_cocoa.py || exit /b 1
+%RUN% tests\test_x11.py || exit /b 1
+%RUN% tests\test_win32.py || exit /b 1
+%RUN% tests\test_units.py || exit /b 1
 rem test.sh runs this suite twice, once per JavaScript engine. Here it runs
 rem once: the Zig engine has never been built on Windows by anything in this
 rem repository, and a line that builds it for the first time inside a test
 rem script is not the way to find out whether it can be.
 set FEETBROWSER_JS=rust
-"%PY%" tests\test_js.py || exit /b 1
+%RUN% tests\test_js.py || exit /b 1
 set FEETBROWSER_JS=
-"%PY%" tests\test_shoes.py || exit /b 1
+%RUN% tests\test_shoes.py || exit /b 1
 rem A fixture page in, its pixels back out.
-"%PY%" tests\test_e2e.py || exit /b 1
-"%PY%" tests\test_nav.py || exit /b 1
-"%PY%" tests\test_toes.py || exit /b 1
+%RUN% tests\test_e2e.py || exit /b 1
+%RUN% tests\test_nav.py || exit /b 1
+%RUN% tests\test_toes.py || exit /b 1
 rem No assembler here, so this checks the pure-Python fallback.
-"%PY%" tests\test_asmblend.py || exit /b 1
-"%PY%" tests\smoke.py || exit /b 1
+%RUN% tests\test_asmblend.py || exit /b 1
+%RUN% tests\smoke.py || exit /b 1
 
 rem The Go port of the transport layer (net/) is a separate toolchain, so it is
 rem run where one is installed and skipped where there is not, the same way the

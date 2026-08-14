@@ -51,9 +51,22 @@ test says which. It exists because `<img>` once stopped drawing anything at
 all, on every page, and the suite had nothing that could tell.
 
 `test_suites.py` is the reason a new file in `tests/` cannot be forgotten.
-`test.sh` and the workflow both name their suites one at a time — one so the
-order and the comments are readable, the other so a red job says which suite
-went red — and this fails if a file in `tests/` is missing from either.
+`test.sh`, `test.cmd` and the workflow all name their suites one at a time —
+the first two so the order and the comments are readable, the third so a red
+job says which suite went red — and this fails if a file in `tests/` is
+missing from any of them.
+
+`test.sh` and `test.cmd` run each suite through `tests/watchdog.py`, which
+gives it a deadline. Several suites start HTTP servers, open real windows or
+reach the network, and any of those can stop forever rather than fail; a run
+that hangs reports nothing, and interrupting it prints a traceback from
+wherever the interrupt landed rather than from whatever was stuck. The
+watchdog arms `faulthandler`'s timer instead, so passing the deadline dumps
+every thread's stack — naming the line that hung — and exits non-zero. It is
+a timer thread rather than `signal.alarm`, which is what makes it work on
+Windows too. `FEETBROWSER_TEST_TIMEOUT` overrides the 900 seconds, and `0`
+turns the deadline off for stepping through a suite in a debugger. CI invokes
+the suites directly and so runs without it, relying on the job timeout.
 
 The transport layer also has a Go port under `net/`, with its own tests.
 `test.sh` runs `go vet ./... && go test ./...` where a Go toolchain is
