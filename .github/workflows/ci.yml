@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Tk and pyflakes
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-tk
+          python -m pip install pyflakes
+
+      - name: Lint (pyflakes)
+        run: python -m pyflakes feetbrowser tests
+
+      - name: Unit tests
+        run: python tests/test_units.py
+
+      - name: JS engine tests
+        run: python tests/test_js.py
+
+      - name: Toe engine tests
+        run: python tests/test_toes.py
