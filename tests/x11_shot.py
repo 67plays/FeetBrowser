@@ -68,23 +68,30 @@ def capture(window):
     offsets, so this produces a correct PNG at any TrueColor depth -- and so
     a picture that comes out wrong is evidence about the backend rather than
     about the two of them agreeing on the same mistake.
+
+    The decoded rows are assembled as RGBA here and handed to the surface in
+    one `blit_rgba`, because a Surface's framebuffer belongs to Rust and
+    `pixels` is a read-only view of it: writing a photograph in is a drawing
+    operation like any other, and every alpha byte is 255 so the blit is a
+    strided copy.
     """
     raw, line = helpers.grab(window)
     fmt = x11._state["format"]
     size = fmt.bits_per_pixel // 8
     order = "little" if fmt.byte_order == x11.LSB_FIRST else "big"
     masks = (fmt.red_mask, fmt.green_mask, fmt.blue_mask)
-    shot = raster.Surface(window.width, window.height)
-    out = shot.pixels
+    rgba = bytearray(b"\xff" * (window.width * window.height * 4))
+    dst = 0
     for y in range(window.height):
         at = y * line
-        dst = y * shot.stride
         for _ in range(window.width):
             value = int.from_bytes(raw[at:at + size], order)
             for channel, mask in enumerate(masks):
-                out[dst + channel] = helpers._channel(value, mask)
+                rgba[dst + channel] = helpers._channel(value, mask)
             at += size
-            dst += 3
+            dst += 4
+    shot = raster.Surface(window.width, window.height)
+    shot.blit_rgba(rgba, window.width, window.height, 0, 0, opaque=True)
     return shot
 
 
