@@ -1,8 +1,8 @@
 # Architecture
 
 FeetBrowser is a **functional web browser written from scratch** — the engine
-(JS interpreter, DOM bridge, and the inner loops of the renderer) is a native
-Rust extension, and the rest is pure Python. It does not wrap Chromium,
+(JS interpreter, DOM bridge, the CSS cascade, and the inner loops of the
+renderer) is a native Rust extension, and the rest is pure Python. It does not wrap Chromium,
 WebKit, Gecko, or any HTTP library — it implements its own:
 
 - **Networking** — raw TCP sockets speaking HTTP/1.1, TLS for `https`,
@@ -16,7 +16,11 @@ WebKit, Gecko, or any HTTP library — it implements its own:
 - **CSS engine** — a parser for tag / class / id / descendant / grouped
   selectors (with pseudo-classes like `:hover` collapsed to their base
   selector), the cascade with specificity, inheritance, inline `style=""`,
-  `@media` unwrapping, and a default user-agent stylesheet (`ua.css`).
+  `@media` unwrapping, and a default user-agent stylesheet (`ua.css`). The
+  parser is Python; the cascade is Rust, because it is the one part that runs
+  once per node per candidate rule and a long article has thousands of both.
+  The selector objects the parser produces are plain Python data, and the
+  matcher compiles them on first use.
 - **Layout engine** — a block-and-inline flow layout with line breaking and
   word wrapping, font size / weight / style, colors, backgrounds, list
   bullets, and `<hr>`, plus **CSS floats** (with text wrapping and `clear`),
@@ -84,7 +88,7 @@ comparison.
 feetbrowser/
   net.py         URL parsing + HTTP/HTTPS/data/file transport + connection pool
   htmlparser.py  HTML tokenizer + DOM tree builder
-  cssparser.py   CSS parser, selectors, specificity, cascade
+  cssparser.py   CSS parser, selectors and specificity; the cascade is Rust
   jsengine.py    thin shim over the Rust `feetbrowser_engine` extension
   jsdom.py       thin shim over the Rust DOM bridge (dom_get/dom_set/dom_call)
   layout.py      block/inline layout -> display list, painting
@@ -107,6 +111,7 @@ rust/
   value.rs       JsValue model, scopes, coercion, JsCallback
   stdlib.rs      built-ins (Array/Object/Map/Set/Date/RegExp/Math/JSON/...)
   dom.rs         DOM bridge (document/element/style/classList/...)
+  css.rs         selector matching and the cascade walk
   pybind.rs      Python-facing classes (Interpreter, JsGlobals, PyJsValue)
   raster.rs      Surface, blitters, scanline rasteriser, text, PNG output
   font.rs        TrueType tables, cmap, metrics, outlines, flattening

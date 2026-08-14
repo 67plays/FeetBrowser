@@ -41,6 +41,15 @@ truncating towards zero rather than flooring, bytes borrowed rather than
 copied, and strings read as code points so a lone surrogate from a numeric
 character reference measures as zero width instead of raising.
 
+One thing above the scene graph is compiled for the same reason: the CSS
+cascade, in `rust/src/css.rs`. It is not a rendering layer, but it runs once
+per node per candidate rule, and on a long article that came to more time than
+everything on this page put together. The split is the same as elsewhere —
+`cssparser.py` still parses the stylesheet, and its selector objects are plain
+Python data that the matcher compiles on first use. The rules list is compiled
+once and cached against its identity, so a script that mutates the DOM
+re-cascades without re-reading the stylesheet.
+
 `window.py` sits beside all of it and supplies what Tk supplied besides
 drawing: a binding table using Tk's own sequence names, `after()` timers, and
 a main loop. `gui.py` is the seam — a facade that picks a backend, so the old
