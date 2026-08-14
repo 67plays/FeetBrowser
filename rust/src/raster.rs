@@ -14,7 +14,7 @@
 //! range-checked once per row rather than trusted.
 
 use crate::pyutil::{bytes_arg, rgb, to_int};
-use pyo3::exceptions::PyMemoryError;
+use pyo3::exceptions::{PyMemoryError, PyValueError};
 use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyMemoryView};
@@ -490,6 +490,176 @@ impl Surface {
             }
         }
     }
+}
+
+// -- outline rasterisation ------------------------------------------------
+
+/// Vertical subsamples per pixel row. Horizontal coverage is computed
+/// analytically, so four rows is enough to look smooth.
+const SUBSAMPLES: usize = 4;
+
+struct Edge {
+    y0: f64,
+    y1: f64,
+    x0: f64,
+    slope: f64,
+    wind: i64,
+}
+
+/// Scan-convert polygons into an 8-bit coverage bitmap.
+///
+/// Nonzero winding, matching TrueType. Coverage is sampled at SUBSAMPLES rows
+/// per pixel and computed analytically across each span, so edges get real
+/// anti-aliasing rather than a hard threshold.
+///
+/// This is the innermost loop of the whole renderer: every glyph that is not
+/// already in the cache comes through here, and so does every polygon a page
+/// draws. The structure is unchanged from the Python -- same sample
+/// positions, same accumulation in floating point, same truncation at the end
+/// -- because the coverage values it produces are what the anti-aliased edges
+/// of the browser's text are made of.
+#[pyfunction]
+#[pyo3(signature = (polys, width, height, offset_x = 0.0, offset_y = 0.0))]
+pub fn rasterize<'py>(
+    py: Python<'py>,
+    polys: &Bound<'py, PyAny>,
+    width: i64,
+    height: i64,
+    offset_x: f64,
+    offset_y: f64,
+) -> PyResult<Bound<'py, PyBytes>> {
+    let area = width.saturating_mul(height);
+    if area < 0 {
+        return Err(PyValueError::new_err("negative count"));
+    }
+    let size = usize::try_from(area)
+        .map_err(|_| PyMemoryError::new_err("coverage bitmap too large"))?;
+    let mut cov = vec![0u8; size];
+    if width <= 0 || height <= 0 {
+        return Ok(PyBytes::new(py, &cov));
+    }
+
+    let mut edges: Vec<Edge> = Vec::new();
+    for poly in polys.try_iter()? {
+        let points: Vec<(f64, f64)> = poly?.extract()?;
+        let n = points.len();
+        for i in 0..n {
+            let (mut x0, mut y0) = points[i];
+            let (mut x1, mut y1) = points[(i + 1) % n];
+            x0 += offset_x;
+            y0 += offset_y;
+            x1 += offset_x;
+            y1 += offset_y;
+            if y0 == y1 {
+                continue; // horizontal edges never cross a scanline
+            }
+            edges.push(Edge {
+                y0,
+                y1,
+                x0,
+                slope: (x1 - x0) / (y1 - y0),
+                wind: if y1 > y0 { 1 } else { -1 },
+            });
+        }
+    }
+    if edges.is_empty() {
+        return Ok(PyBytes::new(py, &cov));
+    }
+
+    let mut lo = f64::INFINITY;
+    let mut hi = f64::NEG_INFINITY;
+    for e in &edges {
+        lo = lo.min(e.y0.min(e.y1));
+        hi = hi.max(e.y0.max(e.y1));
+    }
+    // `int()` truncates towards zero, and an outline that starts above the
+    // bitmap has a negative top, so this is not the same as flooring.
+    let top = trunc_i64(lo).max(0);
+    let bottom = trunc_i64(hi).saturating_add(1).min(height);
+    let step = 1.0 / SUBSAMPLES as f64;
+    let unit = 255.0 / SUBSAMPLES as f64;
+    let w = width as usize;
+
+    let mut acc = vec![0.0f64; w];
+    let mut xs: Vec<(f64, i64)> = Vec::new();
+    for row in top..bottom {
+        acc.iter_mut().for_each(|v| *v = 0.0);
+        let mut hit = false;
+        for k in 0..SUBSAMPLES {
+            let sy = row as f64 + (k as f64 + 0.5) * step;
+            xs.clear();
+            for e in &edges {
+                if (e.y0 <= sy && sy < e.y1) || (e.y1 <= sy && sy < e.y0) {
+                    xs.push((e.x0 + (sy - e.y0) * e.slope, e.wind));
+                }
+            }
+            if xs.len() < 2 {
+                continue;
+            }
+            // Python sorted the (x, winding) pairs as tuples. total_cmp
+            // keeps that order and also gives NaN somewhere to go, which a
+            // page can produce with a degenerate polygon.
+            xs.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+            let mut winding: i64 = 0;
+            let mut span_start = 0.0f64;
+            for &(x, wind) in xs.iter() {
+                if winding == 0 {
+                    span_start = x;
+                }
+                winding += wind;
+                if winding == 0 && x > span_start {
+                    add_span(&mut acc, span_start, x, unit, w);
+                    hit = true;
+                }
+            }
+        }
+        if !hit {
+            continue;
+        }
+        let base = row as usize * w;
+        for (i, &v) in acc.iter().enumerate() {
+            if v > 0.0 {
+                cov[base + i] = if v >= 255.0 { 255 } else { v as u8 };
+            }
+        }
+    }
+    Ok(PyBytes::new(py, &cov))
+}
+
+/// Add one subsample row's coverage for the span [x0, x1).
+fn add_span(acc: &mut [f64], x0: f64, x1: f64, unit: f64, width: usize) {
+    if x1 <= 0.0 || x0 >= width as f64 {
+        return;
+    }
+    let x0 = x0.max(0.0);
+    let x1 = x1.min(width as f64);
+    let i0 = x0 as usize;
+    let i1 = x1 as usize;
+    if i0 == i1 {
+        if let Some(a) = acc.get_mut(i0) {
+            *a += (x1 - x0) * unit;
+        }
+        return;
+    }
+    if let Some(a) = acc.get_mut(i0) {
+        *a += (i0 as f64 + 1.0 - x0) * unit;
+    }
+    for a in acc.iter_mut().take(i1.min(width)).skip(i0 + 1) {
+        *a += unit;
+    }
+    if i1 < width {
+        if let Some(a) = acc.get_mut(i1) {
+            *a += (x1 - i1 as f64) * unit;
+        }
+    }
+}
+
+/// Python's `int()` on a float: truncate towards zero, saturating.
+fn trunc_i64(v: f64) -> i64 {
+    if v.is_nan() {
+        return 0;
+    }
+    v.trunc().clamp(i64::MIN as f64, i64::MAX as f64) as i64
 }
 
 /// CRC-32 as PNG defines it, which is the same polynomial zlib uses.

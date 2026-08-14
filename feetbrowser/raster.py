@@ -17,7 +17,7 @@ rasterised once and cached per (face, size, glyph) -- drawing a character the
 second time is a blend of an existing bitmap, never a re-run of the scanline
 fill.
 """
-from feetbrowser_engine import Surface
+from feetbrowser_engine import Surface, rasterize
 
 from . import fontengine
 
@@ -30,87 +30,10 @@ __all__ = ["Surface", "SUBSAMPLES", "rasterize", "glyph_bitmap", "draw_text",
 
 
 # -- outline rasterisation ------------------------------------------------
-
-def rasterize(polys, width, height, offset_x=0.0, offset_y=0.0):
-    """Scan-convert polygons into an 8-bit coverage bitmap.
-
-    Nonzero winding, matching TrueType. Coverage is sampled at SUBSAMPLES
-    rows per pixel and computed analytically across each span, so edges get
-    real anti-aliasing rather than a hard threshold.
-    """
-    cov = bytearray(width * height)
-    if width <= 0 or height <= 0:
-        return cov
-
-    edges = []
-    for poly in polys:
-        n = len(poly)
-        for i in range(n):
-            x0, y0 = poly[i]
-            x1, y1 = poly[(i + 1) % n]
-            x0 += offset_x
-            y0 += offset_y
-            x1 += offset_x
-            y1 += offset_y
-            if y0 == y1:
-                continue  # horizontal edges never cross a scanline
-            edges.append((y0, y1, x0, (x1 - x0) / (y1 - y0),
-                          1 if y1 > y0 else -1))
-    if not edges:
-        return cov
-
-    top = max(0, int(min(min(e[0], e[1]) for e in edges)))
-    bottom = min(height, int(max(max(e[0], e[1]) for e in edges)) + 1)
-    step = 1.0 / SUBSAMPLES
-    unit = 255.0 / SUBSAMPLES
-
-    for py in range(top, bottom):
-        acc = [0.0] * width
-        hit = False
-        for k in range(SUBSAMPLES):
-            sy = py + (k + 0.5) * step
-            xs = []
-            for y0, y1, x0, slope, wind in edges:
-                if (y0 <= sy < y1) or (y1 <= sy < y0):
-                    xs.append((x0 + (sy - y0) * slope, wind))
-            if len(xs) < 2:
-                continue
-            xs.sort()
-            winding = 0
-            span_start = 0.0
-            for x, wind in xs:
-                if winding == 0:
-                    span_start = x
-                winding += wind
-                if winding == 0 and x > span_start:
-                    _add_span(acc, span_start, x, unit, width)
-                    hit = True
-        if not hit:
-            continue
-        base = py * width
-        for i, v in enumerate(acc):
-            if v > 0:
-                cov[base + i] = 255 if v >= 255 else int(v)
-    return cov
-
-
-def _add_span(acc, x0, x1, unit, width):
-    """Add one subsample row's coverage for the span [x0, x1)."""
-    if x1 <= 0 or x0 >= width:
-        return
-    x0 = max(x0, 0.0)
-    x1 = min(x1, float(width))
-    i0 = int(x0)
-    i1 = int(x1)
-    if i0 == i1:
-        acc[i0] += (x1 - x0) * unit
-        return
-    acc[i0] += (i0 + 1 - x0) * unit
-    for i in range(i0 + 1, i1):
-        acc[i] += unit
-    if i1 < width:
-        acc[i1] += (x1 - i1) * unit
-
+#
+# `rasterize` and its span accumulator are in Rust: they are the innermost
+# loop of the renderer, run once per uncached glyph and once per polygon a
+# page draws, and a 200x200 star went from 4.5ms to a tenth of that.
 
 # -- glyph cache ----------------------------------------------------------
 

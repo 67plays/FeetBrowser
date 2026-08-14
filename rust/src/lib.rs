@@ -39,5 +39,6 @@ fn feetbrowser_engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // -- rasteriser --
     m.add_class::<raster::Surface>()?;
+    m.add_function(wrap_pyfunction!(raster::rasterize, m)?)?;
     Ok(())
 }
