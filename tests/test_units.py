@@ -411,6 +411,31 @@ def test_table_cell_content_flows_at_column_width():
     assert tops["Delta"] == tops["Echo"], "second cell words share a line"
 
 
+def test_empty_inline_block_still_paints_its_box():
+    """A colour swatch is an empty span with a size and a background. It has
+    no text to lay out, which used to mean it was skipped entirely and the
+    about:shoes picker showed no colours at all."""
+    from feetbrowser.layout import DocumentLayout, DrawRect
+    html = ('<p>before <span style="background:#ff0000;display:inline-block;'
+            'width:26px;height:12px;"></span> after</p>')
+    dom = HTMLParser(html).parse()
+    style(dom, [])
+    doc = DocumentLayout(dom, 620)
+    doc.layout()
+    cmds = []
+    stack = [doc]
+    while stack:
+        b = stack.pop()
+        cmds.extend(b.paint())
+        stack.extend(b.children)
+    swatches = [c for c in cmds
+                if isinstance(c, DrawRect) and c.color == "#ff0000"]
+    eq(len(swatches), 1, "the swatch painted exactly once")
+    box = swatches[0]
+    eq(box.right - box.left, 26, "swatch keeps its declared width")
+    eq(box.bottom - box.top, 12, "swatch keeps its declared height")
+
+
 def test_pre_whitespace_does_not_wrap():
     from feetbrowser.layout import DocumentLayout, DrawText
     css = "pre { white-space: pre; }"

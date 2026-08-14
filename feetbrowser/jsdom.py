@@ -81,20 +81,30 @@ def _parse_selector(sel):
     return tag, classes, ids
 
 
+def _int_index(name):
+    try:
+        return int(name)
+    except (TypeError, ValueError):
+        return None
+
+
 class JSDocument:
     """Bridge for the document global: the root of the DOM."""
 
-    def __init__(self, root_node, base_url=None, mark_dirty=None):
+    def __init__(self, root_node, base_url=None, mark_dirty=None, interp=None):
         self.root = root_node
         self.base_url = base_url
         self.mark_dirty = mark_dirty
+        self._interp = interp
         # Shared mutable flag: JS mutations set it; the Tab checks it after
         # running scripts to decide whether a restyle+rerender is needed.
         self._flag = {"dirty": False}
         self._methods = {
             "getElementById": self._get_element_by_id,
             "querySelector": self._query_selector,
+            "querySelectorAll": self._query_selector_all,
             "getElementsByTagName": self._get_elements_by_tag_name,
+            "getElementsByClassName": self._get_elements_by_class_name,
             "createElement": self._create_element,
         }
 
@@ -103,12 +113,47 @@ class JSDocument:
             return self._methods[name]
         if name == "body":
             return self._find(lambda n: n.tag == "body")
+        if name == "head":
+            return self._find(lambda n: n.tag == "head")
         if name == "title":
             return self._get_title()
         if name == "documentElement":
             return JSElement(self.root, self._flag)
+        if name == "readyState":
+            return "complete"
         if name == "cookie":
             return ""
+        if name == "referrer":
+            return ""
+        if name == "domain":
+            return self._host() or ""
+        if name == "URL":
+            return str(self.base_url) if self.base_url else ""
+        if name == "location":
+            return self._location()
+        if name == "visibilityState":
+            return "visible"
+        if name == "hidden":
+            return False
+        if name == "characterSet":
+            return "UTF-8"
+        if name == "contentType":
+            return "text/html"
+        if name == "fonts":
+            return JSFontFaceSet(self._flag, self._interp)
+        if name == "defaultView":
+            return UNDEFINED
+        if name == "all":
+            return JSNodeList([JSElement(n, self._flag)
+                               for n in _iter_elements(self.root)])
+        if name == "scripts":
+            return JSNodeList([JSElement(n, self._flag)
+                               for n in _iter_elements(self.root)
+                               if n.tag == "script"])
+        if name == "images":
+            return JSNodeList([JSElement(n, self._flag)
+                               for n in _iter_elements(self.root)
+                               if n.tag == "img"])
         return UNDEFINED
 
     def js_set(self, name, value):
@@ -142,6 +187,60 @@ class JSDocument:
         tag = tag.lower()
         return JSNodeList([JSElement(n, self._flag)
                            for n in _iter_elements(self.root) if n.tag == tag])
+
+    def _get_elements_by_class_name(self, cls):
+        cls = str(cls)
+        return JSNodeList([JSElement(n, self._flag)
+                           for n in _iter_elements(self.root)
+                           if cls in set(n.attributes.get("class", "").split())])
+
+    def _query_selector_all(self, sel):
+        parsed = _parse_selector(sel)
+        if parsed is None:
+            return JSNodeList([])
+        tag, classes, ids = parsed
+        return JSNodeList([JSElement(n, self._flag)
+                           for n in _iter_elements(self.root)
+                           if isinstance(n, Element)
+                           and (not tag or n.tag == tag)
+                           and (not ids or n.attributes.get("id") in ids)
+                           and (not classes or classes.issubset(
+                               set(n.attributes.get("class", "").split())))])
+
+    def _host(self):
+        try:
+            from urllib.parse import urlparse
+            return urlparse(str(self.base_url)).hostname
+        except Exception:
+            return ""
+
+    def _location(self):
+        base = str(self.base_url) if self.base_url else ""
+        from urllib.parse import urlsplit
+        try:
+            parts = urlsplit(base)
+        except Exception:
+            parts = None
+        if parts is None or not parts.scheme:
+            return {"href": base, "hostname": "", "protocol": "",
+                    "pathname": "", "search": "", "hash": "",
+                    "host": "", "origin": "", "port": "",
+                    "reload": lambda: None, "assign": lambda u=None: None,
+                    "replace": lambda u=None: None}
+        return {
+            "href": base,
+            "hostname": parts.hostname or "",
+            "protocol": parts.scheme + ":",
+            "pathname": parts.path,
+            "search": "?" + parts.query if parts.query else "",
+            "hash": "",
+            "host": parts.netloc,
+            "origin": f"{parts.scheme}://{parts.netloc}",
+            "port": str(parts.port or ""),
+            "reload": lambda: None,
+            "assign": lambda u=None: None,
+            "replace": lambda u=None: None,
+        }
 
     def _create_element(self, tag):
         return JSElement(Element(tag, {}, None), self._flag)
@@ -181,9 +280,14 @@ class JSElement:
         self._methods = {
             "setAttribute": self._set_attribute,
             "getAttribute": self._get_attribute,
+            "removeAttribute": self._remove_attribute,
+            "hasAttribute": self._has_attribute,
             "appendChild": self._append_child,
             "removeChild": self._remove_child,
             "addEventListener": self._add_event_listener,
+            "querySelector": self._query_selector,
+            "querySelectorAll": self._query_selector_all,
+            "getElementsByClassName": self._get_elements_by_class_name,
         }
 
     def js_get(self, name):
@@ -203,6 +307,10 @@ class JSElement:
                                if isinstance(c, Element)])
         if name == "parentNode":
             return JSElement(self.node.parent, self._flag) if self.node.parent else UNDEFINED
+        if name == "classList":
+            return JSClassList(self.node, self._flag)
+        if name == "dataset":
+            return self._dataset()
         if name == "id":
             return self.node.attributes.get("id", "")
         if name == "className":
@@ -229,6 +337,67 @@ class JSElement:
 
     def _get_attribute(self, name):
         return self.node.attributes.get(str(name))
+
+    def _remove_attribute(self, name):
+        self.node.attributes.pop(str(name), None)
+        self._flag["dirty"] = True
+        return UNDEFINED
+
+    def _has_attribute(self, name):
+        return str(name) in self.node.attributes
+
+    def _query_selector(self, sel):
+        parsed = _parse_selector(sel)
+        if parsed is None:
+            return UNDEFINED
+        tag, classes, ids = parsed
+        for n in _iter_elements(self.node):
+            if n is self.node:
+                continue
+            if tag and n.tag != tag:
+                continue
+            if ids and n.attributes.get("id") not in ids:
+                continue
+            if classes and not classes.issubset(
+                    set(n.attributes.get("class", "").split())):
+                continue
+            return JSElement(n, self._flag)
+        return UNDEFINED
+
+    def _query_selector_all(self, sel):
+        parsed = _parse_selector(sel)
+        if parsed is None:
+            return JSNodeList([])
+        tag, classes, ids = parsed
+        out = []
+        for n in _iter_elements(self.node):
+            if n is self.node:
+                continue
+            if tag and n.tag != tag:
+                continue
+            if ids and n.attributes.get("id") not in ids:
+                continue
+            if classes and not classes.issubset(
+                    set(n.attributes.get("class", "").split())):
+                continue
+            out.append(JSElement(n, self._flag))
+        return JSNodeList(out)
+
+    def _get_elements_by_class_name(self, cls):
+        cls = str(cls)
+        return JSNodeList([JSElement(n, self._flag)
+                           for n in _iter_elements(self.node)
+                           if n is not self.node and cls in
+                           set(n.attributes.get("class", "").split())])
+
+    def _dataset(self):
+        data = {}
+        for k, v in self.node.attributes.items():
+            if k.startswith("data-"):
+                key = k[5:]
+                parts = key.split("-")
+                data[parts[0] + "".join(p.title() for p in parts[1:])] = v
+        return data
 
     def _append_child(self, child):
         if not isinstance(child, JSElement):
@@ -291,6 +460,84 @@ class JSNodeList:
             return UNDEFINED
         if name == "length":
             return len(self._items)
+        return UNDEFINED
+
+
+class JSClassList:
+    """Bridge for element.classList."""
+
+    def __init__(self, node, _flag=None):
+        self.node = node
+        self._flag = _flag or {"dirty": False}
+
+    def _classes(self):
+        return set(self.node.attributes.get("class", "").split())
+
+    def _save(self, classes):
+        self.node.attributes["class"] = " ".join(sorted(classes))
+        self._flag["dirty"] = True
+
+    def js_get(self, name):
+        if name == "length":
+            return len(self._classes())
+        if name == "add":
+            return self._add
+        if name == "remove":
+            return self._remove
+        if name == "contains":
+            return lambda cls: str(cls) in self._classes()
+        if name == "toggle":
+            return self._toggle
+        index = _int_index(name)
+        if index is not None:
+            items = sorted(self._classes())
+            if 0 <= index < len(items):
+                return items[index]
+        return UNDEFINED
+
+    def _add(self, *classes):
+        cs = self._classes()
+        cs.update(str(c) for c in classes)
+        self._save(cs)
+        return UNDEFINED
+
+    def _remove(self, *classes):
+        cs = self._classes()
+        cs.difference_update(str(c) for c in classes)
+        self._save(cs)
+        return UNDEFINED
+
+    def _toggle(self, cls, force=UNDEFINED):
+        cs = self._classes()
+        name = str(cls)
+        if force is True or (force is UNDEFINED and name not in cs):
+            cs.add(name)
+            self._save(cs)
+            return True
+        cs.discard(name)
+        self._save(cs)
+        return False
+
+
+class JSFontFaceSet:
+    """Minimal document.fonts: load/check/add/forEach/ready."""
+
+    def __init__(self, _flag=None, interp=None):
+        self._flag = _flag or {"dirty": False}
+        self._faces = []
+        self._interp = interp
+
+    def js_get(self, name):
+        if name == "add":
+            return lambda f: self._faces.append(f)
+        if name == "load":
+            return lambda *args: UNDEFINED
+        if name == "check":
+            return lambda *args: True
+        if name == "forEach":
+            return lambda cb: None
+        if name == "ready":
+            return self._interp.create_promise() if self._interp else UNDEFINED
         return UNDEFINED
 
 

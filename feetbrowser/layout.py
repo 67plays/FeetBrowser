@@ -2223,7 +2223,7 @@ class BlockLayout(LayoutBox):
     def _inline_pill(self, node, bg, pl, pr, pt, pb):
         """Paint a display:inline-block element (background + padding) as a
         single rounded-ish box with its text laid out inside, e.g. a button
-        link. Falls back to normal inline flow if text is empty."""
+        link. Falls back to normal inline flow if there is nothing to draw."""
         parts = []
         for child in node.children:
             if isinstance(child, Text):
@@ -2232,14 +2232,20 @@ class BlockLayout(LayoutBox):
                 parts.append("".join(
                     c.text for c in child.children if isinstance(c, Text)))
         label = "".join(parts).strip()
-        if not label:
+        # An empty inline-block sized by width/height is a colour swatch, a
+        # rule, a bar in a chart -- no text to lay out, but very much
+        # something to paint. Only a box with neither text nor a size has
+        # nothing to say.
+        width = parse_px(node.style.get("width", ""))
+        height = parse_px(node.style.get("height", ""))
+        if not label and not (width or height):
             return
         font = _node_font(node)
         color = resolve_color(node.style.get("color", "black")) or "black"
-        w = _measure(font, label)
+        w = max(_measure(font, label) if label else 0.0, width)
         total_w = self._fit_control(w + pl + pr, min_w=w)
         lh = parse_px(node.style.get("line-height", "0"))
-        h = max(_linespace(font), lh if lh else 0) + pt + pb
+        h = max(height, _linespace(font) if label else 0.0, lh) + pt + pb
         self.line.append(_LineItem("pill", self.cursor_x, label, font, color,
                                    node, total_w, h, bg=bg, pl=pl, pr=pr,
                                    pt=pt, pb=pb))

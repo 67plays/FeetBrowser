@@ -33,6 +33,7 @@ import json
 import math
 import random
 import re
+import time
 from collections import deque
 from dataclasses import dataclass, field
 
@@ -380,6 +381,14 @@ class Spread:
 
 
 @dataclass
+class Pattern:
+    kind: str            # "array" or "object"
+    parts: list = field(default_factory=list)
+    rest: object = None  # rest target (str or Pattern) or None
+    # For "object" parts: (key, target, default); for "array": (target, default)
+
+
+@dataclass
 class TemplateLiteral:
     quasis: list = field(default_factory=list)
     exprs: list = field(default_factory=list)
@@ -475,6 +484,18 @@ class If:
 class While:
     cond: object
     body: object
+
+
+@dataclass
+class DoWhile:
+    body: object
+    cond: object
+
+
+@dataclass
+class Switch:
+    expr: object
+    cases: list = field(default_factory=list)  # [("case"|"default", test, stmts)]
 
 
 @dataclass
@@ -1263,6 +1284,14 @@ class _ObjectGlobal:
             return lambda o: o
         if name == "hasOwnProperty":
             return lambda o, k: isinstance(o, dict) and str(k) in o
+        if name == "prototype":
+            proto = {
+                "hasOwnProperty":
+                    lambda obj, key: isinstance(obj, dict) and key in obj,
+                "toString": lambda obj: self.interp.repr(obj),
+                "valueOf": lambda obj: obj,
+            }
+            return proto
         return UNDEFINED
 
 
@@ -1449,7 +1478,7 @@ class _DateCtor:
 
     def js_get(self, name):
         if name == "now":
-            return lambda: self.interp._now * 1000.0
+            return lambda: time.time() * 1000.0
         if name == "parse":
             return lambda s: self._parse_ms(self.interp.repr(s))
         if name == "UTC":
@@ -1684,7 +1713,7 @@ _KEYWORDS = {
     "for", "break", "continue", "true", "false", "null", "undefined",
     "typeof", "throw", "try", "catch", "finally", "new", "this", "await",
     "class", "extends", "super", "static", "in", "instanceof", "delete",
-    "void", "of",
+    "void", "of", "switch", "case", "default", "do",
 }
 
 # Longest match first, so the tokenizer greedily groups '===', '!=', etc.
@@ -2128,14 +2157,95 @@ class _Parser:
     def _declaration_list(self):
         decls = []
         while True:
-            name = self._expect_ident()
+            target = self._declaration_target()
             value = None
             if self._match_punct("="):
                 value = self._expression()
-            decls.append((name, value))
+            decls.append((target, value))
             if self._match_punct(",") is None:
                 break
         return decls
+
+    def _declaration_target(self):
+        """A var/let/const target: a plain name or a destructuring pattern."""
+        kind, value, _ = self._peek()
+        if kind == "ident":
+            self.pos += 1
+            return value
+        if kind == "punct" and value in ("[", "{"):
+            return self._pattern()
+        self._syntax("expected identifier")
+
+    def _pattern(self):
+        """Parse a destructuring pattern: [a, ...rest] or { k: a, ... }."""
+        kind, value, _ = self._peek()
+        if kind == "punct" and value == "[":
+            self.pos += 1
+            parts = []
+            rest = None
+            while True:
+                if self._match_punct("]"):
+                    break
+                if self._match_punct(","):
+                    continue
+                if self._match_punct("..."):
+                    rest = self._pattern_target()
+                    self._match_punct(",")
+                    self._expect_punct("]")
+                    break
+                target = self._pattern_target()
+                default = None
+                if self._match_punct("="):
+                    default = self._assign()
+                parts.append((target, default))
+                if self._match_punct(",") is None:
+                    self._expect_punct("]")
+                    break
+            return Pattern("array", parts, rest)
+        self._expect_punct("{")
+        parts = []
+        rest = None
+        while True:
+            if self._match_punct("}"):
+                break
+            if self._match_punct(","):
+                continue
+            if self._match_punct("..."):
+                rest = self._pattern_target()
+                self._match_punct(",")
+                self._expect_punct("}")
+                break
+            kt, kv, _ = self._peek()
+            if kt in ("ident", "string", "kw"):
+                self.pos += 1
+                key = kv
+            else:
+                self._syntax("expected property name")
+            target = None
+            default = None
+            if self._match_punct(":"):
+                target = self._pattern_target()
+            else:
+                if kt != "ident":
+                    self._syntax("expected ':' in destructuring")
+                target = key
+            if self._match_punct("="):
+                default = self._assign()
+            parts.append((key, target, default))
+            if self._match_punct(",") is None:
+                self._expect_punct("}")
+                break
+        return Pattern("object", parts, rest)
+
+    def _pattern_target(self):
+        """A single target inside a pattern: name or nested pattern."""
+        kind, value, _ = self._peek()
+        if kind == "ident":
+            self.pos += 1
+            return value
+        if kind == "punct" and value in ("[", "{"):
+            return self._pattern()
+        self._syntax("expected identifier in destructuring")
 
     def _function_declaration(self, async_):
         name = self._expect_ident()
@@ -2235,6 +2345,54 @@ class _Parser:
     def _while_statement(self):
         cond, body = self._cond_body()
         return While(cond, body)
+
+    def _do_while_statement(self):
+        body = self._statement()
+        self._match_punct(";")  # ASI: `do stmt; while(...)`
+        self._match_kw("while")
+        self._expect_punct("(")
+        cond = self._expression()
+        self._expect_punct(")")
+        self._match_punct(";")
+        return DoWhile(body, cond)
+
+    def _switch_statement(self):
+        self._expect_punct("(")
+        expr = self._expression()
+        self._expect_punct(")")
+        self._expect_punct("{")
+        cases = []
+        while True:
+            kind, value, _ = self._peek()
+            if kind is None:
+                self._syntax("expected '}'")
+            if self._match_punct("}"):
+                break
+            if self._match_kw("case"):
+                test = self._expression()
+                self._expect_punct(":")
+                cases.append(("case", test, self._case_body()))
+            elif self._match_kw("default"):
+                self._expect_punct(":")
+                cases.append(("default", None, self._case_body()))
+            else:
+                self._syntax("expected 'case' or 'default'")
+        return Switch(expr, cases)
+
+    def _case_body(self):
+        stmts = []
+        while True:
+            kind, value, _ = self._peek()
+            if kind is None:
+                self._syntax("expected '}'")
+            if kind == "punct" and value == "}":
+                break
+            if kind == "kw" and value in ("case", "default"):
+                break
+            if self._match_punct(";"):
+                continue
+            stmts.append(self._statement())
+        return stmts
 
     def _cond_body(self):
         """Parse `(expression)` then a statement body."""
@@ -2630,8 +2788,12 @@ class _Parser:
             key = value
         else:
             self._syntax("expected property name")
-        self._expect_punct(":")
-        return key, self._expression()
+        if self._match_punct(":"):
+            return key, self._expression()
+        # Property shorthand: { name } === { name: name }.
+        if kind == "ident":
+            return key, Identifier(key)
+        self._syntax("expected ':' after property name")
 
 
 _Parser._STMT = {
@@ -2643,6 +2805,8 @@ _Parser._STMT = {
     "return": lambda s: s._return_statement(),
     "if": lambda s: s._if_statement(),
     "while": lambda s: s._while_statement(),
+    "do": lambda s: s._do_while_statement(),
+    "switch": lambda s: s._switch_statement(),
     "for": lambda s: s._for_statement(),
     "break": lambda s: Break(),
     "continue": lambda s: Continue(),
@@ -2845,6 +3009,38 @@ class Interpreter:
                 return obj.name
             if name == "prototype":
                 return obj.prototype_obj()
+            if name == "call":
+                return lambda this_arg=UNDEFINED, *args: \
+                    self._call_value(obj, list(args), this_arg)
+            if name == "apply":
+                def apply(this_arg=UNDEFINED, args=None):
+                    arg_list = list(args) if isinstance(args, list) else []
+                    return self._call_value(obj, arg_list, this_arg)
+                return apply
+            if name == "bind":
+                def bind(this_arg=UNDEFINED, *pre):
+                    def bound(*args):
+                        return self._call_value(
+                            obj, list(pre) + list(args), this_arg)
+                    return bound
+                return bind
+            return UNDEFINED
+        if callable(obj):
+            if name == "call":
+                return lambda this_arg=UNDEFINED, *args: \
+                    self._call_value(obj, [this_arg, *args])
+            if name == "apply":
+                def apply(this_arg=UNDEFINED, args=None):
+                    arg_list = list(args) if isinstance(args, list) else []
+                    return self._call_value(obj, [this_arg, *arg_list])
+                return apply
+            if name == "bind":
+                def bind(this_arg=UNDEFINED, *pre):
+                    def bound(*args):
+                        return self._call_value(
+                            obj, [this_arg, *pre, *args])
+                    return bound
+                return bind
             return UNDEFINED
         return self._member_tail(obj, name)
 
@@ -3986,13 +4182,17 @@ class Interpreter:
         elif isinstance(node, VarDecl):
             setter = {"var": env.set_var, "let": env.set_let,
                       "const": env.set_const}[node.kind]
-            for name, expr in node.decls:
+            for target, expr in node.decls:
                 if node.kind == "const" and expr is None:
                     raise JSException(
-                        f"Missing initializer in const declaration '{name}'.")
+                        f"Missing initializer in const declaration "
+                        f"'{self._target_name(target)}'.")
                 value = UNDEFINED if expr is None \
                     else (yield from self._eval(expr, env))
-                setter(name, value)
+                if isinstance(target, Pattern):
+                    yield from self._bind_pattern(target, value, env, setter)
+                else:
+                    setter(target, value)
         elif isinstance(node, ClassDecl):
             cls = yield from self._eval_class(node, env)
             env.set_var(node.name, cls)
@@ -4013,6 +4213,18 @@ class Interpreter:
                     break
                 except _Continue:
                     continue
+        elif isinstance(node, DoWhile):
+            while True:
+                try:
+                    yield from self._exec(node.body, env)
+                except _Break:
+                    break
+                except _Continue:
+                    pass
+                if not self._truthy((yield from self._eval(node.cond, env))):
+                    break
+        elif isinstance(node, Switch):
+            yield from self._exec_switch(node, env)
         elif isinstance(node, For):
             yield from self._exec_for(node, env)
         elif isinstance(node, ForIn):
@@ -4048,6 +4260,85 @@ class Interpreter:
                 pass
             if node.update is not None:
                 yield from self._eval(node.update, child)
+
+    def _exec_switch(self, node, env):
+        value = yield from self._eval(node.expr, env)
+        start = None
+        default = None
+        for i, (kind, test, _) in enumerate(node.cases):
+            if kind == "default":
+                default = i
+                continue
+            if _strict_eq(value, (yield from self._eval(test, env))):
+                start = i
+                break
+        if start is None:
+            start = default
+        if start is None:
+            return
+        for kind, _, stmts in node.cases[start:]:
+            try:
+                for stmt in stmts:
+                    yield from self._exec(stmt, env)
+            except _Break:
+                break
+            except _Continue:
+                raise
+
+    def _target_name(self, target):
+        return target if isinstance(target, str) else "..."
+
+    def _pattern_setter(self, env, var_kind):
+        if var_kind is None:
+            return env.assign
+        return {"var": env.set_var, "let": env.set_let,
+                "const": env.set_const}[var_kind]
+
+    def _bind_pattern(self, pattern, value, env, setter):
+        if pattern.kind == "array":
+            items = list(value) if isinstance(value, list) else []
+            for i, (target, default) in enumerate(pattern.parts):
+                item = items[i] if i < len(items) else UNDEFINED
+                if item is UNDEFINED and default is not None:
+                    item = (yield from self._eval(default, env))
+                yield from self._bind_target(target, item, env, setter)
+            if pattern.rest is not None:
+                rest = items[len(pattern.parts):]
+                yield from self._bind_target(pattern.rest, rest, env, setter)
+            return
+        if isinstance(value, dict):
+            src = value
+        else:
+            src = {key: self.js_get(value, key)
+                   for key, _, _ in pattern.parts}
+            if pattern.rest is not None:
+                for key in self._own_keys(value):
+                    src.setdefault(key, self.js_get(value, key))
+        for key, target, default in pattern.parts:
+            item = src.get(key, UNDEFINED)
+            if item is UNDEFINED and default is not None:
+                item = (yield from self._eval(default, env))
+            yield from self._bind_target(target, item, env, setter)
+        if pattern.rest is not None:
+            rest = {k: v for k, v in src.items()}
+            yield from self._bind_target(pattern.rest, rest, env, setter)
+
+    def _own_keys(self, value):
+        if isinstance(value, dict):
+            return list(value.keys())
+        if isinstance(value, list):
+            return [str(i) for i in range(len(value))]
+        return []
+
+    def _bind_target(self, target, value, env, setter):
+        if isinstance(target, str):
+            setter(target, value)
+            return
+        if isinstance(target, Pattern):
+            yield from self._bind_pattern(target, value, env, setter)
+            return
+        if isinstance(target, Identifier):
+            setter(target.name, value)
 
     def _bind_loop_var(self, env, var_kind, name, value):
         if var_kind is not None:

@@ -16,6 +16,8 @@ jobs:
         with:
           python-version: '3.12'
 
+      # No Tk and no Xvfb: rendering is our own and runs with no display.
+      # The only outside requirement is a system font.
       - name: Install fonts and pyflakes
         run: |
           sudo apt-get update
@@ -37,6 +39,9 @@ jobs:
 
       - name: JS engine tests
         run: python tests/test_js.py
+
+      - name: Shoes tests
+        run: python tests/test_shoes.py
 
       - name: Toe engine tests
         run: python tests/test_toes.py

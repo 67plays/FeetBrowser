@@ -562,6 +562,122 @@ def test_js_for_of_and_for_in():
     eq(g["sos"], 6, "for...of iterates array elements")
     eq(g["foic"], 2, "for...in counts own keys")
     eq(g["sos2"], 2, "for...of iterates a string")
+def test_js_modern_syntax():
+    interp = Interpreter()
+    interp.run("""
+        var arrow = (x, y = 2) => x * y;
+        var a = arrow(3);
+        var t = `sum: ${1 + 1}`;
+        var re = /^ab+c$/;
+        var rmatch = re.test("abbbc");
+        class Animal {
+          constructor(name) { this.name = name; }
+          speak() { return this.name + "!"; }
+          static kind() { return "animal"; }
+        }
+        var dog = new Animal("Rex");
+        var s = dog.speak();
+        var k = Animal.kind();
+        var name = "Rex";
+        var o = { name, count: 2 };
+        var n = o.name;
+        var [first, ...rest] = [1, 2, 3];
+        var { count: c } = o;
+        var sw = "none";
+        switch (c) { case 1: sw = "one"; break; case 2: sw = "two"; break; }
+        var b1 = (5 & 3), b2 = (1 << 3), b3 = (-8 >>> 1);
+        var nx = null ?? "fallback";
+        var oc = null ?. missing;
+        var del = delete o.count;
+        console.log("ok");
+    """)
+    g = interp.globals
+    eq(g["a"], 6, "arrow with default param")
+    eq(g["t"], "sum: 2", "template literal interpolation")
+    eq(g["rmatch"], True, "regex literal test")
+    eq(g["s"], "Rex!", "class method + constructor")
+    eq(g["k"], "animal", "static class method")
+    eq(g["n"], "Rex", "object shorthand + value")
+    eq(g["first"], 1, "array destructure")
+    eq(g["rest"], [2, 3], "array rest destructure")
+    eq(g["c"], 2, "object destructure rename")
+    eq(g["sw"], "two", "switch statement")
+    eq(g["b1"], 1, "bitwise and")
+    eq(g["b2"], 8, "left shift")
+    eq(g["b3"], 2147483644, "unsigned right shift")
+    eq(g["nx"], "fallback", "nullish coalescing")
+    assert g["oc"] is None or repr(g["oc"]) == "undefined", "optional chaining"
+    eq(g["del"], True, "delete returns true")
+
+
+def test_js_builtins_and_dom():
+    interp = Interpreter()
+    interp.run("""
+        var up = "abc".toUpperCase() + "xyz".slice(0, 2);
+        var arr = [1, 2, 3].map(function (x) { return x * 2; });
+        var sum = [1, 2, 3, 4].reduce(function (a, b) { return a + b; }, 0);
+        var keys = Object.keys({ a: 1, b: 2 }).length;
+        var merged = Object.assign({}, { a: 1 }, { b: 2 });
+        var j = JSON.parse('{"x": [1, 2]}');
+        var str = JSON.stringify({ p: 1 });
+        var m = Math.max(1, 9) + Math.floor(2.9);
+        var d = Date.now() > 0;
+        var bound = (function (a) { return this.x + a; }).bind({ x: 10 }, 5);
+        var bind = bound();
+        var f = function (a, b) { return a + b; }.apply(null, [3, 4]);
+        var own = Object.prototype.hasOwnProperty.call({ k: 1 }, "k");
+        var isa = [] instanceof Array;
+        console.log("ok");
+    """)
+    g = interp.globals
+    eq(g["up"], "ABCxy", "string methods")
+    eq(g["arr"], [2, 4, 6], "Array.map")
+    eq(g["sum"], 10, "Array.reduce")
+    eq(g["keys"], 2, "Object.keys")
+    eq(g["merged"], {"a": 1, "b": 2}, "Object.assign")
+    eq(g["j"]["x"][1], 2, "JSON.parse")
+    eq(g["str"], '{"p":1}', "JSON.stringify")
+    eq(g["m"], 11, "Math methods")
+    eq(g["d"], True, "Date.now")
+    eq(g["bind"], 15, "Function.bind + this")
+    eq(g["f"], 7, "Function.apply")
+    eq(g["own"], True, "Object.prototype.hasOwnProperty.call")
+    eq(g["isa"], True, "instanceof Array")
+
+
+def test_js_dom_query_and_classlist():
+    tab = _make_tab(
+        '<div id="a" class="x y"><p class="q">hi</p></div>'
+        '<script>'
+        'var el = document.getElementById("a");'
+        'el.classList.add("z");'
+        'var has = el.classList.contains("z");'
+        'var els = document.querySelectorAll("p");'
+        'var n = els.length;'
+        'el.dataset.foo = "1";'
+        'var d = el.dataset.foo;'
+        'el.setAttribute("role", "main");'
+        'var r = el.getAttribute("role");'
+        'el.removeAttribute("role");'
+        'var r2 = el.hasAttribute("role");'
+        '</script>')
+    texts = _texts(tab)
+    assert "hi" in texts, f"page rendered: {texts}"
+    # The script mutated the DOM; classList/dataset attributes applied.
+    root = tab.nodes
+    from feetbrowser.htmlparser import Element
+    div = next((n for n in _walk_all(root) if isinstance(n, Element)
+                and n.attributes.get("id") == "a"), None)
+    assert div is not None, "div present"
+    assert "z" in div.attributes.get("class", "").split(), \
+        f"classList.add applied: {div.attributes.get('class')}"
+    assert div.attributes.get("role") is None, "removeAttribute applied"
+
+
+def _walk_all(node):
+    yield node
+    for child in node.children:
+        yield from _walk_all(child)
 
 
 def _make_tab(body, url="https://example.com/page"):

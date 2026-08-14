@@ -25,6 +25,7 @@ from .htmlparser import HTMLParser, Text, Element
 from .cssparser import CSSParser, style, parse_inline, set_viewport, \
     media_matches, get_viewport
 from .layout import DocumentLayout, paint_tree, get_font, DrawText, _measure
+from . import shoes as shoes
 from .jsdom import JSDocument
 from .jsengine import Interpreter, JSException, UNDEFINED
 from . import toes as toes
@@ -299,20 +300,44 @@ class Tab:
             self._start_async_load(url, payload, push, refresh, pending_scroll)
             return
         try:
+            body, ctype, doc_error = self._fetch_document(url, payload, refresh)
+        except TypeError:
+            # Internal URL objects (about:blank, bookmarks, history) expose a
+            # simpler request(); retry without the refresh flag.
+            body, ctype, doc_error = self._fetch_document(url, payload, False)
+        self._complete_load(url, payload, push, pending_scroll, body, ctype,
+                            doc_error=doc_error)
+
+    def _fetch_document(self, url, payload, refresh):
+        """Fetch a document body, surfacing load errors and retrying through a
+        Chrome-impersonating transport when a JS-gated site (Google) serves an
+        'enable JavaScript' wall instead of its real application."""
+        try:
             _headers, body, ctype = url.request(payload=payload,
                                                 refresh=refresh)
             doc_error = None
         except TypeError:
-            # Internal URL objects (about:blank, bookmarks, history) expose a
-            # simpler request(); retry without the refresh flag.
             _headers, body, ctype = url.request(payload=payload)
             doc_error = None
         except Exception as e:  # noqa: BLE001 - surface any network error in-page
             body = f"<h1>Could not load page</h1><pre>{type(e).__name__}: {e}</pre>"
             doc_error = f"DOC {url} ({type(e).__name__})"
             ctype = "text/html"
-        self._complete_load(url, payload, push, pending_scroll, body, ctype,
-                            doc_error=doc_error)
+        if doc_error is None and self._is_google_js_wall(url, body) \
+                and isinstance(url, URL) and url.scheme in ("http", "https"):
+            try:
+                _headers, body, ctype = url.request_impersonated()
+            except Exception:  # noqa: BLE001 - keep the walled response
+                pass
+        return body, ctype, doc_error
+
+    def _is_google_js_wall(self, url, body):
+        host = (getattr(url, "host", "") or "").lower()
+        if "google.com" not in host:
+            return False
+        low = (body or "").lower()
+        return ("enablejs" in low or "/httpservice/retry/" in low
+                or "isn't supported anymore" in low)
 
     def _gui_mode(self):
         return self.browser is not None \
@@ -329,8 +354,8 @@ class Tab:
 
         def worker():
             try:
-                _headers, body, ctype = url.request(payload=payload,
-                                                    refresh=refresh)
+                body, ctype, _err = self._fetch_document(url, payload,
+                                                         refresh)
                 exc = None
             except Exception as e:  # noqa: BLE001 - surfaced as an error page
                 body, ctype, exc = None, None, e
@@ -1271,12 +1296,25 @@ class ContextMenu:
     PAD_X = 10
     SEP = 8
 
-    def __init__(self):
+    def __init__(self, browser=None):
+        self.browser = browser
         self.items = []
         self.x = self.y = 0
         self.width = self.height = 0
         self.hover = -1
         self.open_ = False
+
+    def c(self, key):
+        """Color from the owning browser's active shoe (or a fallback)."""
+        if self.browser is not None:
+            return self.browser.c(key)
+        fallback = {
+            "menu_bg": "#ffffff", "menu_border": "#666666",
+            "menu_text": "#111111", "menu_hover": "#1a73e8",
+            "menu_sep": "#dddddd", "menu_shadow": "#d0d0d0",
+            "menu_disabled": "#aaaaaa",
+        }
+        return fallback.get(key, key)
 
     def open(self, x, y, items, canvas_w, canvas_h):
         self.items = items
@@ -1355,24 +1393,27 @@ class ContextMenu:
         c = canvas
         x, y = self.x, self.y
         c.create_rectangle(x - 1, y - 1, x + self.width + 1,
-                           y + self.height + 1, fill="#d0d0d0", width=0)
+                           y + self.height + 1, fill=self.c("menu_shadow"),
+                           width=0)
         c.create_rectangle(x, y, x + self.width, y + self.height,
-                           fill="white", outline="#666666", width=1)
+                           fill=self.c("menu_bg"),
+                           outline=self.c("menu_border"), width=1)
         y0 = y + self.PAD
         for i, item in enumerate(self.items):
             if item is None:
                 y0 += self.SEP / 2
                 c.create_line(x + 8, y0, x + self.width - 8, y0,
-                              fill="#dddddd", width=1)
+                              fill=self.c("menu_sep"), width=1)
                 y0 += self.SEP / 2
                 continue
             label, _callback, enabled = item
             if i == self.hover and enabled:
                 c.create_rectangle(x + 1, y0, x + self.width - 1,
-                                   y0 + self.ITEM_H, fill="#1a73e8", width=0)
-                color = "white"
+                                   y0 + self.ITEM_H, fill=self.c("menu_hover"),
+                                   width=0)
+                color = self.c("menu_bg")
             else:
-                color = "#111111" if enabled else "#aaaaaa"
+                color = self.c("menu_text" if enabled else "menu_disabled")
             c.create_text(x + self.PAD_X, y0 + self.ITEM_H / 2, text=label,
                           anchor="w", font=get_font(12, "normal", "roman",
                                                     "Helvetica"), fill=color)
@@ -1386,6 +1427,9 @@ class Browser:
         self.focus = None  # "address" or None
         self.address_text = ""
         self.bookmarks = self._load_bookmarks()
+        # Shoes theme: the active color palette for the chrome.
+        self.shoe = shoes.load()
+        self.theme = shoes.merge(shoes.resolve(self.shoe))
         self.address_caret = 0
         self.address_sel = None  # (start, end) while selecting, else None
         self.address_view = 0  # horizontal scroll offset in px
@@ -1422,7 +1466,7 @@ class Browser:
         self.chrome_font = get_font(14, "normal", "roman", "Helvetica")
         self.bold_font = get_font(14, "bold", "roman", "Helvetica")
 
-        self.context_menu = ContextMenu()
+        self.context_menu = ContextMenu(self)
 
         self._bind()
 
@@ -1460,6 +1504,7 @@ class Browser:
         w.bind("<Control-r>", lambda e: self._reload())
         w.bind("<Control-d>", lambda e: self._toggle_bookmark())
         w.bind("<Control-h>", lambda e: self._open_history_page())
+        w.bind("<Control-Shift-s>", lambda e: self._open_shoes_page())
         w.bind("<Control-Tab>", lambda e: self._cycle_tab(1))
         w.bind("<Control-ISO_Left_Tab>", lambda e: self._cycle_tab(-1))
         w.bind("<Control-Prior>", lambda e: self._next_tab(-1))
@@ -2175,7 +2220,8 @@ class Browser:
             self.focus = None
             query = self.address_text.strip()
             if query == "about:blank":
-                dest = _AboutURL()
+                dest = _AboutURL(theme=self.theme, apply=self.apply_shoe,
+                                 active=lambda: self.shoe)
             else:
                 if not self._looks_like_url(query):
                     query = "https://duckduckgo.com/html/?q=" + \
@@ -2262,6 +2308,11 @@ class Browser:
             self.active_tab.load(self._coerce_url("about:history"))
             self.draw()
 
+    def _open_shoes_page(self):
+        if self.active_tab:
+            self.active_tab.load(self._coerce_url("about:shoes"))
+            self.draw()
+
     def _cycle_tab(self, step):
         if not self.tabs or not self.active_tab:
             return "break"
@@ -2274,12 +2325,24 @@ class Browser:
         if not isinstance(raw, str):
             return raw
         text = raw.strip().lower()
+        active = lambda: self.shoe
         if text in ("about:blank", "about:newtab"):
-            return _AboutURL(lambda: list(self.bookmarks))
+            return _AboutURL(lambda: list(self.bookmarks), theme=self.theme,
+                             apply=self.apply_shoe, active=active)
         if text == "about:bookmarks":
-            return _BookmarksURL(lambda: list(self.bookmarks))
+            return _BookmarksURL(lambda: list(self.bookmarks),
+                                 theme=self.theme, apply=self.apply_shoe,
+                                 active=active)
         if text == "about:history":
-            return _HistoryURL(self._history_snapshot)
+            return _HistoryURL(self._history_snapshot, theme=self.theme,
+                               apply=self.apply_shoe, active=active)
+        if text == "about:shoes":
+            return _ShoesURL(apply=self.apply_shoe, theme=self.theme,
+                             active=active)
+        if text.startswith("about:shoes/"):
+            return _ShoesApplyURL(text[len("about:shoes/"):],
+                                  apply=self.apply_shoe, theme=self.theme,
+                                  active=active)
         return raw
 
     @staticmethod
@@ -2336,7 +2399,8 @@ class Browser:
 
     def _home(self):
         if self.active_tab:
-            self.active_tab.load(_AboutURL())
+            self.active_tab.load(_AboutURL(theme=self.theme, apply=self.apply_shoe,
+                                     active=lambda: self.shoe))
             self.active_tab.status = "Type a URL and press Enter"
             self.draw()
 
@@ -2407,6 +2471,28 @@ class Browser:
         if self.active_tab:
             self.active_tab.draw(self.canvas, self.chrome_height(), rect)
 
+    def c(self, key):
+        """Return the current shoe's color for a chrome role. Always defined:
+        missing keys fall back to the default shoe's palette."""
+        return self.theme.get(key, shoes.SHOES[shoes.DEFAULT_SHOE].get(key))
+
+    def apply_shoe(self, name):
+        """Switch to the named shoe: update the palette, persist, and repaint
+        the chrome so the change applies instantly."""
+        if shoes.find(name) is None:
+            return
+        self.shoe = shoes.find(name)
+        self.theme = shoes.merge(shoes.resolve(self.shoe))
+        shoes.save(self.shoe)
+        self._repaint_needed = True
+        # Re-render internal pages (welcome/shoes/bookmarks/history) so their
+        # themed colors update too.
+        internal = (_AboutURL, _BookmarksURL, _HistoryURL, _ShoesURL)
+        for tab in self.tabs:
+            if isinstance(tab.url, internal):
+                tab.load(tab.url, push=False)
+        self.draw()
+
     def _draw_chrome(self):
         """Repaint only the chrome (tabs, toolbar, address bar, status,
         scrollbar, spinner), leaving the page layer intact. The chrome items
@@ -2419,7 +2505,7 @@ class Browser:
         chrome = self.chrome_height()
         # Chrome background covers page content that scrolled up under it.
         c.create_rectangle(0, 0, c.winfo_width(), chrome,
-                           fill="#e8e8e8", width=0)
+                           fill=self.c("chrome_bg"), width=0)
         # Toe chrome bands paint on top of the chrome background.
         bands = self.chrome_bands()
         if bands:
@@ -2455,8 +2541,8 @@ class Browser:
         tab = self.active_tab
         top = toes.band_height(self.chrome_bands()) + CHROME_HEIGHT
         c.create_rectangle(0, top, c.winfo_width(), top + LOG_HEIGHT,
-                           fill="#fff4e6", width=0)
-        c.create_line(0, top, c.winfo_width(), top, fill="#e0cda8")
+                           fill=self.c("log_bg"), width=0)
+        c.create_line(0, top, c.winfo_width(), top, fill=self.c("log_border"))
         if not tab or not tab.net_errors:
             return
         latest = tab.net_errors[-1]
@@ -2469,18 +2555,19 @@ class Browser:
                 msg = msg[:-1]
             msg += "\u2026"
         c.create_text(8, top + LOG_HEIGHT / 2, text=msg, anchor="w",
-                      font=font, fill="#8a5a00")
+                      font=font, fill=self.c("log_text"))
 
     def _draw_tabs(self):
         c = self.canvas
         top = toes.band_height(self.chrome_bands())
-        c.create_rectangle(0, top, c.winfo_width(), top + 40, fill="#d0d0d0",
-                           width=0)
+        c.create_rectangle(0, top, c.winfo_width(), top + 40,
+                           fill=self.c("tab_bar"), width=0)
         for i, tab in enumerate(self.tabs):
             x0 = self._tab_x(i)
             active = tab is self.active_tab
             c.create_rectangle(x0, top + 4, x0 + TAB_WIDTH, top + 40,
-                               fill="white" if active else "#c4c4c4",
+                               fill=self.c("tab_active" if active
+                                           else "tab_inactive"),
                                width=0)
             title = tab.title or "New Tab"
             # Tabs are TAB_WIDTH wide; fit the title in the space before the
@@ -2493,24 +2580,26 @@ class Browser:
                     t = t[:-1]
                 title = t + "…"
             c.create_text(x0 + 10, top + 20, text=title, anchor="w",
-                          font=self.chrome_font, fill="#222")
+                          font=self.chrome_font, fill=self.c("tab_text"))
             c.create_text(x0 + TAB_WIDTH - 10, top + 20, text="×",
-                          font=self.bold_font, fill="#666")
+                          font=self.bold_font, fill=self.c("tab_close"))
         # New-tab button, to the right of the last tab (browser convention).
         nx = self._new_tab_x()
         c.create_rectangle(nx, top + 4, nx + NEW_TAB_W, top + 40,
-                           fill="#c4c4c4", width=0)
+                           fill=self.c("tab_inactive"), width=0)
         c.create_text(nx + NEW_TAB_W / 2, top + 20, text="+",
-                      font=self.bold_font, fill="#333")
+                      font=self.bold_font, fill=self.c("plus_button"))
 
     def _draw_toolbar(self):
         c = self.canvas
 
         def btn(x, glyph, enabled):
-            c.create_rectangle(x, top + 48, x + 26, top + 72, outline="#999",
-                               fill="#f4f4f4", width=1)
+            c.create_rectangle(x, top + 48, x + 26, top + 72,
+                               outline=self.c("button_border"),
+                               fill=self.c("button_bg"), width=1)
             c.create_text(x + 13, top + 60, text=glyph,
-                          fill="#333" if enabled else "#bbb",
+                          fill=self.c("button_glyph" if enabled
+                                      else "button_glyph_disabled"),
                           font=self.bold_font)
 
         top = toes.band_height(self.chrome_bands())
@@ -2526,8 +2615,11 @@ class Browser:
         # Address bar (after the toe buttons and bookmark star).
         addr_x = 136 + self._toe_buttons_offset() + 30
         c.create_rectangle(addr_x, top + 48, c.winfo_width() - 8, top + 72,
-                           outline="#3b82f6" if self.focus == "address" else "#999",
-                           fill="white", width=2 if self.focus == "address" else 1)
+                           outline=self.c("addr_focus_border"
+                                          if self.focus == "address"
+                                          else "addr_border"),
+                           fill=self.c("addr_bg"),
+                           width=2 if self.focus == "address" else 1)
         if self.focus == "address":
             self._draw_address_editor(c, addr_x, top)
         else:
@@ -2535,7 +2627,7 @@ class Browser:
             if tab and tab.url and not isinstance(tab.url, _AboutURL):
                 url = str(tab.url)
             c.create_text(addr_x + 10, top + 60, text=url, anchor="w",
-                          font=self.chrome_font, fill="#111")
+                          font=self.chrome_font, fill=self.c("addr_text"))
 
     def _draw_address_editor(self, c, addr_x, top):
         """Paint the focused address bar: text (with horizontal scroll),
@@ -2551,8 +2643,8 @@ class Browser:
 
         if not text:
             c.create_text(x0, top + 60, text="Type a URL or search term…",
-                          anchor="w", font=font, fill="#aaa")
-            c.create_line(x0, top + 52, x0, top + 68, fill="#111")
+                          anchor="w", font=font, fill=self.c("addr_placeholder"))
+            c.create_line(x0, top + 52, x0, top + 68, fill=self.c("caret"))
             return
 
         def char_x(i):
@@ -2574,7 +2666,7 @@ class Browser:
         if sel is not None and sel[1] > start and sel[0] < end:
             c.create_rectangle(char_x(max(start, sel[0])), top + 51,
                                char_x(min(end, sel[1])), top + 69,
-                               fill="#1a73e8", width=0)
+                               fill=self.c("accent"), width=0)
 
         y = top + 60
         if sel is not None and sel[0] < end and sel[1] > start:
@@ -2582,20 +2674,20 @@ class Browser:
             part1, part2, part3 = text[start:s1], text[s1:s2], text[s2:end]
             if part1:
                 c.create_text(char_x(start), y, text=part1, anchor="w",
-                              font=font, fill="#111")
+                              font=font, fill=self.c("addr_text"))
             if part2:
                 c.create_text(char_x(s1), y, text=part2, anchor="w",
-                              font=font, fill="white")
+                              font=font, fill=self.c("addr_bg"))
             if part3:
                 c.create_text(char_x(s2), y, text=part3, anchor="w",
-                              font=font, fill="#111")
+                              font=font, fill=self.c("addr_text"))
         else:
             c.create_text(char_x(start), y, text=text[start:end], anchor="w",
-                          font=font, fill="#111")
+                          font=font, fill=self.c("addr_text"))
 
         # Caret.
         cx = char_x(self.address_caret)
-        c.create_line(cx, top + 52, cx, top + 68, fill="#111")
+        c.create_line(cx, top + 52, cx, top + 68, fill=self.c("caret"))
 
     def _toe_buttons(self):
         return [btn for ctx in self.toe_contexts
@@ -2609,10 +2701,11 @@ class Browser:
         top = toes.band_height(self.chrome_bands())
         x = 136
         for btn in self._toe_buttons():
-            c.create_rectangle(x, top + 48, x + 26, top + 72, outline="#999",
-                               fill="#fdf6e3", width=1)
-            c.create_text(x + 13, top + 60, text=btn.glyph[:2], fill="#333",
-                          font=self.bold_font)
+            c.create_rectangle(x, top + 48, x + 26, top + 72,
+                               outline=self.c("button_border"),
+                               fill=self.c("toe_btn_bg"), width=1)
+            c.create_text(x + 13, top + 60, text=btn.glyph[:2],
+                          fill=self.c("button_glyph"), font=self.bold_font)
             x += 30
 
     def _draw_status(self):
@@ -2620,13 +2713,14 @@ class Browser:
         c.delete("statusbar")
         h = c.winfo_height()
         c.create_rectangle(0, h - 22, c.winfo_width(), h,
-                           fill="#efefef", width=0, tags=("statusbar",))
-        c.create_line(0, h - 22, c.winfo_width(), h - 22, fill="#ccc",
-                      tags=("statusbar",))
+                           fill=self.c("status_bg"), width=0,
+                           tags=("statusbar",))
+        c.create_line(0, h - 22, c.winfo_width(), h - 22,
+                      fill=self.c("status_border"), tags=("statusbar",))
         status = self.active_tab.status if self.active_tab else ""
         c.create_text(8, h - 11, text=status[:200], anchor="w",
                       font=get_font(11, "normal", "roman", "Helvetica"),
-                      fill="#444", tags=("statusbar",))
+                      fill=self.c("status_text"), tags=("statusbar",))
 
     def _draw_scrollbar(self):
         tab = self.active_tab
@@ -2645,7 +2739,8 @@ class Browser:
         thumb_h = max(30, track_h * frac)
         thumb_top = track_top + (track_h - thumb_h) * (tab.scroll / (total - view))
         c.create_rectangle(track_x, thumb_top, track_x + 6, thumb_top + thumb_h,
-                           fill="#9aa0a6", width=0, tags=("scrollbar",))
+                           fill=self.c("scroll_thumb"), width=0,
+                           tags=("scrollbar",))
 
     def run(self):
         self.window.update_idletasks()
@@ -2697,7 +2792,7 @@ class Browser:
         cy = top + 60
         c.create_arc(cx - 6, cy - 6, cx + 6, cy + 6,
                      start=self._loading_angle, extent=250,
-                     style="arc", outline="#1a73e8", width=2,
+                     style="arc", outline=self.c("accent"), width=2,
                      tags=("spinner",))
 
 
@@ -2730,7 +2825,7 @@ class PopupWindow:
         self.canvas.pack(fill="both", expand=True)
         self.tab = Tab(height - self.TITLE_BAR, browser)
         self.tab.load(URL(str(url)) if isinstance(url, str) else url)
-        self.context_menu = ContextMenu()
+        self.context_menu = ContextMenu(browser)
         self._bind()
         self.draw()
 
@@ -2856,15 +2951,16 @@ class PopupWindow:
         self.tab.tab_height = self.height - self.TITLE_BAR
         self.tab.draw(c, self.TITLE_BAR)
         c.create_rectangle(0, 0, self.width, self.TITLE_BAR,
-                           fill="#d0d0d0", width=0)
+                           fill=self.browser.c("popup_titlebar"), width=0)
         c.create_line(0, self.TITLE_BAR, self.width, self.TITLE_BAR,
-                      fill="#999")
+                      fill=self.browser.c("popup_border"))
         c.create_text(6, self.TITLE_BAR // 2, text=str(self.tab.url)[:40],
                       anchor="w", font=get_font(10, "normal", "roman",
-                                                "Helvetica"), fill="#333")
+                                                "Helvetica"),
+                      fill=self.browser.c("popup_text"))
         c.create_text(self.width - 10, self.TITLE_BAR // 2, text="×",
                       font=get_font(12, "bold", "roman", "Helvetica"),
-                      fill="#333")
+                      fill=self.browser.c("popup_text"))
         # Scrollbar.
         view = self.height - self.TITLE_BAR
         total = self.tab.content_height()
@@ -2875,7 +2971,7 @@ class PopupWindow:
                 self.tab.scroll / (total - view))
             c.create_rectangle(self.width - 6, thumb_top,
                                 self.width - 2, thumb_top + thumb_h,
-                                fill="#9aa0a6", width=0)
+                                fill=self.browser.c("scroll_thumb"), width=0)
         self.context_menu.draw(self.canvas)
 
 
@@ -3033,20 +3129,33 @@ class _AboutURL:
     view_source = False
     fragment = ""
 
-    def __init__(self, bookmarks_provider=None):
+    def __init__(self, bookmarks_provider=None, theme=None, apply=None,
+                 active=None):
         self.bookmarks_provider = bookmarks_provider
+        self.theme = theme
+        self.apply = apply
+        self.active = active
 
     def resolve(self, url):
         if url == "about:blank":
-            return _AboutURL(self.bookmarks_provider)
+            return _AboutURL(self.bookmarks_provider, self.theme,
+                             self.apply, self.active)
         if url == "about:bookmarks":
-            return _BookmarksURL(self.bookmarks_provider)
+            return _BookmarksURL(self.bookmarks_provider, self.theme,
+                                 self.apply, self.active)
         if url == "about:history":
-            return _HistoryURL(lambda: {"back": [], "current": "", "forward": []})
+            return _HistoryURL(
+                lambda: {"back": [], "current": "", "forward": []},
+                self.theme, self.apply, self.active)
+        if url == "about:shoes":
+            return _ShoesURL(self.apply, self.theme, self.active)
+        if url.startswith("about:shoes/"):
+            return _ShoesApplyURL(url[len("about:shoes/"):],
+                                  self.apply, self.theme, self.active)
         return URL(url) if "://" in url else URL("https://" + url)
 
     def request(self, payload=None):
-        return {}, welcome_html(), "text/html"
+        return {}, welcome_html(self.theme), "text/html"
 
     def __str__(self):
         return "about:blank"
@@ -3057,20 +3166,34 @@ class _BookmarksURL:
     view_source = False
     fragment = ""
 
-    def __init__(self, bookmarks_provider=None):
+    def __init__(self, bookmarks_provider=None, theme=None, apply=None,
+                 active=None):
         self.bookmarks_provider = bookmarks_provider or (lambda: [])
+        self.theme = theme
+        self.apply = apply
+        self.active = active
 
     def resolve(self, url):
         if url == "about:blank":
-            return _AboutURL(self.bookmarks_provider)
+            return _AboutURL(self.bookmarks_provider, self.theme,
+                             self.apply, self.active)
         if url == "about:bookmarks":
-            return _BookmarksURL(self.bookmarks_provider)
+            return _BookmarksURL(self.bookmarks_provider, self.theme,
+                                 self.apply, self.active)
         if url == "about:history":
-            return _HistoryURL(lambda: {"back": [], "current": "", "forward": []})
+            return _HistoryURL(
+                lambda: {"back": [], "current": "", "forward": []},
+                self.theme, self.apply, self.active)
+        if url == "about:shoes":
+            return _ShoesURL(self.apply, self.theme, self.active)
+        if url.startswith("about:shoes/"):
+            return _ShoesApplyURL(url[len("about:shoes/"):],
+                                  self.apply, self.theme, self.active)
         return URL(url) if "://" in url else URL("https://" + url)
 
     def request(self, payload=None):
-        return {}, bookmarks_html(self.bookmarks_provider()), "text/html"
+        return {}, bookmarks_html(self.bookmarks_provider(), self.theme), \
+            "text/html"
 
     def __str__(self):
         return "about:bookmarks"
@@ -3081,27 +3204,145 @@ class _HistoryURL:
     view_source = False
     fragment = ""
 
-    def __init__(self, snapshot_provider=None):
+    def __init__(self, snapshot_provider=None, theme=None, apply=None,
+                 active=None):
         self.snapshot_provider = snapshot_provider or (
             lambda: {"back": [], "current": "", "forward": []})
+        self.theme = theme
+        self.apply = apply
+        self.active = active
 
     def resolve(self, url):
         if url == "about:blank":
-            return _AboutURL()
+            return _AboutURL(theme=self.theme, apply=self.apply,
+                             active=self.active)
         if url == "about:bookmarks":
-            return _BookmarksURL()
+            return _BookmarksURL(theme=self.theme, apply=self.apply,
+                                 active=self.active)
         if url == "about:history":
-            return _HistoryURL(self.snapshot_provider)
+            return _HistoryURL(self.snapshot_provider, self.theme,
+                               self.apply, self.active)
+        if url == "about:shoes":
+            return _ShoesURL(self.apply, self.theme, self.active)
+        if url.startswith("about:shoes/"):
+            return _ShoesApplyURL(url[len("about:shoes/"):],
+                                  self.apply, self.theme, self.active)
         return URL(url) if "://" in url else URL("https://" + url)
 
     def request(self, payload=None):
-        return {}, history_html(self.snapshot_provider()), "text/html"
+        return {}, history_html(self.snapshot_provider(), self.theme), \
+            "text/html"
 
     def __str__(self):
         return "about:history"
 
 
-def bookmarks_html(bookmarks):
+class _ShoesURL:
+    """Internal URL for the theme picker page (about:shoes)."""
+    view_source = False
+    fragment = ""
+
+    def __init__(self, apply=None, theme=None, active=None):
+        self.apply = apply
+        self.theme = theme
+        self.active = active
+
+    def resolve(self, url):
+        if url == "about:shoes":
+            return _ShoesURL(self.apply, self.theme, self.active)
+        if url.startswith("about:shoes/"):
+            return _ShoesApplyURL(url[len("about:shoes/"):],
+                                  self.apply, self.theme, self.active)
+        if url == "about:blank":
+            return _AboutURL(theme=self.theme, apply=self.apply,
+                             active=self.active)
+        if url == "about:bookmarks":
+            return _BookmarksURL(theme=self.theme, apply=self.apply,
+                                 active=self.active)
+        if url == "about:history":
+            return _HistoryURL(theme=self.theme, apply=self.apply,
+                               active=self.active)
+        return URL(url) if "://" in url else URL("https://" + url)
+
+    def request(self, payload=None):
+        active = self.active() if callable(self.active) else self.active
+        return {}, shoes_html(self.theme, active), "text/html"
+
+    def __str__(self):
+        return "about:shoes"
+
+
+class _ShoesApplyURL:
+    """Internal URL that applies a shoe when visited (about:shoes/<Name>)."""
+    view_source = False
+    fragment = ""
+
+    def __init__(self, name, apply=None, theme=None, active=None):
+        self.name = name
+        self.apply = apply
+        self.theme = theme
+        self.active = active
+
+    def resolve(self, url):
+        if url == "about:shoes":
+            return _ShoesURL(self.apply, self.theme, self.active)
+        if url.startswith("about:shoes/"):
+            return _ShoesApplyURL(url[len("about:shoes/"):],
+                                  self.apply, self.theme, self.active)
+        if url == "about:blank":
+            return _AboutURL(theme=self.theme, apply=self.apply,
+                             active=self.active)
+        if url == "about:bookmarks":
+            return _BookmarksURL(theme=self.theme, apply=self.apply,
+                                 active=self.active)
+        if url == "about:history":
+            return _HistoryURL(theme=self.theme, apply=self.apply,
+                               active=self.active)
+        return URL(url) if "://" in url else URL("https://" + url)
+
+    def request(self, payload=None):
+        canonical = shoes.find(self.name)
+        if canonical is not None and callable(self.apply):
+            self.apply(canonical)
+        applied = html.escape(canonical or self.name)
+        p = _page_palette(self.theme)
+        return {}, f"""
+<!doctype html>
+<html><head><title>Applied</title>
+<style>
+  body {{ font-family: Helvetica; margin: 60px; color: {p['text']};
+         background: {p['bg']}; }}
+  h1 {{ font-size: 36px; color: {p['accent']}; }}
+  a {{ color: {p['link']}; }}
+</style></head>
+<body>
+  <h1>{applied} on.</h1>
+  <p><a href="about:shoes">Back to Shoes</a> or keep browsing.</p>
+</body></html>
+""", "text/html"
+
+    def __str__(self):
+        return f"about:shoes/{self.name}"
+
+
+def _page_palette(theme):
+    """Map a shoe palette onto the colors used by the internal pages."""
+    t = _page_theme(theme)
+    return {
+        "bg": t["page_bg"], "text": t["page_text"], "accent": t["accent"],
+        "link": t["link_color"], "muted": t["status_text"],
+        "surface": t["addr_bg"], "border": t["button_border"],
+    }
+
+
+def _page_theme(theme):
+    if theme is None:
+        return shoes.merge(shoes.resolve(shoes.DEFAULT_SHOE))
+    return theme
+
+
+def bookmarks_html(bookmarks, theme=None):
+    p = _page_palette(theme)
     items = []
     for entry in bookmarks:
         safe = html.escape(entry, quote=True)
@@ -3111,11 +3352,12 @@ def bookmarks_html(bookmarks):
 <!doctype html>
 <html><head><title>Bookmarks</title>
 <style>
-  body {{ font-family: Helvetica; margin: 60px; color: #222; }}
-  h1 {{ font-size: 40px; color: #1a73e8; }}
-  .sub {{ color: #666; font-size: 18px; }}
+  body {{ font-family: Helvetica; margin: 60px; color: {p['text']};
+         background: {p['bg']}; }}
+  h1 {{ font-size: 40px; color: {p['accent']}; }}
+  .sub {{ color: {p['muted']}; font-size: 18px; }}
   li {{ margin-top: 8px; }}
-  a {{ color: #1a73e8; word-break: break-all; }}
+  a {{ color: {p['link']}; word-break: break-all; }}
 </style></head>
 <body>
   <h1>Bookmarks</h1>
@@ -3125,7 +3367,8 @@ def bookmarks_html(bookmarks):
 """
 
 
-def history_html(snapshot):
+def history_html(snapshot, theme=None):
+    p = _page_palette(theme)
     back_items = []
     for url in snapshot.get("back", []):
         safe = html.escape(url, quote=True)
@@ -3141,13 +3384,15 @@ def history_html(snapshot):
 <!doctype html>
 <html><head><title>History</title>
 <style>
-  body {{ font-family: Helvetica; margin: 60px; color: #222; }}
-  h1 {{ font-size: 40px; color: #1a73e8; }}
+  body {{ font-family: Helvetica; margin: 60px; color: {p['text']};
+         background: {p['bg']}; }}
+  h1 {{ font-size: 40px; color: {p['accent']}; }}
   h2 {{ margin-top: 30px; }}
-  .sub {{ color: #666; font-size: 18px; }}
+  .sub {{ color: {p['muted']}; font-size: 18px; }}
   li {{ margin-top: 8px; }}
-  a {{ color: #1a73e8; word-break: break-all; }}
-  .current {{ background: #f0f4ff; padding: 10px; border-left: 4px solid #1a73e8; }}
+  a {{ color: {p['link']}; word-break: break-all; }}
+  .current {{ background: {p['surface']}; padding: 10px;
+              border-left: 4px solid {p['accent']}; }}
 </style></head>
 <body>
   <h1>History</h1>
@@ -3162,23 +3407,25 @@ def history_html(snapshot):
 """
 
 
-def welcome_html():
-    """Render the New Tab page: a clean centered card on a light backdrop."""
-    return """
+def welcome_html(theme=None):
+    """Render the New Tab page: a clean centered card on a themed backdrop."""
+    p = _page_palette(theme)
+    return f"""
 <!doctype html>
 <html><head><title>New Tab</title>
 <style>
-  body { font-family: Helvetica; margin: 0; color: #222; background: #f5f7fa; }
-  .stage { display: flex; justify-content: center; }
-  .shell { width: 540px; margin-top: 70px; background: #ffffff;
-            padding: 36px 44px; box-shadow: 2px 3px 12px #c8cdd4; }
-  h1 { font-size: 42px; color: #1a73e8; margin-top: 0; }
-  .tagline { color: #666; font-size: 17px; }
-  h3 { margin-top: 26px; color: #333; }
-  ul { margin-left: 24px; }
-  li { margin-top: 6px; }
-  a { color: #1a73e8; }
-  .foot { margin-top: 30px; }
+  body {{ font-family: Helvetica; margin: 0; color: {p['text']};
+         background: {p['bg']}; }}
+  .stage {{ display: flex; justify-content: center; }}
+  .shell {{ width: 540px; margin-top: 70px; background: {p['surface']};
+            padding: 36px 44px; box-shadow: 2px 3px 12px {p['border']}; }}
+  h1 {{ font-size: 42px; color: {p['accent']}; margin-top: 0; }}
+  .tagline {{ color: {p['muted']}; font-size: 17px; }}
+  h3 {{ margin-top: 26px; color: {p['text']}; }}
+  ul {{ margin-left: 24px; }}
+  li {{ margin-top: 6px; }}
+  a {{ color: {p['link']}; }}
+  .foot {{ margin-top: 30px; }}
 </style></head>
 <body>
   <div class="stage">
@@ -3194,6 +3441,7 @@ def welcome_html():
         <li><a href="https://en.wikipedia.org/wiki/Web_browser">Wikipedia: Web browser</a></li>
         <li><a href="about:bookmarks">about:bookmarks</a> — your saved pages</li>
         <li><a href="about:history">about:history</a> — back/forward timeline</li>
+        <li><a href="about:shoes">about:shoes</a> — satisfy your sole with a fitting theme</li>
         <li><a href="view-source:https://example.com">view-source:example.com</a></li>
       </ul>
       <h3>Your toes</h3>
@@ -3212,6 +3460,56 @@ def welcome_html():
       <p class="tagline">Type a URL or a search term in the address bar to begin.</p>
     </div>
   </div>
+</body></html>
+"""
+
+
+def shoes_html(theme, active):
+    """Render the Shoes theme picker: one card per shoe, with a swatch strip
+    showing its palette. Clicking a card applies it instantly."""
+    p = _page_palette(theme)
+    cards = []
+    for name in shoes.shoe_names():
+        pal = shoes.merge(shoes.resolve(name))
+        strip_keys = ("chrome_bg", "tab_bar", "addr_bg", "accent",
+                      "status_bg")
+        swatches = "".join(
+            f'<span style="background:{pal[k]};display:inline-block;'
+            f'width:26px;height:26px;border:1px solid {p["border"]};'
+            f'border-radius:4px;"></span>'
+            for k in strip_keys)
+        in_use = ' <span class="inuse">in use</span>' if name == active else ""
+        cards.append(
+            f'<li class="shoe{" current" if name == active else ""}">'
+            f'<a href="about:shoes/{html.escape(name, quote=True)}">'
+            f'<div class="swatches">{swatches}</div>'
+            f'<div class="name">{html.escape(name)}{in_use}</div>'
+            f'</a></li>')
+    listing = "\n".join(cards)
+    return f"""
+<!doctype html>
+<html><head><title>Shoes</title>
+<style>
+  body {{ font-family: Helvetica; margin: 60px; color: {p['text']};
+         background: {p['bg']}; }}
+  h1 {{ font-size: 40px; color: {p['accent']}; }}
+  .sub {{ color: {p['muted']}; font-size: 18px; }}
+  ul.shoes {{ list-style: none; padding: 0; display: flex; flex-wrap: wrap;
+              gap: 16px; margin-top: 24px; }}
+  li.shoe {{ background: {p['surface']}; border: 2px solid {p['border']};
+             border-radius: 10px; padding: 12px; width: 220px; }}
+  li.shoe.current {{ border-color: {p['accent']}; }}
+  li.shoe a {{ text-decoration: none; color: {p['text']}; }}
+  .swatches {{ display: flex; gap: 4px; margin-bottom: 10px; }}
+  .name {{ font-weight: bold; }}
+  .inuse {{ color: {p['accent']}; font-weight: bold; }}
+  .foot {{ margin-top: 30px; color: {p['muted']}; }}
+</style></head>
+<body>
+  <h1>Shoes</h1>
+  <p class="sub">Pick a pair. The chrome and built-in pages restyle instantly.</p>
+  <ul class="shoes">{listing}</ul>
+  <p class="foot">Your choice is saved and used on the next launch.</p>
 </body></html>
 """
 
