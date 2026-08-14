@@ -30,6 +30,15 @@ a         { color: blue; text-decoration: underline; }
 
 ul, ol   { margin-top: 14px; margin-bottom: 14px; margin-left: 30px; }
 li       { display: list-item; }
+ol       { list-style-type: decimal; }
+/* Nested bullets change shape, the way every browser's default sheet does.
+   Only unordered lists do -- a list of numbers stays a list of numbers. */
+ul ul, ol ul { list-style-type: circle; }
+ul ul ul, ol ul ul { list-style-type: square; }
+
+/* Cells get a little breathing room unless the page says otherwise; without
+   this a bordered table has its text pressed against the rules. */
+td, th   { padding: 4px; }
 
 pre, code, tt, kbd, samp { font-family: monospace; white-space: pre; }
 pre      { margin-top: 14px; margin-bottom: 14px; }

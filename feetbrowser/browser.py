@@ -3525,6 +3525,10 @@ def screenshot(url, path, width=WIDTH, height=HEIGHT, settle=3.0):
     browser = Browser()
     browser.window.geometry("%dx%d" % (width, height))
     browser.canvas.resize(width, height)
+    # Resizing the canvas normally reaches layout via a debounced <Configure>
+    # handler, which needs a timer flush that has not happened yet. Apply it
+    # now, or the page lays out for the default viewport and gets cropped.
+    browser._apply_resize()
     browser.new_tab(url)
     # Images and deferred scripts land on the timer queue; give them a
     # bounded window to arrive before the frame is captured.

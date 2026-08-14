@@ -529,6 +529,41 @@ def test_canvas_render_paints_in_creation_order():
     assert _pixel(s, 15, 15) == (255, 0, 0)
 
 
+def test_small_filled_oval_is_a_round_dot():
+    """A `disc` list marker. The oval used to be stroked only, so a filled
+    one came out hollow -- and the corners have to stay empty or the dot is
+    a square."""
+    c = canvasmod.Canvas(width=20, height=20, bg="white")
+    c.create_oval(4, 4, 14, 14, fill="#000000", outline="", width=0)
+    s = c.render()
+    assert _pixel(s, 9, 9) == (0, 0, 0), "the middle is filled"
+    assert _pixel(s, 4, 4) == (255, 255, 255), "the corner is outside the dot"
+
+
+def test_small_hollow_oval_keeps_its_hole():
+    """A `circle` marker is a ring. At six pixels across an aliased ring is
+    indistinguishable from a square, so this one is anti-aliased: the edge
+    pixels land between the two colours."""
+    c = canvasmod.Canvas(width=20, height=20, bg="white")
+    c.create_oval(4, 4, 14, 14, fill="", outline="#000000", width=1)
+    s = c.render()
+    assert _pixel(s, 9, 9) == (255, 255, 255), "the middle stays open"
+    edge = _pixel(s, 9, 4)
+    assert edge != (255, 255, 255), "the top of the ring is drawn"
+    corner = _pixel(s, 4, 4)
+    assert corner[0] > 200, f"the corner is outside the ring: {corner}"
+
+
+def test_big_oval_still_fills_without_supersampling():
+    """Past the anti-aliasing size limit the cheap scanline takes over; it
+    still has to fill."""
+    c = canvasmod.Canvas(width=120, height=120, bg="white")
+    c.create_oval(5, 5, 115, 115, fill="#ff0000", outline="", width=0)
+    s = c.render()
+    assert _pixel(s, 60, 60) == (255, 0, 0), "interior filled"
+    assert _pixel(s, 6, 6) == (255, 255, 255), "corner untouched"
+
+
 def test_canvas_render_is_repeatable():
     c = canvasmod.Canvas(width=30, height=30, bg="white")
     c.create_rectangle(5, 5, 10, 10, fill="#123456", width=0)

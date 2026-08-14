@@ -250,6 +250,27 @@ class DrawRect(_DrawShape):
                 width=0, fill="black", tags=tags)
 
 
+class DrawOval(_DrawShape):
+    """An ellipse, filled or hollow. List markers are the only user so far:
+    `disc` is a filled dot, `circle` the same dot as a ring."""
+
+    def __init__(self, x1, y1, x2, y2, fill=None, outline=None):
+        super().__init__(x1, y1, x2, y2, fill or outline, 1 if outline else 0)
+        self.fill = fill
+        self.outline = outline
+
+    def execute(self, scroll, canvas, tags=()):
+        try:
+            canvas.create_oval(
+                self.left, self.top - scroll, self.right, self.bottom - scroll,
+                fill=self.fill or "", outline=self.outline or "",
+                width=1 if self.outline else 0, tags=tags)
+        except gui.TclError:
+            canvas.create_oval(
+                self.left, self.top - scroll, self.right, self.bottom - scroll,
+                fill="black", outline="", width=0, tags=tags)
+
+
 class DrawLine(_DrawShape):
     def execute(self, scroll, canvas, tags=()):
         try:
@@ -488,10 +509,124 @@ def resolve_color(name):
     return name  # Tk understands names and #rrggbb
 
 
+_ROMAN_NUMERALS = ((1000, "m"), (900, "cm"), (500, "d"), (400, "cd"),
+                   (100, "c"), (90, "xc"), (50, "l"), (40, "xl"),
+                   (10, "x"), (9, "ix"), (5, "v"), (4, "iv"), (1, "i"))
+
+
+def _roman(number):
+    if number <= 0:
+        return str(number)
+    out = []
+    for value, numeral in _ROMAN_NUMERALS:
+        while number >= value:
+            out.append(numeral)
+            number -= value
+    return "".join(out)
+
+
+def _alpha(number):
+    """1 -> a, 26 -> z, 27 -> aa: how a list counts in letters."""
+    if number <= 0:
+        return str(number)
+    out = []
+    while number > 0:
+        number, remainder = divmod(number - 1, 26)
+        out.append(chr(ord("a") + remainder))
+    return "".join(reversed(out))
+
+
+def _marker_text(kind, index):
+    """The text of a counting list marker, or None for the bullet shapes."""
+    if kind == "decimal":
+        return "%d." % index
+    if kind == "decimal-leading-zero":
+        return "%02d." % index
+    if kind in ("lower-alpha", "lower-latin"):
+        return "%s." % _alpha(index)
+    if kind in ("upper-alpha", "upper-latin"):
+        return "%s." % _alpha(index).upper()
+    if kind == "lower-roman":
+        return "%s." % _roman(index)
+    if kind == "upper-roman":
+        return "%s." % _roman(index).upper()
+    return None
+
+
+def _int_attr(node, name, fallback):
+    if not isinstance(node, Element):
+        return fallback
+    try:
+        return int(node.attributes.get(name, fallback))
+    except (TypeError, ValueError):
+        return fallback
+
+
+def _list_index(node):
+    """What number this list item shows.
+
+    There is one counter per list, not one number per item: `<ol start>` seeds
+    it, `<li value>` sets it, and every item after that carries on from
+    wherever it was left -- so a `value="9"` renumbers its whole tail.
+    """
+    parent = node.parent
+    if not isinstance(parent, Element):
+        return _int_attr(node, "value", 1)
+    index = _int_attr(parent, "start", 1)
+    for child in parent.children:
+        if not (isinstance(child, Element) and
+                child.style.get("display") == "list-item"):
+            continue
+        index = _int_attr(child, "value", index)
+        if child is node:
+            return index
+        index += 1
+    return _int_attr(node, "value", index)
+
+
+def _is_inline_level(node):
+    """True when `node` lays out inside a line rather than starting one.
+
+    An element is inline either because CSS said so or because it is one of
+    the tags that is inline by default and nothing overrode it.
+    """
+    if not isinstance(node, Element):
+        return False
+    display = node.style.get("display")
+    if display == "none":
+        return False
+    if display is None:
+        return node.tag in INLINE_ELEMENTS
+    return display in ("inline", "inline-block")
+
+
+def _wraps_block_content(node):
+    """True when an inline element contains block-level content.
+
+    The shape is `<a><div class="thumb"></div><div class="title"></div></a>`
+    -- a whole card wrapped in one link. Treating that as inline would run
+    the thumbnail and the title together on a single line, so the enclosing
+    box has to lay out as a block. Only inline descendants are walked
+    through: once a block turns up, the answer is settled.
+    """
+    stack = list(node.children)
+    while stack:
+        child = stack.pop()
+        if isinstance(child, Text):
+            continue
+        if child.style.get("display") == "none":
+            continue
+        if _is_inline_level(child):
+            stack.extend(child.children)
+            continue
+        return True
+    return False
+
+
 def _block_padding(node):
     """Vertical padding (top + bottom) of a block's own style."""
-    return parse_px(node.style.get("padding-top", "0")) \
-        + parse_px(node.style.get("padding-bottom", "0"))
+    pt, _pr, pb, _pl = _padding_box(getattr(node, "style", {}) or {})
+    return pt + pb
 
 
 def _dispatch_layout(box):
@@ -511,9 +646,159 @@ def _dispatch_layout(box):
         box._layout_inline()
 
 
+_BORDER_SIDES = ("top", "right", "bottom", "left")
+_BORDER_STYLES = ("none", "hidden", "solid", "dashed", "dotted", "double",
+                  "groove", "ridge", "inset", "outset")
+# CSS names three widths instead of giving numbers; these are the pixel
+# values browsers settled on.
+_BORDER_WIDTH_KEYWORDS = {"thin": 1.0, "medium": 3.0, "thick": 5.0}
+# A value is a run of non-space characters, except that a function call
+# keeps its parentheses (and the spaces inside them) together, so
+# `1px solid rgb(0, 0, 0)` is three tokens rather than five.
+_VALUE_TOKEN_RE = re.compile(r"[^\s(]+\([^)]*\)|\S+")
+
+
+def _value_tokens(value):
+    return _VALUE_TOKEN_RE.findall(value or "")
+
+
+def _four_sides(value):
+    """Map a 1-to-4 value box property onto its sides, CSS's clock order."""
+    parts = _value_tokens(value)
+    if not parts:
+        return {}
+    if len(parts) == 1:
+        top = right = bottom = left = parts[0]
+    elif len(parts) == 2:
+        top, bottom, right, left = parts[0], parts[0], parts[1], parts[1]
+    elif len(parts) == 3:
+        top, right, bottom = parts
+        left = right
+    else:
+        top, right, bottom, left = parts[:4]
+    return {"top": top, "right": right, "bottom": bottom, "left": left}
+
+
+def _border_width(token):
+    token = token.strip().lower()
+    if token in _BORDER_WIDTH_KEYWORDS:
+        return _BORDER_WIDTH_KEYWORDS[token]
+    return parse_px(token, 0.0)
+
+
+def _parse_border_shorthand(value):
+    """Split `2px solid #ccc` -- in any order, with any part missing -- into
+    (width, style, color).
+
+    The shorthand resets all three, so an omitted width becomes `medium` and
+    an omitted style becomes `none`, exactly as the spec says. An omitted
+    colour comes back as None, meaning `currentColor`.
+    """
+    width = style = color = None
+    for token in _value_tokens(value):
+        low = token.lower()
+        if low in _BORDER_STYLES:
+            style = low
+        elif low in _BORDER_WIDTH_KEYWORDS or re.match(
+                r"^[\d.]+(px|rem|em|pt|%)?$", low):
+            width = _border_width(token)
+        else:
+            color = token
+    return (width if width is not None else 3.0, style or "none", color)
+
+
+def _border_box(style):
+    """Resolve every border declaration into an (width, color) per side.
+
+    The same edge can be described four ways, each more specific than the
+    last: `border`, the `border-width`/`border-style`/`border-color` boxes,
+    `border-left`, and `border-left-width`. They are applied in that order,
+    which is what the cascade would have done had the shorthands been
+    expanded when they were parsed. A side with no style, no width, or
+    `style: none` reports a width of zero and is not painted.
+    """
+    widths = dict.fromkeys(_BORDER_SIDES, 0.0)
+    styles = dict.fromkeys(_BORDER_SIDES, "none")
+    colors = dict.fromkeys(_BORDER_SIDES, None)
+
+    shorthand = style.get("border")
+    if shorthand:
+        width, kind, color = _parse_border_shorthand(shorthand)
+        for side in _BORDER_SIDES:
+            widths[side], styles[side], colors[side] = width, kind, color
+    for side, token in _four_sides(style.get("border-width", "")).items():
+        widths[side] = _border_width(token)
+    for side, token in _four_sides(style.get("border-style", "")).items():
+        styles[side] = token.lower()
+    for side, token in _four_sides(style.get("border-color", "")).items():
+        colors[side] = token
+    for side in _BORDER_SIDES:
+        edge = style.get("border-%s" % side)
+        if edge:
+            widths[side], styles[side], colors[side] = \
+                _parse_border_shorthand(edge)
+        width = style.get("border-%s-width" % side)
+        if width:
+            widths[side] = _border_width(width)
+        kind = style.get("border-%s-style" % side)
+        if kind:
+            styles[side] = kind.strip().lower()
+        color = style.get("border-%s-color" % side)
+        if color:
+            colors[side] = color
+
+    resolved = {}
+    for side in _BORDER_SIDES:
+        if styles[side] in ("none", "hidden") or widths[side] <= 0:
+            resolved[side] = (0.0, None)
+            continue
+        color = resolve_color(colors[side] or style.get("color", "black")) \
+            or "black"
+        resolved[side] = (widths[side], color)
+    return resolved
+
+
+def _paint_border(box, cmds):
+    """Draw the box's borders as four filled edges.
+
+    They are drawn *inside* the box rather than around it, which keeps a
+    border from shifting the layout of everything after it -- the same
+    bargain `box-sizing: border-box` makes. Every drawable style is painted
+    solid; dashes and ridges would need stroke patterns the canvas does not
+    have, and a solid line of the right weight and colour is much closer to
+    the intent than nothing at all.
+    """
+    node = box.node
+    if not isinstance(node, Element):
+        return
+    sides = _border_box(node.style)
+    if not any(width for width, _color in sides.values()):
+        return
+    left, top = box.x, box.y
+    right, bottom = box.x + box.width, box.y + box.height
+    if right <= left or bottom <= top:
+        return
+    width, color = sides["top"]
+    if width:
+        cmds.append(DrawRect(left, top, right, min(top + width, bottom), color))
+    width, color = sides["bottom"]
+    if width:
+        cmds.append(DrawRect(left, max(bottom - width, top), right, bottom,
+                             color))
+    width, color = sides["left"]
+    if width:
+        cmds.append(DrawRect(left, top, min(left + width, right), bottom,
+                             color))
+    width, color = sides["right"]
+    if width:
+        cmds.append(DrawRect(max(right - width, left), top, right, bottom,
+                             color))
+
+
 def _paint_bg(box, cmds, require_size=True):
     """Emit background paint for `box`: box-shadow (behind), then either a
-    linear-gradient (bands) or the resolved flat background color."""
+    linear-gradient (bands) or the resolved flat background color, then the
+    borders on top of both."""
     node = box.node
     if not isinstance(node, Element):
         return
@@ -523,12 +808,14 @@ def _paint_bg(box, cmds, require_size=True):
     grad = _gradient_spec(node)
     if grad is not None:
         cmds.extend(_gradient_rects(box, *grad))
+        _paint_border(box, cmds)
         return
     bg = resolve_color(node.style.get("background-color")) or \
         resolve_color(node.style.get("background"))
     if bg:
         cmds.append(DrawRect(box.x, box.y, box.x + box.width,
                              box.y + box.height, bg))
+    _paint_border(box, cmds)
 
 
 def _paint_box_shadow(box, cmds):
@@ -713,15 +1000,26 @@ class _LineItem:
 
 
 class BlockLayout(LayoutBox):
-    # Horizontal padding drawn on either side of table cell content.
-    CELL_PAD = 4
+    def _parent_content_box(self):
+        """Where the parent leaves room for its children: (left, width, top),
+        the parent's box inset by the parent's own padding."""
+        parent = self.parent
+        pstyle = getattr(parent.node, "style", {}) or {}
+        pt, pr, _pb, pl = _padding_box(pstyle)
+        return (parent.x + pl,
+                max(0.0, parent.width - pl - pr),
+                pt)
 
     def layout(self):
         node = self.node
         style = getattr(node, "style", {}) or {}
         ml, ml_auto = _margin_side(style, "left")
         mr, mr_auto = _margin_side(style, "right")
-        base = max(0.0, self.parent.width - ml - mr)
+        # A child fills its parent's *content* box, which is the parent's box
+        # inset by the parent's padding. Ignoring that is why a padded card
+        # used to have its contents sitting flush against its own border.
+        parent_left, parent_width, parent_top = self._parent_content_box()
+        base = max(0.0, parent_width - ml - mr)
 
         # CSS 2.1 §10.3.3 for block-level, non-replaced elements in normal
         # flow: resolve the used width (auto fills the parent), clamp it with
@@ -730,21 +1028,21 @@ class BlockLayout(LayoutBox):
         css_w = style.get("width", "")
         if css_w.strip().lower() not in ("", "auto", "fit-content",
                                          "min-content", "max-content"):
-            content_width = max(0.0, _resolve_len(css_w, self.parent.width, base))
+            content_width = max(0.0, _resolve_len(css_w, parent_width, base))
         else:
             content_width = base
         mw = style.get("max-width", "")
         if mw.strip().lower() not in ("", "none"):
             content_width = min(
                 content_width,
-                max(0.0, _resolve_len(mw, self.parent.width, content_width)))
+                max(0.0, _resolve_len(mw, parent_width, content_width)))
         mnw = style.get("min-width", "")
         if mnw.strip().lower() not in ("", "auto"):
             content_width = max(
                 content_width,
-                max(0.0, _resolve_len(mnw, self.parent.width, content_width)))
+                max(0.0, _resolve_len(mnw, parent_width, content_width)))
 
-        remaining = self.parent.width - content_width - ml - mr
+        remaining = parent_width - content_width - ml - mr
         if ml_auto and mr_auto:
             ml = mr = (remaining / 2) if remaining > 0 else 0
         elif ml_auto:
@@ -755,15 +1053,14 @@ class BlockLayout(LayoutBox):
             # Over-constrained in LTR: margin-right absorbs the shortfall.
             mr = max(0.0, mr + remaining)
 
-        self.x = self.parent.x + ml
+        self.x = parent_left + ml
         self.width = content_width
         if self.previous:
             # margin-bottom is "0" for text nodes, so this is safe for them too.
             self.y = self.previous.y + self.previous.height \
                 + parse_px(self.previous.node.style.get("margin-bottom", "0"))
         else:
-            self.y = self.parent.y + parse_px(
-                self.parent.node.style.get("padding-top", "0"))
+            self.y = self.parent.y + parent_top
         self.y += parse_px(node.style.get("margin-top", "0"))
         # `clear` pushes a block (or a float/line box) below its side's floats.
         if getattr(self, "_y_floor", None) is not None:
@@ -793,22 +1090,37 @@ class BlockLayout(LayoutBox):
             return "inline"
         for child in node.children:
             if isinstance(child, Text):
-                if child.text.strip():
-                    return "inline"
-            elif child.style.get("display") not in ("none",) and \
-                    (child.tag in INLINE_ELEMENTS and child.style.get("display") is None
-                     or child.style.get("display") in ("inline", "inline-block")):
+                # Text next to a block does not make the box inline: CSS
+                # wraps it in an anonymous block instead, which is what
+                # `<li>item<ul>...</ul></li>` needs to stack rather than run
+                # the sub-list onto the item's own line. _layout_block gives
+                # a bare text child its own box, so that fall-out is free.
                 continue
-            elif isinstance(child, Element) and child.style.get("display") == "none":
+            if child.style.get("display") == "none":
                 continue
-            else:
-                return "block"
+            if _is_inline_level(child):
+                # An inline element can still hide block content: <a><div>
+                # ...</div></a> is the card link on every listing page. CSS
+                # splits the inline box around the block, so the box holding
+                # it is a block box no matter what its own display says.
+                if _wraps_block_content(child):
+                    return "block"
+                continue
+            return "block"
         # No block children -> inline (even if empty).
         return "inline"
 
     def _layout_block(self):
         previous = None
         float_boxes = []
+        # A list item whose content is blocks -- one holding a nested list,
+        # or a paragraph -- gets its marker here; the inline path only ever
+        # reached the items that were a single line of text.
+        if isinstance(self.node, Element) and \
+                self.node.style.get("display") == "list-item":
+            self.display_list = []
+            self._draw_bullet(
+                self.y + _padding_box(self.node.style)[0])
         for child in self.node.children:
             if isinstance(child, Element) and child.style.get("display") == "none":
                 continue
@@ -935,8 +1247,9 @@ class BlockLayout(LayoutBox):
     def _line_bounds(self):
         """Horizontal span available to the current line, clipped by any
         floats whose vertical span covers the line's top."""
-        x0 = self.x
-        x1 = self.x + self.width
+        _pt, pr, _pb, pl = _padding_box(getattr(self.node, "style", {}) or {})
+        x0 = self.x + pl
+        x1 = max(x0, self.x + self.width - pr)
         y = self.cursor_y
         for f in self._all_float_regions():
             if f["top"] <= y < f["bottom"]:
@@ -996,11 +1309,11 @@ class BlockLayout(LayoutBox):
         for row_cells in grid:
             for c, cs, rs, el in row_cells:
                 mi, ma = self._measure_width(el)
-                # The content box is the column minus CELL_PAD on each side,
-                # so the measured single-line width only fits if the padding
-                # is added back to the column's min/max widths.
-                mi += 2 * self.CELL_PAD
-                ma += 2 * self.CELL_PAD
+                # A column has to be wide enough for the text *and* the
+                # cell's padding, which the cell lays out inside itself.
+                _pt, pr, _pb, pl = _padding_box(el.style)
+                mi += pl + pr
+                ma += pl + pr
                 share = max(1, cs)
                 for k in range(c, c + cs):
                     col_min[k] = max(col_min[k], mi / share)
@@ -1044,7 +1357,9 @@ class BlockLayout(LayoutBox):
         for ri, row_cells in enumerate(grid):
             for c, cs, rs, el in row_cells:
                 col_w = sum(self._widths[c:c + cs])
-                content_w = max(1, col_w - 2 * self.CELL_PAD)
+                # The cell box is the whole column: it insets its own
+                # content by its own padding, like any other box.
+                content_w = max(1, col_w)
                 cb = BlockLayout(el, self, None)
                 cb.x = 0
                 cb.y = 0
@@ -1059,12 +1374,12 @@ class BlockLayout(LayoutBox):
         row_h = [0.0] * len(grid)
         for ri, c, cs, rs, el, cb, content_h, col_w in cells:
             if rs == 1:
-                row_h[ri] = max(row_h[ri], content_h + 2 * self.CELL_PAD)
+                row_h[ri] = max(row_h[ri], content_h)
         for ri, c, cs, rs, el, cb, content_h, col_w in cells:
             if rs <= 1:
                 continue
             span_sum = sum(row_h[ri:ri + rs])
-            overflow = (content_h + 2 * self.CELL_PAD) - span_sum
+            overflow = content_h - span_sum
             if overflow > 0:
                 row_h[ri] += overflow
 
@@ -1153,21 +1468,21 @@ class BlockLayout(LayoutBox):
 
     def _render_cell(self, cb, cell_box, content_h):
         """Flatten a cell's laid-out subtree into absolute paint coordinates,
-        applying padding and the cell's vertical alignment."""
-        pad = self.CELL_PAD
+        applying the cell's vertical alignment. The cell's padding is already
+        inside `content_h`; the cell box laid its own content out."""
         cell_node = cb.node
         valign = cell_node.style.get("vertical-align",
                                      "middle" if cell_node.tag in ("td", "th")
                                      else "top") if isinstance(cell_node, Element) \
             else "top"
-        cap = max(0, cell_box.height - 2 * pad - content_h)
-        dy = pad
+        cap = max(0, cell_box.height - content_h)
+        dy = 0.0
         if valign == "middle":
             dy += cap / 2
         elif valign == "bottom":
             dy += cap
         out = []
-        self._flatten_paint(cb, out, cell_box.x + pad, cell_box.y + dy)
+        self._flatten_paint(cb, out, cell_box.x, cell_box.y + dy)
         return out
 
     def _shift_cmd(self, cmd, dx, dy):
@@ -1909,19 +2224,21 @@ class BlockLayout(LayoutBox):
     def _layout_inline(self):
         self.display_list = []
         clear = self.node.style.get("clear") if isinstance(self.node, Element) else ""
-        self.cursor_y = self._cleared(clear, self.y)
+        pt, _pr, pb, _pl = _padding_box(getattr(self.node, "style", {}) or {})
+        # Text starts below the box's own padding; _line_bounds keeps it
+        # inside the left and right padding as each line is placed.
+        self.cursor_y = self._cleared(clear, self.y) + pt
         self.cursor_x = self._line_bounds()[0]
         self.line = []  # pending words on the current line
 
         # List item bullet.
         if isinstance(self.node, Element) and \
                 self.node.style.get("display") == "list-item":
-            self._draw_bullet()
+            self._draw_bullet(self.cursor_y)
 
         self.recurse(self.node)
         self.flush()
-        self.height = self.cursor_y - self.y \
-            + parse_px(self.node.style.get("padding-bottom", "0"))
+        self.height = self.cursor_y - self.y + pb
 
     # -- inline layout ---------------------------------------------------
 
@@ -2057,23 +2374,68 @@ class BlockLayout(LayoutBox):
         self.line = []
 
     def _maybe_underline(self, x, y, word, font, color, node):
-        # Walk up to see if any ancestor requests underline (links, <u>).
+        """Underline a word when the nearest box that says anything about
+        text-decoration asks for one.
+
+        The property does not inherit -- the box that declares it draws the
+        line through everything inside -- so the *nearest* declaration wins
+        and settles the question. That is what makes `a { text-decoration:
+        none }` work: without it the UA sheet's underline on every link
+        could never be taken back.
+        """
+        def underline():
+            yb = y + _metrics(font, "ascent") + 1
+            self.display_list.append(
+                DrawLine(x, yb, x + _measure(font, word), yb, color, 1))
+
         n = node
         while n is not None:
-            if isinstance(n, Element) and (n.tag in ("a", "u")
-                    or n.style.get("text-decoration") == "underline"):
-                yb = y + _metrics(font, "ascent") + 1
-                self.display_list.append(
-                    DrawLine(x, yb, x + _measure(font, word), yb, color, 1))
-                return
+            if isinstance(n, Element):
+                decoration = n.style.get("text-decoration") \
+                    or n.style.get("text-decoration-line")
+                if decoration:
+                    if "underline" in decoration.lower().split():
+                        underline()
+                    return
+                if n.tag in ("a", "u"):
+                    # No sheet loaded at all (some tests lay out bare DOMs);
+                    # links and <u> are underlined by every browser's default.
+                    underline()
+                    return
             n = n.parent
 
-    def _draw_bullet(self):
-        size = int(round(parse_px(self.node.style.get("font-size", "16px"), 16)))
-        color = resolve_color(self.node.style.get("color", "black")) or "black"
-        by = self.cursor_y + size * 0.5
-        bx = self.x - 14
-        self.display_list.append(DrawRect(bx, by, bx + 5, by + 5, color))
+    def _draw_bullet(self, top):
+        """Draw the list item's marker in the margin to its left, level with
+        the first line of the item, whose top is `top`.
+
+        Which marker depends on `list-style-type`, which inherits, so a
+        `list-style: none` on the <ul> reaches every <li> inside it and an
+        <ol> counts in whatever numbering its sheet asked for.
+        """
+        style = self.node.style
+        kind = (style.get("list-style-type") or "disc").strip().lower()
+        if kind == "none":
+            return
+        color = resolve_color(style.get("color", "black")) or "black"
+        text = _marker_text(kind, _list_index(self.node))
+        if text is not None:
+            font = _node_font(self.node)
+            self.display_list.append(
+                DrawText(self.x - _measure(font, text) - 8, top,
+                         text, font, color, self.node))
+            return
+        size = int(round(parse_px(style.get("font-size", "16px"), 16)))
+        top = top + size * 0.5
+        left = self.x - 14
+        if kind == "square":
+            self.display_list.append(
+                DrawRect(left, top, left + 6, top + 6, color))
+        elif kind == "circle":
+            self.display_list.append(
+                DrawOval(left, top, left + 6, top + 6, None, color))
+        else:
+            self.display_list.append(
+                DrawOval(left, top, left + 6, top + 6, color))
 
     def _draw_hr(self, node):
         y = self.cursor_y + 4
@@ -2293,15 +2655,10 @@ class CellLayout(LayoutBox):
 
     def paint(self):
         cmds = []
+        # A cell's border comes out of _paint_bg like any other box's now,
+        # at the weight and colour the sheet asked for instead of the flat
+        # grey outline this used to draw.
         _paint_bg(self, cmds, require_size=False)
-        node = self.node
-        if isinstance(node, Element):
-            border = node.style.get("border") or \
-                node.style.get("border-top-width") or ""
-            if border:
-                cmds.append(DrawOutline(self.x, self.y,
-                                        self.x + self.width, self.y + self.height,
-                                        "#666666", 1))
         cmds.extend(self.content)
         return cmds
 

@@ -750,6 +750,31 @@ def _build_rule_index(rules):
     return index
 
 
+_LIST_STYLE_POSITIONS = ("inside", "outside")
+
+
+def _expand(prop, value):
+    """Yield the properties a declaration really sets.
+
+    Almost every shorthand in this engine is left un-expanded and read
+    where it is used, which works because layout can go looking for it.
+    `list-style` cannot be handled that way: only its type component
+    inherits, and the whole point of `list-style: none` on a <ul> is that
+    the <li>s inside it lose their markers. So it is expanded here, in
+    declaration order, exactly as writing the longhand would have been.
+    """
+    yield prop, value
+    if prop == "list-style":
+        for token in value.split():
+            lowered = token.lower()
+            if lowered in _LIST_STYLE_POSITIONS:
+                yield "list-style-position", lowered
+            elif lowered.startswith("url("):
+                yield "list-style-image", token
+            else:
+                yield "list-style-type", lowered
+
+
 def style(node, rules):
     """Compute the `.style` dict for `node` and its subtree.
 
@@ -803,12 +828,14 @@ def style(node, rules):
             if not selector.matches(node):
                 continue
             for prop, value in body.items():
-                node.style[prop] = value
+                for expanded, v in _expand(prop, value):
+                    node.style[expanded] = v
 
         # 3. Inline style attribute (highest, aside from !important we ignore).
         if isinstance(node, Element) and "style" in node.attributes:
             for prop, value in parse_inline(node.attributes["style"]).items():
-                node.style[prop] = value
+                for expanded, v in _expand(prop, value):
+                    node.style[expanded] = v
 
         # 3b. Resolve var(--custom, fallback) references. Custom properties
         # inherit, so lookups walk up the parent chain.

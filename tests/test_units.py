@@ -1261,6 +1261,228 @@ def test_resolve_color_handles_css_color_functions():
     eq(resolve_color("red"), "red", "named color passes through")
 
 
+def _paint_all(html, css="", width=620, ua=False):
+    """Lay a fragment out and collect every paint command in the tree."""
+    from feetbrowser.layout import DocumentLayout
+    rules = []
+    if ua:
+        from feetbrowser.browser import DEFAULT_STYLE_SHEET
+        rules += DEFAULT_STYLE_SHEET
+    if css:
+        rules += CSSParser(css).parse()
+    dom = HTMLParser(html).parse()
+    style(dom, rules)
+    doc = DocumentLayout(dom, width)
+    doc.layout()
+    cmds = []
+    stack = [doc]
+    while stack:
+        box = stack.pop()
+        cmds.extend(box.paint())
+        stack.extend(box.children)
+    return cmds
+
+
+def test_border_shorthand_paints_all_four_edges():
+    """`border: 2px solid` used to paint nothing at all -- borders were a
+    hardcoded grey outline on table cells and nowhere else."""
+    from feetbrowser.layout import DrawRect
+    cmds = _paint_all(
+        '<div style="border:2px solid #3b6ea5;width:100px;height:40px"></div>')
+    edges = [c for c in cmds
+             if isinstance(c, DrawRect) and c.color == "#3b6ea5"]
+    eq(len(edges), 4, "one filled rect per side")
+    for edge in edges:
+        assert min(edge.right - edge.left, edge.bottom - edge.top) == 2, \
+            f"edge is 2px thick: {edge.right - edge.left}x{edge.bottom - edge.top}"
+
+
+def test_border_is_painted_inside_the_box():
+    """Borders sit inside the box edge so adding one never shifts layout."""
+    from feetbrowser.layout import DrawRect
+    cmds = _paint_all(
+        '<div style="background:#eeeeee;border:4px solid #000000;'
+        'width:120px;height:50px"></div>')
+    bg = [c for c in cmds if isinstance(c, DrawRect) and c.color == "#eeeeee"][0]
+    for edge in [c for c in cmds
+                 if isinstance(c, DrawRect) and c.color == "#000000"]:
+        assert bg.left <= edge.left and edge.right <= bg.right, "inside x"
+        assert bg.top <= edge.top and edge.bottom <= bg.bottom, "inside y"
+
+
+def test_border_width_without_a_style_paints_nothing():
+    """`border-style` initially is `none`, so a width on its own is invisible.
+    Getting this wrong puts a black box around half the web."""
+    from feetbrowser.layout import DrawRect
+    cmds = _paint_all(
+        '<div style="border-width:6px;border-color:red;'
+        'width:80px;height:30px"></div>')
+    eq([c for c in cmds if isinstance(c, DrawRect) and c.color == "red"], [],
+       "no style means no border")
+
+
+def test_border_side_beats_the_shorthand():
+    """Declaration order does not decide this -- specificity within the
+    border family does: `border-left` always wins over `border`."""
+    from feetbrowser.layout import DrawRect
+    cmds = _paint_all(
+        '<div style="border-left:5px solid #ff0000;border:1px solid #000000;'
+        'width:90px;height:40px"></div>')
+    reds = [c for c in cmds if isinstance(c, DrawRect) and c.color == "#ff0000"]
+    eq(len(reds), 1, "just the left edge is red")
+    eq(reds[0].right - reds[0].left, 5, "and it keeps its own width")
+    eq(len([c for c in cmds
+            if isinstance(c, DrawRect) and c.color == "#000000"]), 3,
+       "the other three sides come from the shorthand")
+
+
+def test_border_clock_order_and_omitted_colour():
+    """`border-width: 1px 2px 3px 4px` runs top/right/bottom/left, and a
+    shorthand with no colour picks up `color`."""
+    from feetbrowser.layout import _border_box
+    sides = _border_box({"border-style": "solid",
+                         "border-width": "1px 2px 3px 4px",
+                         "color": "#123456"})
+    eq(sides["top"][0], 1.0)
+    eq(sides["right"][0], 2.0)
+    eq(sides["bottom"][0], 3.0)
+    eq(sides["left"][0], 4.0)
+    eq(sides["top"][1], "#123456", "currentColor fills in for the colour")
+    eq(_border_box({"border": "solid red"})["top"][0], 3.0,
+       "an omitted width is medium")
+
+
+def test_block_padding_insets_its_children():
+    """A padded card used to lay its text out flush against its own border,
+    because padding only ever applied to inline content."""
+    from feetbrowser.layout import DrawText
+    cmds = _paint_all('<div style="padding:20px"><p>Inside</p></div>')
+    word = [c for c in cmds if isinstance(c, DrawText) and c.text == "Inside"][0]
+    assert word.left >= 20, f"text starts past the left padding: {word.left}"
+    assert word.top >= 20, f"text starts below the top padding: {word.top}"
+
+
+def test_block_padding_narrows_the_content_box():
+    """Padding takes width away from children instead of letting them spill
+    over the right edge of the box."""
+    from feetbrowser.layout import DrawRect
+    cmds = _paint_all(
+        '<div style="padding:25px;width:300px">'
+        '<div style="background:#00ff00;height:10px"></div></div>')
+    fill = [c for c in cmds if isinstance(c, DrawRect) and c.color == "#00ff00"][0]
+    eq(fill.right - fill.left, 250, "300 wide minus 25 of padding each side")
+
+
+def test_block_inside_inline_lays_out_as_a_block():
+    """A card wrapped in a link -- <a><div>..</div><div>..</div></a> -- put
+    every div on one line, because the <a> looked inline to layout_mode."""
+    from feetbrowser.layout import DrawText
+    cmds = _paint_all(
+        '<div><a href="#"><div>First</div><div>Second</div></a></div>')
+    tops = {c.text: c.top for c in cmds if isinstance(c, DrawText)}
+    assert tops["Second"] > tops["First"], \
+        f"the two blocks stack: {tops}"
+
+
+def test_inline_wrapper_without_blocks_stays_inline():
+    """The flip side: a plain link keeps flowing with the text around it."""
+    from feetbrowser.layout import DrawText
+    cmds = _paint_all('<div>before <a href="#">link</a> after</div>')
+    tops = {c.text: c.top for c in cmds if isinstance(c, DrawText)}
+    eq(tops["before"], tops["link"], "same line")
+    eq(tops["link"], tops["after"], "same line")
+
+
+def test_ordered_list_numbers_honour_start_and_value():
+    from feetbrowser.layout import DrawText
+    cmds = _paint_all(
+        '<ol start="3"><li>a</li><li value="9">b</li><li>c</li></ol>',
+        ua=True)
+    markers = sorted(
+        (c.top, c.text) for c in cmds
+        if isinstance(c, DrawText) and c.text.endswith("."))
+    eq([text for _top, text in markers], ["3.", "9.", "10."],
+       "start seeds the count and value resets it")
+
+
+def test_list_style_type_covers_the_counting_styles():
+    from feetbrowser.layout import _marker_text
+    eq(_marker_text("decimal", 4), "4.")
+    eq(_marker_text("decimal-leading-zero", 4), "04.")
+    eq(_marker_text("lower-alpha", 27), "aa.")
+    eq(_marker_text("upper-alpha", 2), "B.")
+    eq(_marker_text("lower-roman", 14), "xiv.")
+    eq(_marker_text("upper-roman", 1990), "MCMXC.")
+    eq(_marker_text("disc", 1), None, "shapes are drawn, not written")
+
+
+def test_nested_bullets_change_shape():
+    """disc, then circle, then square -- what every default sheet does."""
+    from feetbrowser.layout import DrawOval, DrawRect
+    cmds = _paint_all(
+        '<ul><li>one<ul><li>two<ul><li>three</li></ul></li></ul></li></ul>',
+        ua=True)
+    ovals = [c for c in cmds if isinstance(c, DrawOval)]
+    eq(len([o for o in ovals if o.fill]), 1, "one filled disc")
+    eq(len([o for o in ovals if o.outline and not o.fill]), 1, "one ring")
+    marks = [c for c in cmds if isinstance(c, DrawRect)
+             and c.right - c.left == 6 and c.bottom - c.top == 6]
+    eq(len(marks), 1, "one square")
+
+
+def test_list_style_none_shorthand_reaches_the_items():
+    """`list-style` does not inherit, but the type it sets does -- so the
+    shorthand has to be expanded at cascade time or `list-style: none` on a
+    <ul> leaves every bullet in place."""
+    from feetbrowser.layout import DrawOval
+    cmds = _paint_all(
+        '<ul style="list-style:none"><li>one</li><li>two</li></ul>', ua=True)
+    eq([c for c in cmds if isinstance(c, DrawOval)], [], "no bullets left")
+
+
+def test_list_style_shorthand_keeps_its_position_component():
+    from feetbrowser.cssparser import _expand
+    eq(dict(_expand("list-style", "square outside")),
+       {"list-style": "square outside", "list-style-type": "square",
+        "list-style-position": "outside"})
+    eq(dict(_expand("color", "red")), {"color": "red"},
+       "other properties pass through untouched")
+
+
+def test_list_item_with_block_content_still_gets_a_marker():
+    """Markers were drawn on the inline path only, so an <li> holding a <div>
+    silently lost its bullet once block-in-inline started working."""
+    from feetbrowser.layout import DrawOval
+    cmds = _paint_all('<ul><li><div>boxed</div></li></ul>', ua=True)
+    eq(len([c for c in cmds if isinstance(c, DrawOval)]), 1, "bullet survives")
+
+
+def test_text_decoration_none_wins_over_the_ua_underline():
+    """text-decoration does not inherit; the nearest box that declares one
+    decides. That is the whole reason `a { text-decoration: none }` works."""
+    from feetbrowser.layout import DrawLine
+    underlined = _paint_all('<p><a href="#">plain</a></p>', ua=True)
+    assert [c for c in underlined if isinstance(c, DrawLine)], \
+        "links underline by default"
+    bare = _paint_all('<p><a href="#">plain</a></p>',
+                      css="a { text-decoration: none; }", ua=True)
+    eq([c for c in bare if isinstance(c, DrawLine)], [], "and the page can say no")
+
+
+def test_table_cell_padding_comes_from_css():
+    """Cells used to be pinned to a hardcoded 4px inset. Now the padding is
+    theirs, so a sheet can widen it and the column widens to match."""
+    from feetbrowser.layout import DrawText
+    tight = _paint_all('<table><tr><td>Cell</td><td>Two</td></tr></table>',
+                       ua=True)
+    roomy = _paint_all('<table><tr><td>Cell</td><td>Two</td></tr></table>',
+                       css="td { padding: 20px; }", ua=True)
+    def second(cmds):
+        return [c for c in cmds if isinstance(c, DrawText) and c.text == "Two"][0]
+    assert second(roomy).left > second(tight).left + 20, \
+        "the wider padding pushes the second column right"
+
+
 def _start_server(handler, **kw):
     """Serve `handler` on an ephemeral port in a background thread."""
     import http.server

@@ -647,7 +647,9 @@ class Canvas:
                     y -= photo.height() / 2
                 surface.blit_rgba(photo.rgba, photo.width(), photo.height(),
                                   x, y, getattr(photo, "opaque", False))
-        elif kind in ("oval", "arc"):
+        elif kind == "oval":
+            self._paint_oval(surface, item)
+        elif kind == "arc":
             self._paint_arc(surface, item)
         elif kind == "polygon":
             fill = color(opts.get("fill"))
@@ -677,6 +679,63 @@ class Canvas:
         for line in str(text).split("\n"):
             font.draw(surface, line, x, baseline, fill)
             baseline += font.linespace
+
+    def _paint_oval(self, surface, item):
+        """Fill an ellipse, then stroke its edge.
+
+        List markers are what this is for: `list-style-type: disc` is a
+        small filled dot and `circle` is the same dot hollow, and stroking
+        an arc alone can only ever give you the hollow one.
+
+        A marker is about six pixels across, which is small enough that
+        aliasing decides what shape the reader thinks they are looking at --
+        a hard-edged six-pixel ring reads as a square. Small ovals therefore
+        go through the supersampled path, which costs a few hundred samples;
+        big ones keep the cheap scanline, where a stair-step of one pixel in
+        two hundred is invisible anyway.
+        """
+        x0, y0, x1, y1 = _ordered(item.coords)
+        fill = color(item.opts.get("fill"))
+        outline = color(item.opts.get("outline"))
+        rx, ry = (x1 - x0) / 2.0, (y1 - y0) / 2.0
+        if rx <= 0 or ry <= 0 or not (fill or outline):
+            return
+        width = float(item.opts.get("width", 1) or 0) if outline else 0.0
+        if max(x1 - x0, y1 - y0) <= _OVAL_AA_LIMIT:
+            self._paint_oval_aa(surface, x0, y0, x1, y1, fill, outline, width)
+            return
+        cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
+        if fill:
+            for y in range(int(math.floor(y0)), int(math.ceil(y1))):
+                dy = (y + 0.5 - cy) / ry
+                if abs(dy) > 1.0:
+                    continue
+                half = rx * math.sqrt(1.0 - dy * dy)
+                surface.fill_rect(cx - half, y, cx + half, y + 1, fill, 255)
+        if outline:
+            self._paint_arc(surface, item)
+
+    def _paint_oval_aa(self, surface, x0, y0, x1, y1, fill, outline, width):
+        """Draw a small ellipse pixel by pixel, each one blended by how much
+        of it the shape actually covers."""
+        cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
+        rx, ry = (x1 - x0) / 2.0, (y1 - y0) / 2.0
+        # The outline is drawn inside the edge, so the hole is the ellipse
+        # inset by its width. Without an outline the two coincide and every
+        # pixel is simply interior.
+        inner_rx, inner_ry = max(0.0, rx - width), max(0.0, ry - width)
+        for y in range(int(math.floor(y0)), int(math.ceil(y1))):
+            for x in range(int(math.floor(x0)), int(math.ceil(x1))):
+                outer = _ellipse_coverage(x, y, cx, cy, rx, ry)
+                if outer <= 0.0:
+                    continue
+                inner = _ellipse_coverage(x, y, cx, cy, inner_rx, inner_ry)
+                if fill and inner > 0.0:
+                    surface.fill_rect(x, y, x + 1, y + 1, fill,
+                                      int(round(inner * 255)))
+                if outline and outer > inner:
+                    surface.fill_rect(x, y, x + 1, y + 1, outline,
+                                      int(round((outer - inner) * 255)))
 
     def _paint_arc(self, surface, item):
         """Stroke an elliptical arc. Tk measures angles counter-clockwise
@@ -709,6 +768,29 @@ class Canvas:
 
     def save_png(self, path):
         self.render().save_png(path)
+
+
+_OVAL_AA_LIMIT = 48   # px across; above this the scanline path is good enough
+_OVAL_AA_SAMPLES = 4  # per axis, so 16 samples a pixel
+
+
+def _ellipse_coverage(x, y, cx, cy, rx, ry, samples=_OVAL_AA_SAMPLES):
+    """How much of pixel (x, y) falls inside the ellipse, from 0 to 1."""
+    if rx <= 0 or ry <= 0:
+        return 0.0
+    step = 1.0 / samples
+    inside = 0
+    for row in range(samples):
+        dy = (y + (row + 0.5) * step - cy) / ry
+        dy2 = dy * dy
+        if dy2 > 1.0:
+            continue
+        span = math.sqrt(1.0 - dy2) * rx
+        for col in range(samples):
+            dx = x + (col + 0.5) * step - cx
+            if -span <= dx <= span:
+                inside += 1
+    return inside / float(samples * samples)
 
 
 def _ordered(coords):
