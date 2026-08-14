@@ -8,7 +8,9 @@ Native methods are returned by Rust as callable `_DomMethod` objects, so no
 callable to `typeof`).
 """
 
-from feetbrowser_engine import dom_get, dom_set
+from urllib.parse import urlsplit
+
+from feetbrowser_engine import dom_get, dom_set, UNDEFINED
 
 _DOCUMENT = "document"
 _ELEMENT = "element"
@@ -18,19 +20,96 @@ _STYLE = "style"
 _FONTS = "fonts"
 
 
+class JSLocation:
+    """Bridge for `window.location` / `document.location`.
+
+    Reads expose the parsed parts of the current page URL. Writes — assigning
+    `href`, or calling `assign`/`replace`/`reload` — hand a navigation request
+    to the host's `navigate(url_str, replace)` callback, which the Tab wires to
+    its load pipeline. This is how JS-driven redirects navigate the browser
+    (e.g. DuckDuckGo's `window.parent.location.replace(...)`).
+    """
+
+    def __init__(self, base_url=None, navigate=None):
+        self.base_url = base_url
+        self._navigate = navigate
+
+    def _parts(self):
+        base = str(self.base_url) if self.base_url else ""
+        try:
+            return urlsplit(base)
+        except Exception:
+            return None
+
+    def js_get(self, name):
+        if name in ("assign", "replace", "reload"):
+            return getattr(self, "_" + name)
+        parts = self._parts()
+        if name == "href":
+            return str(self.base_url) if self.base_url else ""
+        if parts is None or not parts.scheme:
+            return "" if name in (
+                "hostname", "protocol", "pathname", "search", "hash",
+                "host", "origin", "port") else UNDEFINED
+        if name == "hostname":
+            return parts.hostname or ""
+        if name == "protocol":
+            return parts.scheme + ":"
+        if name == "pathname":
+            return parts.path
+        if name == "search":
+            return "?" + parts.query if parts.query else ""
+        if name == "hash":
+            return parts.fragment or ""
+        if name == "host":
+            return parts.netloc
+        if name == "origin":
+            return f"{parts.scheme}://{parts.netloc}"
+        if name == "port":
+            return str(parts.port or "")
+        return UNDEFINED
+
+    def js_set(self, name, value):
+        if name == "href":
+            self._navigate_url(value, replace=False)
+
+    def _assign(self, url=None):
+        self._navigate_url(url, replace=False)
+        return UNDEFINED
+
+    def _replace(self, url=None):
+        self._navigate_url(url, replace=True)
+        return UNDEFINED
+
+    def _reload(self):
+        if self._navigate is not None and self.base_url is not None:
+            self._navigate(str(self.base_url), replace=True)
+        return UNDEFINED
+
+    def _navigate_url(self, url, replace):
+        if url is None or url is UNDEFINED:
+            return
+        if self._navigate is not None:
+            self._navigate(str(url), replace)
+
+
 class JSDocument:
     """Bridge for the document global: the root of the DOM."""
 
-    def __init__(self, root_node, base_url=None, mark_dirty=None, interp=None):
+    def __init__(self, root_node, base_url=None, mark_dirty=None, interp=None,
+                 location=None):
         self.root = root_node
         self.base_url = base_url
         self.mark_dirty = mark_dirty
         self._interp = interp
+        self._location_obj = location
         # Shared mutable flag: JS mutations set it; the Tab checks it after
         # running scripts to decide whether a restyle+rerender is needed.
         self._flag = {"dirty": False}
 
     def js_get(self, name):
+        if name == "location" and self._location_obj is not None:
+            return self._location_obj
         return dom_get(_DOCUMENT, self, name)
 
     def js_set(self, name, value):
