@@ -1,9 +1,11 @@
 # 🦶 FeetBrowser
 *See the web from a new ankle*
 
-A web browser written **from scratch in pure Python**. No Chromium, no
-WebKit, no borrowed libraries — it does its own networking, HTML parsing,
-CSS, layout, JavaScript, and drawing. Tk is only the surface it paints on.
+A web browser written **from scratch**. No Chromium, no WebKit, no borrowed
+libraries — it does its own networking, HTML parsing, CSS, layout, JavaScript,
+and drawing. Tk is only the surface it paints on. The JavaScript engine and
+DOM bridge are compiled to a native Rust extension; the rest (networking,
+parsing, layout, rendering, chrome) is Python.
 
 ## STRIDE — how code is judged
 
@@ -24,8 +26,14 @@ Code in this repo is evaluated on six principles:
 ./run.sh https://example.com
 ```
 
-Need Tk? On Debian/Ubuntu: `sudo apt install python3-tk` (other distros:
-`python3-tkinter` on Fedora, `tk` on Arch). Then `python3 -m feetbrowser <url>`.
+`run.sh` builds the Rust JS engine (`feetbrowser_engine`) into a local `.venv`
+if it isn't importable — so a first run needs the Rust toolchain and
+`maturin` (the script installs maturin into the venv for you). Need Tk? On
+Debian/Ubuntu: `sudo apt install python3-tk` (other distros:
+`python3-tkinter` on Fedora, `tk` on Arch).
+
+If the extension is already built and installed for the interpreter you're
+invoking, `python3 -m feetbrowser <url>` works directly.
 
 ## What you can do
 

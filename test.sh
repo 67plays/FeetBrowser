@@ -4,18 +4,27 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
+# Ensure the Rust JS engine (feetbrowser_engine) is built in the local venv.
+if ! python3 -c "import feetbrowser_engine" 2>/dev/null; then
+  if [ ! -x .venv/bin/python ]; then
+    python3 -m venv .venv
+  fi
+  .venv/bin/pip install -q maturin
+  .venv/bin/maturin develop --release --manifest-path rust/Cargo.toml
+fi
+
 run() {
-  python3 -m pyflakes feetbrowser tests
-  python3 tests/test_units.py
-  python3 tests/test_js.py
-  python3 tests/test_shoes.py
-  python3 tests/test_nav.py
-  python3 tests/test_toes.py
-  python3 tests/test_gh_scroll.py
-  python3 tests/smoke.py
+  .venv/bin/python -m pyflakes feetbrowser tests
+  .venv/bin/python tests/test_units.py
+  .venv/bin/python tests/test_js.py
+  .venv/bin/python tests/test_shoes.py
+  .venv/bin/python tests/test_nav.py
+  .venv/bin/python tests/test_toes.py
+  .venv/bin/python tests/test_gh_scroll.py
+  .venv/bin/python tests/smoke.py
 }
 
-if python3 -c "import tkinter" 2>/dev/null && python3 -c "import pyflakes" 2>/dev/null; then
+if .venv/bin/python -c "import tkinter" 2>/dev/null && .venv/bin/python -c "import pyflakes" 2>/dev/null; then
   run
 else
   nix-shell -p "python3.withPackages(ps: with ps; [ tkinter pyflakes ])" \

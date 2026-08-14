@@ -8,10 +8,14 @@
 ./run.sh view-source:https://example.com
 ```
 
-`run.sh` uses your system Python if it has Tkinter; on NixOS it fetches one
-on the fly via `nix-shell`. On other distros install Tk first
-(`python3-tk` on Debian/Ubuntu, `python3-tkinter` on Fedora, `tk` on Arch)
-and then `python3 -m feetbrowser <url>`.
+`run.sh` builds the Rust JS engine (`feetbrowser_engine`) into a local `.venv`
+with maturin if it isn't importable yet, then runs the browser from that venv
+(first run needs the Rust toolchain; maturin is installed into the venv
+automatically). On NixOS it fetches a Python with Tk on the fly via
+`nix-shell`. On other distros install Tk first (`python3-tk` on
+Debian/Ubuntu, `python3-tkinter` on Fedora, `tk` on Arch). Once the extension
+is built and installed for your interpreter, `python3 -m feetbrowser <url>`
+works directly.
 
 ## Keyboard shortcuts
 

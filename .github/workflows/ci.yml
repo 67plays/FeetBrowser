@@ -16,23 +16,28 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install Tk, Xvfb, and pyflakes
+      - name: Install Tk and Xvfb
         run: |
           sudo apt-get update
           sudo apt-get install -y python3-tk xvfb
-          python -m pip install pyflakes
+
+      - name: Build the Rust JS engine
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install maturin pyflakes
+          .venv/bin/maturin develop --release --manifest-path rust/Cargo.toml
 
       - name: Lint (pyflakes)
-        run: python -m pyflakes feetbrowser tests
+        run: .venv/bin/python -m pyflakes feetbrowser tests
 
       - name: Unit tests
-        run: xvfb-run -a python tests/test_units.py
+        run: xvfb-run -a .venv/bin/python tests/test_units.py
 
       - name: JS engine tests
-        run: xvfb-run -a python tests/test_js.py
+        run: xvfb-run -a .venv/bin/python tests/test_js.py
 
       - name: Toe engine tests
-        run: xvfb-run -a python tests/test_toes.py
+        run: xvfb-run -a .venv/bin/python tests/test_toes.py
 
       - name: Pseudo-toe (gh-scroll) tests
-        run: xvfb-run -a python tests/test_gh_scroll.py
+        run: xvfb-run -a .venv/bin/python tests/test_gh_scroll.py
