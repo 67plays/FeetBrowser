@@ -352,7 +352,10 @@ out: once from `C:\Program Files\FeetBrowser`, and once from a directory
 called `Café Über Test`. The runner's own Python is renamed out of the hosted
 tool cache and `PATH` is cut back to the system directories, and a step
 asserts that `python`, `python3`, `pythonw`, `py`, `pip` and `conda` are all
-unreachable before anything else runs.
+unreachable before anything else runs. That assertion earns its keep: the
+image also has `py.exe`, the PEP 397 launcher, sitting in `C:\Windows`
+itself, where cutting `PATH` back to the system directories does not reach
+it. It gets renamed too.
 
 
 ## Installing it

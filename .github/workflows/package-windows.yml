@@ -194,12 +194,25 @@ jobs:
       # directories -- see the `env: PATH:` on each one.
       - name: Take the runner's Python away
         run: |
-          foreach ($dir in @('C:\hostedtoolcache\windows\Python',
-                             'C:\hostedtoolcache\windows\PyPy',
-                             'C:\Miniconda')) {
-            if (Test-Path $dir) {
-              Rename-Item -Path $dir -NewName ((Split-Path -Leaf $dir) + '-hidden-from-the-bundle-test')
-              Write-Host "moved $dir out of the way"
+          # C:\Windows\py.exe is the PEP 397 launcher, which the image's
+          # system-wide Python drops straight into the Windows directory --
+          # so it survives cutting PATH back to the system directories, which
+          # is the entire point of cutting PATH back. It goes too, along with
+          # its .ini and the windowed variant.
+          foreach ($item in @('C:\hostedtoolcache\windows\Python',
+                              'C:\hostedtoolcache\windows\PyPy',
+                              'C:\Miniconda',
+                              'C:\Windows\py.exe',
+                              'C:\Windows\pyw.exe',
+                              'C:\Windows\py.ini')) {
+            if (Test-Path $item) {
+              $hidden = (Split-Path -Leaf $item) + '-hidden-from-the-bundle-test'
+              try {
+                Rename-Item -Path $item -NewName $hidden -ErrorAction Stop
+                Write-Host "moved $item out of the way"
+              } catch {
+                throw "could not move $item out of the way: $($_.Exception.Message)"
+              }
             }
           }
 
