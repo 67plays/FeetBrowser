@@ -1,13 +1,15 @@
 # Tests
 
 ```bash
-./test.sh          # builds the Rust engine, then pyflakes + unit + JS + navigation + toe + live smoke
+./test.sh          # builds both JS engines, then pyflakes + unit + JS + navigation + toe + live smoke
 ```
 
-`test.sh` builds the Rust JS engine (`feetbrowser_engine`) into the local
-`.venv` with `maturin develop --release` on first use, then runs every suite
-from that venv — so a first run needs the Rust toolchain (maturin is
-installed into the venv automatically).
+`test.sh` builds the Zig JS engine and runs its own tests — the VM suite, the
+parser suite and the regex suite, 500-odd cases that never cross into Python —
+then builds the Rust JS engine (`feetbrowser_engine`) into the local `.venv`
+with `maturin develop --release` on first use and runs every Python suite from
+that venv. A first run therefore needs both a Zig compiler and a Rust
+toolchain (maturin is installed into the venv automatically).
 
 Most suites run fully offline: `test_units.py`, `test_js.py` (which serves its
 `fetch`/`XMLHttpRequest` cases from a local HTTP server), and `test_toes.py`

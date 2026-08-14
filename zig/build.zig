@@ -28,5 +28,23 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const run_tests = b.addRunArtifact(tests);
-    b.step("test", "Run the engine's own tests").dependOn(&run_tests.step);
+    const test_step = b.step("test", "Run the engine's own tests");
+    test_step.dependOn(&run_tests.step);
+
+    // The parser and regex suites are standalone programs rather than `test`
+    // blocks, because both count their own cases and the parser one doubles as
+    // a tree dumper you can hand a snippet. `zig build test` has to build and
+    // run them itself; importing them the way tests.zig imports engine_test
+    // would compile them and run nothing.
+    for ([_][]const u8{ "src/parser_test.zig", "src/regex_test.zig" }) |path| {
+        const exe = b.addExecutable(.{
+            .name = std.fs.path.stem(path),
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(path),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        test_step.dependOn(&b.addRunArtifact(exe).step);
+    }
 }

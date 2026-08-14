@@ -59,8 +59,13 @@ fragments, node insertion and removal, events, timers, `fetch`,
 `createTextNode` returns a text-node wrapper, but the tree walks
 (`childNodes`, `firstChild`) still see elements only; there are no
 `Element`/`Node` constructor objects to hang polyfills on, and no CSSOM.
-jQuery 1.8 loads and runs against this; Modernizr and anything that measures
-a laid-out box do not.
+jQuery 1.8.2 parses, compiles and runs to completion against this — the whole
+library, its feature detection included — and `jQuery("#id")`, `.text()` and
+the traversal it drives all work. Its Sizzle half does not: the feature
+detection that decides whether `querySelectorAll` is usable runs against a
+detached element and fails here, so `jQuery(".class")` and `jQuery("li")`
+select nothing even though `document.querySelectorAll` answers both correctly.
+Modernizr and anything that measures a laid-out box do not run at all.
 
 **Cycles across the boundary are not collected.** The engine's collector is a
 precise mark-and-sweep over its own heap, and Python's is a reference count
