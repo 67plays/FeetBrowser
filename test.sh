@@ -8,11 +8,13 @@
 # each in turn, because two engines behind one contract are only worth having
 # if both are held to it.
 #
-# Three suites step outside all that: test_cocoa.py and test_x11.py open real
-# windows wherever their platform has one and skip everywhere else, and
-# test_nav.py and smoke.py reach the network. The last of those is why CI
-# runs both of them against the offline mirror in tests/fixtures instead --
-# see tests/fixture_server.py.
+# Four suites step outside all that: test_cocoa.py, test_x11.py and
+# test_win32.py open real windows wherever their platform has one and skip
+# everywhere else, and test_nav.py and smoke.py reach the network. The last
+# of those is why CI runs both of them against the offline mirror in
+# tests/fixtures instead -- see tests/fixture_server.py.
+#
+# On Windows, run test.cmd instead; it runs the same suites in the same order.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -53,19 +55,28 @@ if ! .venv/bin/python -c "import pyflakes" 2>/dev/null; then
 fi
 
 .venv/bin/python -m pyflakes feetbrowser tests
-.venv/bin/python tests/test_suites.py  # every file below, and nothing missing
-.venv/bin/python tests/test_render.py
-.venv/bin/python tests/test_cocoa.py   # opens real windows on macOS, skips elsewhere
-.venv/bin/python tests/test_x11.py     # opens real windows under X11, skips elsewhere
-.venv/bin/python tests/test_units.py
-FEETBROWSER_JS=zig .venv/bin/python tests/test_js.py
-FEETBROWSER_JS=rust .venv/bin/python tests/test_js.py
-.venv/bin/python tests/test_shoes.py
-.venv/bin/python tests/test_e2e.py     # a fixture page in, its pixels back out
-.venv/bin/python tests/test_nav.py
-.venv/bin/python tests/test_toes.py
-.venv/bin/python tests/test_asmblend.py  # raw assembly on Linux/x86-64, Python elsewhere
-.venv/bin/python tests/smoke.py
+
+# Every suite below runs behind a deadline. Several of them start HTTP
+# servers, open real windows or reach the network, and any of those can stop
+# forever rather than fail -- at which point the run says nothing at all. The
+# watchdog turns that into every thread's stack and a non-zero exit. See
+# tests/watchdog.py; FEETBROWSER_TEST_TIMEOUT overrides the number.
+run=".venv/bin/python tests/watchdog.py 900"
+
+$run tests/test_suites.py  # every file below, and nothing missing
+$run tests/test_render.py
+$run tests/test_cocoa.py   # opens real windows on macOS, skips elsewhere
+$run tests/test_x11.py     # opens real windows under X11, skips elsewhere
+$run tests/test_win32.py   # opens real windows on Windows, skips elsewhere
+$run tests/test_units.py
+FEETBROWSER_JS=zig $run tests/test_js.py
+FEETBROWSER_JS=rust $run tests/test_js.py
+$run tests/test_shoes.py
+$run tests/test_e2e.py     # a fixture page in, its pixels back out
+$run tests/test_nav.py
+$run tests/test_toes.py
+$run tests/test_asmblend.py  # raw assembly on Linux/x86-64, Python elsewhere
+$run tests/smoke.py
 
 # The Go port of the transport layer (net/) is a separate toolchain, so it is
 # run where one is installed and skipped where there is not, the same way the

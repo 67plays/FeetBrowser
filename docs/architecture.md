@@ -39,6 +39,14 @@ WebKit, Gecko, or any HTTP library — it implements its own:
   pixel — the surface, the font parser and the image decoders — are in the
   same Rust extension as the JS engine; the scene graph, the event loop and
   font *discovery* stay in Python. See [docs/rendering.md](rendering.md).
+- **Platform windows** — a real window on macOS (`cocoa.py`, ctypes into
+  AppKit), on Linux and the BSDs (`x11.py`, ctypes into Xlib, which also
+  covers Wayland desktops through XWayland) and on Windows (`win32.py`,
+  ctypes into `user32`/`gdi32`/`kernel32`), each translating native events
+  into the same Tk-shaped bindings and pushing the same framebuffer to the
+  screen. None of them needs a bindings package. Anywhere else, and anywhere
+  with no display, the browser runs headless, which is also how
+  `--screenshot` and the whole test suite run on every platform.
 - **Browser UI** — a hand-drawn chrome on that canvas: tabs, an address bar
   with search fallback, back / forward / reload / home buttons,
   hover + clickable links, middle-click / ctrl-click to open in a new tab,
@@ -97,6 +105,7 @@ feetbrowser/
   window.py      windows, event bindings, after() timers, main loop
   cocoa.py       the macOS window: AppKit through ctypes, no PyObjC
   x11.py         the Linux window: Xlib through ctypes, no python-xlib
+  win32.py       the Windows window: user32/gdi32 through ctypes, no pywin32
   gui.py         which native window to open, or none at all
   browser.py     window, chrome, tabs, history, event loop, layered repaint
   toes.py        extension hooking (Toes): discovery, dispatch, CLI
@@ -123,6 +132,7 @@ tests/
   test_cocoa.py  the macOS window, driven by real NSEvents (macOS only)
   test_x11.py    the X11 window, driven by real X events (skips with no server)
   x11_shot.py    photographs a real X11 window with XGetImage (CI artifact)
+  test_win32.py  the Windows window, driven by real messages (Windows only)
   test_units.py  offline unit tests (URL, HTML, CSS, layout, internal pages)
   test_js.py     offline tests for the JS engine + DOM bridge
   test_nav.py    click-to-navigate, history, view-source
@@ -132,4 +142,6 @@ tests/
 ```
 
 The Rust engine is built with maturin into a local venv; `run.sh` and
-`test.sh` build it on first use (`maturin develop --release`).
+`test.sh` build it on first use (`maturin develop --release`), as do their
+Windows counterparts `run.cmd` and `test.cmd`. There is no pure-Python
+fallback for it, so a Rust toolchain is a prerequisite on every platform.

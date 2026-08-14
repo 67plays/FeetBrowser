@@ -154,6 +154,11 @@ _MAX_BODY_BYTES = 64 * 1024 * 1024
 KNOWN_SCHEMES = {"http", "https", "file", "data"}
 
 
+def _is_drive(text):
+    """True for "C:" or the older "C|", a Windows drive in a file: URL."""
+    return len(text) == 2 and text[0].isalpha() and text[1] in ":|"
+
+
 class URL:
     """A parsed URL plus the logic to fetch it."""
 
@@ -183,13 +188,7 @@ class URL:
         if self.scheme in ("http", "https"):
             self._parse_http(rest)
         elif self.scheme == "file":
-            # file:///path, file://host/path (host ignored) or file:/path
-            if rest.startswith("//"):
-                remainder = rest[2:]
-                slash = remainder.find("/")
-                self.path = remainder[slash:] if slash != -1 else "/"
-            else:
-                self.path = rest or "/"
+            self._parse_file(rest)
         elif self.scheme == "data":
             self.data_payload = rest
         else:
@@ -208,6 +207,48 @@ class URL:
                 self.host = ""
                 self.path = rest or "/"
                 self.port = None
+
+    def _parse_file(self, rest):
+        """Parse the path out of a file: URL, in any of the shapes people
+        actually type.
+
+        The plain ones are ``file:///path``, ``file://host/path`` (the host is
+        ignored) and ``file:/path``. Windows adds two more, because a drive
+        letter does not fit the grammar: ``file://C:/x`` puts the drive where
+        the host goes, and a path pasted out of Explorer arrives with
+        backslashes.
+
+        What comes out is still a *URL* path -- forward slashes, leading
+        slash, percent-escapes intact -- so resolve(), str() and the
+        same-origin check all keep working in one coordinate system.
+        ``local_path()`` is what turns it back into something open() takes.
+        """
+        path = rest.replace("\\", "/")
+        if path.startswith("//"):
+            remainder = path[2:]
+            slash = remainder.find("/")
+            authority = remainder if slash == -1 else remainder[:slash]
+            if _is_drive(authority):
+                path = "/" + remainder
+            elif slash != -1:
+                path = remainder[slash:]
+            else:
+                path = "/"
+        self.path = path if path.startswith("/") else "/" + path
+
+    def local_path(self):
+        """The filesystem path this file: URL names.
+
+        A URL path and a filesystem path are different strings, and on Windows
+        they are not even the same shape: ``file:///C:/x`` carries a leading
+        slash that ``open()`` must not see, and the separator is a backslash.
+        Percent-escapes come off here too, which is what makes a directory
+        listing's own links openable -- it writes them escaped.
+        """
+        path = urllib.parse.unquote(self.path)
+        if _is_drive(path[1:3]):
+            path = path[1] + ":" + path[3:] if len(path) > 3 else path[1] + ":"
+        return path if os.sep == "/" else path.replace("/", os.sep)
 
     def _parse_http(self, rest):
         # rest looks like //host[:port]/path?query#frag
@@ -355,25 +396,32 @@ class URL:
         return dict(r.headers), r.text, ctype
 
     def _request_file(self, raw=False):
+        local = self.local_path()
         try:
-            with open(self.path, "rb") as f:
+            with open(local, "rb") as f:
                 payload = f.read(_MAX_BODY_BYTES + 1)
-        except (FileNotFoundError, IsADirectoryError, PermissionError) as e:
-            if os.path.isdir(self.path):
-                items = sorted(os.listdir(self.path))
+        # OSError, not the three obvious subclasses: a Windows path can be
+        # rejected outright (a bad drive, a reserved name), and that arrives
+        # as a plain OSError or ValueError rather than FileNotFoundError.
+        except (OSError, ValueError) as e:
+            if os.path.isdir(local):
+                # The links are built in URL space, not with os.path.join --
+                # a backslash in an href is not a path separator, it is a
+                # character that has to be escaped.
+                base = self.path if self.path.endswith("/") else self.path + "/"
                 links = "".join(
-                    f'<li><a href="file://{urllib.parse.quote(os.path.join(self.path, i))}">{i}</a></li>'
-                    for i in items)
-                body = f"<h1>Index of {self.path}</h1><ul>{links}</ul>"
+                    f'<li><a href="file://{urllib.parse.quote(base + i)}">{i}</a></li>'
+                    for i in sorted(os.listdir(local)))
+                body = f"<h1>Index of {local}</h1><ul>{links}</ul>"
             else:
                 body = f"<h1>Cannot open file</h1><p>{e}</p>"
             return {}, body.encode("utf8", "replace") if raw else body, \
                 "text/html"
         if len(payload) > _MAX_BODY_BYTES:
-            body = f"<h1>File too large to open</h1><p>{self.path}</p>"
+            body = f"<h1>File too large to open</h1><p>{local}</p>"
             return {}, body.encode("utf8", "replace") if raw else body, \
                 "text/html"
-        ext = os.path.splitext(self.path)[1].lower()
+        ext = os.path.splitext(local)[1].lower()
         ctype = "text/html" if ext in (".html", ".htm") else "text/plain"
         return {}, payload if raw else payload.decode("utf8", "replace"), ctype
 

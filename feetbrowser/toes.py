@@ -36,7 +36,7 @@ def _config_path():
 
 def _load_config():
     try:
-        with open(_config_path()) as f:
+        with open(_config_path(), encoding="utf8") as f:
             return json.load(f)
     except (OSError, ValueError):
         return {}
@@ -45,7 +45,7 @@ def _load_config():
 def _save_config(cfg):
     try:
         os.makedirs(os.path.dirname(_config_path()), exist_ok=True)
-        with open(_config_path(), "w") as f:
+        with open(_config_path(), "w", encoding="utf8") as f:
             json.dump(cfg, f, indent=2)
     except OSError:
         pass
@@ -270,7 +270,7 @@ class Context:
         path = self._settings_path()
         try:
             os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, "w") as f:
+            with open(path, "w", encoding="utf8") as f:
                 json.dump(self._settings, f, indent=2)
         except OSError as e:
             sys.stderr.write(
@@ -285,7 +285,7 @@ class Context:
     def _load_settings(self):
         path = self._settings_path()
         try:
-            with open(path) as f:
+            with open(path, encoding="utf8") as f:
                 return json.load(f)
         except (OSError, ValueError):
             return {}
@@ -351,7 +351,7 @@ def discover_toes(toes_dir=None):
         if not os.path.isfile(manifest_path):
             continue
         try:
-            with open(manifest_path) as f:
+            with open(manifest_path, encoding="utf8") as f:
                 manifest = json.load(f)
             entry = manifest["entry"]
             module_path = os.path.join(folder, entry)
@@ -523,10 +523,13 @@ def new_toe(name):
         "description": "A brand new toe.",
         "entry": "toe.py",
     }
-    with open(os.path.join(folder, "toe.json"), "w") as f:
+    with open(os.path.join(folder, "toe.json"), "w", encoding="utf8") as f:
         json.dump(manifest, f, indent=2)
         f.write("\n")
-    with open(os.path.join(folder, "toe.py"), "w") as f:
+    # newline="\n" so the scaffold is the same file on every platform rather
+    # than gaining CRLFs on Windows.
+    with open(os.path.join(folder, "toe.py"), "w", encoding="utf8",
+              newline="\n") as f:
         f.write('"""%s toe."""\n\n\n'
                 'def activate(ctx):\n'
                 '    # ctx.on("on_load", on_load)\n'
