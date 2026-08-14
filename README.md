@@ -76,6 +76,7 @@ To render a page to a PNG without opening a window:
 
 - Open tabs, back/forward, reload, bookmarks, history, and page source
 - Fill in forms, follow links, search from the address bar
+- Download files, watching them arrive — `Ctrl-J` shows the manager
 - Add extensions ("toes") — open **`toe://hub`** in the browser
 - Restyle the browser with **Shoes** themes — open **`about:shoes`**
   (`Ctrl+Shift+S`)

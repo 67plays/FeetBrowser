@@ -22,7 +22,7 @@ from .window import Tk
 import urllib.parse
 from collections import deque
 
-from .net import URL
+from .net import URL, open_stream
 from .htmlparser import HTMLParser, Text, Element
 from .cssparser import CSSParser, style, parse_inline, set_viewport, \
     media_matches, get_viewport
@@ -34,6 +34,7 @@ from .layout import DocumentLayout, paint_tree, get_font, _measure, \
 from .selection import Index as SelectionIndex, Selection, \
     contrasting_text_color
 from . import shoes as shoes
+from . import downloads as downloads
 from .jsdom import JSDocument, JSLocation, _JSStaticProps, _JSComputedStyle
 from .jsengine import Interpreter, JSException, UNDEFINED
 from . import toes as toes
@@ -364,13 +365,70 @@ class Tab:
             # Internal URL objects (about:blank, bookmarks, history) expose a
             # simpler request(); retry without the refresh flag.
             body, ctype, doc_error = self._fetch_document(url, payload, False)
+        if body is None and ctype is None:
+            # The response was a file, not a page: it is downloading now and
+            # this tab stays where it was, the way every browser behaves
+            # when a link turns out to be an attachment.
+            self.loading = False
+            return
         self._complete_load(url, payload, push, pending_scroll, body, ctype,
                             doc_error=doc_error)
+
+    def _stream_document(self, url, payload, refresh):
+        """Fetch an http(s) GET as a stream and decide, from the headers
+        alone, whether this navigation is a page or a file.
+
+        This is the only place a link to a 2 GB installer can be told apart
+        from a link to a page without paying for it: the headers arrive, the
+        body is still on the socket, and if the answer is "file" the live
+        connection is handed to the download manager, which keeps reading it
+        straight to disk. One request, no buffering, no navigation.
+
+        Returns the (body, ctype, doc_error) triple _fetch_document owes its
+        caller, or (None, None, None) when the response became a download,
+        or None when this path does not apply or did not work out -- in
+        which case _fetch_document falls back to the buffered request() it
+        has always used. Falling back costs a second request and only
+        happens on an error, which is the case that was going to be slow
+        anyway.
+        """
+        manager = getattr(self.browser, "downloads", None) \
+            if self.browser is not None else None
+        if manager is None or payload is not None or not isinstance(url, URL) \
+                or url.scheme not in ("http", "https"):
+            return None
+        stream = None
+        try:
+            extra = {"Cache-Control": "no-cache"} if refresh else None
+            stream = open_stream(url, extra_headers=extra,
+                                 accept_encoding="gzip, deflate")
+            if stream.status < 400 and downloads.should_download(stream.headers):
+                manager.start(stream.url, stream=stream)
+                self.status = "Downloading %s" % downloads.filename_for(
+                    stream.url, stream.headers)
+                stream = None  # the manager owns the connection now
+                return (None, None, None)
+            body = stream.read_all()
+            ctype = stream.content_type or "text/html"
+            text = body.decode(stream.charset(), "replace")
+            if self._is_google_js_wall(url, text):
+                return None  # let the buffered path do its impersonation
+            if str(stream.url) != str(url):
+                url._adopt(stream.url)
+            return (text, ctype, None)
+        except Exception:  # noqa: BLE001 - any trouble here: use the old path
+            return None
+        finally:
+            if stream is not None:
+                stream.close()
 
     def _fetch_document(self, url, payload, refresh):
         """Fetch a document body, surfacing load errors and retrying through a
         Chrome-impersonating transport when a JS-gated site (Google) serves an
         'enable JavaScript' wall instead of its real application."""
+        streamed = self._stream_document(url, payload, refresh)
+        if streamed is not None:
+            return streamed
         try:
             _headers, body, ctype = url.request(payload=payload,
                                                 refresh=refresh)
@@ -451,6 +509,11 @@ class Tab:
             ctype = "text/html"
         else:
             doc_error = None
+        if body is None and ctype is None:
+            # A download took the navigation over (see _stream_document);
+            # the tab keeps the page it was showing.
+            self.loading = False
+            return
         self._complete_load(meta["url"], meta["payload"], meta["push"],
                             meta["pending_scroll"], body, ctype,
                             doc_error=doc_error)
@@ -2127,6 +2190,202 @@ class SelectPopup:
             y0 += self.ROW_H
 
 
+class DownloadsPanel:
+    """The download manager, drawn by hand on the browser canvas.
+
+    Same deal as ContextMenu and SelectPopup: rectangles and text in the
+    active shoe's colors, because there is no widget toolkit here to borrow
+    a list view from. It shows one row per download with its name, a
+    progress bar, a line of status, and an × that cancels while the transfer
+    is still running.
+
+    It owns no state about the transfers themselves -- it reads the
+    DownloadManager every time it paints, on the UI thread, while workers
+    write to those records from their own threads. That is the whole
+    synchronisation story: short locks inside Download, and a panel that
+    only ever reads.
+    """
+
+    WIDTH = 400
+    HEADER_H = 32
+    ITEM_H = 64
+    FOOTER_H = 26
+    PAD = 12
+    MAX_ROWS = 6
+    BAR_H = 6
+
+    def __init__(self, browser):
+        self.browser = browser
+        self.open_ = False
+        self.x = self.y = 0
+        self.width = self.WIDTH
+        self.height = self.HEADER_H + self.FOOTER_H
+        self._rows = []  # (download, y0) laid out by the last draw()
+
+    # -- geometry --------------------------------------------------------
+
+    def _visible(self):
+        return self.browser.downloads.items()[:self.MAX_ROWS]
+
+    def _layout(self):
+        canvas = self.browser.canvas
+        rows = max(1, len(self._visible()))
+        self.width = min(self.WIDTH, max(220, canvas.winfo_width() - 24))
+        self.height = self.HEADER_H + rows * self.ITEM_H + self.FOOTER_H
+        self.x = max(8, canvas.winfo_width() - self.width - 12)
+        self.y = self.browser.chrome_height() + 6
+
+    def point_in(self, x, y):
+        return (self.open_ and self.x <= x <= self.x + self.width
+                and self.y <= y <= self.y + self.height)
+
+    def toggle(self):
+        self.open_ = not self.open_
+        return self.open_
+
+    def close(self):
+        self.open_ = False
+
+    # -- input -----------------------------------------------------------
+
+    def hit(self, x, y):
+        """What a click at (x, y) means: (action, download) or None.
+
+        Actions are "close", "clear", "cancel" and "row"; a click anywhere
+        else inside the panel is swallowed ("row" with no download) so it
+        does not fall through to the page behind it.
+        """
+        if not self.point_in(x, y):
+            return None
+        if y <= self.y + self.HEADER_H:
+            if x >= self.x + self.width - 28:
+                return ("close", None)
+            return ("row", None)
+        if y >= self.y + self.height - self.FOOTER_H:
+            if x <= self.x + 120:
+                return ("clear", None)
+            return ("row", None)
+        for download, y0 in self._rows:
+            if y0 <= y < y0 + self.ITEM_H:
+                if x >= self.x + self.width - 34 and download.is_active():
+                    return ("cancel", download)
+                return ("row", download)
+        return ("row", None)
+
+    # -- painting --------------------------------------------------------
+
+    def draw(self, canvas):
+        canvas.delete("downloads")
+        if not self.open_:
+            self._rows = []
+            return
+        self._layout()
+        items = self._visible()
+        tags = ("downloads",)
+        x, y, w, h = self.x, self.y, self.width, self.height
+        canvas.create_rectangle(x + 2, y + 2, x + w + 2, y + h + 2,
+                                fill=self.browser.c("menu_shadow"), width=0,
+                                tags=tags)
+        canvas.create_rectangle(x, y, x + w, y + h,
+                                fill=self.browser.c("menu_bg"),
+                                outline=self.browser.c("menu_border"), width=1,
+                                tags=tags)
+        canvas.create_text(x + self.PAD, y + self.HEADER_H / 2,
+                           text="Downloads", anchor="w",
+                           font=self.browser.bold_font,
+                           fill=self.browser.c("menu_text"), tags=tags)
+        canvas.create_text(x + w - 14, y + self.HEADER_H / 2, text="×",
+                           font=self.browser.bold_font,
+                           fill=self.browser.c("menu_text"), tags=tags)
+        canvas.create_line(x + 1, y + self.HEADER_H, x + w - 1,
+                           y + self.HEADER_H,
+                           fill=self.browser.c("menu_sep"), tags=tags)
+
+        self._rows = []
+        y0 = y + self.HEADER_H
+        if not items:
+            canvas.create_text(x + self.PAD, y0 + self.ITEM_H / 2,
+                               text="Nothing downloaded yet.", anchor="w",
+                               font=get_font(12, "normal", "roman",
+                                             "Helvetica"),
+                               fill=self.browser.c("menu_disabled"), tags=tags)
+        for download in items:
+            self._rows.append((download, y0))
+            self._draw_row(canvas, download, y0, tags)
+            y0 += self.ITEM_H
+
+        canvas.create_line(x + 1, y + h - self.FOOTER_H, x + w - 1,
+                           y + h - self.FOOTER_H,
+                           fill=self.browser.c("menu_sep"), tags=tags)
+        canvas.create_text(x + self.PAD, y + h - self.FOOTER_H / 2,
+                           text="Clear finished", anchor="w",
+                           font=get_font(11, "normal", "roman", "Helvetica"),
+                           fill=self.browser.c("link_color"), tags=tags)
+        canvas.create_text(x + w - self.PAD, y + h - self.FOOTER_H / 2,
+                           text=self.browser.downloads.directory(), anchor="e",
+                           font=get_font(10, "normal", "roman", "Helvetica"),
+                           fill=self.browser.c("menu_disabled"), tags=tags)
+
+    def _draw_row(self, canvas, download, y0, tags):
+        x, w = self.x, self.width
+        name_font = get_font(12, "normal", "roman", "Helvetica")
+        info_font = get_font(10, "normal", "roman", "Helvetica")
+        name = _elide(download.filename or "download", name_font,
+                      w - 2 * self.PAD - 30)
+        canvas.create_text(x + self.PAD, y0 + 16, text=name, anchor="w",
+                           font=name_font,
+                           fill=self.browser.c("menu_text"), tags=tags)
+        if download.is_active():
+            canvas.create_text(x + w - 18, y0 + 16, text="×",
+                               font=self.browser.bold_font,
+                               fill=self.browser.c("menu_text"), tags=tags)
+
+        bar_x0 = x + self.PAD
+        bar_x1 = x + w - self.PAD
+        bar_y = y0 + 30
+        canvas.create_rectangle(bar_x0, bar_y, bar_x1, bar_y + self.BAR_H,
+                                fill=self.browser.c("menu_sep"), width=0,
+                                tags=tags)
+        fraction = download.percent()
+        state = download.state
+        if state == downloads.COMPLETE:
+            fill, span = self.browser.c("accent"), (bar_x0, bar_x1)
+        elif state == downloads.FAILED:
+            fill, span = self.browser.c("log_text"), (bar_x0, bar_x1)
+        elif state == downloads.CANCELLED:
+            fill, span = self.browser.c("menu_disabled"), (bar_x0, bar_x1)
+        elif fraction is None:
+            # No Content-Length, so there is no share of the whole to draw.
+            # A band sliding along the track says "still going" without
+            # claiming a percentage nobody sent us.
+            fill = self.browser.c("accent")
+            width = (bar_x1 - bar_x0) * 0.25
+            travel = (bar_x1 - bar_x0) - width
+            phase = (self.browser._downloads_phase % 100) / 100.0
+            start = bar_x0 + travel * abs(1 - 2 * phase)
+            span = (start, start + width)
+        else:
+            fill = self.browser.c("accent")
+            span = (bar_x0, bar_x0 + (bar_x1 - bar_x0) * fraction)
+        if span[1] > span[0]:
+            canvas.create_rectangle(span[0], bar_y, span[1],
+                                    bar_y + self.BAR_H, fill=fill, width=0,
+                                    tags=tags)
+        status = _elide(download.describe(), info_font, w - 2 * self.PAD)
+        canvas.create_text(x + self.PAD, y0 + 48, text=status, anchor="w",
+                           font=info_font,
+                           fill=self.browser.c("status_text"), tags=tags)
+
+
+def _elide(text, font, width):
+    """Trim `text` with an ellipsis until it fits `width` pixels."""
+    if _measure(font, text) <= width:
+        return text
+    while text and _measure(font, text + "…") > width:
+        text = text[:-1]
+    return text + "…"
+
+
 class Browser:
     def __init__(self, window=None):
         self.tabs = []
@@ -2189,6 +2448,13 @@ class Browser:
 
         self.context_menu = ContextMenu(self)
         self.select_popup = SelectPopup(self)
+        # Downloads: the manager owns the worker threads and the records,
+        # the panel is a view of them. `_downloads_phase` advances on the
+        # UI timer and drives the indeterminate progress bar for transfers
+        # whose total nobody stated.
+        self.downloads = downloads.DownloadManager()
+        self.downloads_panel = DownloadsPanel(self)
+        self._downloads_phase = 0
 
         self._bind()
 
@@ -2226,6 +2492,7 @@ class Browser:
         w.bind("<Control-r>", lambda e: self._reload())
         w.bind("<Control-d>", lambda e: self._toggle_bookmark())
         w.bind("<Control-h>", lambda e: self._open_history_page())
+        w.bind("<Control-j>", lambda e: self._toggle_downloads())
         w.bind("<Control-Shift-s>", lambda e: self._open_shoes_page())
         w.bind("<Control-Tab>", lambda e: self._cycle_tab(1))
         w.bind("<Control-ISO_Left_Tab>", lambda e: self._cycle_tab(-1))
@@ -2450,6 +2717,9 @@ class Browser:
             return
         if self.select_popup.open_:
             self._select_popup_click(e.x, e.y)
+            return
+        if self.downloads_panel.point_in(e.x, e.y):
+            self._downloads_click(e.x, e.y)
             return
         was_address = self.focus == "address"
         self.focus = None
@@ -2770,6 +3040,44 @@ class Browser:
         if tab and isinstance(tab.url, URL):
             self._navigate(tab, URL("view-source:" + str(tab.url)))
 
+    # -- downloads -------------------------------------------------------
+
+    def _toggle_downloads(self):
+        self.downloads_panel.toggle()
+        self.draw()
+
+    def _download(self, url):
+        """Save `url` to the download directory, without navigating.
+
+        This is what "Download Link" does. There is no file picker to open
+        -- a native save dialog is exactly the sort of thing this browser
+        does not have -- so the file lands in the download directory under
+        the name the server suggests, and the panel says where.
+        """
+        if not isinstance(url, URL):
+            try:
+                url = URL(str(url))
+            except Exception:  # noqa: BLE001 - a malformed href downloads nothing
+                return
+        if url.scheme not in ("http", "https"):
+            return
+        self.downloads.start(url)
+        self.downloads_panel.open_ = True
+        self.draw()
+
+    def _downloads_click(self, x, y):
+        action = self.downloads_panel.hit(x, y)
+        if action is None:
+            return
+        what, download = action
+        if what == "close":
+            self.downloads_panel.close()
+        elif what == "clear":
+            self.downloads.clear_finished()
+        elif what == "cancel" and download is not None:
+            download.cancel()
+        self.draw()
+
     # -- <select> drop-down ----------------------------------------------
 
     def _open_select_popup(self, action):
@@ -2925,6 +3233,7 @@ class Browser:
                 ("View Source", self._view_source,
                  bool(tab and isinstance(tab.url, URL))),
                 ("History", self._open_history_page, bool(tab)),
+                ("Downloads", self._toggle_downloads, True),
             ]
         doc_y = y - self.chrome_height()
         node = tab._node_at(x, doc_y)
@@ -2945,6 +3254,10 @@ class Browser:
                               lambda r=resolved: self._navigate(tab, r), True))
                 items.append(("Open Link in New Tab",
                               lambda r=resolved: self.new_tab(str(r)), True))
+                items.append(("Download Link",
+                              lambda r=resolved: self._download(r),
+                              getattr(resolved, "scheme", "")
+                              in ("http", "https")))
             items.append(("Copy Link Address",
                           lambda h=href: self._copy_text(h), True))
             items.append(None)
@@ -2957,6 +3270,10 @@ class Browser:
             if img_url is not None:
                 items.append(("Open Image",
                               lambda u=img_url: self._navigate(tab, u), True))
+                items.append(("Download Image",
+                              lambda u=img_url: self._download(u),
+                              getattr(img_url, "scheme", "")
+                              in ("http", "https")))
                 items.append(("Copy Image URL",
                               lambda u=str(img_url): self._copy_text(u), True))
             items.append(None)
@@ -2974,6 +3291,7 @@ class Browser:
             None,
             ("New Tab", lambda: self.new_tab("about:blank"), True),
             ("Close Tab", self.close_tab, len(self.tabs) > 1),
+            ("Downloads", self._toggle_downloads, True),
         ])
         return items
 
@@ -3479,6 +3797,7 @@ class Browser:
             if item_id not in before:
                 c.addtag_withtag("toe-draw", item_id)
         self._draw_chrome()
+        self.downloads_panel.draw(self.canvas)
         self.context_menu.draw(self.canvas)
         self._draw_select_popup()
         self._update_title()
@@ -3504,7 +3823,9 @@ class Browser:
         for item_id in c.find_all():
             if item_id not in before:
                 c.addtag_withtag("toe-draw", item_id)
-        # An open drop-down must stay on top of the page it floats over.
+        # An open drop-down (or the downloads panel) must stay on top of the
+        # page it floats over.
+        self.downloads_panel.draw(self.canvas)
         self._draw_select_popup()
         self._update_title()
 
@@ -3563,8 +3884,9 @@ class Browser:
         for item_id in c.find_all():
             if item_id not in before:
                 c.addtag_withtag("chrome", item_id)
-        # After the tagging, so the drop-down is not mistaken for chrome and
-        # wiped by the next chrome repaint.
+        # After the tagging, so neither the drop-down nor the downloads
+        # panel is mistaken for chrome and wiped by the next chrome repaint.
+        self.downloads_panel.draw(self.canvas)
         self._draw_select_popup()
 
     def _repaint_selection(self):
@@ -3927,11 +4249,31 @@ class Browser:
             tab._flush_pending_nav()
             if tab.loading:
                 loading = True
+        self._poll_downloads()
         if loading:
             self._loading_angle = (self._loading_angle + 18) % 360
             self.canvas.delete("spinner")
             self._draw_spinner()
         self.window.after(60, self._poll_images)
+
+    def _poll_downloads(self):
+        """UI thread: repaint the downloads panel as transfers move.
+
+        The workers never touch the canvas; they update their own Download
+        record and set a flag. This picks the flag up on the same 60ms timer
+        that drains image fetches, so a progress bar advances without a
+        thread anywhere near the rasteriser -- and when nothing is
+        downloading, nothing repaints.
+        """
+        panel = self.downloads_panel
+        if self.downloads.take_announcement():
+            panel.open_ = True
+        moved = self.downloads.take_changed()
+        active = self.downloads.active()
+        if active:
+            self._downloads_phase += 1
+        if panel.open_ and (moved or active):
+            panel.draw(self.canvas)
 
     def _draw_spinner(self):
         """Chrome-style spinning arc at the left of the address bar."""

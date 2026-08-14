@@ -170,6 +170,15 @@ def main():
 
     test_form_round_trip()
 
+    # Downloads: a link that turns out to be a file rather than a page is
+    # navigation's other ending, so it is checked from here. The cases live
+    # in their own module because test.sh and the CI workflow name every
+    # suite by hand and tests/test_suites.py fails a tests/test_*.py that
+    # neither of them runs -- and this change does not edit a runner.
+    print("\n-- downloads --")
+    import download_cases
+    download_cases.main()
+
     print("\nALL NAVIGATION TESTS PASSED")
 
 

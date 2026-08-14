@@ -101,18 +101,20 @@ for images to load, and writes a PNG.
 
 ## Environment variables
 
-The browser reads three variables of its own, and none of them has to be set
+The browser reads four variables of its own, and none of them has to be set
 for it to work: every one has a default that is the right answer on a normal
-machine. They exist because the browser has two of some things — two window
-backends, two JavaScript engines — and a choice that is only ever made at
-build time cannot be tested both ways. A fourth, the standard `DISPLAY`, is
-not ours but decides whether the X11 window can open, so it is described here
-too.
+machine. Three of them exist because the browser has two of some things — two
+window backends, two JavaScript engines — and a choice that is only ever made
+at build time cannot be tested both ways; the fourth names a directory whose
+right answer is different on every platform. A fifth, the standard `DISPLAY`,
+is not ours but decides whether the X11 window can open, so it is described
+here too.
 
-The three are read as text, stripped of surrounding whitespace and lowercased,
-so `Zig` and ` zig ` are the same as `zig`. Each is read once and the choice
-is then fixed for the life of the process; changing one from inside a running
-browser does nothing.
+The first three are read as text, stripped of surrounding whitespace and
+lowercased, so `Zig` and ` zig ` are the same as `zig`. Each is read once and
+the choice is then fixed for the life of the process; changing one from inside
+a running browser does nothing. The fourth is a path, so it is taken as
+written apart from a leading `~`.
 
 There is nothing here that picks a renderer. There is one — our own font
 engine, rasteriser and event loop — and every window backend, and the
@@ -192,6 +194,22 @@ A path that does not exist is an error either way, and the message names the
 missing file and suggests running `zig build` or falling back to
 `FEETBROWSER_JS=rust`. There is no search of the system library path.
 
+### `FEETBROWSER_DOWNLOAD_DIR`
+
+Where saved files land, from `feetbrowser/downloads.py`. Unset, the directory
+is the platform's own: `XDG_DOWNLOAD_DIR` (from the environment, or from
+`~/.config/user-dirs.dirs`) on Linux, the shell's Downloads known folder on
+Windows, and `~/Downloads` on macOS and wherever those two have nothing to
+say. Set, it is that path, with a leading `~` expanded.
+
+Either way the directory is created if it is missing, when the first download
+starts rather than at import. A name that cannot be created — a file already
+sitting there, a volume that is not writable — is reported as a failed
+download, not raised.
+
+Nothing a server sends can put a file outside this directory. See
+[downloads](#downloads).
+
 ### `DISPLAY`
 
 Not ours, but read: the X11 backend needs the standard X11 variable to find a
@@ -211,6 +229,7 @@ ways the browser ends up headless.
 | `PgUp` / `PgDn` / `Home` / `End` | page scroll controls | `Alt-←` / `Alt-→` | back / forward |
 | `↑` / `↓` / wheel | scroll | `Esc` | blur address / input |
 | middle / `Ctrl`-click | open link in new tab | `Ctrl-PgUp/Dn` | cycle tabs |
+| `Ctrl-J` | show / hide downloads | | |
 
 The scrollbar down the right-hand edge works with the mouse as well: drag the
 thumb and the page follows it, keeping whatever part of the thumb you grabbed
@@ -229,6 +248,45 @@ focusable and typeable, checkboxes toggle, and submitting a form (clicking a
 submit button or pressing Enter in a field) sends `GET` or `POST` to the form
 `action`, which is resolved against the document's `<base href>` when one is
 present.
+
+## Downloads
+
+A response that is a file rather than a page is saved instead of rendered.
+Three things start a download:
+
+* a `Content-Disposition: attachment` header, whatever the content type;
+* a content type this browser cannot put on screen — anything that is not
+  HTML, plain text, an image, CSS, JavaScript, JSON or XML;
+* **Download Link** or **Download Image** from the right-click menu, which
+  saves what a click would otherwise have opened.
+
+`Ctrl-J`, or **Downloads** in the right-click menu, shows the panel. Each
+transfer has a bar, its size and rate, and a `×` to stop it with while it is
+running; `Clear finished` takes the ended ones off the list. Up to four run at
+once and none of them blocks the page you are reading.
+
+The bar tracks `Content-Length` when the server sends one. A chunked response
+has no total and no honest percentage, so that bar animates instead of
+filling, and the status line reads `unknown size` with the byte count and rate
+next to it. An ETA is shown only where there is a total to divide by.
+
+Bytes go to `name.part` and are moved onto `name` only once the last one has
+arrived, so an interrupted download never leaves something that looks
+complete. A second file of the same name becomes `file (1).txt` rather than
+overwriting the first. A transfer that dies against a server supporting
+`Range` is resumed from where it stopped rather than started again.
+
+The filename is the server's suggestion — `Content-Disposition`, else the last
+segment of the URL — reduced to one safe component before it is used:
+percent-escapes are decoded first, directories are dropped, and NULs, control
+characters, `/`, `\`, and the characters Windows reserves are removed. `.` and
+`..` are refused, and a name that is a DOS device (`CON`, `NUL`, `LPT1`, and
+the rest) is prefixed. Nothing a server sends can write outside the download
+directory.
+
+A dropped connection, a full disk, a directory that cannot be written to and a
+404 all end as a failed download that says why, in the panel. None of them is
+a traceback and none is silence.
 
 ## CLI reference
 

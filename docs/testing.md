@@ -36,6 +36,7 @@ tests/
   test_shoes.py     the Shoes theme manager
   test_e2e.py       a fixture page in, its pixels back out
   test_nav.py       click-to-navigate, history, view-source
+  download_cases.py downloads, against a local server (run from test_nav.py)
   test_toes.py      toe engine + ToeHub tests (install/uninstall/toggle)
   test_asmblend.py  the assembly span kernels against their Python references
   smoke.py          end-to-end pipeline over a real socket
@@ -49,6 +50,14 @@ then counts the colours in that PNG: each of those five things has a shade of
 its own, so a layer that stops drawing takes a colour off the picture and the
 test says which. It exists because `<img>` once stopped drawing anything at
 all, on every page, and the suite had nothing that could tell.
+
+`download_cases.py` is the one file here that is not named `test_*.py`, and
+that is deliberate: it is a suite of its own — a local HTTP server serving
+known lengths, chunked bodies, a connection cut mid-transfer and a shelf of
+hostile filenames — but it runs from the end of `test_nav.py` rather than from
+a runner, because saving a file is where a navigation ends. Naming it
+`test_downloads.py` would put it in front of `test_suites.py` below, which
+would then demand a line in `test.sh`, `test.cmd` and the workflow.
 
 `test_suites.py` is the reason a new file in `tests/` cannot be forgotten.
 `test.sh`, `test.cmd` and the workflow all name their suites one at a time —
