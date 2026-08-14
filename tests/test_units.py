@@ -798,15 +798,20 @@ def _control_box(tab, **attrs):
 
 
 def test_load_errors_are_collected():
+    import tempfile
     html_body = (
         '<html><head>'
         '<link rel="stylesheet" href="http://127.0.0.1:1/x.css">'
         '<script src="http://127.0.0.1:1/y.js"></script>'
         '</head><body><p>hi</p></body></html>')
-    with open("/tmp/opencode/_units_netfail.html", "w") as f:
-        f.write(html_body)
-    tab = Tab(700)
-    tab.load("file:///tmp/opencode/_units_netfail.html")
+    fd, path = tempfile.mkstemp(suffix=".html")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(html_body)
+        tab = Tab(700)
+        tab.load("file://" + path)
+    finally:
+        os.unlink(path)
     kinds = [e.split()[0] for e in tab.net_errors]
     assert "CSS" in kinds, f"CSS failure logged, got {kinds}"
     assert "JS" in kinds, f"JS failure logged, got {kinds}"
@@ -817,6 +822,45 @@ def test_doc_error_is_collected():
     tab.load("http://127.0.0.1:1/")
     assert tab.net_errors and tab.net_errors[0].startswith("DOC"), \
         tab.net_errors
+
+
+def test_import_lead_char_preserved():
+    """An @import statement matched at a statement boundary must not eat the
+    character before it (e.g. the `}` closing the previous rule)."""
+    from feetbrowser.browser import _expand_imports
+    from feetbrowser.net import URL
+    css = ("a{color:red}@import 'http://127.0.0.1:1/nope.css';"
+           "b{color:blue}")
+    out = _expand_imports(css, URL("https://example.com/"))
+    assert "a{color:red}" in out, out
+    assert "b{color:blue}" in out, out
+
+
+def test_media_query_em_units():
+    """em/rem media-feature values are resolved at the 16px root size, not
+    read as raw pixel numbers."""
+    from feetbrowser.cssparser import media_matches
+    assert media_matches("(min-width: 40em)", 800, 600), "640px breakpoint matched"
+    assert not media_matches("(min-width: 40em)", 600, 600), "600px < 640px"
+    assert media_matches("(max-width: 40rem)", 600, 600), "rem max-width matched"
+    assert not media_matches("(max-width: 40rem)", 700, 600), "700px > 640px"
+
+
+def test_viewport_accessor_tracks_set_viewport():
+    from feetbrowser.cssparser import get_viewport, set_viewport
+    set_viewport(1234, 567)
+    assert get_viewport() == (1234.0, 567.0)
+    set_viewport(1000, 720)
+
+
+def test_js_errors_captured_once():
+    """_capture_js_errors must not re-count errors already scanned."""
+    tab = _make_tab("<script>throw new Error('boom')</script>")
+    js = lambda: sum(1 for e in tab.net_errors if e.startswith("JS"))
+    before = js()
+    assert before > 0, "page-load JS error captured"
+    tab._capture_js_errors(tab._js_interp.logs)  # a re-dispatch re-scan
+    assert js() == before, "errors must not be double-counted"
 
 
 def test_form_submit_get():

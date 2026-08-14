@@ -585,10 +585,20 @@ class BlockLayout(LayoutBox):
         for dropdowns, modals and tooltips so they never stretch the parent;
         hidden ones are skipped by painting."""
         box = BlockLayout(el, self, None)
-        x = self.x + parse_px(el.style.get("left", ""), 0)
+        left_css = el.style.get("left")
+        right_css = el.style.get("right")
         y = self.y + parse_px(el.style.get("top", ""), 0)
-        right = parse_px(el.style.get("right", ""), 0)
-        w = max(0.0, self.width - right) if right else self.width
+        right = parse_px(right_css or "", 0)
+        if left_css is None and right_css is not None:
+            # Right-anchored (and no explicit left): shrink to the parent minus
+            # the offset and pin the box's right edge to the containing block's
+            # right edge. `right: 0` is a real offset, not "absent".
+            w = max(0.0, self.width - right)
+            x = self.x + self.width - right - w
+        else:
+            x = self.x + parse_px(left_css or "", 0)
+            w = max(0.0, self.width - right) if right_css is not None \
+                else self.width
         box._absolute_pos = (x, y, w)
         return box
 
@@ -604,7 +614,7 @@ class BlockLayout(LayoutBox):
         mi, ma = self._measure_width(el)
         w = max(1.0, min(avail, max(mi, ma)))
         css_w = el.style.get("width")
-        if css_w and css_w.strip() not in (
+        if css_w and css_w.strip().lower() not in (
                 "auto", "fit-content", "min-content", "max-content"):
             w = max(1.0, min(avail, parse_px(css_w, avail)))
 
@@ -740,7 +750,9 @@ class BlockLayout(LayoutBox):
                     explicit = avail * min(100.0, max(0.0, float(cw[:-1]))) / 100.0
                 except ValueError:
                     pass
-            elif cw == "fit-content":
+            elif cw.lower() in ("auto", "fit-content", "min-content",
+                                "max-content"):
+                # Intrinsic keywords mean shrink-to-fit, not an explicit width.
                 explicit = None
             else:
                 explicit = parse_px(cw, avail)
@@ -1524,6 +1536,10 @@ class BlockLayout(LayoutBox):
         if not nowrap and x0 >= x1:
             # A float covers the whole line (e.g. a full-width floated table):
             # don't draw the word on top of the float, drop below it first.
+            # Flush any words already queued so their baseline isn't dragged
+            # down with the cursor.
+            if self.line:
+                self.flush()
             bottom = self.cursor_y
             for f in self._all_float_regions():
                 if f["top"] <= self.cursor_y < f["bottom"]:
