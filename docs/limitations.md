@@ -11,8 +11,8 @@ enable, and disable them without a restart — and restyle the whole browser
 with **Shoes** color themes (`about:shoes`, or `Ctrl+Shift+S`).
 
 **Doesn't (yet):** flexbox wrapping, `<textarea>`/`<select>` selection (beyond
-read-only), or the full ECMAScript feature set (no `class` inheritance, no
-getters/setters, no generators, no modules, no `Proxy`). Shoes themes are
-preset solid-color palettes only — there's no custom color editor, and page
-colors aren't themed (only the browser chrome and the built-in pages). These
-are natural next milestones — the architecture has clean seams for each.
+read-only), or the full ECMAScript feature set (no getters/setters, no
+generators, no ES modules, no `Proxy`). Shoes themes are preset solid-color
+palettes only — there's no custom color editor, and page colors aren't themed
+(only the browser chrome and the built-in pages). These are natural next
+milestones — the architecture has clean seams for each.
