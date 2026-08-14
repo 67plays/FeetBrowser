@@ -1103,6 +1103,15 @@ fn element_set(
     match name {
         "textContent" => set_text_content(py, &node, &flag, value)?,
         "innerHTML" => set_inner_html(py, &node, &flag, value)?,
+        // `element.value` reads out of the attribute dictionary (the fallback
+        // arm of element_get), so writing it has to put it back in the same
+        // place -- otherwise `select.value = "b"` or `input.value = ""` would
+        // read back the old value and change nothing on screen.
+        "value" => {
+            let attrs = node_attributes(&node)?;
+            attrs.set_item("value", str_of(py, value)?)?;
+            mark_dirty(&flag);
+        }
         _ => {}
     }
     Ok(())

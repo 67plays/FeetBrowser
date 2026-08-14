@@ -512,6 +512,14 @@ class JSElement:
             self._set_text_content(value)
         elif name == "innerHTML":
             self._set_inner_html(value)
+        elif name == "value":
+            # `element.value` reads out of the attribute dictionary, in the
+            # fallback arm of js_get, so writing it has to put it back in the
+            # same place. Tab._sync_selects then believes the attribute and
+            # moves the <select>'s selected option to match.
+            self.node.attributes["value"] = \
+                "" if value is None or value is UNDEFINED else str(value)
+            self._flag["dirty"] = True
         # style writes are no-ops; mutations go through JSElementStyle.
 
     # -- native methods -------------------------------------------------
