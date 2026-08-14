@@ -836,6 +836,7 @@ class X11Window(Window):
         self._cursor_name = None
         self._cursor = 0
         self._selection = ""    # what we last put on the clipboard
+        self._primary = ""      # ...and on PRIMARY, the mouse selection
         screen = _state["screen"]
         self._window = x11.XCreateSimpleWindow(
             display, _state["root"], 0, 0, self.width, self.height, 0,
@@ -1189,13 +1190,24 @@ class X11Window(Window):
     # is nobody left to ask.
 
     def on_clipboard_set(self, text):
-        self._selection = text
+        self._selection = self._primary = text
         x11 = _libs["x11"]
         # Both selections: CLIPBOARD is Ctrl-V and PRIMARY is middle-click,
         # and a Linux user expects a copy to satisfy either.
         for selection in (_state["CLIPBOARD"], XA_PRIMARY):
             x11.XSetSelectionOwner(self._display, selection, self._window,
                                    CURRENT_TIME)
+        x11.XFlush(self._display)
+
+    def on_primary_set(self, text):
+        """Claim PRIMARY only: a mouse selection is a copy, but not *the*
+        copy. Leaving CLIPBOARD alone is the whole point -- dragging over a
+        paragraph must not throw away what the user pressed Ctrl+C on a
+        minute ago, which is what would happen if this took both."""
+        self._primary = text
+        x11 = _libs["x11"]
+        x11.XSetSelectionOwner(self._display, XA_PRIMARY, self._window,
+                               CURRENT_TIME)
         x11.XFlush(self._display)
 
     def on_clipboard_get(self):
@@ -1255,8 +1267,14 @@ class X11Window(Window):
         """Answer another application asking for what we copied."""
         if event.type == SELECTION_CLEAR:
             # Somebody else copied something. Ours is no longer the answer,
-            # and claiming otherwise would hand out stale text.
-            self._selection = ""
+            # and claiming otherwise would hand out stale text. Only the
+            # selection we actually lost: losing PRIMARY to another window's
+            # drag says nothing about what we copied.
+            lost = int(event.xselectionclear.selection)
+            if lost == XA_PRIMARY:
+                self._primary = ""
+            else:
+                self._selection = ""
             return
         request = event.xselectionrequest
         x11 = _libs["x11"]
@@ -1264,7 +1282,8 @@ class X11Window(Window):
         # A requestor from before ICCCM leaves the property unset and means
         # "put it where the target says"; honouring that costs one line.
         prop = int(request.property) or target
-        granted = self._serve_target(int(request.requestor), target, prop)
+        granted = self._serve_target(int(request.requestor), target, prop,
+                                     int(request.selection))
         reply = XEvent()
         reply.xselection.type = SELECTION_NOTIFY
         reply.xselection.display = self._display
@@ -1277,8 +1296,13 @@ class X11Window(Window):
                        ctypes.byref(reply))
         x11.XFlush(self._display)
 
-    def _serve_target(self, requestor, target, prop):
-        """Write the requested form of the selection, or say we cannot."""
+    def _serve_target(self, requestor, target, prop, selection=None):
+        """Write the requested form of the selection, or say we cannot.
+
+        `selection` says which of ours is being asked for: PRIMARY is the
+        mouse selection and anything else is the clipboard. It defaults to
+        the clipboard, which is what a caller with only one in mind means.
+        """
         x11 = _libs["x11"]
         if target == _state["TARGETS"]:
             offered = (Atom * 3)(_state["TARGETS"], _state["UTF8_STRING"],
@@ -1289,7 +1313,8 @@ class X11Window(Window):
             return True
         if target not in (_state["UTF8_STRING"], _state["TEXT"], XA_STRING):
             return False
-        raw = self._selection.encode("utf-8")
+        text = self._primary if selection == XA_PRIMARY else self._selection
+        raw = text.encode("utf-8")
         # TEXT means "whatever encoding you like, tell me which"; the answer
         # is always UTF-8, so that is what the property is typed as.
         kind = XA_STRING if target == XA_STRING else _state["UTF8_STRING"]
