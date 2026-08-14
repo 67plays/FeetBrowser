@@ -4,10 +4,10 @@
 A web browser written **from scratch**. No Chromium, no WebKit, no borrowed
 libraries — it does its own networking, HTML parsing, CSS, layout, JavaScript,
 fonts, and pixels. No GUI toolkit either: the TrueType parser, the antialiased
-rasteriser and the image decoders are all in this repo. The JavaScript engine
-and DOM bridge are compiled to a native Rust extension; everything else
-(networking, parsing, layout, rendering, chrome) is Python, standard library
-only.
+rasteriser and the image decoders are all in this repo. The JavaScript engine,
+the DOM bridge and the renderer's inner loops are compiled to a native Rust
+extension; everything else (networking, parsing, layout, the scene graph,
+chrome) is Python, standard library only.
 
 ## STRIDE — how code is judged
 
@@ -37,8 +37,8 @@ No GUI toolkit to install — the window is ours too. macOS gets one through
 AppKit, Linux one through Xlib, and Windows one through user32/gdi32, all by
 ctypes, so there is nothing to install for any of them, and X11 covers
 Wayland desktops through XWayland. What you do need is Python 3, a system
-font, and a Rust toolchain, because the JavaScript engine is a compiled
-extension and there is no Python fallback for it: `run.sh` and `run.cmd`
+font, and a Rust toolchain, because the engine is a compiled extension and
+there is no Python fallback for it: `run.sh` and `run.cmd`
 build `feetbrowser_engine` into a local `.venv` when it isn't importable
 (installing `maturin` into the venv for you). Once the extension is built and
 installed for the interpreter you're invoking, `python3 -m feetbrowser <url>`

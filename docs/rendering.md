@@ -7,9 +7,8 @@ browser somebody else owned.
 
 It is ours now. There is no GUI toolkit in the import graph: no Tk, no Qt, no
 GTK, no SDL, no Cairo, no FreeType, no Pillow. The stack below turns glyph
-outlines and paint commands into a framebuffer using nothing but the standard
-library, and the only thing it asks of the operating system is a font file to
-read.
+outlines and paint commands into a framebuffer using nothing but our own code,
+and the only thing it asks of the operating system is a font file to read.
 
 ```
 layout.py            display list (paint commands, CSS px)
@@ -18,11 +17,38 @@ canvas.py            retained scene graph  --  Tk canvas semantics
      |                 Font, PhotoImage, Canvas, create_*/delete/itemconfig
      |
 raster.py            Surface: spans, scanline AA, glyph cache, PNG out
-     |     \
+     |     \            -> rust/src/raster.rs
+     |      \
 fontengine.py         imagecodec.py
-  TrueType tables      PNG / GIF / PNM -> RGBA
-  outlines, metrics
+  discovery, index      PNG / GIF / PNM -> RGBA
+  -> rust/src/font.rs   -> rust/src/image.rs
 ```
+
+The three layers under the scene graph are the ones that touch every pixel of
+every frame, and they are compiled: they live in the same `feetbrowser_engine`
+extension as the JS engine, in `rust/src/raster.rs`, `rust/src/font.rs` and
+`rust/src/image.rs`. The Python modules that name them are shims — same
+functions, same arguments, same exceptions — because everything above them was
+written against that API and none of it had to change.
+
+The rule at that boundary is that a page must never be able to make Rust
+panic: a panic crosses into Python as `PanicException` and takes the whole
+page load with it, which is a worse failure than the `IndexError` it replaced.
+So every read of page-supplied data goes through a bounds-checked accessor and
+every coordinate is saturating. `rust/src/pyutil.rs` holds the conversions
+that keep the Python semantics the rest of the browser relies on: `int()`
+truncating towards zero rather than flooring, bytes borrowed rather than
+copied, and strings read as code points so a lone surrogate from a numeric
+character reference measures as zero width instead of raising.
+
+One thing above the scene graph is compiled for the same reason: the CSS
+cascade, in `rust/src/css.rs`. It is not a rendering layer, but it runs once
+per node per candidate rule, and on a long article that came to more time than
+everything on this page put together. The split is the same as elsewhere —
+`cssparser.py` still parses the stylesheet, and its selector objects are plain
+Python data that the matcher compiles on first use. The rules list is compiled
+once and cached against its identity, so a script that mutates the DOM
+re-cascades without re-reading the stylesheet.
 
 `window.py` sits beside all of it and supplies what Tk supplied besides
 drawing: a binding table using Tk's own sequence names, `after()` timers, and
@@ -60,36 +86,65 @@ CFF outlines is skipped when picking a face to draw with.
 `{family: {(bold, italic): (path, face)}}`. That single dict is what lets
 `Font(family="Helvetica")` and glyph-level fallback both work.
 
+The parser is `rust/src/font.rs`; discovery stays in `fontengine.py`, because
+walking directories and deciding what counts as a font directory on this
+platform is policy, it happens once, and it is easier to read in Python. A
+font file is the least trustworthy input in the browser after the network —
+every offset in it is a number some other program wrote — so the whole parser
+treats a table that runs off the end as a table that is absent. Where the
+Python this replaced leaned on a slice quietly clamping, the Rust clamps on
+purpose and says so in a comment, because the two are only the same by
+accident: a `name` record whose length overruns its table still names the
+font, and dropping it would have changed which family a page resolves to.
+
 ## raster.py — turning outlines into pixels
 
-A `Surface` is a `bytearray` of packed RGB and a clip rectangle. Nothing more.
+A `Surface` is a run of packed RGB bytes and a clip rectangle. Nothing more.
+The buffer belongs to Rust, and `surface.pixels` is a read-only memoryview
+onto it, so presenting a frame costs no copy: the window backend hands that
+same memory to `CGImageCreate`.
 
-The interesting part is that pure Python cannot afford a per-pixel inner loop,
-so the hot paths are all expressed as operations on `bytes` objects, where the
-work happens in C:
+Every drawing method starts by clipping its rectangle into byte offsets and
+gives up if nothing survives, which is what makes the loops underneath safe to
+write as plain indexing on a page's coordinates. Beyond that the shapes are
+what they sound like:
 
-- **Opaque spans** are `self.pixels[o:o + span] = row`, one slice assignment
-  per scanline — a `memcpy`.
-- **Translucent spans** use three cached 256-byte translate tables (one per
-  channel) and three strided `bytes.translate()` calls per scanline. This is
-  the single biggest win in the whole engine: one full-page translucent
-  rectangle went from 76.8 ms in a Python loop to under a millisecond.
-- **Opaque images** drop the alpha channel with `del line[3::4]` on a
-  bytearray copy of the row, then blit it as one slice.
+- **Opaque spans** are a fill or a copy per scanline.
+- **Translucent spans** blend per channel, `(dst * (255 - a) + src * a) // 255`
+  — the same integer arithmetic the Python did, because it decides the exact
+  byte in every antialiased edge on the page.
+- **Opaque images** take the strided-copy path: `blit_rgba` is told when every
+  alpha byte is 255, and then the inner loop does no arithmetic at all. That
+  is the difference between a photo costing microseconds and milliseconds.
+
+The translucent fill used to have two Python implementations racing under it:
+a 256-entry translate table per channel, and, on Linux/x86-64, a call into the
+hand-written span kernels in `asmblend.py` once per row. Both were answers to
+the same question — how do you blend a run of bytes without a Python loop —
+and the Rust fill answers it by crossing the boundary once for the whole
+rectangle rather than once per row, so neither is on this path any more. The
+kernels are still there and still tested (`tests/test_asmblend.py` checks them
+against their Python references); nothing in the browser calls them now. One
+detail worth carrying forward: the assembly rounded by `>> 8` where the tables
+and the Rust round by `// 255`, so a translucent fill could land one level
+darker at the top of the range on Linux/x86-64 and nowhere else.
 
 Antialiasing is a scanline sampler: 4× vertical subsampling with analytic
 horizontal coverage, accumulated with the nonzero winding rule — which is what
 keeps the counter of an `o` open instead of filling it in. Coverage comes out
-as an 8-bit mask, and blitting a mask is the same strided-translate trick with
-a table per distinct (colour, alpha).
+as an 8-bit mask, and blitting a mask is one blend per covered pixel.
 
-Glyph rasterisation is cached on `(face, size, glyph id)`, because a page of
-text is a few dozen distinct glyphs drawn hundreds of times each. A warm cache
-draws a 40×135 character screenful in 8.4 ms; a full page composite is 9.9 ms,
-comfortably inside a frame.
+Glyph rasterisation is cached on `(size, glyph id)`, held by the face itself,
+because a page of text is a few dozen distinct glyphs drawn hundreds of times
+each. Keying a shared cache on the font's address instead would let a
+collected face hand its address — and its glyph shapes — to the next face
+allocated there. A warm cache draws a 40×135 character screenful in 0.97 ms,
+against 8.4 ms when the same loop was Python.
 
-`to_png()` writes the surface out through stdlib `zlib`, which is how
-`--screenshot` works and how the renderer is tested.
+`to_png()` prefixes each row with a zero filter byte and compresses through
+stdlib `zlib` at level 6. That last step deliberately stayed in Python: the
+compressor is C already, and using the same one keeps a `--screenshot` PNG
+byte-identical to the ones the test corpus was captured with.
 
 ## imagecodec.py — decoding what pages send
 
@@ -97,7 +152,8 @@ Everything returns `(width, height, rgba)`.
 
 - **PNG**: all five colour types, bit depths 1/2/4/8/16, all five scanline
   filters including Paeth, `tRNS` transparency for palette / grey / truecolour,
-  and Adam7 interlacing. `zlib` does the inflate; the rest is ours.
+  and Adam7 interlacing. An inflate with a ceiling on it does the
+  decompression; the rest is ours.
 - **GIF**: a hand-written variable-width LZW decoder, global and local colour
   tables, transparency index, and interlacing. First frame only, which is what
   Tk did too.
@@ -105,6 +161,25 @@ Everything returns `(width, height, rgba)`.
 
 Scaling is nearest-neighbour, matching the `subsample`/`zoom` semantics the
 browser already relied on.
+
+This is the code in the browser most likely to be handed something written
+specifically to break it, so two limits are hard-coded and enforced before any
+allocation: `MAX_PIXELS` (20 million) rejects a header claiming a billion-pixel
+image, and `MAX_INFLATED` bounds what a compressed stream is allowed to expand
+into, so a few kilobytes of IDAT cannot ask for a gigabyte of memory. Short
+input is not an error, though: a connection dropping mid-image is ordinary, so
+a truncated stream keeps whatever inflated and the rows that never arrived
+stay background, exactly as the Python decompressobj behaved.
+
+The decoders are exercised deliberately badly. `tests/test_render.py` feeds
+them truncated chunks, bad CRCs, headers no decoder can honour, absurd
+dimensions, compressed data that expands without end, LZW code sizes that
+cannot exist, and a few thousand rounds of randomly corrupted real images, and
+asserts `ImageError` rather than a crash — a distinction that matters more
+now, because the layer
+that used to raise `IndexError` in Python would panic here, and a panic
+crossing the extension boundary would kill the page load rather than the
+image.
 
 ## canvas.py — the scene graph
 
@@ -307,6 +382,12 @@ The end-to-end check is a screenshot: `python3 -m feetbrowser --screenshot
 <url> out.png` runs the real browser — chrome, tabs, toolbar, page, scrollbar —
 settles the image loads, and writes a PNG. CI does this on every push, on both
 platforms it can run on.
+
+It is also the check that made moving this layer into Rust safe to do. A
+rewrite of a rasteriser is only correct if it produces the same bytes, so the
+corpus was captured before the port and compared byte for byte after each
+step, and `tests/bench_render.py` prints the timings the two versions are
+argued about with.
 
 ## Known gaps
 

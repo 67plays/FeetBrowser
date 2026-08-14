@@ -1,9 +1,9 @@
 # Architecture
 
 FeetBrowser is a **functional web browser written from scratch** — the engine
-(JS interpreter + DOM bridge) is a native Rust extension, and the rest is pure
-Python. It does not wrap Chromium, WebKit, Gecko, or any HTTP library — it
-implements its own:
+(JS interpreter, DOM bridge, the CSS cascade, and the inner loops of the
+renderer) is a native Rust extension, and the rest is pure Python. It does not wrap Chromium,
+WebKit, Gecko, or any HTTP library — it implements its own:
 
 - **Networking** — raw TCP sockets speaking HTTP/1.1, TLS for `https`,
   redirect following, `gzip`/`deflate` decoding, chunked transfer decoding,
@@ -16,7 +16,11 @@ implements its own:
 - **CSS engine** — a parser for tag / class / id / descendant / grouped
   selectors (with pseudo-classes like `:hover` collapsed to their base
   selector), the cascade with specificity, inheritance, inline `style=""`,
-  `@media` unwrapping, and a default user-agent stylesheet (`ua.css`).
+  `@media` unwrapping, and a default user-agent stylesheet (`ua.css`). The
+  parser is Python; the cascade is Rust, because it is the one part that runs
+  once per node per candidate rule and a long article has thousands of both.
+  The selector objects the parser produces are plain Python data, and the
+  matcher compiles them on first use.
 - **Layout engine** — a block-and-inline flow layout with line breaking and
   word wrapping, font size / weight / style, colors, backgrounds, list
   bullets, and `<hr>`, plus **CSS floats** (with text wrapping and `clear`),
@@ -30,15 +34,19 @@ implements its own:
   `<select>`), producing a display list of paint commands.
 - **Rendering engine** — our own pixels, no GUI toolkit: a TrueType parser
   (`cmap`/`glyf`/`hmtx`/…, composite glyphs, real metrics), an antialiased
-  scanline rasteriser writing into a `bytearray` framebuffer, PNG/GIF/PNM
-  decoders, a retained scene graph, and an event loop. See
-  [docs/rendering.md](rendering.md).
+  scanline rasteriser owning its own framebuffer, PNG/GIF/PNM decoders, a
+  retained scene graph, and an event loop. The three layers that touch every
+  pixel — the surface, the font parser and the image decoders — are in the
+  same Rust extension as the JS engine; the scene graph, the event loop and
+  font *discovery* stay in Python. See [docs/rendering.md](rendering.md).
 - **Platform windows** — a real window on macOS (`cocoa.py`, ctypes into
-  AppKit) and on Windows (`win32.py`, ctypes into `user32`/`gdi32`/
-  `kernel32`), each translating native events into the same Tk-shaped
-  bindings and pushing the same framebuffer to the screen. Neither needs a
-  bindings package. Everywhere else the browser runs headless, which is also
-  how `--screenshot` and the whole test suite run on every platform.
+  AppKit), on Linux and the BSDs (`x11.py`, ctypes into Xlib, which also
+  covers Wayland desktops through XWayland) and on Windows (`win32.py`,
+  ctypes into `user32`/`gdi32`/`kernel32`), each translating native events
+  into the same Tk-shaped bindings and pushing the same framebuffer to the
+  screen. None of them needs a bindings package. Anywhere else, and anywhere
+  with no display, the browser runs headless, which is also how
+  `--screenshot` and the whole test suite run on every platform.
 - **Browser UI** — a hand-drawn chrome on that canvas: tabs, an address bar
   with search fallback, back / forward / reload / home buttons,
   hover + clickable links, middle-click / ctrl-click to open in a new tab,
@@ -88,13 +96,13 @@ comparison.
 feetbrowser/
   net.py         URL parsing + HTTP/HTTPS/data/file transport + connection pool
   htmlparser.py  HTML tokenizer + DOM tree builder
-  cssparser.py   CSS parser, selectors, specificity, cascade
+  cssparser.py   CSS parser, selectors and specificity; the cascade is Rust
   jsengine.py    thin shim over the Rust `feetbrowser_engine` extension
   jsdom.py       thin shim over the Rust DOM bridge (dom_get/dom_set/dom_call)
   layout.py      block/inline layout -> display list, painting
-  fontengine.py  TrueType parsing: tables, cmap, metrics, glyph outlines
-  raster.py      antialiased software rasteriser, glyph cache, PNG output
-  imagecodec.py  PNG / GIF / PNM decoders -> RGBA
+  fontengine.py  font discovery and the family index; parsing is Rust
+  raster.py      thin shim over the Rust surface, glyph cache and PNG output
+  imagecodec.py  thin shim over the Rust PNG / GIF / PNM decoders
   canvas.py      retained scene graph, fonts, colors, images (Tk semantics)
   window.py      windows, Tk-shaped events, after() timers, main loop
   cocoa.py       the macOS window: AppKit through ctypes, no PyObjC
@@ -106,7 +114,7 @@ feetbrowser/
   toehub.py      the ToeHub: catalog fetch, install/uninstall/toggle
   ua.css         default user-agent stylesheet
 rust/
-  lib.rs         PyO3 module wiring; exposes Interpreter, JSException, UNDEFINED
+  lib.rs         PyO3 module wiring; the JS engine, DOM and renderer bindings
   interp.rs      evaluator, host bridge, promises, microtasks, timers
   parser.rs      recursive-descent parser + AST construction
   token.rs       lexer
@@ -114,7 +122,12 @@ rust/
   value.rs       JsValue model, scopes, coercion, JsCallback
   stdlib.rs      built-ins (Array/Object/Map/Set/Date/RegExp/Math/JSON/...)
   dom.rs         DOM bridge (document/element/style/classList/...)
+  css.rs         selector matching and the cascade walk
   pybind.rs      Python-facing classes (Interpreter, JsGlobals, PyJsValue)
+  raster.rs      Surface, blitters, scanline rasteriser, text, PNG output
+  font.rs        TrueType tables, cmap, metrics, outlines, flattening
+  image.rs       PNG / GIF / PNM decoders and nearest-neighbour resize
+  pyutil.rs      shared argument conversions (bytes, coordinates, strings)
 toes/            user-installed toes (gitignored; empty on a fresh checkout)
 tests/
   test_render.py offline tests for fonts, rasteriser, image codecs, canvas

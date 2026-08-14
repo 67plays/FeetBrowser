@@ -68,24 +68,69 @@ def capture(window):
     offsets, so this produces a correct PNG at any TrueColor depth -- and so
     a picture that comes out wrong is evidence about the backend rather than
     about the two of them agreeing on the same mistake.
+
+    The decoded rows are assembled as RGBA here and handed to the surface in
+    one `blit_rgba`, because a Surface's framebuffer belongs to Rust and
+    `pixels` is a read-only view of it: writing a photograph in is a drawing
+    operation like any other, and every alpha byte is 255 so the blit is a
+    strided copy.
     """
     raw, line = helpers.grab(window)
     fmt = x11._state["format"]
     size = fmt.bits_per_pixel // 8
     order = "little" if fmt.byte_order == x11.LSB_FIRST else "big"
     masks = (fmt.red_mask, fmt.green_mask, fmt.blue_mask)
-    shot = raster.Surface(window.width, window.height)
-    out = shot.pixels
+    rgba = bytearray(b"\xff" * (window.width * window.height * 4))
+    dst = 0
     for y in range(window.height):
         at = y * line
-        dst = y * shot.stride
         for _ in range(window.width):
             value = int.from_bytes(raw[at:at + size], order)
             for channel, mask in enumerate(masks):
-                out[dst + channel] = helpers._channel(value, mask)
+                rgba[dst + channel] = helpers._channel(value, mask)
             at += size
-            dst += 3
+            dst += 4
+    shot = raster.Surface(window.width, window.height)
+    shot.blit_rgba(rgba, window.width, window.height, 0, 0, opaque=True)
     return shot
+
+
+def check(shot):
+    """Say what is wrong with the photograph, or nothing if it is right.
+
+    The picture used to be uploaded and never looked at, which made it an
+    artifact rather than a test: the job stayed green whatever came back off
+    the server. The page above is built so that a handful of colours settle
+    the question. Red, green and blue have to be there, as blocks big enough
+    to be the swatches, and in that order across the window -- a visual's
+    channel masks and the server's byte order are precisely what a wrong
+    answer permutes, and permuting them is invisible in the file size.
+    """
+    swatches = ((0xD9, 0x2B, 0x2B), (0x2B, 0xD9, 0x4F), (0x2B, 0x6B, 0xD9))
+    header = (0x2F, 0x6F, 0xB0)
+    total = {colour: 0 for colour in swatches + (header,)}
+    sum_x = dict(total)
+    pixels = shot.pixels
+    for y in range(shot.height):
+        row = y * shot.stride
+        for x in range(shot.width):
+            at = row + x * 3
+            colour = (pixels[at], pixels[at + 1], pixels[at + 2])
+            if colour in total:
+                total[colour] += 1
+                sum_x[colour] += x
+    if total[header] < 5000:
+        return "the header block is missing (%d px of #2f6fb0)" % total[header]
+    for colour in swatches:
+        if total[colour] < 2000:
+            return ("the #%02x%02x%02x swatch is missing (%d px)"
+                    % (colour + (total[colour],)))
+    middles = [sum_x[colour] / total[colour] for colour in swatches]
+    if not middles[0] < middles[1] < middles[2]:
+        return ("red, green and blue came out at x=%s, which is not the "
+                "order they were drawn in"
+                % [round(m) for m in middles])
+    return None
 
 
 def main():
@@ -129,9 +174,13 @@ def main():
     size = os.path.getsize(path)
     print("wrote %s (%dx%d, %d bytes)" % (path, shot.width, shot.height, size))
     # A window that never got painted still writes a perfectly valid PNG, and
-    # a flat one compresses to almost nothing -- so the size is the check.
+    # a flat one compresses to almost nothing -- so the size is the floor.
     if size < 5000:
         sys.exit("the screenshot is suspiciously small; nothing was drawn")
+    problem = check(shot)
+    if problem:
+        sys.exit("the window came out wrong: %s" % problem)
+    print("red, green and blue arrived in order; the header block is there")
 
 
 if __name__ == "__main__":

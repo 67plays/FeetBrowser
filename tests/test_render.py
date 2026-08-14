@@ -20,8 +20,11 @@ from feetbrowser.window import Event, Window
 # -- helpers ---------------------------------------------------------------
 
 def _png(width, height, depth, color, samples, palette=None, trns=None,
-         interlace=0):
-    """Build a PNG so the decoder can be tested against known pixels."""
+         interlace=0, idat=None):
+    """Build a PNG so the decoder can be tested against known pixels.
+
+    `idat` replaces the compressed pixel data outright, which is how the
+    malformed-input tests hand the decoder something no encoder wrote."""
     def chunk(tag, payload):
         body = tag + payload
         return (struct.pack(">I", len(payload)) + body
@@ -30,9 +33,11 @@ def _png(width, height, depth, color, samples, palette=None, trns=None,
     channels = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}[color]
     stride = (width * channels * depth + 7) // 8
     raw = bytearray()
-    for y in range(height):
-        raw.append(0)
-        raw += samples[y * stride:(y + 1) * stride]
+    if idat is None:
+        for y in range(height):
+            raw.append(0)
+            raw += samples[y * stride:(y + 1) * stride]
+        idat = zlib.compress(bytes(raw))
     out = b"\x89PNG\r\n\x1a\n" + chunk(
         b"IHDR", struct.pack(">IIBBBBB", width, height, depth, color, 0, 0,
                              interlace))
@@ -40,7 +45,26 @@ def _png(width, height, depth, color, samples, palette=None, trns=None,
         out += chunk(b"PLTE", palette)
     if trns:
         out += chunk(b"tRNS", trns)
-    return out + chunk(b"IDAT", zlib.compress(bytes(raw))) + chunk(b"IEND", b"")
+    return out + chunk(b"IDAT", idat) + chunk(b"IEND", b"")
+
+
+def _gif():
+    """A 2x2 GIF whose LZW stream is four literal codes and an end marker."""
+    palette = bytes([255, 0, 0, 0, 0, 255]) + bytes(6)
+    stream, acc, bits = bytearray(), 0, 0
+    for code in (0, 1, 1, 0, 5):     # 4-entry table: clear=4, end=5, 3 bits
+        acc |= code << bits
+        bits += 3
+        while bits >= 8:
+            stream.append(acc & 0xFF)
+            acc >>= 8
+            bits -= 8
+    if bits:
+        stream.append(acc & 0xFF)
+    return (b"GIF89a" + struct.pack("<HHBBB", 2, 2, 0x80 | 0x01, 0, 0)
+            + palette
+            + b"\x2C" + struct.pack("<HHHHB", 0, 0, 2, 2, 0)
+            + bytes([2, len(stream)]) + bytes(stream) + b"\x00" + b"\x3B")
 
 
 def _pixel(surface, x, y):
@@ -134,6 +158,205 @@ def test_missing_glyph_falls_back_to_another_face():
     assert font.measure(ch) >= 0
 
 
+# -- malformed fonts -------------------------------------------------------
+#
+# Fonts come off the local disk rather than off the network, so the threat is
+# not a hostile author but a truncated download, a partially written file, or
+# a face doing something the spec allows and nobody expects. The rule is the
+# same either way: a file that is not a font raises FontError, and a font that
+# is merely strange gives up on the glyph it cannot read and keeps going. It
+# may never crash the parser, which since the parser is Rust would mean
+# taking the process with it.
+
+def _sfnt(tables):
+    """Assemble an sfnt file from ``{tag: payload}``."""
+    tags = sorted(tables)
+    out = struct.pack(">IHHHH", 0x00010000, len(tags), 0, 0, 0)
+    offset = 12 + 16 * len(tags)
+    body = b""
+    for tag in tags:
+        payload = tables[tag]
+        out += tag.encode("ascii").ljust(4)[:4]
+        out += struct.pack(">III", 0, offset + len(body), len(payload))
+        body += payload + b"\x00" * (-len(payload) % 4)
+    return out + body
+
+
+def _minimal(glyf=None, loca=None, cmap=None, n_glyphs=2, n_metrics=2,
+             index_to_loc=0):
+    head = bytearray(54)
+    struct.pack_into(">H", head, 18, 1000)          # unitsPerEm
+    struct.pack_into(">h", head, 50, index_to_loc)  # indexToLocFormat
+    hhea = bytearray(36)
+    struct.pack_into(">hhh", hhea, 4, 800, -200, 0)
+    struct.pack_into(">H", hhea, 34, n_metrics)
+    maxp = bytearray(6)
+    struct.pack_into(">H", maxp, 4, n_glyphs)
+    hmtx = struct.pack(">HhHh", 500, 0, 300, 0)
+    if glyf is None:
+        # One square contour, points given as 16-bit deltas.
+        glyf = (struct.pack(">hhhhh", 1, 0, 0, 100, 100)
+                + struct.pack(">HH", 3, 0) + bytes([1, 1, 1, 1])
+                + struct.pack(">hhhh", 0, 100, 0, -100)
+                + struct.pack(">hhhh", 0, 0, 100, 0))
+    if loca is None:
+        loca = struct.pack(">HHH", 0, 0, len(glyf) // 2)
+    if cmap is None:
+        # Format 6, mapping 'A' to glyph 1.
+        sub = struct.pack(">HHHHHH", 6, 12, 0, ord("A"), 1, 1)
+        cmap = struct.pack(">HHHHI", 0, 1, 3, 1, 12) + sub
+    return _sfnt({"head": bytes(head), "hhea": bytes(hhea),
+                  "maxp": bytes(maxp), "hmtx": hmtx, "glyf": glyf,
+                  "loca": loca, "cmap": cmap})
+
+
+def _raises_fonterror(data, why):
+    try:
+        fontengine.Font(data)
+    except fontengine.FontError:
+        return
+    raise AssertionError(why)
+
+
+def test_minimal_font_parses():
+    """The scaffolding above has to make a font, or the tests below prove
+    nothing about the cases they break."""
+    font = fontengine.Font(_minimal())
+    assert (font.units_per_em, font.ascent, font.descent) == (1000, 800, -200)
+    assert font.glyph_id("A") == 1 and font.glyph_id("B") == 0
+    assert len(font.glyph_contours(1)) == 1
+    assert font.advance(0) == 500 and font.advance(1) == 300
+
+
+def test_font_rejects_files_that_are_not_fonts():
+    _raises_fonterror(b"", "an empty file is not a font")
+    _raises_fonterror(b"<html>not a font at all</html>", "HTML is not a font")
+    _raises_fonterror(b"\x00\x01\x00\x00", "a bare sfnt tag is not a font")
+    _raises_fonterror(_sfnt({"cmap": b"\x00" * 8}),
+                      "a font without head cannot be measured")
+
+
+def test_font_rejects_a_collection_index_it_does_not_have():
+    _raises_fonterror(b"ttcf" + struct.pack(">IIII", 0x00010000, 1, 200, 0),
+                      "a one-font collection has no second face")
+
+
+def test_font_treats_tables_pointing_past_the_end_as_absent():
+    """A truncated font leaves directory entries pointing into nothing. Those
+    read as missing tables, which is how a partly written file still gives up
+    politely instead of indexing off the end of the buffer."""
+    data = bytearray(_minimal())
+    # The directory is sorted by tag, so cmap is the first entry: aim its
+    # offset a megabyte past the end of the file.
+    struct.pack_into(">I", data, 12 + 8, 1 << 20)
+    font = fontengine.Font(bytes(data))
+    assert font.glyph_id("A") == 0, "a missing cmap maps nothing"
+    assert font.names() == {}
+
+
+def test_font_ignores_a_truncated_glyph():
+    good = _minimal()
+    for cut in (10, 12, 14, 16, 20, 24):
+        glyf = (struct.pack(">hhhhh", 1, 0, 0, 100, 100)
+                + struct.pack(">HH", 3, 0) + bytes([1, 1, 1, 1])
+                + struct.pack(">hhhh", 0, 100, 0, -100)
+                + struct.pack(">hhhh", 0, 0, 100, 0))[:cut]
+        font = fontengine.Font(_minimal(glyf=glyf,
+                                        loca=struct.pack(">HHH", 0, 0,
+                                                         len(glyf) // 2)))
+        assert font.glyph_contours(1) == [], f"cut at {cut} produced an outline"
+    assert fontengine.Font(good).glyph_contours(1), "the whole glyph is fine"
+
+
+def test_font_ignores_loca_entries_past_glyf():
+    font = fontengine.Font(_minimal(loca=struct.pack(">HHH", 0, 0, 30000)))
+    assert font.glyph_contours(1) == []
+    assert font.glyph_contours(9999) == [], "a glyph id past loca is blank"
+
+
+def test_font_stops_on_a_composite_that_refers_to_itself():
+    """A composite pointing at itself would recurse for ever. The parser gives
+    up after a few levels and returns nothing, which is the only answer that
+    terminates."""
+    glyf = (struct.pack(">hhhhh", -1, 0, 0, 100, 100)
+            + struct.pack(">HH", 0x0002, 1) + bytes([0, 0]))
+    font = fontengine.Font(_minimal(glyf=glyf,
+                                    loca=struct.pack(">HHH", 0, 0,
+                                                     len(glyf) // 2)))
+    assert font.glyph_contours(1) == []
+
+
+def test_font_cmap_ignores_impossible_ranges():
+    """A format 12 group spanning the whole 32-bit space is a corrupt record,
+    not four billion characters to enumerate."""
+    groups = (struct.pack(">III", ord("A"), ord("A"), 1)
+              + struct.pack(">III", 0, 0xFFFFFFFF, 1))
+    sub = struct.pack(">HHIII", 12, 0, 16 + len(groups), 0, 2) + groups
+    cmap = struct.pack(">HHHHI", 0, 1, 3, 10, 12) + sub
+    font = fontengine.Font(_minimal(cmap=cmap))
+    assert font.glyph_id("A") == 1
+    assert font.glyph_id("B") == 0, "the impossible group should be skipped"
+
+
+def test_font_advance_falls_back_to_the_last_metric():
+    """hmtx stops after numberOfHMetrics entries and every glyph after that
+    shares the last advance -- that is how the format spells a monospaced
+    tail, not a reason to index past the table."""
+    font = fontengine.Font(_minimal())
+    assert font.advance(1) == 300
+    assert font.advance(50000) == 300
+    assert font.advance(-1) == 300
+
+
+def test_font_survives_arbitrary_corruption():
+    """Flip bytes through a real font and a hand-built one and insist the
+    parser always either works or raises FontError. A font is read once and
+    then asked for outlines all day, so a stray offset must be survivable at
+    every one of those calls, not just at parse time."""
+    import random
+
+    seeds = [_minimal()]
+    for faces in fontengine.index().values():
+        path, _face = next(iter(faces.values()))
+        with open(path, "rb") as f:
+            seeds.append(f.read(200000))
+        break
+    rng = random.Random(20260814)
+    for _ in range(1500):
+        data = bytearray(rng.choice(seeds))
+        for _flip in range(rng.randint(1, 8)):
+            data[rng.randrange(len(data))] = rng.randrange(256)
+        if rng.random() < 0.3:
+            del data[rng.randrange(len(data)):]
+        try:
+            font = fontengine.Font(bytes(data))
+            font.names()
+            for ch in ("A", "g", "☃"):
+                font.glyph_id(ch)
+            for gid in (0, 1, 7, 4000):
+                fontengine.flatten(font.glyph_contours(gid), font.scale(16))
+                font.advance(gid)
+        except fontengine.FontError:
+            pass
+        except Exception as exc:                 # noqa: BLE001
+            raise AssertionError(
+                f"{type(exc).__name__} escaped the font parser: {exc}")
+
+
+def test_text_survives_lone_surrogates():
+    """``&#xD800;`` puts a lone surrogate in a page's text. It is not a
+    character any font maps, but measuring and drawing it must come back
+    quietly rather than raise on the way into the renderer."""
+    font = _sans()
+    face = font.face
+    assert face.glyph_id("\ud800") == 0
+    assert face.has_char("\ud800") is False
+    text = "a\ud800b"
+    assert raster.measure_text(face, 16, text) >= 0
+    s = raster.Surface(40, 20, (255, 255, 255))
+    raster.draw_text(s, face, 16, text, 2, 15, (0, 0, 0))
+
+
 # -- rasteriser ------------------------------------------------------------
 
 def test_surface_starts_filled_with_background():
@@ -167,32 +390,31 @@ def test_fill_rect_alpha_blends_halfway():
         f"half-alpha blend gave {(r, g, b)}"
 
 
-def test_fill_rect_alpha_uses_the_span_kernels_when_they_exist():
-    """The translucent fill hands whole rows to asmblend where the raw
-    kernels are compiled in. Force that path on -- asmblend's own fallback
-    computes the same thing the assembly does -- and check the blend landed
-    in the surface's own bytes, in the right rows and nowhere else."""
-    from feetbrowser import asmblend
-    saved = raster._ASM_SPANS
-    raster._ASM_SPANS = True
-    try:
-        s = raster.Surface(6, 4, (40, 40, 40))
-        s.fill_rect(1, 1, 5, 3, (200, 100, 50), 128)
-    finally:
-        raster._ASM_SPANS = saved
+def test_fill_rect_alpha_lands_in_the_right_rows_and_nowhere_else():
+    """This is what is left of the span-kernel test after the fill moved to
+    Rust. The row-at-a-time asmblend path is gone -- the Rust fill covers the
+    whole rectangle in one crossing instead of one per row -- so what is worth
+    checking is the same thing that test checked underneath the plumbing: the
+    blend is exact, it covers every pixel of the rectangle, and it touches
+    nothing outside it. The kernels themselves are still exercised, directly
+    against their Python references, in tests/test_asmblend.py.
+
+    Note the arithmetic: `// 255`, as the translate tables did. The assembly
+    rounded by `>> 8`, which is one level darker at the top of the range.
+    """
+    s = raster.Surface(6, 4, (40, 40, 40))
+    s.fill_rect(1, 1, 5, 3, (200, 100, 50), 128)
     inv = 255 - 128
-    expect = tuple((c * 128 + 40 * inv) >> 8 for c in (200, 100, 50))
+    expect = tuple((c * 128 + 40 * inv) // 255 for c in (200, 100, 50))
     assert _pixel(s, 1, 1) == expect, (_pixel(s, 1, 1), expect)
     assert _pixel(s, 4, 2) == expect, "the last covered pixel blended too"
     assert _pixel(s, 0, 1) == (40, 40, 40), "the blend escaped to the left"
     assert _pixel(s, 5, 1) == (40, 40, 40), "the blend escaped to the right"
     assert _pixel(s, 1, 0) == (40, 40, 40), "the blend escaped upwards"
+    assert _pixel(s, 1, 3) == (40, 40, 40), "the blend escaped downwards"
 
-    # And the surface is still a plain bytearray afterwards: every ctypes
-    # view over it has to be gone or it cannot be resized or replaced again.
     s.fill_all((1, 2, 3))
-    assert _pixel(s, 0, 0) == (1, 2, 3)
-    assert asmblend.using_assembly() in (True, False)
+    assert _pixel(s, 0, 0) == (1, 2, 3), "the surface still refills afterwards"
 
 
 def test_clip_confines_drawing():
@@ -470,6 +692,178 @@ def test_resize_nearest_neighbour():
 def test_resize_is_identity_at_same_size():
     rgba = bytearray(bytes([1, 2, 3, 4]) * 4)
     assert imagecodec.resize(rgba, 2, 2, 2, 2) is rgba
+
+# -- malformed images ------------------------------------------------------
+#
+# Everything below feeds the decoders bytes no encoder would ever produce.
+# Images are the one part of a page that arrives as raw binary from a
+# stranger, so the decoders are where a hostile file gets its chance: the
+# rule is that a broken image is an ImageError and never a crash, a hang or
+# an allocation the file chose the size of. That mattered when this was
+# Python and it matters more now that it is Rust, where an unchecked index
+# is a panic no `except` can catch.
+
+def _rejects(data, why):
+    try:
+        imagecodec.decode(data)
+    except imagecodec.ImageError:
+        return
+    raise AssertionError(why)
+
+
+def test_decode_png_rejects_truncation_in_the_header():
+    """Cut a good PNG short at each structural boundary up to the end of
+    IHDR: the signature, the length word, the chunk tag, mid-payload."""
+    good = _png(4, 3, 8, 2, bytes(36))
+    for cut in (0, 1, 7, 8, 12, 20, 25):
+        _rejects(good[:cut], f"truncation at {cut} bytes should be rejected")
+
+
+def test_decode_png_pads_a_truncated_image():
+    """Past the header a short file is not an error: a header we believe
+    plus fewer pixels than it promised comes back padded, which is what a
+    half-arrived image on a slow connection looks like."""
+    good = _png(4, 3, 8, 2, bytes(range(36)))
+    width, height, rgba = imagecodec.decode(good[:len(good) - 20])
+    assert (width, height) == (4, 3)
+    assert len(rgba) == 4 * 3 * 4
+
+
+def test_decode_png_ignores_chunk_crcs():
+    """We have never checked CRCs and must not start: a stray bad checksum
+    is common in the wild and the pixels are usually perfectly fine."""
+    good = _png(2, 2, 8, 2, bytes(12))
+    _w, _h, rgba = imagecodec.decode(good[:-4] + b"\x00\x00\x00\x00")
+    assert len(rgba) == 2 * 2 * 4
+
+
+def test_decode_png_rejects_headers_it_cannot_honour():
+    _rejects(_png(2, 2, 8, 2, bytes(12), interlace=3),
+             "unknown interlace method should be rejected")
+    _rejects(_png(2, 2, 7, 2, bytes(12)), "bit depth 7 should be rejected")
+    header = struct.pack(">IIBBBBB", 2, 2, 8, 9, 0, 0, 0)
+    body = b"IHDR" + header
+    _rejects(b"\x89PNG\r\n\x1a\n" + struct.pack(">I", len(header)) + body
+             + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF),
+             "colour type 9 should be rejected")
+
+
+def test_decode_png_rejects_absurd_dimensions():
+    """Twenty million pixels is the cap, and a header is a claim rather
+    than a fact: a 65535x65535 IHDR must not become a 17-gigabyte buffer."""
+    _rejects(_png(0xFFFF, 0xFFFF, 8, 2, b""), "4G pixels should be rejected")
+    _rejects(_png(0, 0, 8, 2, b""), "a zero-area image should be rejected")
+    header = struct.pack(">IIBBBBB", 0x80000000, 4, 8, 2, 0, 0, 0)
+    body = b"IHDR" + header
+    _rejects(b"\x89PNG\r\n\x1a\n" + struct.pack(">I", len(header)) + body
+             + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF),
+             "a width past 2^31 should be rejected")
+
+
+def test_decode_png_rejects_undecodable_pixel_data():
+    _rejects(_png(2, 2, 8, 2, bytes(12), idat=b"junkjunkjunk"),
+             "an IDAT that is not deflate data should be rejected")
+    _rejects(_png(2, 2, 8, 2, bytes(12),
+                  idat=zlib.compress(bytes([9, 1, 2, 3, 4, 5, 6,
+                                            9, 1, 2, 3, 4, 5, 6]))),
+             "filter type 9 does not exist and should be rejected")
+
+
+def test_decode_png_inflate_is_bounded():
+    """A third of a megabyte on the wire that would expand past
+    MAX_INFLATED has to stop at the ceiling rather than eat the machine."""
+    packer = zlib.compressobj(9)
+    megabyte = b"\x00" * (1 << 20)
+    parts = [packer.compress(megabyte)
+             for _ in range((imagecodec.MAX_INFLATED >> 20) + 4)]
+    parts.append(packer.flush())
+    bomb = b"".join(parts)
+    assert len(bomb) < (1 << 20), "the bomb should be small on the wire"
+    _rejects(_png(64, 64, 8, 2, b"", idat=bomb),
+             "a zip bomb should be rejected, not decoded")
+
+
+def test_decode_gif_rejects_truncation():
+    good = _gif()
+    for cut in (0, 3, 6, 10, 13, 20, 26, 30):
+        _rejects(good[:cut], f"truncation at {cut} bytes should be rejected")
+
+
+def test_decode_gif_rejects_impossible_code_sizes():
+    """A GIF palette holds 256 colours at most, so an initial LZW code size
+    above 8 is a file asking us to size a table from a number it invented."""
+    for min_code in (9, 12, 200, 255):
+        raw = bytearray(_gif())
+        raw[raw.index(b"\x2C") + 10] = min_code
+        _rejects(bytes(raw),
+                 f"LZW code size {min_code} should be rejected")
+
+
+def test_decode_gif_rejects_absurd_geometry():
+    _rejects(b"GIF89a" + struct.pack("<HHBBB", 0xFFFF, 0xFFFF, 0, 0, 0)
+             + b"\x3B", "a 4G-pixel canvas should be rejected")
+    _rejects(b"GIF89a" + struct.pack("<HHBBB", 4, 4, 0, 0, 0) + b"\x3B",
+             "a GIF with no image block should be rejected")
+    _rejects(b"GIF89a" + struct.pack("<HHBBB", 2, 2, 0x80 | 0x01, 0, 0)
+             + bytes(12) + b"\x2C"
+             + struct.pack("<HHHHB", 60000, 60000, 2, 2, 0)
+             + bytes([2, 1]) + b"\x00\x00\x3B",
+             "a frame placed 60000 pixels off canvas should be rejected")
+
+
+def test_decode_pnm_rejects_malformed_headers():
+    _rejects(b"P6", "a header with nothing after it should be rejected")
+    _rejects(b"P6\n2 1\n", "a missing maxval should be rejected")
+    _rejects(b"P6\nx y\n255\n" + bytes(6), "junk dimensions are rejected")
+    _rejects(b"P6\n0 0\n255\n", "a zero-area image should be rejected")
+    _rejects(b"P6\n99999 99999\n255\n" + bytes(6),
+             "ten billion pixels should be rejected")
+    _rejects(b"P3\n2 1\n255\nred green blue\n", "junk samples are rejected")
+    _rejects(b"P9\n2 1\n255\n" + bytes(6), "P9 is not a Netpbm type")
+
+
+def test_decode_pnm_accepts_the_awkward_but_legal():
+    """Comments mid-header, 16-bit samples and bitmaps are all in the spec
+    and all three take a different path through the reader."""
+    _w, _h, rgba = imagecodec.decode(b"P6\n# who\n2 1\n# what\n255\n"
+                                     + bytes([1, 2, 3, 4, 5, 6]))
+    assert tuple(rgba[:4]) == (1, 2, 3, 255)
+    _w, _h, rgba = imagecodec.decode(b"P5\n2 1\n65535\n"
+                                     + bytes([255, 255, 0, 0]))
+    assert rgba[0] == 255 and rgba[4] == 0
+    _w, _h, rgba = imagecodec.decode(b"P4\n8 1\n" + bytes([0b10000000]))
+    assert rgba[0] == 0 and rgba[4] == 255, "in PBM a set bit is black"
+    _w, _h, rgba = imagecodec.decode(b"P6\n4 4\n255\n" + bytes(6))
+    assert len(rgba) == 4 * 4 * 4, "short pixel data is padded, not fatal"
+
+
+def test_decoders_survive_arbitrary_corruption():
+    """Flip bytes at random through each format and insist that the only
+    thing which ever comes back is a picture or an ImageError."""
+    import random
+
+    seeds = [_png(4, 3, 8, 2, bytes(36)),
+             _png(4, 2, 8, 3, bytes([0, 1, 2, 3, 0, 1, 2, 3]),
+                  palette=bytes(12)),
+             _png(2, 2, 16, 6, bytes(32)),
+             _gif(),
+             b"P6\n3 2\n255\n" + bytes(18),
+             b"P3\n2 2\n255\n1 2 3 4 5 6 7 8\n"]
+    rng = random.Random(20260813)
+    for _ in range(3000):
+        data = bytearray(rng.choice(seeds))
+        for _flip in range(rng.randint(1, 5)):
+            data[rng.randrange(len(data))] = rng.randrange(256)
+        if rng.random() < 0.3:
+            del data[rng.randrange(len(data)):]
+        try:
+            imagecodec.decode(bytes(data))
+        except imagecodec.ImageError:
+            pass
+        except Exception as exc:                 # noqa: BLE001
+            raise AssertionError(
+                f"{type(exc).__name__} escaped the decoder for "
+                f"{bytes(data)!r}: {exc}")
 
 
 # -- colours ---------------------------------------------------------------
