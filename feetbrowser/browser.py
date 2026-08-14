@@ -18,14 +18,16 @@ import html
 import threading
 from . import gui
 import urllib.parse
-from collections import deque, namedtuple
+from collections import deque
 
 from .net import URL
 from .htmlparser import HTMLParser, Text, Element
 from .cssparser import CSSParser, style, parse_inline, set_viewport, \
     media_matches, get_viewport
 from .layout import DocumentLayout, paint_tree, get_font, DrawText, _measure, \
-    select_options, selected_options, option_label, option_value
+    select_options, selected_options, option_value, \
+    select_rows, listbox_rows, listbox_scroll, listbox_active, \
+    LISTBOX_ROW_H, LISTBOX_PAD
 from . import shoes as shoes
 from .jsdom import JSDocument, JSLocation
 from .jsengine import Interpreter, JSException, UNDEFINED
@@ -1097,7 +1099,7 @@ class Tab:
         node = self._node_at(x, y)
         control = self._hit_control(node)
         if control is not None:
-            result = self._activate_control(control)
+            result = self._activate_control(control, x, y + self.scroll)
         else:
             href = self._enclosing_link(node)
             if not href:
@@ -1220,7 +1222,11 @@ class Tab:
             node = node.parent
         return None
 
-    def _activate_control(self, control):
+    def _activate_control(self, control, px=0, py=0):
+        """React to a click on a form control. (px, py) are the click in page
+        coordinates, which only an expanded <select> needs -- it is one hit
+        box holding many rows, so it has to know where inside it the click
+        landed."""
         if control.tag == "input" and control.attributes.get("type", "").lower() \
                 in ("checkbox", "radio"):
             current = control.attributes.get("value", "on")
@@ -1243,6 +1249,8 @@ class Tab:
         if control.tag == "select":
             if "disabled" in control.attributes:
                 return None
+            if listbox_rows(control):
+                return self._click_listbox(control, px, py)
             rect = self._control_rect(control)
             if rect is None:
                 return None
@@ -1294,6 +1302,10 @@ class Tab:
                     else:
                         opt.attributes.pop("selected", None)
                 node.attributes.pop("value", None)
+                # An expanded one goes back to the top with the keyboard on
+                # whatever the markup chose, the same as a freshly loaded page.
+                node.attributes.pop("data-active", None)
+                node.attributes.pop("data-scroll", None)
         self.render()
 
     def choose_option(self, select, option):
@@ -1325,6 +1337,137 @@ class Tab:
         if changed:
             self._dispatch_js_event(select, "change")
         return changed
+
+    # -- expanded <select> (size / multiple) ------------------------------
+    #
+    # An expanded <select> is one hit box with rows inside it rather than a
+    # control with a list behind it, so everything here is arithmetic on that
+    # box. Which row the keyboard is on, and how far a list too long for the
+    # box has been scrolled, are kept on the node itself -- layout is rebuilt
+    # from the DOM on every render, so anything the painter has to read has
+    # to survive there.
+
+    def listbox_at(self, x, y):
+        """The expanded <select> at page coords (x, y), or None."""
+        if not self.document:
+            return None
+        for lx, ty, rx, by, node in self.document.input_boxes:
+            if isinstance(node, Element) and node.tag == "select" \
+                    and listbox_rows(node) and lx <= x <= rx and ty <= y <= by:
+                return node
+        return None
+
+    def listbox_row_at(self, node, x, y):
+        """Index of the row of an expanded <select> under page coords (x, y).
+
+        -1 for a point outside the box, past the last row, or on a heading or
+        a disabled option -- everywhere, that is, that a click cannot choose.
+        """
+        rect = self._control_rect(node)
+        if rect is None:
+            return -1
+        lx, ty, rx, by = rect
+        if not (lx <= x <= rx and ty <= y <= by):
+            return -1
+        rows = select_rows(node)
+        top = listbox_scroll(node, len(rows))
+        i = top + int((y - ty - LISTBOX_PAD) // LISTBOX_ROW_H)
+        if top <= i < min(len(rows), top + listbox_rows(node)) \
+                and rows[i].enabled:
+            return i
+        return -1
+
+    def _click_listbox(self, node, x, y):
+        """A click inside an expanded <select>: take the row under it.
+
+        Nothing drops down here -- the options are already on the page -- so
+        the click goes straight to the DOM. Clicking the box but missing a
+        usable row still focuses it, which is what gives the keyboard
+        somewhere to start.
+        """
+        i = self.listbox_row_at(node, x, y)
+        rows = select_rows(node)
+        if i >= 0:
+            node.attributes["data-active"] = str(i)
+        self._focus(node)
+        if i >= 0:
+            self.choose_option(node, rows[i].option)
+        return None
+
+    def move_listbox(self, node, delta, to_end=False, last=False):
+        """Walk the keyboard row of an expanded <select>.
+
+        A single-choice listbox takes each row as the cursor passes over it:
+        that is what a real one does, and with no Enter to confirm with it is
+        the only way an arrow can change the value at all. A `multiple` one
+        only moves, because taking every row walked over would select the
+        lot; there, Space is what commits.
+
+        The ends do not wrap. In a drop-down wrapping costs nothing, but here
+        it would mean Down at the bottom of the list silently changing the
+        value to the first option.
+        """
+        rows = select_rows(node)
+        if not rows:
+            return
+        n = len(rows)
+        if to_end:
+            order = range(n - 1, -1, -1) if last else range(n)
+            i = next((k for k in order if rows[k].enabled), -1)
+        else:
+            i, j = -1, listbox_active(node, rows)
+            while True:
+                j += delta
+                if not 0 <= j < n:
+                    break
+                if rows[j].enabled:
+                    i = j
+                    break
+        if i < 0:
+            return
+        node.attributes["data-active"] = str(i)
+        self._listbox_reveal(node, i, n)
+        if "multiple" in node.attributes:
+            self.render()
+        else:
+            self.choose_option(node, rows[i].option)
+
+    def toggle_listbox_active(self, node):
+        """Take (or drop) the row the keyboard is on. Multi-choice only: a
+        single-choice listbox has already taken it on the way past."""
+        rows = select_rows(node)
+        i = listbox_active(node, rows)
+        if 0 <= i < len(rows) and rows[i].enabled:
+            self.choose_option(node, rows[i].option)
+
+    def scroll_listbox(self, node, steps):
+        """Scroll an expanded <select> by whole rows.
+
+        False when there is nothing left to scroll, which lets the caller
+        hand the turn back to the page rather than swallowing it.
+        """
+        nrows = len(select_rows(node))
+        visible = listbox_rows(node)
+        if nrows <= visible:
+            return False
+        top = listbox_scroll(node, nrows)
+        new = max(0, min(top + steps, nrows - visible))
+        if new == top:
+            return False
+        node.attributes["data-scroll"] = str(new)
+        self.render()
+        return True
+
+    def _listbox_reveal(self, node, i, nrows):
+        """Scroll row `i` of an expanded <select> into its box."""
+        visible = listbox_rows(node)
+        top = listbox_scroll(node, nrows)
+        if i < top:
+            top = i
+        elif i >= top + visible:
+            top = i - visible + 1
+        node.attributes["data-scroll"] = str(
+            max(0, min(top, max(0, nrows - visible))))
 
     def _sync_selects(self):
         """Keep every <select>'s `value` attribute and its selected <option>
@@ -1644,24 +1787,6 @@ class ContextMenu:
             y0 += self.ITEM_H
 
 
-# One line of an open drop-down. A row with no `option` is an <optgroup>
-# heading: it is drawn, but it can never be highlighted or chosen.
-_SelectRow = namedtuple("_SelectRow", "option label enabled heading")
-
-
-def _select_rows(node):
-    """Flatten a <select> into the lines its drop-down shows."""
-    rows = []
-    group = None
-    for option, group_label in select_options(node):
-        if group_label is not None and group_label != group:
-            rows.append(_SelectRow(None, group_label, False, True))
-        group = group_label
-        rows.append(_SelectRow(option, option_label(option),
-                               "disabled" not in option.attributes, False))
-    return rows
-
-
 class SelectPopup:
     """The list a <select> drops down, drawn by hand on the browser canvas.
 
@@ -1709,7 +1834,7 @@ class SelectPopup:
         long to fit stops at the chrome instead of burying the address bar.
         Returns False (and opens nothing) for a select with no options.
         """
-        rows = _select_rows(node)
+        rows = select_rows(node)
         if not rows:
             return False
         bx0, by0, bx1, by1 = bounds
@@ -2063,14 +2188,14 @@ class Browser:
         self.draw()
 
     def _on_down(self, e):
-        if self._select_popup_move(1):
+        if self._select_popup_move(1) or self._listbox_move(1):
             return "break"
         if self.focus == "address":
             return
         self._scroll(SCROLL_STEP)
 
     def _on_up(self, e):
-        if self._select_popup_move(-1):
+        if self._select_popup_move(-1) or self._listbox_move(-1):
             return "break"
         if self.focus == "address":
             return
@@ -2111,6 +2236,8 @@ class Browser:
             self.select_popup.move_to_end(last=False)
             self._draw_select_popup()
             return "break"
+        if self._listbox_move(0, to_end=True, last=False):
+            return "break"
         if self.focus == "address" or not self.active_tab:
             return
         self.active_tab.set_scroll(0)
@@ -2122,6 +2249,8 @@ class Browser:
             self.select_popup.move_to_end(last=True)
             self._draw_select_popup()
             return "break"
+        if self._listbox_move(0, to_end=True, last=True):
+            return "break"
         if self.focus == "address" or not self.active_tab:
             return
         self.active_tab.set_scroll(self.active_tab.content_height())
@@ -2129,7 +2258,11 @@ class Browser:
         return "break"
 
     def _on_wheel(self, e):
-        self._scroll(-e.delta if abs(e.delta) < 30 else -int(e.delta / 30) * SCROLL_STEP)
+        delta = -e.delta if abs(e.delta) < 30 \
+            else -int(e.delta / 30) * SCROLL_STEP
+        if self._listbox_wheel(getattr(e, "x", -1), getattr(e, "y", -1), delta):
+            return
+        self._scroll(delta)
 
     def _scroll(self, delta):
         # Scrolling the page out from under a drop-down would leave it
@@ -2503,6 +2636,56 @@ class Browser:
         self.canvas.delete("select-popup")
         self.select_popup.draw(self.canvas)
 
+    # -- expanded <select> (size / multiple) ------------------------------
+
+    def _focused_listbox(self):
+        """The expanded <select> holding form focus, or None. This is what
+        decides whether an arrow key belongs to a listbox or to the page."""
+        tab = self.active_tab
+        node = tab.focused_input if tab else None
+        if node is not None and node.tag == "select" \
+                and "disabled" not in node.attributes and listbox_rows(node):
+            return node
+        return None
+
+    def _listbox_move(self, delta, to_end=False, last=False):
+        """Walk a focused listbox; True when the key was ours."""
+        node = self._focused_listbox()
+        if node is None:
+            return False
+        self.active_tab.move_listbox(node, delta, to_end=to_end, last=last)
+        self._draw_page()
+        return True
+
+    def _listbox_commit(self):
+        """Space on a focused multi-choice listbox toggles the row the
+        keyboard is on; True when the key was ours."""
+        node = self._focused_listbox()
+        if node is None or "multiple" not in node.attributes:
+            return False
+        self.active_tab.toggle_listbox_active(node)
+        self._draw_page()
+        return True
+
+    def _listbox_wheel(self, x, y, delta):
+        """Give a wheel turn over a listbox to the listbox.
+
+        A listbox with more options than rows is its own scrolling area, so
+        the page must not slide out from under the reader's pointer. When
+        there is nothing left to scroll the turn is handed back, which is
+        what stops a short list from trapping the wheel.
+        """
+        tab = self.active_tab
+        if not tab or x < 0 or y < self.chrome_height():
+            return False
+        node = tab.listbox_at(x, y - self.chrome_height() + tab.scroll)
+        if node is None or "disabled" in node.attributes:
+            return False
+        if not tab.scroll_listbox(node, 1 if delta > 0 else -1):
+            return False
+        self._draw_page()
+        return True
+
     def _context_items(self, x, y):
         """Build the context-menu entries for a right-click at (x, y)."""
         tab = self.active_tab
@@ -2602,6 +2785,10 @@ class Browser:
         # return means "not handled").
         if any(r is True for r in toes.dispatch(
                 self.toe_contexts, "on_keypress", e)):
+            return
+        # Space on a focused multi-choice listbox toggles a row rather than
+        # typing a space nowhere.
+        if e.char == " " and self._listbox_commit():
             return
         # Typing into a focused form field.
         if self.active_tab and self.active_tab.focused_input and \
@@ -2803,6 +2990,8 @@ class Browser:
     def _on_enter(self, e):
         if self.select_popup.open_:
             self._commit_select()
+            return
+        if self.focus != "address" and self._listbox_commit():
             return
         if self.focus == "address":
             if not self.address_text.strip():

@@ -10,7 +10,7 @@ from feetbrowser import gui
 from feetbrowser.net import URL
 from feetbrowser.browser import Tab, tree_to_list
 from feetbrowser.htmlparser import Element
-from feetbrowser.layout import DrawText
+from feetbrowser.layout import DrawText, LISTBOX_ROW_H, LISTBOX_PAD
 from feetbrowser.jsengine import Interpreter, JSException, UNDEFINED
 
 
@@ -979,6 +979,34 @@ def test_writing_select_value_moves_the_selection():
         "and take it off the option that had it"
     assert "Cherry" in _texts(tab), \
         f"the closed control must repaint with the new label: {_texts(tab)}"
+
+
+def test_clicking_a_listbox_row_fires_change():
+    tab = _make_tab(
+        '<select id="s" size="3">'
+        '<option value="a" selected>Apple</option>'
+        '<option value="b">Banana</option>'
+        '</select>'
+        '<script>window.seen = "";'
+        'document.getElementById("s").addEventListener("change", function(){'
+        '  window.seen = document.getElementById("s").value; });</script>')
+    node = _select(tab)
+    lx, ty, _rx, _by = tab._control_rect(node)
+    tab.click(lx + 6, ty + LISTBOX_PAD + 1.5 * LISTBOX_ROW_H - tab.scroll)
+    eq(tab._js_interp.globals["seen"], "b",
+       "a click inside an expanded select must reach a change listener")
+
+
+def test_a_multiple_listbox_reads_its_first_chosen_value():
+    tab = _make_tab(
+        '<select id="s" multiple>'
+        '<option value="a">Apple</option>'
+        '<option value="b" selected>Banana</option>'
+        '<option value="c" selected>Cherry</option>'
+        '</select>'
+        '<script>window.v = document.getElementById("s").value;</script>')
+    eq(tab._js_interp.globals["v"], "b",
+       ".value on a multi-choice select is its first chosen option")
 
 
 def main():

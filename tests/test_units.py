@@ -9,7 +9,8 @@ from feetbrowser.net import URL
 from feetbrowser.htmlparser import HTMLParser, Element, Text
 from feetbrowser.cssparser import CSSParser, style
 from feetbrowser.layout import DrawText, get_font, _measure, \
-    selected_options, option_value
+    selected_options, option_value, option_label, listbox_rows, \
+    listbox_scroll, listbox_active, LISTBOX_ROW_H, LISTBOX_PAD
 from feetbrowser.browser import (
     Tab, Browser, _AboutURL, _BookmarksURL, _HistoryURL,
     bookmarks_html, history_html,
@@ -2002,6 +2003,7 @@ class _SelectBrowser(Browser):
 
     def __init__(self, tab):
         self.active_tab = tab
+        self.focus = None
         self.select_popup = SelectPopup()
         self.paints = 0
         self.canvas = type("C", (), {"winfo_width": lambda s: 1000,
@@ -2210,6 +2212,209 @@ def test_resetting_a_form_puts_the_select_back():
     tab.reset_form(form)
     eq([option_value(o) for o in selected_options(_select_node(tab))], ["b"],
        "reset returns to the markup's own choice")
+
+
+# -- expanded <select>: size and multiple ------------------------------------
+
+_LISTBOX_PAGE = (
+    '<form><select name="city" size="4">'
+    '<option value="a">Amsterdam</option>'
+    '<option value="b" selected>Berlin</option>'
+    '<option value="c" disabled>Copenhagen</option>'
+    '<option value="d">Dublin</option>'
+    '<option value="e">Edinburgh</option>'
+    '<option value="f">Faroe</option>'
+    '</select></form>'
+)
+
+_MULTI_PAGE = (
+    '<select multiple>'
+    '<option value="a" selected>Ant</option>'
+    '<option value="b">Bee</option>'
+    '<option value="c">Cricket</option>'
+    '</select>'
+)
+
+
+class _Ev:
+    """A stand-in for a GUI event, carrying only what a handler reads."""
+
+    def __init__(self, x=0, y=0, delta=0, char="", keysym="", state=0):
+        self.x, self.y, self.delta = x, y, delta
+        self.char, self.keysym, self.state = char, keysym, state
+
+
+def _listbox(body=_LISTBOX_PAGE):
+    """Load a page whose select is expanded, returning (browser, tab)."""
+    tab = _make_tab(body)
+    return _SelectBrowser(tab), tab
+
+
+def _click_row(browser, tab, i, node=None):
+    """Click row `i` of the page's (only) expanded select."""
+    node = node or _select_node(tab)
+    lx, ty, _rx, _by = tab._control_rect(node)
+    top = listbox_scroll(node)
+    y = ty + LISTBOX_PAD + (i - top + 0.5) * LISTBOX_ROW_H
+    tab.click(lx + 6, y - tab.scroll)
+
+
+def _chosen(tab, node=None):
+    return [option_label(o)
+            for o in selected_options(node or _select_node(tab))]
+
+
+def test_size_expands_a_select_into_a_listbox():
+    _browser, tab = _listbox()
+    node = _select_node(tab)
+    eq(listbox_rows(node), 4, "size=4 shows four rows")
+    lx, ty, rx, by = tab._control_rect(node)
+    eq(by - ty, 4 * LISTBOX_ROW_H + 2 * LISTBOX_PAD, "the box is four rows tall")
+    # The rows are on the page, not behind a control that has to be opened.
+    labels = _labels(tab)
+    for name in ("Amsterdam", "Berlin", "Copenhagen", "Dublin"):
+        assert name in labels, f"{name} not painted: {labels}"
+    assert "Edinburgh" not in labels, "the fifth row must be out of view"
+
+
+def test_size_one_is_still_a_drop_down():
+    tab = _make_tab('<select size="1"><option>Ant</option>'
+                    '<option selected>Bee</option></select>')
+    eq(listbox_rows(_select_node(tab)), 0, "size=1 is a combo, not a listbox")
+    x, y = _select_centre(tab)
+    assert isinstance(tab.click(x, y), SelectAction), \
+        "size=1 must still open a drop-down"
+
+
+def test_a_listbox_takes_up_room_in_the_flow():
+    """The listbox is page content, so what follows it must start below it."""
+    tab = _make_tab(_LISTBOX_PAGE + "<p>after</p>")
+    _lx, _ty, _rx, by = tab._control_rect(_select_node(tab))
+    after = next(c for c in tab.display_list
+                 if isinstance(c, DrawText) and c.text == "after")
+    assert after.top >= by, \
+        f"the paragraph after the listbox starts at {after.top}, inside it"
+
+
+def test_clicking_a_listbox_row_selects_it():
+    browser, tab = _listbox()
+    _click_row(browser, tab, 3)              # Dublin
+    eq(_chosen(tab), ["Dublin"], "the clicked row is taken")
+    eq(_select_node(tab).attributes.get("value"), "d", "select.value follows")
+    assert "data-focused" in _select_node(tab).attributes, \
+        "clicking a listbox focuses it, which is what the keyboard needs"
+
+
+def test_a_disabled_option_or_heading_in_a_listbox_swallows_the_click():
+    browser, tab = _listbox()
+    _click_row(browser, tab, 2)              # Copenhagen, disabled
+    eq(_chosen(tab), ["Berlin"], "a disabled row cannot be taken")
+
+    browser, tab = _listbox(
+        '<select size="4"><optgroup label="Warm">'
+        '<option>Red</option></optgroup></select>')
+    _click_row(browser, tab, 0)              # the "Warm" heading
+    eq(_chosen(tab), ["Red"], "a heading cannot be taken")
+
+
+def test_a_disabled_listbox_ignores_clicks():
+    browser, tab = _listbox(
+        '<select size="3" disabled><option>Locked</option>'
+        '<option selected>Also</option></select>')
+    _click_row(browser, tab, 0)
+    eq(_chosen(tab), ["Also"], "a disabled listbox cannot be changed")
+
+
+def test_arrows_move_and_commit_in_a_single_choice_listbox():
+    browser, tab = _listbox()
+    _click_row(browser, tab, 1)              # focus, on Berlin
+    Browser._on_down(browser, None)
+    # Copenhagen is disabled, so Down from Berlin lands past it.
+    eq(_chosen(tab), ["Dublin"], "down skips disabled options and commits")
+    Browser._on_up(browser, None)
+    eq(_chosen(tab), ["Berlin"], "up comes back")
+    Browser._on_home(browser, None)
+    eq(_chosen(tab), ["Amsterdam"], "Home goes to the top")
+    Browser._on_up(browser, None)
+    eq(_chosen(tab), ["Amsterdam"],
+       "the top does not wrap round to the bottom")
+    Browser._on_end(browser, None)
+    eq(_chosen(tab), ["Faroe"], "End goes to the bottom")
+
+
+def test_multiple_expands_with_a_default_row_count():
+    _browser, tab = _listbox(_MULTI_PAGE)
+    node = _select_node(tab)
+    eq(listbox_rows(node), 4, "a multiple with no size still shows rows")
+    lx, ty, rx, by = tab._control_rect(node)
+    eq(by - ty, 4 * LISTBOX_ROW_H + 2 * LISTBOX_PAD, "and is that tall")
+
+
+def test_clicking_a_second_row_of_a_multiple_adds_it():
+    browser, tab = _listbox(_MULTI_PAGE)
+    _click_row(browser, tab, 1)
+    eq(_chosen(tab), ["Ant", "Bee"], "a second click adds rather than moves")
+    _click_row(browser, tab, 0)
+    eq(_chosen(tab), ["Bee"], "clicking a taken row drops it")
+
+
+def test_arrows_in_a_multiple_move_without_choosing_until_space():
+    browser, tab = _listbox(_MULTI_PAGE)
+    # Clicking the row that was already taken focuses the box and drops it,
+    # which is the toggle a multiple is for.
+    _click_row(browser, tab, 0)
+    eq(_chosen(tab), [], "clicking a taken row of a multiple drops it")
+    node = _select_node(tab)
+    Browser._on_down(browser, None)
+    eq(listbox_active(node), 1, "the keyboard moved")
+    eq(_chosen(tab), [],
+       "but walking a multiple must not sweep rows up as it goes")
+    # Space and Enter both land here; _on_key routes the one, _on_enter the
+    # other, and this is the work they share.
+    assert browser._listbox_commit(), "Space belongs to the listbox"
+    eq(_chosen(tab), ["Bee"], "it takes the row the keyboard is on")
+    Browser._on_enter(browser, None)
+    eq(_chosen(tab), [], "and pressing again drops it")
+
+
+def test_a_long_listbox_scrolls_the_active_row_into_view():
+    browser, tab = _listbox()
+    _click_row(browser, tab, 1)
+    node = _select_node(tab)
+    Browser._on_end(browser, None)
+    top = listbox_scroll(node)
+    assert top <= listbox_active(node) < top + listbox_rows(node), \
+        f"row {listbox_active(node)} is outside the window at top={top}"
+
+
+def test_the_wheel_scrolls_a_listbox_instead_of_the_page():
+    # Plenty of page below the control, so a turn that reaches the page has
+    # somewhere to go and the assertion means something.
+    browser, tab = _listbox(_LISTBOX_PAGE + "<p>tall</p>" * 200)
+    node = _select_node(tab)
+    lx, ty, _rx, _by = tab._control_rect(node)
+    aim = lambda: _Ev(x=lx + 6, y=ty - tab.scroll + 10, delta=-3)
+    browser._on_wheel(aim())
+    eq(listbox_scroll(node), 1, "the listbox took the turn")
+    eq(tab.scroll, 0, "and the page stayed put")
+    # Wheeling past the end hands the turn back rather than trapping it.
+    for _ in range(4):
+        browser._on_wheel(aim())
+    eq(listbox_scroll(node), 2, "a six-row list in a four-row box stops here")
+    assert tab.scroll > 0, "the leftover turns went to the page"
+
+
+def test_resetting_a_form_puts_a_listbox_back():
+    browser, tab = _listbox()
+    _click_row(browser, tab, 3)
+    eq(_chosen(tab), ["Dublin"], "moved first")
+    form = next(n for n in tree_to_list(tab.nodes, [])
+                if isinstance(n, Element) and n.tag == "form")
+    tab.reset_form(form)
+    eq(_chosen(tab), ["Berlin"], "reset returns to the markup's own choice")
+    node = _select_node(tab)
+    eq(node.attributes.get("data-active"), None,
+       "and the keyboard goes back to where the markup left it")
 
 
 def main():
