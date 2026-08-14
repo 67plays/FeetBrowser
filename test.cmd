@@ -21,6 +21,13 @@ if errorlevel 1 (
   exit /b 1
 )
 
+rem test_win32.py opens dozens of real windows in a few seconds, and each one
+rem would otherwise take the foreground and the keyboard -- which makes the
+rem machine unusable for as long as the run lasts. QUIET drops that and
+rem nothing else: the windows are still created, shown, drawn into and sent
+rem real messages. Set FEETBROWSER_QUIET=0 to watch them work.
+if not defined FEETBROWSER_QUIET set FEETBROWSER_QUIET=1
+
 rem Same venv run.cmd builds, and unsealed for the same reason: the optional
 rem image decoders (Pillow, cairosvg) live in the system python, and tests
 rem that run without them are not testing what a user runs.

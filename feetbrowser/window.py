@@ -14,6 +14,7 @@ them only ever sees the Tk-shaped API.
 """
 import heapq
 import itertools
+import os
 import time
 
 from . import canvas as canvasmod
@@ -23,6 +24,27 @@ from . import canvas as canvasmod
 STATE_SHIFT = 0x1
 STATE_CONTROL = 0x4
 STATE_ALT = 0x8
+
+
+def _flag(name):
+    return os.environ.get(name, "").strip().lower() not in \
+        ("", "0", "no", "false", "off")
+
+
+# ``test_cocoa.py`` and ``test_x11.py`` earn their keep by opening real
+# windows -- a stubbed window cannot catch the typo that costs you every
+# mouse click. The cost is that a suite run opens and tears down dozens of
+# them in a few seconds, and a window's default manners are to place itself
+# in the middle of the display, raise above everything and take the keyboard.
+# On the machine running the tests that is not a window appearing, it is the
+# machine becoming unusable until the suite ends.
+#
+# ``FEETBROWSER_QUIET`` drops exactly those manners and nothing else. The
+# window is still created, sized, mapped, drawn into and sent real events, so
+# every assertion in both suites is testing the same thing it was before --
+# it simply stops asking to be looked at. Set it for test runs; leave it
+# unset for the browser itself, where being raised and focused is the point.
+QUIET = _flag("FEETBROWSER_QUIET")
 
 
 def key_sequences(keysym, state):

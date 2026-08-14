@@ -27,8 +27,8 @@ can be made -- see ``tests/test_units.py`` for the parts that are not.
 import ctypes
 import sys
 
-from .window import (STATE_ALT, STATE_CONTROL, STATE_SHIFT, Event, Window,
-                     key_sequences)
+from .window import (QUIET, STATE_ALT, STATE_CONTROL, STATE_SHIFT, Event,
+                     Window, key_sequences)
 
 # -- types -----------------------------------------------------------------
 #
@@ -115,6 +115,10 @@ WS_OVERLAPPEDWINDOW = 0x00CF0000
 WS_VISIBLE = 0x10000000
 CW_USEDEFAULT = -2147483648        # 0x80000000 as a signed int
 SW_HIDE, SW_SHOW, SW_RESTORE = 0, 5, 9
+# Shows the window without making it the active one, which is the whole of
+# what QUIET wants here: still mapped and painted, but the keyboard stays
+# wherever the user left it.
+SW_SHOWNOACTIVATE = 4
 SWP_NOMOVE, SWP_NOZORDER, SWP_NOACTIVATE = 0x0002, 0x0004, 0x0010
 HWND_BOTTOM, HWND_TOP = 1, 0
 PM_REMOVE = 0x0001
@@ -623,9 +627,11 @@ class Win32Window(Window):
         # Registered before the window is shown, because ShowWindow delivers
         # WM_SIZE and WM_PAINT synchronously and the procedure has to find us.
         _WINDOWS[_handle_key(self._hwnd)] = self
-        user32.ShowWindow(self._hwnd, SW_SHOW)
-        user32.SetForegroundWindow(self._hwnd)
-        user32.SetFocus(self._hwnd)
+        user32.ShowWindow(self._hwnd,
+                          SW_SHOWNOACTIVATE if QUIET else SW_SHOW)
+        if not QUIET:
+            user32.SetForegroundWindow(self._hwnd)
+            user32.SetFocus(self._hwnd)
         # Windows runs modal loops of its own -- dragging the title bar, a
         # resize border, the system menu -- and inside one of those,
         # DispatchMessageW does not return until the user lets go. Our
@@ -1011,9 +1017,12 @@ class Win32Window(Window):
 
     def deiconify(self):
         super().deiconify()
-        _libs["user32"].ShowWindow(self._hwnd, SW_SHOW)
+        _libs["user32"].ShowWindow(
+            self._hwnd, SW_SHOWNOACTIVATE if QUIET else SW_SHOW)
 
     def lift(self, *_args):
+        if QUIET:
+            return      # asking to be looked at is the one thing QUIET drops
         user32 = _libs["user32"]
         user32.SetWindowPos(self._hwnd, HWND_TOP, 0, 0, 0, 0,
                             SWP_NOMOVE | 0x0001)   # | SWP_NOSIZE

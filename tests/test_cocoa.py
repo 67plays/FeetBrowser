@@ -26,6 +26,7 @@ if sys.platform != "darwin":
 
 from feetbrowser import browser as browsermod  # noqa: E402
 from feetbrowser import cocoa  # noqa: E402
+from feetbrowser import window  # noqa: E402
 
 if not cocoa.available():
     _skip("AppKit is not loadable here")
@@ -162,6 +163,28 @@ def test_window_opens_with_the_size_asked_for():
         assert win._content_size() == (900, 600), \
             "content size does not match the requested size"
         assert win.winfo_exists()
+
+
+def test_a_quiet_window_does_not_take_the_keyboard():
+    """The suite opens dozens of windows in a few seconds. Under QUIET each
+    one must stay out of the way -- no Dock icon, and above all no stealing
+    focus from whatever the user is typing into -- while still being a real
+    window the rest of this file can post events at. Without this, the fix
+    regresses the moment someone reinstates makeKeyAndOrderFront: and the
+    only symptom is a machine nobody can use while the tests run."""
+    if not window.QUIET:
+        print("  ..  quiet-window check needs FEETBROWSER_QUIET=1")
+        return
+    with _Session() as win:
+        assert not cocoa.msg(win._window, "isKeyWindow",
+                             restype=ctypes.c_bool), \
+            "a quiet window took the keyboard"
+        policy = cocoa.msg(win._app, "activationPolicy",
+                           restype=ctypes.c_long)
+        assert policy == cocoa._ACTIVATION_ACCESSORY, \
+            "a quiet run still asks for a Dock icon"
+        # Still a real window, or the quiet is worthless.
+        assert win.winfo_exists() and win._content_size() == (900, 600)
 
 
 def test_struct_returning_selectors_use_the_right_abi():

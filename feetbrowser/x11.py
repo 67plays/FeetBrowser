@@ -34,8 +34,8 @@ import ctypes.util
 import os
 import time
 
-from .window import (STATE_ALT, STATE_CONTROL, STATE_SHIFT, Event, Window,
-                     key_sequences)
+from .window import (QUIET, STATE_ALT, STATE_CONTROL, STATE_SHIFT, Event,
+                     Window, key_sequences)
 
 # -- types -----------------------------------------------------------------
 #
@@ -111,6 +111,27 @@ class XSizeHints(ctypes.Structure):
                 ("max_aspect_x", ctypes.c_int), ("max_aspect_y", ctypes.c_int),
                 ("base_width", ctypes.c_int), ("base_height", ctypes.c_int),
                 ("win_gravity", ctypes.c_int)]
+
+
+class XSetWindowAttributes(ctypes.Structure):
+    # Declared in full even though only one field is ever set: the value mask
+    # tells the server which members to read, and it counts them by their
+    # offset in this struct. A short version puts `override_redirect` at the
+    # wrong offset and the server reads whatever happens to be there.
+    _fields_ = [("background_pixmap", XID), ("background_pixel",
+                ctypes.c_ulong), ("border_pixmap", XID),
+                ("border_pixel", ctypes.c_ulong),
+                ("bit_gravity", ctypes.c_int), ("win_gravity", ctypes.c_int),
+                ("backing_store", ctypes.c_int),
+                ("backing_planes", ctypes.c_ulong),
+                ("backing_pixel", ctypes.c_ulong), ("save_under", Bool),
+                ("event_mask", ctypes.c_long),
+                ("do_not_propagate_mask", ctypes.c_long),
+                ("override_redirect", Bool), ("colormap", XID),
+                ("cursor", XID)]
+
+
+CW_OVERRIDE_REDIRECT = 1 << 9
 
 
 class XErrorEvent(ctypes.Structure):
@@ -641,6 +662,9 @@ def _declare():
          [Display, XID, cint, cint, cuint, cuint, cuint, ctypes.c_ulong,
           ctypes.c_ulong]),
         ("XDestroyWindow", cint, [Display, XID]),
+        ("XChangeWindowAttributes", cint,
+         [Display, XID, ctypes.c_ulong,
+          ctypes.POINTER(XSetWindowAttributes)]),
         ("XSelectInput", cint, [Display, XID, clong]),
         ("XMapWindow", cint, [Display, XID]),
         ("XUnmapWindow", cint, [Display, XID]),
@@ -827,6 +851,18 @@ class X11Window(Window):
         self._gc = x11.XCreateGC(display, self._window, 0, None)
         self._apply_hints()
         self.on_title_changed(title)
+        if QUIET:
+            # Override-redirect takes the window out of the window manager's
+            # hands entirely, which is the only portable way to say "map this
+            # without placing it, decorating it, raising it or focusing it" --
+            # every other route is a hint the manager is free to ignore. The
+            # server still maps and renders it, so it is readable with
+            # XGetImage and events still arrive.
+            attrs = XSetWindowAttributes()
+            attrs.override_redirect = True
+            x11.XChangeWindowAttributes(
+                display, self._window, CW_OVERRIDE_REDIRECT,
+                ctypes.byref(attrs))
         x11.XMapWindow(display, self._window)
         x11.XFlush(display)
 
@@ -1134,6 +1170,8 @@ class X11Window(Window):
         _libs["x11"].XFlush(self._display)
 
     def lift(self, *_args):
+        if QUIET:
+            return      # asking to be looked at is the one thing QUIET drops
         _libs["x11"].XRaiseWindow(self._display, self._window)
         _libs["x11"].XFlush(self._display)
 
