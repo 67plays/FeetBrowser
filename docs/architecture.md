@@ -1,9 +1,9 @@
 # Architecture
 
 FeetBrowser is a **functional web browser written from scratch** — the engine
-(JS interpreter + DOM bridge) is a native Rust extension, and the rest is pure
-Python. It does not wrap Chromium, WebKit, Gecko, or any HTTP library — it
-implements its own:
+(JS interpreter, DOM bridge, and the inner loops of the renderer) is a native
+Rust extension, and the rest is pure Python. It does not wrap Chromium,
+WebKit, Gecko, or any HTTP library — it implements its own:
 
 - **Networking** — raw TCP sockets speaking HTTP/1.1, TLS for `https`,
   redirect following, `gzip`/`deflate` decoding, chunked transfer decoding,
@@ -30,9 +30,11 @@ implements its own:
   `<select>`), producing a display list of paint commands.
 - **Rendering engine** — our own pixels, no GUI toolkit: a TrueType parser
   (`cmap`/`glyf`/`hmtx`/…, composite glyphs, real metrics), an antialiased
-  scanline rasteriser writing into a `bytearray` framebuffer, PNG/GIF/PNM
-  decoders, a retained scene graph, and an event loop. See
-  [docs/rendering.md](rendering.md).
+  scanline rasteriser owning its own framebuffer, PNG/GIF/PNM decoders, a
+  retained scene graph, and an event loop. The three layers that touch every
+  pixel — the surface, the font parser and the image decoders — are in the
+  same Rust extension as the JS engine; the scene graph, the event loop and
+  font *discovery* stay in Python. See [docs/rendering.md](rendering.md).
 - **Browser UI** — a hand-drawn chrome on that canvas: tabs, an address bar
   with search fallback, back / forward / reload / home buttons,
   hover + clickable links, middle-click / ctrl-click to open in a new tab,
@@ -86,9 +88,9 @@ feetbrowser/
   jsengine.py    thin shim over the Rust `feetbrowser_engine` extension
   jsdom.py       thin shim over the Rust DOM bridge (dom_get/dom_set/dom_call)
   layout.py      block/inline layout -> display list, painting
-  fontengine.py  TrueType parsing: tables, cmap, metrics, glyph outlines
-  raster.py      antialiased software rasteriser, glyph cache, PNG output
-  imagecodec.py  PNG / GIF / PNM decoders -> RGBA
+  fontengine.py  font discovery and the family index; parsing is Rust
+  raster.py      thin shim over the Rust surface, glyph cache and PNG output
+  imagecodec.py  thin shim over the Rust PNG / GIF / PNM decoders
   canvas.py      retained scene graph, fonts, colors, images (Tk semantics)
   window.py      windows, Tk-shaped events, after() timers, main loop
   gui.py         backend facade (raster by default, tk still selectable)
@@ -97,7 +99,7 @@ feetbrowser/
   toehub.py      the ToeHub: catalog fetch, install/uninstall/toggle
   ua.css         default user-agent stylesheet
 rust/
-  lib.rs         PyO3 module wiring; exposes Interpreter, JSException, UNDEFINED
+  lib.rs         PyO3 module wiring; the JS engine, DOM and renderer bindings
   interp.rs      evaluator, host bridge, promises, microtasks, timers
   parser.rs      recursive-descent parser + AST construction
   token.rs       lexer
@@ -106,6 +108,10 @@ rust/
   stdlib.rs      built-ins (Array/Object/Map/Set/Date/RegExp/Math/JSON/...)
   dom.rs         DOM bridge (document/element/style/classList/...)
   pybind.rs      Python-facing classes (Interpreter, JsGlobals, PyJsValue)
+  raster.rs      Surface, blitters, scanline rasteriser, text, PNG output
+  font.rs        TrueType tables, cmap, metrics, outlines, flattening
+  image.rs       PNG / GIF / PNM decoders and nearest-neighbour resize
+  pyutil.rs      shared argument conversions (bytes, coordinates, strings)
 toes/            user-installed toes (gitignored; empty on a fresh checkout)
 tests/
   test_render.py offline tests for fonts, rasteriser, image codecs, canvas
