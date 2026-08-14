@@ -16,13 +16,23 @@ Selection is by the ``FEETBROWSER_BACKEND`` environment variable:
 want. Opening a window on the screen is a separate, explicit act:
 ``new_window()``. Nothing gets a native window by accident.
 """
+import importlib
 import os
 
 BACKEND = os.environ.get("FEETBROWSER_BACKEND", "raster").strip().lower()
 
-# "cocoa", "x11", ... or "none" to stay headless even where a window is
+# "cocoa", "win32", ... or "none" to stay headless even where a window is
 # possible. Empty means "use whatever this platform offers".
 DISPLAY = os.environ.get("FEETBROWSER_DISPLAY", "").strip().lower()
+
+# The native window backends, tried in order when nothing was asked for by
+# name: (module, label, the names that select it, the root class).
+# Each one answers `available()` for itself, so a backend that cannot run
+# here simply says so and the next is tried.
+NATIVE_BACKENDS = (
+    ("cocoa", "Cocoa", ("cocoa", "macos", "darwin"), "CocoaTk"),
+    ("win32", "Win32", ("win32", "windows"), "Win32Tk"),
+)
 
 
 def _use_tk():
@@ -72,19 +82,23 @@ def platform_root():
     """
     if DISPLAY == "none":
         return None
-    if DISPLAY in ("", "cocoa"):
+    for module, label, names, root in NATIVE_BACKENDS:
+        asked = DISPLAY in names
+        if DISPLAY and not asked:
+            continue
+        problem = "no %s window available here" % label
         try:
-            from . import cocoa
+            backend_module = importlib.import_module("." + module, __package__)
         except ImportError as exc:
-            # Asking for Cocoa by name and silently getting a headless root
-            # is the kind of thing you discover from an empty screenshot.
-            if DISPLAY == "cocoa":
-                raise RuntimeError("no Cocoa window available here") from exc
-            return None
-        if cocoa.available():
-            return cocoa.CocoaTk
-        if DISPLAY == "cocoa":
-            raise RuntimeError("no Cocoa window available here")
+            # Asking for a backend by name and silently getting a headless
+            # root is the kind of thing you discover from an empty screenshot.
+            if asked:
+                raise RuntimeError(problem) from exc
+            continue
+        if backend_module.available():
+            return getattr(backend_module, root)
+        if asked:
+            raise RuntimeError(problem)
     return None
 
 
