@@ -13,9 +13,52 @@ and add a surface to present and a source of real input; everything above
 them only ever sees the Tk-shaped API.
 """
 import heapq
+import itertools
 import time
 
 from . import canvas as canvasmod
+
+# Tk's event.state bits, which browser.py reads directly. Platform windows
+# translate whatever their operating system calls a modifier into these.
+STATE_SHIFT = 0x1
+STATE_CONTROL = 0x4
+STATE_ALT = 0x8
+
+
+def key_sequences(keysym, state):
+    """Candidate binding names for a keypress, most specific first.
+
+    Two Tk rules are being reproduced here, and both platform backends need
+    them, so they live with the binding table rather than beside any one
+    operating system. A binding matches when its modifiers are a *subset* of
+    the ones actually held, which is what lets ``<Control-ISO_Left_Tab>``
+    catch a Control-Shift-Tab -- so every subset is a candidate. And only the
+    most specific match fires, so a caller stopping at the first hit is the
+    behaviour, not an optimisation: a browser that bound both ``<Up>`` and
+    ``<Key>`` must not see the event twice.
+
+    Single-character keysyms are offered in both cases, because Tk names a
+    shifted letter two ways: ``<Control-S>`` is what the keysym spells and
+    ``<Control-Shift-s>`` is what browser.py binds for view-source.
+    """
+    mods = []
+    if state & STATE_CONTROL:
+        mods.append("Control-")
+    if state & STATE_ALT:
+        mods.append("Alt-")
+    if state & STATE_SHIFT:
+        mods.append("Shift-")
+    names = []
+    lowered = keysym.lower()
+    for size in range(len(mods), 0, -1):
+        for combo in itertools.combinations(mods, size):
+            prefix = "".join(combo)
+            names.append("<%s%s>" % (prefix, keysym))
+            if len(keysym) == 1 and lowered != keysym:
+                names.append("<%s%s>" % (prefix, lowered))
+    names.append("<%s>" % keysym)
+    names.append("<Key>")
+    return names
 
 
 class Event:

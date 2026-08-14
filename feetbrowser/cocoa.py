@@ -18,11 +18,11 @@ the frame path, just a data provider handed to an ``NSImageView``.
 """
 import ctypes
 import ctypes.util
-import itertools
 import platform
 import sys
 
-from .window import Event, Window
+from .window import (STATE_ALT, STATE_CONTROL, STATE_SHIFT, Event, Window,
+                     key_sequences)
 
 _FRAMEWORKS = {
     "objc": "/usr/lib/libobjc.A.dylib",
@@ -57,10 +57,10 @@ _MOD_CONTROL = 1 << 18
 _MOD_OPTION = 1 << 19
 _MOD_COMMAND = 1 << 20
 
-# Tk's event.state bits, which browser.py reads directly.
-_STATE_SHIFT = 0x1
-_STATE_CONTROL = 0x4
-_STATE_ALT = 0x8
+# Tk's event.state bits, shared with every other platform window.
+_STATE_SHIFT = STATE_SHIFT
+_STATE_CONTROL = STATE_CONTROL
+_STATE_ALT = STATE_ALT
 
 # Virtual key codes -> Tk keysyms, for the keys that carry no character.
 _KEYSYMS = {
@@ -492,39 +492,9 @@ class CocoaWindow(Window):
         if not keysym:
             return
         event_obj = Event(keysym=keysym, char=char, state=state, type="<Key>")
-        for sequence in self._key_sequences(keysym, state):
+        for sequence in key_sequences(keysym, state):
             if self.dispatch(sequence, event_obj):
                 return
-
-    def _key_sequences(self, keysym, state):
-        """Candidate binding names, most specific first.
-
-        Two Tk rules are being reproduced here. A binding matches when its
-        modifiers are a *subset* of the ones actually held, which is what lets
-        ``<Control-ISO_Left_Tab>`` catch a Control-Shift-Tab -- so every
-        subset is a candidate. And only the most specific match fires, so
-        stopping at the first hit is the behaviour, not an optimisation: a
-        browser that bound both ``<Up>`` and ``<Key>`` must not see the event
-        twice.
-        """
-        mods = []
-        if state & _STATE_CONTROL:
-            mods.append("Control-")
-        if state & _STATE_ALT:
-            mods.append("Alt-")
-        if state & _STATE_SHIFT and len(keysym) > 1:
-            mods.append("Shift-")
-        names = []
-        for size in range(len(mods), 0, -1):
-            for combo in itertools.combinations(mods, size):
-                prefix = "".join(combo)
-                names.append("<%s%s>" % (prefix, keysym))
-                lowered = keysym.lower()
-                if len(keysym) == 1 and lowered != keysym:
-                    names.append("<%s%s>" % (prefix, lowered))
-        names.append("<%s>" % keysym)
-        names.append("<Key>")
-        return names
 
     def _apply_cursor(self):
         wanted = getattr(self.canvas, "cursor", "") if self.canvas else ""
