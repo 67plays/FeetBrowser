@@ -22,9 +22,9 @@ pub enum JsError {
     Js(String),
     /// A thrown JS value (the `throw` statement).
     Thrown(JsValue),
-    /// Control-flow signals.
-    Break,
-    Continue,
+    /// Control-flow signals, each optionally aimed at a named statement.
+    Break(Option<String>),
+    Continue(Option<String>),
     Return(JsValue),
     Budget(String),
 }

@@ -25,10 +25,15 @@ implements its own:
   `justify-content`, `align-items`), a **CSS grid** subset
   (`grid-template-columns` px/%/fr/auto, auto row placement,
   `grid-column`/`grid-row` spans, `gap`), and **`<img>` rendering** (PNG/GIF
-  natively, JPEG via Pillow, fetched off the UI thread), plus form controls
-  (text fields, checkboxes, submit/reset buttons, `<select>`), producing a
-  display list of paint commands.
-- **Browser UI** — a hand-drawn chrome on a Tk canvas: tabs, an address bar
+  natively, JPEG via Pillow if it happens to be installed, fetched off the UI
+  thread), plus form controls (text fields, checkboxes, submit/reset buttons,
+  `<select>`), producing a display list of paint commands.
+- **Rendering engine** — our own pixels, no GUI toolkit: a TrueType parser
+  (`cmap`/`glyf`/`hmtx`/…, composite glyphs, real metrics), an antialiased
+  scanline rasteriser writing into a `bytearray` framebuffer, PNG/GIF/PNM
+  decoders, a retained scene graph, and an event loop. See
+  [docs/rendering.md](rendering.md).
+- **Browser UI** — a hand-drawn chrome on that canvas: tabs, an address bar
   with search fallback, back / forward / reload / home buttons,
   hover + clickable links, middle-click / ctrl-click to open in a new tab,
   scrolling, a scrollbar, bookmark toggling, and a status bar. Repainting is
@@ -61,8 +66,15 @@ implements its own:
   that layout renders; `feetbrowser/jsdom.py` is a thin shim that delegates
   to the Rust functions.
 
-Tk is used **only as the pixel surface** (a canvas to draw text and rectangles
-on) and for font metrics — the browser engine itself is all in this repo.
+Beyond the engine extension, which is our own code in another language, no
+Python package is *required*, and that now includes the pixels: there is no
+Tk, Qt, GTK, SDL, Cairo or FreeType anywhere, and the only thing the renderer
+asks of the operating system is a font file to parse. Two
+optional imports are tried and shrugged off when absent — Pillow for JPEG and
+cairosvg for SVG, formats `imagecodec.py` does not decode itself. Without them
+those images simply do not appear; everything else is unaffected. The old Tk
+path is still selectable with `FEETBROWSER_BACKEND=tk` for side-by-side
+comparison.
 
 ## Layout of the code
 
@@ -74,7 +86,15 @@ feetbrowser/
   jsengine.py    thin shim over the Rust `feetbrowser_engine` extension
   jsdom.py       thin shim over the Rust DOM bridge (dom_get/dom_set/dom_call)
   layout.py      block/inline layout -> display list, painting
-  browser.py     Tk window, chrome, tabs, history, event loop, layered repaint
+  fontengine.py  TrueType parsing: tables, cmap, metrics, glyph outlines
+  raster.py      antialiased software rasteriser, glyph cache, PNG output
+  imagecodec.py  PNG / GIF / PNM decoders -> RGBA
+  canvas.py      retained scene graph, fonts, colors, images (Tk semantics)
+  window.py      windows, Tk-shaped events, after() timers, main loop
+  cocoa.py       the macOS window: AppKit through ctypes, no PyObjC
+  x11.py         the Linux window: Xlib through ctypes, no python-xlib
+  gui.py         backend facade (raster by default, tk still selectable)
+  browser.py     window, chrome, tabs, history, event loop, layered repaint
   toes.py        extension hooking (Toes): discovery, dispatch, CLI
   toehub.py      the ToeHub: catalog fetch, install/uninstall/toggle
   ua.css         default user-agent stylesheet
@@ -90,6 +110,10 @@ rust/
   pybind.rs      Python-facing classes (Interpreter, JsGlobals, PyJsValue)
 toes/            user-installed toes (gitignored; empty on a fresh checkout)
 tests/
+  test_render.py offline tests for fonts, rasteriser, image codecs, canvas
+  test_cocoa.py  the macOS window, driven by real NSEvents (macOS only)
+  test_x11.py    the X11 window, driven by real X events (skips with no server)
+  x11_shot.py    photographs a real X11 window with XGetImage (CI artifact)
   test_units.py  offline unit tests (URL, HTML, CSS, layout, internal pages)
   test_js.py     offline tests for the JS engine + DOM bridge
   test_nav.py    click-to-navigate, history, view-source

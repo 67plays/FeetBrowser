@@ -21,6 +21,11 @@ pub enum Node {
     ArrayLit(Vec<Rc<Node>>),
     ObjectLit(Vec<ObjectPair>),
     Unary(String, Rc<Node>),
+    /// `a, b, c` -- evaluate each in turn, and the value is the last one.
+    /// Minifiers lean on it: it is how `return f(x), y` and
+    /// `for (i = 0, n = 5;;)` get written once every statement boundary has
+    /// been squeezed out.
+    Sequence(Vec<Rc<Node>>),
     Update { op: String, operand: Rc<Node>, prefix: bool },
     Binary(String, Rc<Node>, Rc<Node>),
     Logical(String, Rc<Node>, Rc<Node>),
@@ -49,15 +54,37 @@ pub enum Node {
     ClassDecl(ClassNode),
     ExprStmt(Rc<Node>),
     If { cond: Rc<Node>, then: Rc<Node>, else_: Option<Rc<Node>> },
-    While { cond: Rc<Node>, body: Rc<Node> },
-    DoWhile { body: Rc<Node>, cond: Rc<Node> },
+    While { cond: Rc<Node>, body: Rc<Node>, label: Option<String> },
+    DoWhile { body: Rc<Node>, cond: Rc<Node>, label: Option<String> },
     Switch { expr: Rc<Node>, cases: Vec<(String, Option<Rc<Node>>, Vec<Rc<Node>>)> },
-    For { init: Option<Rc<Node>>, cond: Option<Rc<Node>>, update: Option<Rc<Node>>, body: Rc<Node> },
-    ForIn { var_kind: Option<String>, name: String, iterable: Rc<Node>, body: Rc<Node> },
-    ForOf { var_kind: Option<String>, name: String, iterable: Rc<Node>, body: Rc<Node> },
+    For {
+        init: Option<Rc<Node>>,
+        cond: Option<Rc<Node>>,
+        update: Option<Rc<Node>>,
+        body: Rc<Node>,
+        label: Option<String>,
+    },
+    ForIn {
+        var_kind: Option<String>,
+        name: String,
+        iterable: Rc<Node>,
+        body: Rc<Node>,
+        label: Option<String>,
+    },
+    ForOf {
+        var_kind: Option<String>,
+        name: String,
+        iterable: Rc<Node>,
+        body: Rc<Node>,
+        label: Option<String>,
+    },
+    /// `name: statement`. Only two things ever look at the name: a `break` or
+    /// `continue` that spells it out, and the `a: { ... break a }` a minifier
+    /// writes where an early return would cost more bytes.
+    Labelled { name: String, body: Rc<Node> },
     Return(Option<Rc<Node>>),
-    Break,
-    Continue,
+    Break(Option<String>),
+    Continue(Option<String>),
     Throw(Rc<Node>),
     TryCatch {
         try_block: Rc<Node>,

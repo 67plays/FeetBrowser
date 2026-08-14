@@ -7,9 +7,10 @@ import json
 import os
 import sys
 import tempfile
-import tkinter
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from feetbrowser import gui
 
 from feetbrowser import toes
 from feetbrowser.browser import Tab
@@ -430,7 +431,7 @@ def _strip(html):
 
 
 def main():
-    root = tkinter.Tk(); root.withdraw()
+    root = gui.Tk(); root.withdraw()
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0
     for t in tests:

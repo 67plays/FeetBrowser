@@ -3,9 +3,11 @@
 
 A web browser written **from scratch**. No Chromium, no WebKit, no borrowed
 libraries — it does its own networking, HTML parsing, CSS, layout, JavaScript,
-and drawing. Tk is only the surface it paints on. The JavaScript engine and
-DOM bridge are compiled to a native Rust extension; the rest (networking,
-parsing, layout, rendering, chrome) is Python.
+fonts, and pixels. No GUI toolkit either: the TrueType parser, the antialiased
+rasteriser and the image decoders are all in this repo. The JavaScript engine
+and DOM bridge are compiled to a native Rust extension; everything else
+(networking, parsing, layout, rendering, chrome) is Python, standard library
+only.
 
 ## STRIDE — how code is judged
 
@@ -26,14 +28,25 @@ Code in this repo is evaluated on six principles:
 ./run.sh https://example.com
 ```
 
-`run.sh` builds the Rust JS engine (`feetbrowser_engine`) into a local `.venv`
-if it isn't importable — so a first run needs the Rust toolchain and
-`maturin` (the script installs maturin into the venv for you). Need Tk? On
-Debian/Ubuntu: `sudo apt install python3-tk` (other distros:
-`python3-tkinter` on Fedora, `tk` on Arch).
+No GUI toolkit to install — just Python 3 and a system font. The one thing
+that does get built is the JavaScript engine: `run.sh` compiles the Rust
+extension (`feetbrowser_engine`) into a local `.venv` when it isn't
+importable, so a first run needs the Rust toolchain (the script installs
+`maturin` into the venv for you). Once the extension is built and installed
+for the interpreter you're invoking, `python3 -m feetbrowser <url>` works
+directly.
 
-If the extension is already built and installed for the interpreter you're
-invoking, `python3 -m feetbrowser <url>` works directly.
+The window itself is ours too. macOS gets one through AppKit and Linux gets
+one through Xlib — both by ctypes, so there is nothing to install for either,
+and X11 covers Wayland desktops through XWayland. Anywhere else, and anywhere
+with no display, the browser still renders: `--screenshot` writes the page to
+a PNG without opening anything.
+
+To render a page to a PNG without opening a window:
+
+```bash
+./run.sh --screenshot https://example.com page.png
+```
 
 ## What you can do
 
@@ -49,6 +62,7 @@ invoking, `python3 -m feetbrowser <url>` works directly.
 
 - [Usage & shortcuts](docs/usage.md)
 - [Architecture — how the engine works](docs/architecture.md)
+- [The rendering engine — fonts, rasteriser, pixels](docs/rendering.md)
 - [Extensions (Toes & ToeHub)](docs/toes.md)
 - [What it does and doesn't do](docs/limitations.md)
 - [Running the tests](docs/testing.md)

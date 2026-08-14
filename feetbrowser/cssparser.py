@@ -27,11 +27,34 @@ def get_viewport():
     return _VIEWPORT
 
 
+# What this browser is, in the vocabulary media queries ask questions in.
+# Anything missing from here still matches, so an unfamiliar query never
+# silently drops a rule -- but the ones we can answer have to be answered.
+# `prefers-color-scheme` especially: assuming it matched meant every site
+# with a dark theme got the dark theme, and a site whose dark rules are all
+# custom properties we do not resolve came out as a black rectangle.
+_MEDIA_FEATURES = {
+    "prefers-color-scheme": "light",
+    "prefers-reduced-motion": "no-preference",
+    "prefers-reduced-transparency": "no-preference",
+    "prefers-contrast": "no-preference",
+    "forced-colors": "none",
+    "inverted-colors": "none",
+    "hover": "hover",
+    "any-hover": "hover",
+    "pointer": "fine",
+    "any-pointer": "fine",
+    "scripting": "enabled",
+    "display-mode": "browser",
+}
+
+
 def media_matches(prelude, width, height):
     """Evaluate a media-query prelude against a viewport. Handles `and`,
-    comma-OR lists, media types (all/screen/print) and the common
-    (min/max-width/height) features; unknown features are assumed to match so
-    rules aren't silently dropped."""
+    comma-OR lists, media types (all/screen/print), the common
+    (min/max-width/height) features and the preference features this browser
+    can answer for itself; anything else is assumed to match so rules aren't
+    silently dropped."""
     if not prelude or not prelude.strip():
         return True
     for alt in re.split(r"\s*,\s*", prelude):
@@ -61,6 +84,11 @@ def media_matches(prelude, width, height):
                     cond = False
                 elif prop == "max-height" and height > n:
                     cond = False
+            elif prop == "orientation":
+                if val != ("portrait" if height >= width else "landscape"):
+                    cond = False
+            elif prop in _MEDIA_FEATURES and val != _MEDIA_FEATURES[prop]:
+                cond = False
         if re.search(r"(?:^|\s)print(?:\s|$)", alt):
             cond = False
         if negated:
@@ -153,6 +181,52 @@ class DescendantSelector:
                 return True
             parent = parent.parent
         return False
+
+
+class ChildSelector:
+    """`a > b`: b's own parent must be an a, not merely some ancestor.
+
+    Treating this as a descendant relationship is how one `.menu > li` rule
+    reaches every list item on the page, submenus included.
+    """
+
+    def __init__(self, parent, child):
+        self.parent = parent
+        self.child = child
+        self.priority = tuple(
+            a + b for a, b in zip(parent.priority, child.priority))
+
+    def matches(self, node):
+        return self.child.matches(node) and node.parent is not None \
+            and isinstance(node.parent, Element) \
+            and self.parent.matches(node.parent)
+
+
+class SiblingSelector:
+    """`a + b` (adjacent) and `a ~ b` (any earlier sibling)."""
+
+    def __init__(self, before, after, adjacent):
+        self.before = before
+        self.after = after
+        self.adjacent = adjacent
+        self.priority = tuple(
+            a + b for a, b in zip(before.priority, after.priority))
+
+    def matches(self, node):
+        if not self.after.matches(node):
+            return False
+        parent = node.parent
+        if not isinstance(parent, Element):
+            return False
+        earlier = []
+        for child in parent.children:
+            if child is node:
+                break
+            if isinstance(child, Element):
+                earlier.append(child)
+        if self.adjacent:
+            return bool(earlier) and self.before.matches(earlier[-1])
+        return any(self.before.matches(sib) for sib in earlier)
 
 
 class RootSelector:
@@ -377,6 +451,34 @@ _VENDOR_PREFIXES = ("-webkit-", "-moz-", "-ms-", "-o-", "-khtml-")
 # still applies, so simple_selector() emits nothing for this token.
 _SKIP_PSEUDO = object()
 
+def _strip_comments(value):
+    """Drop /* ... */ from a declaration value, leaving quoted text alone.
+
+    `content: "a/*b*/c"` is a string that happens to contain the characters,
+    not a comment, and it is the one place they can legally appear.
+    """
+    out = []
+    i, n, quote = 0, len(value), None
+    while i < n:
+        ch = value[i]
+        if quote:
+            if ch == quote:
+                quote = None
+            out.append(ch)
+        elif ch in "\"'":
+            quote = ch
+            out.append(ch)
+        elif value[i:i + 2] == "/*":
+            end = value.find("*/", i + 2)
+            i = n if end == -1 else end + 2
+            out.append(" ")
+            continue
+        else:
+            out.append(ch)
+        i += 1
+    return "".join(out)
+
+
 _ATTR_SEL_RE = re.compile(
     r"\[\s*([-_A-Za-z0-9]+)\s*"
     r"(?:([~|^$*]?=)\s*(?:\"([^\"]*)\"|'([^']*)'|([^\]\s]+))\s*)?\]")
@@ -430,7 +532,13 @@ class CSSParser:
             elif depth == 0 and c in ";}":
                 break
             self.i += 1
-        value = self.s[vstart:self.i].strip()
+        value = self.s[vstart:self.i]
+        if "/*" in value:
+            # A comment is not part of the value, and inside a calc() it looks
+            # like a division: `calc(10px + /* logo */ 18px)` is how a page
+            # explains where its numbers came from.
+            value = _strip_comments(value)
+        value = value.strip()
         if not value or not prop:
             return None
         if value.endswith("!important"):
@@ -568,38 +676,61 @@ class CSSParser:
         return sels
 
     def selector(self, text):
-        # Split on whitespace outside parentheses (so `:has(> img)` keeps its
-        # internal space), treating >, + and ~ as descendant relationships;
-        # unsupported tokens are dropped rather than left to crash the rule.
+        # Split into compounds and the combinators between them. Whitespace
+        # inside parentheses is left alone, so `:has(> img)` survives; a
+        # combinator needs no space around it, because minified CSS writes
+        # `.menu>li+li` and that is three compounds, not one.
         tokens = []
         buf = []
         depth = 0
         for ch in text:
-            if ch == "(":
+            if ch in "([":
                 depth += 1
                 buf.append(ch)
-            elif ch == ")":
+            elif ch in ")]":
                 depth = max(0, depth - 1)
                 buf.append(ch)
-            elif ch in " \t\r\n\f" and depth == 0:
+            elif depth == 0 and (ch in " \t\r\n\f" or ch in ">+~"):
                 if buf:
                     tokens.append("".join(buf))
                     buf = []
+                if ch in ">+~":
+                    # A combinator replaces any descendant space beside it.
+                    if tokens and tokens[-1] in (">", "+", "~"):
+                        tokens[-1] = ch
+                    else:
+                        tokens.append(ch)
             else:
                 buf.append(ch)
         if buf:
             tokens.append("".join(buf))
-        tokens = [t for t in tokens if t not in (">", "+", "~")]
+        while tokens and tokens[0] in (">", "+", "~"):
+            # A leading combinator means a relative selector, and the only
+            # place we accept one is inside `:has()` -- `:has(> img)`. What it
+            # is relative to is the element being tested, which _has_match
+            # already supplies by walking descendants, so the combinator has
+            # nothing left to say here.
+            tokens.pop(0)
         if not tokens:
             return None
         result = self.simple_selector(tokens[0])
         if result is None:
             return None
+        combinator = " "
         for tok in tokens[1:]:
+            if tok in (">", "+", "~"):
+                combinator = tok
+                continue
             simple = self.simple_selector(tok)
             if simple is None:
                 return None
-            result = DescendantSelector(result, simple)
+            if combinator == ">":
+                result = ChildSelector(result, simple)
+            elif combinator in ("+", "~"):
+                result = SiblingSelector(result, simple, combinator == "+")
+            else:
+                result = DescendantSelector(result, simple)
+            combinator = " "
         return result
 
     def parse(self):
@@ -650,8 +781,22 @@ class CSSParser:
                 rules.extend(inner.parse())
             else:
                 self._read_block()
-        elif keyword == "@supports":
-            # Naively include the inner rules regardless of the query.
+        elif keyword == "@container":
+            # A container query is the one grouping at-rule whose contents are
+            # written *expecting* to be off most of the time -- it is how a
+            # card says "and when my column is wide, stack me differently".
+            # Flattening it makes that variant unconditional, and being later
+            # in the sheet it wins over the plain rule it was meant to
+            # override. Until container sizes are tracked, off is the honest
+            # answer.
+            self._read_block()
+        elif keyword in ("@supports", "@layer", "@scope"):
+            # Grouping at-rules whose condition we cannot evaluate, but whose
+            # contents are ordinary rules. Including them naively is much
+            # closer to right than dropping them: a modern site puts its
+            # entire stylesheet inside `@layer`, and skipping the block left
+            # such a page with nothing but the UA sheet. Layer ordering is
+            # not modelled -- everything lands in one flat cascade.
             inner = CSSParser(self._read_block())
             rules.extend(inner.parse())
         else:
@@ -750,6 +895,31 @@ def _build_rule_index(rules):
     return index
 
 
+_LIST_STYLE_POSITIONS = ("inside", "outside")
+
+
+def _expand(prop, value):
+    """Yield the properties a declaration really sets.
+
+    Almost every shorthand in this engine is left un-expanded and read
+    where it is used, which works because layout can go looking for it.
+    `list-style` cannot be handled that way: only its type component
+    inherits, and the whole point of `list-style: none` on a <ul> is that
+    the <li>s inside it lose their markers. So it is expanded here, in
+    declaration order, exactly as writing the longhand would have been.
+    """
+    yield prop, value
+    if prop == "list-style":
+        for token in value.split():
+            lowered = token.lower()
+            if lowered in _LIST_STYLE_POSITIONS:
+                yield "list-style-position", lowered
+            elif lowered.startswith("url("):
+                yield "list-style-image", token
+            else:
+                yield "list-style-type", lowered
+
+
 def style(node, rules):
     """Compute the `.style` dict for `node` and its subtree.
 
@@ -803,12 +973,14 @@ def style(node, rules):
             if not selector.matches(node):
                 continue
             for prop, value in body.items():
-                node.style[prop] = value
+                for expanded, v in _expand(prop, value):
+                    node.style[expanded] = v
 
         # 3. Inline style attribute (highest, aside from !important we ignore).
         if isinstance(node, Element) and "style" in node.attributes:
             for prop, value in parse_inline(node.attributes["style"]).items():
-                node.style[prop] = value
+                for expanded, v in _expand(prop, value):
+                    node.style[expanded] = v
 
         # 3b. Resolve var(--custom, fallback) references. Custom properties
         # inherit, so lookups walk up the parent chain.

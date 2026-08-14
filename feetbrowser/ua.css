@@ -30,6 +30,15 @@ a         { color: blue; text-decoration: underline; }
 
 ul, ol   { margin-top: 14px; margin-bottom: 14px; margin-left: 30px; }
 li       { display: list-item; }
+ol       { list-style-type: decimal; }
+/* Nested bullets change shape, the way every browser's default sheet does.
+   Only unordered lists do -- a list of numbers stays a list of numbers. */
+ul ul, ol ul { list-style-type: circle; }
+ul ul ul, ol ul ul { list-style-type: square; }
+
+/* Cells get a little breathing room unless the page says otherwise; without
+   this a bordered table has its text pressed against the rules. */
+td, th   { padding: 4px; }
 
 pre, code, tt, kbd, samp { font-family: monospace; white-space: pre; }
 pre      { margin-top: 14px; margin-bottom: 14px; }
@@ -46,5 +55,18 @@ hr       { margin-top: 8px; margin-bottom: 8px; }
 
 title, head, style, script, meta, link { display: none; }
 
+/* The HTML `hidden` attribute is a presentation hint every browser wires up
+   in its default sheet, and pages lean on it to keep menus and dialogs out
+   of the way until something opens them. */
+[hidden] { display: none; }
+
 nav      { display: block; }
 header   { display: block; }
+
+/* A closed <details> shows its <summary> and nothing else. Pages use it for
+   dropdowns and "read more" panels, so without this rule every one of them
+   spills its contents onto the page with no way to tell them apart from the
+   real text around them. */
+details  { display: block; }
+summary  { display: block; font-weight: bold; }
+details:not([open]) > *:not(summary) { display: none; }

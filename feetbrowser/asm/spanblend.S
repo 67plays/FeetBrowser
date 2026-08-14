@@ -8,8 +8,11 @@
  *
  * SysV ABI, x86-64:
  *   arg1 = rdi, arg2 = rsi, arg3 = rdx, arg4 = rcx, arg5 = r8
- * r9-r15 and rax are caller-saved scratch.  Position-independent: only
- * local ('.L') labels, so the blob can live anywhere in a PROT_EXEC page.
+ * rax, rcx, rdx, rsi, rdi and r8-r11 are caller-saved, so those are the
+ * only registers touched here; rbx, rbp and r12-r15 belong to whoever
+ * called us and would have to be saved and restored to be used at all.
+ * Position-independent: only local ('.L') labels, so the blob can live
+ * anywhere in a PROT_EXEC page.
  */
 
     .text
@@ -56,10 +59,10 @@ blend_rgb:
     xor %ecx, %ecx              /* i = 0                       */
 .Lblend_loop:
     movzbl (%rsi,%rcx), %r11d   /* src[i]                      */
-    movzbl (%rdi,%rcx), %r12d   /* dst[i]                      */
+    movzbl (%rdi,%rcx), %r8d    /* dst[i]                      */
     imul %r9d, %r11d            /* src * a                     */
-    imul %r10d, %r12d           /* dst * (255-a)               */
-    add %r12d, %r11d            /* sum                         */
+    imul %r10d, %r8d            /* dst * (255-a)               */
+    add %r8d, %r11d             /* sum                         */
     shr $8, %r11d               /* >> 8                        */
     movb %r11b, (%rdi,%rcx)     /* store                       */
     inc %rcx                    /* i++                         */

@@ -3,11 +3,10 @@ picker page, and applying a shoe."""
 import os
 import sys
 import tempfile
-import tkinter
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from feetbrowser import shoes
+from feetbrowser import gui, shoes
 from feetbrowser.browser import (
     _AboutURL, _ShoesURL, _ShoesApplyURL, welcome_html, bookmarks_html,
     history_html,
@@ -126,7 +125,7 @@ def test_apply_page_back_link_does_not_crash():
 
 
 def main():
-    root = tkinter.Tk(); root.withdraw()
+    root = gui.Tk(); root.withdraw()
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0
     for t in tests:

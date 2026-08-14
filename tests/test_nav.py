@@ -1,6 +1,8 @@
 """Headless test of click-to-navigate, history, and forms plumbing."""
-import sys, os, tkinter, threading, http.server
+import sys, os, threading, http.server
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from feetbrowser import gui
 
 from feetbrowser.browser import Tab, FormAction
 from feetbrowser.htmlparser import Element
@@ -127,7 +129,7 @@ def test_form_round_trip():
 
 
 def main():
-    root = tkinter.Tk(); root.withdraw()
+    root = gui.Tk(); root.withdraw()
     tab = Tab(700)
     tab.load("https://example.com")
     assert tab.title == "Example Domain", tab.title

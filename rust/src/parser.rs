@@ -128,6 +128,24 @@ impl Parser {
     }
 
     fn statement(&mut self) -> PResult {
+        if let Some(t) = self.peek() {
+            if t.kind == TokKind::Ident && self.peek2_is_punct(":") {
+                let name = t.text.clone();
+                self.pos += 2;
+                let body = self.statement()?;
+                // A loop needs its own name to hand back to `continue name`;
+                // everything else only ever sees a `break`, which the
+                // Labelled node catches for itself.
+                let body = label_loop(body, &name);
+                return Ok(rc(Labelled { name, body }));
+            }
+        }
+        if self.peek_is_punct(";") {
+            // The empty statement. `if (a) ; else b()` is real code, and
+            // `for (;;) ;` is how you spell a body-less loop.
+            self.pos += 1;
+            return Ok(rc(Block(Vec::new())));
+        }
         if self.peek_is_punct("{") {
             return Ok(rc(Block(self.parse_stmts_until(Some("}"))?)));
         }
@@ -141,12 +159,12 @@ impl Parser {
             {
                 self.pos += 1;
                 self.pos += 1;
-                let name = self.expect_ident()?;
+                let _name = self.expect_ident()?;
                 let f = self.function_rest(true)?;
                 return Ok(rc(FunctionDecl(f)));
             }
         }
-        let expr = self.expression()?;
+        let expr = self.sequence()?;
         Ok(rc(ExprStmt(expr)))
     }
 
@@ -193,15 +211,15 @@ impl Parser {
             }
             "break" => {
                 self.pos += 1;
-                Some(rc(Break))
+                Some(rc(Break(self.optional_label())))
             }
             "continue" => {
                 self.pos += 1;
-                Some(rc(Continue))
+                Some(rc(Continue(self.optional_label())))
             }
             "throw" => {
                 self.pos += 1;
-                let expr = self.expression()?;
+                let expr = self.sequence()?;
                 Some(rc(Throw(expr)))
             }
             "try" => {
@@ -216,14 +234,37 @@ impl Parser {
     fn return_value(&mut self) -> Result<Option<Rc<Node>>, JsError> {
         if let Some(t) = self.peek() {
             if !(t.kind == TokKind::Punct && (t.text == ";" || t.text == "}")) {
-                return Ok(Some(self.expression()?));
+                return Ok(Some(self.sequence()?));
             }
         }
         Ok(None)
     }
 
+    /// The name after `break`/`continue`, when there is one on the line.
+    ///
+    /// A newline ends the statement instead (automatic semicolon insertion),
+    /// so `break\nfoo()` breaks and then calls -- it does not break to a
+    /// label named foo.
+    fn optional_label(&mut self) -> Option<String> {
+        let (name, offset) = match self.peek() {
+            Some(t) if t.kind == TokKind::Ident => (t.text.clone(), t.offset),
+            _ => return None,
+        };
+        let prev_end = if self.pos > 0 {
+            let prev = &self.tokens[self.pos - 1];
+            prev.offset + prev.text.len()
+        } else {
+            0
+        };
+        if self.source[prev_end.min(offset)..offset].contains('\n') {
+            return None;
+        }
+        self.pos += 1;
+        Some(name)
+    }
+
     fn parse_stmts_until(&mut self, closing: Option<&str>) -> Result<Vec<Rc<Node>>, JsError> {
-        if let Some(c) = closing {
+        if let Some(_c) = closing {
             self.expect_punct("{")?;
         }
         let mut stmts = Vec::new();
@@ -516,29 +557,12 @@ impl Parser {
         Ok(())
     }
 
-    fn list_trailing(
-        &mut self,
-        opener: &str,
-        closer: &str,
-        mut item: impl FnMut(&mut Parser) -> Result<Rc<Node>, JsError>,
-    ) -> Result<Vec<Rc<Node>>, JsError> {
-        self.expect_punct(opener)?;
-        let mut out = Vec::new();
-        loop {
-            if self.match_punct(closer) {
-                break;
-            }
-            out.push(item(self)?);
-            if self.match_punct(closer) {
-                break;
-            }
-            self.expect_punct(",")?;
-        }
-        Ok(out)
-    }
-
     fn if_statement(&mut self) -> PResult {
         let (cond, then) = self.cond_body()?;
+        // The semicolon belongs to the statement it ends, and only a
+        // statement list bothers to eat one. Left here it hides the `else`
+        // in `if (a) b(); else c();` -- which is every minified if/else.
+        self.match_punct(";");
         let else_ = if self.match_kw("else") {
             Some(self.statement()?)
         } else {
@@ -549,7 +573,7 @@ impl Parser {
 
     fn while_statement(&mut self) -> PResult {
         let (cond, body) = self.cond_body()?;
-        Ok(rc(While { cond, body }))
+        Ok(rc(While { cond, body, label: None }))
     }
 
     fn do_while_statement(&mut self) -> PResult {
@@ -557,15 +581,15 @@ impl Parser {
         self.match_punct(";");
         self.match_kw("while");
         self.expect_punct("(")?;
-        let cond = self.expression()?;
+        let cond = self.sequence()?;
         self.expect_punct(")")?;
         self.match_punct(";");
-        Ok(rc(DoWhile { body, cond }))
+        Ok(rc(DoWhile { body, cond, label: None }))
     }
 
     fn switch_statement(&mut self) -> PResult {
         self.expect_punct("(")?;
-        let expr = self.expression()?;
+        let expr = self.sequence()?;
         self.expect_punct(")")?;
         self.expect_punct("{")?;
         let mut cases = Vec::new();
@@ -615,7 +639,7 @@ impl Parser {
 
     fn cond_body(&mut self) -> Result<(Rc<Node>, Rc<Node>), JsError> {
         self.expect_punct("(")?;
-        let cond = self.expression()?;
+        let cond = self.sequence()?;
         self.expect_punct(")")?;
         let body = self.statement()?;
         Ok((cond, body))
@@ -640,7 +664,7 @@ impl Parser {
                     if t2.kind == TokKind::Kw && (t2.text == "in" || t2.text == "of") {
                         let op = t2.text.clone();
                         self.pos += 1;
-                        let iterable = self.expression()?;
+                        let iterable = self.sequence()?;
                         self.expect_punct(")")?;
                         let body = self.statement()?;
                         return Ok(rc(if op == "in" {
@@ -649,6 +673,7 @@ impl Parser {
                                 name,
                                 iterable,
                                 body,
+                                label: None,
                             }
                         } else {
                             ForOf {
@@ -656,6 +681,7 @@ impl Parser {
                                 name,
                                 iterable,
                                 body,
+                                label: None,
                             }
                         }));
                     }
@@ -669,7 +695,7 @@ impl Parser {
                     if t2.kind == TokKind::Kw && (t2.text == "in" || t2.text == "of") {
                         let op = t2.text.clone();
                         self.pos += 1;
-                        let iterable = self.expression()?;
+                        let iterable = self.sequence()?;
                         self.expect_punct(")")?;
                         let body = self.statement()?;
                         return Ok(rc(if op == "in" {
@@ -678,6 +704,7 @@ impl Parser {
                                 name,
                                 iterable,
                                 body,
+                                label: None,
                             }
                         } else {
                             ForOf {
@@ -685,6 +712,7 @@ impl Parser {
                                 name,
                                 iterable,
                                 body,
+                                label: None,
                             }
                         }));
                     }
@@ -703,7 +731,7 @@ impl Parser {
                     let decls = self.declaration_list()?;
                     Some(rc(VarDecl { kind, decls }))
                 } else {
-                    let expr = self.expression()?;
+                    let expr = self.sequence()?;
                     Some(rc(ExprStmt(expr)))
                 }
             } else {
@@ -714,17 +742,17 @@ impl Parser {
         let cond = if self.peek_is_punct(";") {
             None
         } else {
-            Some(self.expression()?)
+            Some(self.sequence()?)
         };
         self.expect_punct(";")?;
         let update = if self.peek_is_punct(")") {
             None
         } else {
-            Some(self.expression()?)
+            Some(self.sequence()?)
         };
         self.expect_punct(")")?;
         let body = self.statement()?;
-        Ok(rc(For { init, cond, update, body }))
+        Ok(rc(For { init, cond, update, body, label: None }))
     }
 
     fn try_statement(&mut self) -> PResult {
@@ -752,8 +780,26 @@ impl Parser {
 
     // -- expressions --------------------------------------------------------
 
+    /// One expression, stopping at a comma.
+    ///
+    /// This is the form that goes in an argument list, an array element or an
+    /// object value -- everywhere a comma separates things rather than
+    /// joining them. `sequence` is the other one.
     fn expression(&mut self) -> PResult {
         self.assign()
+    }
+
+    /// An expression where a comma joins rather than separates.
+    fn sequence(&mut self) -> PResult {
+        let node = self.assign()?;
+        if !self.peek_is_punct(",") {
+            return Ok(node);
+        }
+        let mut items = vec![node];
+        while self.match_punct(",") {
+            items.push(self.assign()?);
+        }
+        Ok(rc(Sequence(items)))
     }
 
     fn assign(&mut self) -> PResult {
@@ -1092,10 +1138,7 @@ impl Parser {
                                 return self.arrow_rest(params, defaults, rest, false);
                             }
                             self.pos += 1;
-                            let mut node = self.expression()?;
-                            while self.match_punct(",") {
-                                node = self.expression()?;
-                            }
+                            let node = self.sequence()?;
                             self.expect_punct(")")?;
                             return Ok(node);
                         }
@@ -1112,7 +1155,6 @@ impl Parser {
                         _ => {}
                     }
                 }
-                _ => {}
             }
         }
         self.syntax("unexpected token")
@@ -1290,6 +1332,48 @@ impl Parser {
 
 fn rc(n: Node) -> Rc<Node> {
     Rc::new(n)
+}
+
+/// Hand a loop the name it was labelled with, so a `continue name` aimed at
+/// it can be resumed there rather than escaping. Anything that is not a loop
+/// is returned untouched: only `break` can name it, and the enclosing
+/// `Labelled` node catches that.
+fn label_loop(node: Rc<Node>, name: &str) -> Rc<Node> {
+    let labelled = match &*node {
+        While { cond, body, .. } => While {
+            cond: cond.clone(),
+            body: body.clone(),
+            label: Some(name.to_string()),
+        },
+        DoWhile { body, cond, .. } => DoWhile {
+            body: body.clone(),
+            cond: cond.clone(),
+            label: Some(name.to_string()),
+        },
+        For { init, cond, update, body, .. } => For {
+            init: init.clone(),
+            cond: cond.clone(),
+            update: update.clone(),
+            body: body.clone(),
+            label: Some(name.to_string()),
+        },
+        ForIn { var_kind, name: var, iterable, body, .. } => ForIn {
+            var_kind: var_kind.clone(),
+            name: var.clone(),
+            iterable: iterable.clone(),
+            body: body.clone(),
+            label: Some(name.to_string()),
+        },
+        ForOf { var_kind, name: var, iterable, body, .. } => ForOf {
+            var_kind: var_kind.clone(),
+            name: var.clone(),
+            iterable: iterable.clone(),
+            body: body.clone(),
+            label: Some(name.to_string()),
+        },
+        _ => return node,
+    };
+    rc(labelled)
 }
 
 

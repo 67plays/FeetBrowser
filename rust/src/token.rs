@@ -132,6 +132,18 @@ fn find_template_end(s: &str, start: usize) -> Option<usize> {
     None
 }
 
+/// The character at byte offset `i`, which is not the same thing as the byte
+/// there. Reading `bytes[i] as char` is a Latin-1 misreading of the leading
+/// byte of a UTF-8 sequence: `×` scans as `Ã` followed by a control character,
+/// which is both wrong (string and regex literals came out as mojibake) and
+/// fatal (`Ã` is alphabetic, so the identifier scanner accepted it, then
+/// stopped one byte in and sliced through the middle of the character). Every
+/// scanner below decodes a real character and advances by `len_utf8`, so the
+/// cursor only ever lands on a boundary.
+fn char_at(source: &str, i: usize) -> char {
+    source[i..].chars().next().unwrap_or('\0')
+}
+
 pub fn tokenize(source: &str) -> Result<Vec<Token>, JsError> {
     let kw = keywords();
     let mut tokens: Vec<Token> = Vec::new();
@@ -144,7 +156,7 @@ pub fn tokenize(source: &str) -> Result<Vec<Token>, JsError> {
     };
 
     while i < n {
-        let ch = bytes[i] as char;
+        let ch = char_at(source, i);
         let prev = tokens.last();
         match ch {
             ' ' | '\t' | '\r' | '\n' => i += 1,
@@ -240,14 +252,14 @@ pub fn tokenize(source: &str) -> Result<Vec<Token>, JsError> {
                     if i >= n {
                         return Err(fail(i, "unterminated string literal"));
                     }
-                    let c = bytes[i] as char;
+                    let c = char_at(source, i);
                     if c == '\\' {
                         i += 1;
                         if i >= n {
                             return Err(fail(i, "unterminated string literal"));
                         }
-                        let esc = bytes[i] as char;
-                        i += 1;
+                        let esc = char_at(source, i);
+                        i += esc.len_utf8();
                         if let Some(s) = simple_esc(esc) {
                             if s == '\0' {
                                 // continuation: skip the newline
@@ -256,8 +268,9 @@ pub fn tokenize(source: &str) -> Result<Vec<Token>, JsError> {
                             }
                         } else if matches!(esc, 'x' | 'u') {
                             let size = if esc == 'u' { 4 } else { 2 };
-                            if i + size <= n {
-                                let hex = &source[i..i + size];
+                            // `get` declines both a short tail and a range
+                            // that would cut a character in half.
+                            if let Some(hex) = source.get(i..i + size) {
                                 if let Ok(cp) = u32::from_str_radix(hex, 16) {
                                     if let Some(chr) = char::from_u32(cp) {
                                         buf.push(chr);
@@ -281,7 +294,7 @@ pub fn tokenize(source: &str) -> Result<Vec<Token>, JsError> {
                         return Err(fail(i, "unterminated string literal"));
                     } else {
                         buf.push(c);
-                        i += 1;
+                        i += c.len_utf8();
                     }
                 }
             }
@@ -299,11 +312,12 @@ pub fn tokenize(source: &str) -> Result<Vec<Token>, JsError> {
             }
             _ if ch.is_alphabetic() || ch == '_' || ch == '$' => {
                 let mut j = i;
-                while j < n
-                    && ((bytes[j] as char).is_alphanumeric()
-                        || matches!(bytes[j] as char, '_' | '$'))
-                {
-                    j += 1;
+                while j < n {
+                    let c = char_at(source, j);
+                    if !(c.is_alphanumeric() || c == '_' || c == '$') {
+                        break;
+                    }
+                    j += c.len_utf8();
                 }
                 let word = &source[i..j];
                 let is_kw = kw.contains(word);
@@ -321,13 +335,14 @@ pub fn tokenize(source: &str) -> Result<Vec<Token>, JsError> {
                 let mut in_class = false;
                 let mut terminated = false;
                 while j < n {
-                    let c = bytes[j] as char;
+                    let c = char_at(source, j);
                     if c == '\\' {
                         buf.push(c);
                         j += 1;
                         if j < n {
-                            buf.push(bytes[j] as char);
-                            j += 1;
+                            let esc = char_at(source, j);
+                            buf.push(esc);
+                            j += esc.len_utf8();
                         }
                         continue;
                     }
@@ -343,15 +358,19 @@ pub fn tokenize(source: &str) -> Result<Vec<Token>, JsError> {
                         return Err(fail(i, "unterminated regular expression"));
                     }
                     buf.push(c);
-                    j += 1;
+                    j += c.len_utf8();
                 }
                 if !terminated {
                     return Err(fail(i, "unterminated regular expression"));
                 }
                 let mut flags = String::new();
-                while j < n && (bytes[j] as char).is_alphabetic() {
-                    flags.push(bytes[j] as char);
-                    j += 1;
+                while j < n {
+                    let c = char_at(source, j);
+                    if !c.is_alphabetic() {
+                        break;
+                    }
+                    flags.push(c);
+                    j += c.len_utf8();
                 }
                 tokens.push(Token {
                     kind: TokKind::Regex,
@@ -380,7 +399,9 @@ pub fn tokenize(source: &str) -> Result<Vec<Token>, JsError> {
                 } else {
                     let mut matched = false;
                     for (text, len) in PUNCT {
-                        if *len <= n - i && source[i..i + len] == **text {
+                        // Compared as bytes: `i` is on a boundary but `i + len`
+                        // need not be, and `+×` would slice into the `×`.
+                        if bytes.get(i..i + len) == Some(text.as_bytes()) {
                             tokens.push(Token {
                                 kind: TokKind::Punct,
                                 text: text.to_string(),

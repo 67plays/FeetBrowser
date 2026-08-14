@@ -11,6 +11,9 @@ FeetBrowser — a functional web browser built from scratch.
 options:
   -h, --help       show this help message and exit
   -v, --version    print the version and exit
+  --screenshot <url> [out.png]
+                   render <url> headlessly and write a PNG, then exit
+                   (default: feetbrowser.png)
   --toes           list installed toes and their status
   --toe-search <term>      search the ToeHub catalog
   --toe-install <name>     install a toe from the catalog
@@ -28,8 +31,7 @@ def main():
     args = sys.argv[1:]
     if not args:
         from .browser import main as browser_main
-        browser_main()
-        return
+        sys.exit(browser_main() or 0)
     flag = args[0]
     if flag == "-h" or flag == "--help":
         print(USAGE)
@@ -73,7 +75,7 @@ def main():
         return
     # Anything else is a URL passed to the browser.
     from .browser import main as browser_main
-    browser_main()
+    sys.exit(browser_main() or 0)
 
 
 if __name__ == "__main__":

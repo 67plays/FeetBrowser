@@ -162,7 +162,7 @@ impl Interpreter {
 
 // -- public API ------------------------------------------------------------
 
-pub fn drive_sync(this: &Rc<Interpreter>, fut: EvResult) -> Result<JsValue, JsError> {
+pub fn drive_sync(_this: &Rc<Interpreter>, fut: EvResult) -> Result<JsValue, JsError> {
     let mut fut = fut;
     let waker = Waker::noop();
     let mut cx = Context::from_waker(&waker);
@@ -172,7 +172,7 @@ pub fn drive_sync(this: &Rc<Interpreter>, fut: EvResult) -> Result<JsValue, JsEr
     }
 }
 
-pub fn drive_sync_unit(this: &Rc<Interpreter>, fut: StResult) -> Result<(), JsError> {
+pub fn drive_sync_unit(_this: &Rc<Interpreter>, fut: StResult) -> Result<(), JsError> {
     let mut fut = fut;
     let waker = Waker::noop();
     let mut cx = Context::from_waker(&waker);
@@ -193,7 +193,7 @@ impl Interpreter {
         let fut = exec_block(self, &stmts, self.global_env.clone());
         match drive_sync_unit(self, fut) {
             Ok(()) => Ok(()),
-            Err(JsError::Return(_)) | Err(JsError::Break) | Err(JsError::Continue) => {
+            Err(JsError::Return(_)) | Err(JsError::Break(_)) | Err(JsError::Continue(_)) => {
                 Err(JsError::js("Illegal statement outside its context."))
             }
             Err(JsError::Budget(b)) => Err(JsError::js(b)),
@@ -380,13 +380,11 @@ pub fn js_error_message(this: &Interpreter, e: &JsError) -> String {
         JsError::Js(m) => m.clone(),
         JsError::Thrown(v) => this.repr(v),
         JsError::Return(v) => this.repr(v),
-        JsError::Break | JsError::Continue => "Break or continue outside of a loop.".to_string(),
+        JsError::Break(_) | JsError::Continue(_) => {
+            "Break or continue outside of a loop.".to_string()
+        }
         JsError::Budget(m) => m.clone(),
     }
-}
-
-pub fn repr_js(this: &Interpreter, v: &JsValue) -> String {
-    this.repr(v)
 }
 
 // -- host bridge -----------------------------------------------------------
@@ -549,7 +547,7 @@ pub fn index_name(this: &Interpreter, value: &JsValue) -> String {
     }
 }
 
-pub fn own_keys(this: &Interpreter, value: &JsValue) -> Vec<String> {
+pub fn own_keys(_this: &Interpreter, value: &JsValue) -> Vec<String> {
     match value {
         JsValue::Object(m) => m.borrow().keys().cloned().collect(),
         JsValue::Array(a) => (0..a.borrow().len()).map(|i| i.to_string()).collect(),
@@ -662,7 +660,7 @@ pub fn string_split(
 }
 
 pub fn string_match(
-    this: &Interpreter,
+    _this: &Interpreter,
     text: &str,
     regex: &JsValue,
 ) -> Result<JsValue, JsError> {
@@ -993,7 +991,7 @@ fn make_host_method(h: Py<PyAny>, name: &str) -> JsValue {
             _ => {
                 let this_arg = args.first().cloned().unwrap_or(JsValue::Undefined);
                 let pre = args.into_iter().skip(1).collect::<Vec<_>>();
-                let i3 = interp.clone();
+                let _i3 = interp.clone();
                 let h3 = Python::attach(|py| h.clone_ref(py));
                 let pre2 = pre.clone();
                 let t = this_arg.clone();
@@ -1236,7 +1234,7 @@ pub fn list_get(
                     } as usize;
                     let items = args.into_iter().skip(2).collect::<Vec<_>>();
                     let removed: Vec<JsValue> = arr.drain(s..s + dc).collect();
-                    let mut tail = arr.split_off(s);
+                    let tail = arr.split_off(s);
                     arr.extend(items);
                     arr.extend(tail);
                     Ok(JsValue::array(removed))
@@ -1301,7 +1299,7 @@ pub fn list_get(
             let i0 = this.clone();
             return JsValue::Callback(Rc::new(move |i: &Rc<Interpreter>, args: Vec<JsValue>| -> EvResult {
                 let i2 = i.clone();
-                let i3 = i0.clone();
+                let _i3 = i0.clone();
                 let a2 = a.clone();
                 let op2 = op.clone();
                 Box::pin(async move {
@@ -1377,7 +1375,7 @@ pub fn list_get(
             let i0 = this.clone();
             return JsValue::Callback(Rc::new(move |i: &Rc<Interpreter>, args: Vec<JsValue>| -> EvResult {
                 let i2 = i.clone();
-                let i3 = i0.clone();
+                let _i3 = i0.clone();
                 let a2 = a.clone();
                 let op2 = op.clone();
                 Box::pin(async move {
@@ -1435,10 +1433,8 @@ pub fn list_get(
             }));
         }
         "flatMap" => {
-            let i0 = this.clone();
             return JsValue::Callback(Rc::new(move |i: &Rc<Interpreter>, args: Vec<JsValue>| -> EvResult {
                 let i2 = i.clone();
-                let i3 = i0.clone();
                 let a2 = a.clone();
                 Box::pin(async move {
                     let fn_ = args.first().cloned().unwrap_or(JsValue::Undefined);
@@ -1539,7 +1535,7 @@ pub fn string_get(this: &Rc<Interpreter>, text: &Rc<str>, name: &str) -> JsValue
         return JsValue::Number(char_count(text) as f64);
     }
     let t = text.clone();
-    let i0 = this.clone();
+    let _i0 = this.clone();
     match name {
         "charAt" => {
             return JsValue::Callback(Rc::new(move |_i: &Rc<Interpreter>, args: Vec<JsValue>| -> EvResult {
@@ -1751,7 +1747,7 @@ pub fn string_get(this: &Rc<Interpreter>, text: &Rc<str>, name: &str) -> JsValue
         "concat" => {
             let i0 = this.clone();
             return JsValue::Callback(Rc::new(move |i: &Rc<Interpreter>, args: Vec<JsValue>| -> EvResult {
-                let i2 = i.clone();
+                let _i2 = i.clone();
                 let i3 = i0.clone();
                 let t2 = t.clone();
                 Box::pin(async move {
@@ -1778,7 +1774,7 @@ pub fn string_get(this: &Rc<Interpreter>, text: &Rc<str>, name: &str) -> JsValue
         "padStart" | "padEnd" => {
             let op = name.to_string();
             return JsValue::Callback(Rc::new(move |i: &Rc<Interpreter>, args: Vec<JsValue>| -> EvResult {
-                let i2 = i.clone();
+                let _i2 = i.clone();
                 let t2 = t.clone();
                 let op2 = op.clone();
                 Box::pin(async move {
@@ -1795,7 +1791,7 @@ pub fn string_get(this: &Rc<Interpreter>, text: &Rc<str>, name: &str) -> JsValue
         "split" => {
             let i0 = this.clone();
             return JsValue::Callback(Rc::new(move |i: &Rc<Interpreter>, args: Vec<JsValue>| -> EvResult {
-                let i2 = i.clone();
+                let _i2 = i.clone();
                 let i3 = i0.clone();
                 let t2 = t.clone();
                 Box::pin(async move {
@@ -1808,7 +1804,7 @@ pub fn string_get(this: &Rc<Interpreter>, text: &Rc<str>, name: &str) -> JsValue
         "match" | "matchAll" => {
             let i0 = this.clone();
             return JsValue::Callback(Rc::new(move |i: &Rc<Interpreter>, args: Vec<JsValue>| -> EvResult {
-                let i2 = i.clone();
+                let _i2 = i.clone();
                 let i3 = i0.clone();
                 let t2 = t.clone();
                 Box::pin(async move {
@@ -1881,7 +1877,7 @@ pub fn number_get(this: &Rc<Interpreter>, num: f64, name: &str) -> JsValue {
         "toString" => {
             let i0 = this.clone();
             return JsValue::Callback(Rc::new(move |i: &Rc<Interpreter>, args: Vec<JsValue>| -> EvResult {
-                let i2 = i.clone();
+                let _i2 = i.clone();
                 let i3 = i0.clone();
                 Box::pin(async move {
                     let radix = args.first().cloned().unwrap_or(JsValue::Undefined);
@@ -1892,7 +1888,7 @@ pub fn number_get(this: &Rc<Interpreter>, num: f64, name: &str) -> JsValue {
         "toLocaleString" => {
             let i0 = this.clone();
             return JsValue::Callback(Rc::new(move |i: &Rc<Interpreter>, args: Vec<JsValue>| -> EvResult {
-                let i2 = i.clone();
+                let _i2 = i.clone();
                 let i3 = i0.clone();
                 Box::pin(async move {
                     let radix = args.first().cloned().unwrap_or(JsValue::Undefined);
@@ -1966,7 +1962,7 @@ pub fn map_get(this: &Rc<Interpreter>, m: &Rc<RefCell<JsMap>>, name: &str) -> Js
             let m3 = m.clone();
             return JsValue::Callback(Rc::new(move |i: &Rc<Interpreter>, args: Vec<JsValue>| -> EvResult {
                 let i2 = i.clone();
-                let i3 = i0.clone();
+                let _i3 = i0.clone();
                 let m2 = m3.clone();
                 Box::pin(async move {
                     let fn_ = args.first().cloned().unwrap_or(JsValue::Undefined);
@@ -2029,7 +2025,7 @@ pub fn set_get(this: &Rc<Interpreter>, s: &Rc<RefCell<JsSet>>, name: &str) -> Js
             return JsValue::Number(s.borrow().store.borrow().len() as f64);
         }
         "forEach" => {
-            let i0 = this.clone();
+            let _i0 = this.clone();
             let s3 = s.clone();
             return JsValue::Callback(Rc::new(move |i: &Rc<Interpreter>, args: Vec<JsValue>| -> EvResult {
                 let i2 = i.clone();
@@ -2077,10 +2073,10 @@ fn month_name(m: u32) -> &'static str {
     const N: [&str; 12] = [
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
     ];
-    N[((m as usize + 11) % 12)]
+    N[(m as usize + 11) % 12]
 }
 
-pub fn date_get(this: &Rc<Interpreter>, d: &Rc<RefCell<JsDate>>, name: &str) -> JsValue {
+pub fn date_get(_this: &Rc<Interpreter>, d: &Rc<RefCell<JsDate>>, name: &str) -> JsValue {
     let d2 = d.clone();
     let make = move |f: fn(&JsDate) -> Option<f64>| -> JsValue {
         let d2 = d2.clone();
@@ -2174,7 +2170,7 @@ pub fn date_get(this: &Rc<Interpreter>, d: &Rc<RefCell<JsDate>>, name: &str) -> 
 
 // -- regex/error -----------------------------------------------------------
 
-pub fn regex_get(this: &Rc<Interpreter>, r: &Rc<RefCell<JsRegex>>, name: &str) -> JsValue {
+pub fn regex_get(_this: &Rc<Interpreter>, r: &Rc<RefCell<JsRegex>>, name: &str) -> JsValue {
     let r2 = r.clone();
     match name {
         "source" => {
@@ -2201,7 +2197,7 @@ pub fn regex_get(this: &Rc<Interpreter>, r: &Rc<RefCell<JsRegex>>, name: &str) -
                 let r2 = r2.clone();
                 Box::pin(async move {
                     let text = i2.repr(&args.first().cloned().unwrap_or(JsValue::Undefined));
-                    let mut r = r2.borrow_mut();
+                    let r = r2.borrow_mut();
                     let start = if r.global_ {
                         r.last_index.get() as usize
                     } else {
@@ -2232,7 +2228,7 @@ pub fn regex_get(this: &Rc<Interpreter>, r: &Rc<RefCell<JsRegex>>, name: &str) -
                 let r2 = r2.clone();
                 Box::pin(async move {
                     let text = i2.repr(&args.first().cloned().unwrap_or(JsValue::Undefined));
-                    let mut r = r2.borrow_mut();
+                    let r = r2.borrow_mut();
                     let start = if r.global_ {
                         r.last_index.get() as usize
                     } else {
@@ -2319,16 +2315,6 @@ pub fn class_get(this: &Rc<Interpreter>, c: &Rc<RefCell<JsClass>>, name: &str) -
     Ok(JsValue::Undefined)
 }
 
-pub fn class_set(c: &Rc<RefCell<JsClass>>, name: &str, value: &JsValue) -> Result<(), JsError> {
-    let is_proto_member = c.borrow().prototype.borrow().contains_key(name);
-    if is_proto_member {
-        c.borrow().prototype.borrow_mut().insert(name.to_string(), value.clone());
-    } else {
-        c.borrow().statics.borrow_mut().insert(name.to_string(), value.clone());
-    }
-    Ok(())
-}
-
 pub fn instance_get(inst: &Rc<RefCell<JsClassInstance>>, name: &str) -> JsValue {
     let inst = inst.borrow();
     if let Some(v) = inst.props.borrow().get(name) {
@@ -2351,7 +2337,7 @@ pub fn instance_get(inst: &Rc<RefCell<JsClassInstance>>, name: &str) -> JsValue 
 // -- function_get ----------------------------------------------------------
 
 pub fn function_get(
-    this: &Rc<Interpreter>,
+    _this: &Rc<Interpreter>,
     f: &Rc<JSFunction>,
     name: &str,
 ) -> Result<JsValue, JsError> {
@@ -2417,7 +2403,7 @@ fn make_bound(f: Rc<JSFunction>, this_arg: JsValue, pre: Vec<JsValue>) -> JsValu
 // -- promise_get -----------------------------------------------------------
 
 pub fn promise_get(
-    this: &Rc<Interpreter>,
+    _this: &Rc<Interpreter>,
     p: &Rc<RefCell<JsPromise>>,
     name: &str,
 ) -> Result<JsValue, JsError> {
@@ -2508,7 +2494,7 @@ fn settle(this: &Rc<Interpreter>, p: &Rc<RefCell<JsPromise>>, ok: bool, value: J
         let this2 = this.clone();
         for cb in observers {
             let v = value.clone();
-            let this3 = this2.clone();
+            let _this3 = this2.clone();
             this2.enqueue(Rc::new(move || cb(v.clone(), !ok)));
         }
         if !ok {
@@ -2533,7 +2519,7 @@ pub fn promise_on_settle(
     if pending {
         p.borrow_mut().observers.borrow_mut().push(cb);
     } else {
-        let this2 = this.clone();
+        let _this2 = this.clone();
         this.enqueue(Rc::new(move || {
             cb(state_value.clone(), rejected);
         }));
@@ -2783,7 +2769,7 @@ fn call_function(
             match exec_block(&this, &fn_.body, scope.clone()).await {
                 Ok(()) => Ok(JsValue::Undefined),
                 Err(JsError::Return(v)) => Ok(v),
-                Err(JsError::Break) | Err(JsError::Continue) => {
+                Err(JsError::Break(_)) | Err(JsError::Continue(_)) => {
                     Err(JsError::js("Break or continue outside of a loop."))
                 }
                 Err(e) => Err(e),
@@ -2825,7 +2811,7 @@ fn finish_async(this: &Rc<Interpreter>, p: &Rc<RefCell<JsPromise>>, r: Result<()
     match r {
         Ok(()) => promise_resolve(this, p, JsValue::Undefined),
         Err(JsError::Return(v)) => promise_resolve(this, p, v),
-        Err(JsError::Break) | Err(JsError::Continue) => {
+        Err(JsError::Break(_)) | Err(JsError::Continue(_)) => {
             promise_reject(this, p, JsValue::str("Break or continue outside of a loop."))
         }
         Err(JsError::Thrown(v)) => promise_reject(this, p, v),
@@ -3055,6 +3041,13 @@ async fn eval_inner(
             compile_regex(source, flags),
         )))),
         Node::Unary(op, operand) => eval_unary(this, op, operand, env.clone()).await,
+        Node::Sequence(items) => {
+            let mut value = JsValue::Undefined;
+            for item in items {
+                value = eval(this, item, env.clone()).await?;
+            }
+            Ok(value)
+        }
         Node::Update { op, operand, prefix } => {
             eval_update(this, op, operand, *prefix, env.clone()).await
         }
@@ -3162,7 +3155,7 @@ async fn await_promise(
             PromiseState::Rejected(v) => Poll::Ready(Err(JsError::Thrown(v.clone()))),
             PromiseState::Pending => {
                 let waker = cx.waker().clone();
-                let p2 = promise.clone();
+                let _p2 = promise.clone();
                 p.observers.borrow_mut().push(Rc::new(move |_v, _r| {
                     waker.wake_by_ref();
                 }));
@@ -3757,24 +3750,28 @@ async fn exec_inner(
                 Ok(())
             }
         }
-        Node::While { cond, body } => {
+        Node::While { cond, body, label } => {
             while truthy(&eval(this, cond, env.clone()).await?) {
                 match exec(this, body, env.clone()).await {
                     Ok(()) => {}
-                    Err(JsError::Break) => break,
-                    Err(JsError::Continue) => continue,
-                    Err(e) => return Err(e),
+                    Err(e) => match loop_signal(e, label) {
+                        LoopSignal::Break => break,
+                        LoopSignal::Continue => continue,
+                        LoopSignal::Propagate(e) => return Err(e),
+                    },
                 }
             }
             Ok(())
         }
-        Node::DoWhile { body, cond } => {
+        Node::DoWhile { body, cond, label } => {
             loop {
                 match exec(this, body, env.clone()).await {
                     Ok(()) => {}
-                    Err(JsError::Break) => break,
-                    Err(JsError::Continue) => {}
-                    Err(e) => return Err(e),
+                    Err(e) => match loop_signal(e, label) {
+                        LoopSignal::Break => break,
+                        LoopSignal::Continue => {}
+                        LoopSignal::Propagate(e) => return Err(e),
+                    },
                 }
                 if !truthy(&eval(this, cond, env.clone()).await?) {
                     break;
@@ -3788,19 +3785,22 @@ async fn exec_inner(
             cond,
             update,
             body,
-        } => exec_for(this, init, cond, update, body, env.clone()).await,
+            label,
+        } => exec_for(this, init, cond, update, body, label, env.clone()).await,
         Node::ForIn {
             var_kind,
             name,
             iterable,
             body,
-        } => exec_for_in(this, var_kind, name, iterable, body, env.clone()).await,
+            label,
+        } => exec_for_in(this, var_kind, name, iterable, body, label, env.clone()).await,
         Node::ForOf {
             var_kind,
             name,
             iterable,
             body,
-        } => exec_for_of(this, var_kind, name, iterable, body, env.clone()).await,
+            label,
+        } => exec_for_of(this, var_kind, name, iterable, body, label, env.clone()).await,
         Node::Return(v) => {
             let value = match v {
                 Some(e) => eval(this, e, env.clone()).await?,
@@ -3808,8 +3808,15 @@ async fn exec_inner(
             };
             Err(JsError::Return(value))
         }
-        Node::Break => Err(JsError::Break),
-        Node::Continue => Err(JsError::Continue),
+        Node::Break(label) => Err(JsError::Break(label.clone())),
+        Node::Continue(label) => Err(JsError::Continue(label.clone())),
+        Node::Labelled { name, body } => match exec(this, body, env.clone()).await {
+            // A loop swallows a `continue` aimed at its own name itself; all
+            // that can still reach here is the `break` out of a labelled
+            // block, which is where it stops.
+            Err(JsError::Break(Some(l))) if l == *name => Ok(()),
+            other => other,
+        },
         Node::Throw(e) => Err(JsError::Thrown(eval(this, e, env.clone()).await?)),
         Node::TryCatch {
             try_block,
@@ -3831,12 +3838,32 @@ async fn exec_inner(
     }
 }
 
+/// What a loop should do with a control-flow signal that reached it.
+enum LoopSignal {
+    Break,
+    Continue,
+    Propagate(JsError),
+}
+
+/// A bare `break`/`continue` belongs to the nearest loop. A named one belongs
+/// to the loop that carries that name, and travels past every loop in between.
+fn loop_signal(e: JsError, label: &Option<String>) -> LoopSignal {
+    match e {
+        JsError::Break(None) => LoopSignal::Break,
+        JsError::Continue(None) => LoopSignal::Continue,
+        JsError::Break(Some(ref l)) if Some(l) == label.as_ref() => LoopSignal::Break,
+        JsError::Continue(Some(ref l)) if Some(l) == label.as_ref() => LoopSignal::Continue,
+        other => LoopSignal::Propagate(other),
+    }
+}
+
 async fn exec_for(
     this: &Rc<Interpreter>,
     init: &Option<Rc<Node>>,
     cond: &Option<Rc<Node>>,
     update: &Option<Rc<Node>>,
     body: &Rc<Node>,
+    label: &Option<String>,
     env: Env,
 ) -> Result<(), JsError> {
     let child = Environment::new(Some(env.clone()));
@@ -3851,9 +3878,12 @@ async fn exec_for(
         }
         match exec(this, body, child.clone()).await {
             Ok(()) => {}
-            Err(JsError::Break) => break,
-            Err(JsError::Continue) => {}
-            Err(e) => return Err(e),
+            Err(e) => match loop_signal(e, label) {
+                LoopSignal::Break => break,
+                // `continue` still owes the header its update expression.
+                LoopSignal::Continue => {}
+                LoopSignal::Propagate(e) => return Err(e),
+            },
         }
         if let Some(u) = update {
             eval(this, u, child.clone()).await?;
@@ -3890,8 +3920,7 @@ async fn exec_switch(
             for stmt in stmts {
                 match exec(this, stmt, env.clone()).await {
                     Ok(()) => {}
-                    Err(JsError::Break) => return Ok(()),
-                    Err(JsError::Continue) => return Err(JsError::Continue),
+                    Err(JsError::Break(None)) => return Ok(()),
                     Err(e) => return Err(e),
                 }
             }
@@ -3944,7 +3973,7 @@ fn bind_pattern(
                         m.insert(key.clone(), js_get(&this, &value, key)?);
                     }
                 }
-                if let Some(rest) = &pattern.rest {
+                if let Some(_rest) = &pattern.rest {
                     for key in own_keys(&this, &value) {
                         m.entry(key.clone())
                             .or_insert_with(|| js_get(&this, &value, &key).unwrap_or(JsValue::Undefined));
@@ -4011,6 +4040,7 @@ async fn exec_for_in(
     name: &str,
     iterable: &Rc<Node>,
     body: &Rc<Node>,
+    label: &Option<String>,
     env: Env,
 ) -> Result<(), JsError> {
     let obj = eval(this, iterable, env.clone()).await?;
@@ -4050,9 +4080,11 @@ async fn exec_for_in(
         bind_loop_var(&child, var_kind, name, key);
         match exec(this, body, child.clone()).await {
             Ok(()) => {}
-            Err(JsError::Break) => break,
-            Err(JsError::Continue) => continue,
-            Err(e) => return Err(e),
+            Err(e) => match loop_signal(e, label) {
+                LoopSignal::Break => break,
+                LoopSignal::Continue => continue,
+                LoopSignal::Propagate(e) => return Err(e),
+            },
         }
     }
     Ok(())
@@ -4064,6 +4096,7 @@ async fn exec_for_of(
     name: &str,
     iterable: &Rc<Node>,
     body: &Rc<Node>,
+    label: &Option<String>,
     env: Env,
 ) -> Result<(), JsError> {
     let obj = eval(this, iterable, env.clone()).await?;
@@ -4077,9 +4110,11 @@ async fn exec_for_of(
         bind_loop_var(&child, var_kind, name, item);
         match exec(this, body, child.clone()).await {
             Ok(()) => {}
-            Err(JsError::Break) => break,
-            Err(JsError::Continue) => continue,
-            Err(e) => return Err(e),
+            Err(e) => match loop_signal(e, label) {
+                LoopSignal::Break => break,
+                LoopSignal::Continue => continue,
+                LoopSignal::Propagate(e) => return Err(e),
+            },
         }
     }
     Ok(())

@@ -1,8 +1,10 @@
 """Fast, offline unit tests for URL parsing, HTML, CSS, and internal pages."""
 import http.server
 import urllib.parse
-import sys, os, tkinter
+import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from feetbrowser import gui
 
 from feetbrowser.net import URL
 from feetbrowser.htmlparser import HTMLParser, Element, Text
@@ -410,6 +412,31 @@ def test_table_cell_content_flows_at_column_width():
     assert tops["Delta"] == tops["Echo"], "second cell words share a line"
 
 
+def test_empty_inline_block_still_paints_its_box():
+    """A colour swatch is an empty span with a size and a background. It has
+    no text to lay out, which used to mean it was skipped entirely and the
+    about:shoes picker showed no colours at all."""
+    from feetbrowser.layout import DocumentLayout, DrawRect
+    html = ('<p>before <span style="background:#ff0000;display:inline-block;'
+            'width:26px;height:12px;"></span> after</p>')
+    dom = HTMLParser(html).parse()
+    style(dom, [])
+    doc = DocumentLayout(dom, 620)
+    doc.layout()
+    cmds = []
+    stack = [doc]
+    while stack:
+        b = stack.pop()
+        cmds.extend(b.paint())
+        stack.extend(b.children)
+    swatches = [c for c in cmds
+                if isinstance(c, DrawRect) and c.color == "#ff0000"]
+    eq(len(swatches), 1, "the swatch painted exactly once")
+    box = swatches[0]
+    eq(box.right - box.left, 26, "swatch keeps its declared width")
+    eq(box.bottom - box.top, 12, "swatch keeps its declared height")
+
+
 def test_pre_whitespace_does_not_wrap():
     from feetbrowser.layout import DocumentLayout, DrawText
     css = "pre { white-space: pre; }"
@@ -498,10 +525,14 @@ def test_double_br_advances_line():
 def test_image_does_not_overlap_following_text():
     tab = Tab(700)
     # A wide image pushes the following word onto the next line, which must
-    # start below the image's line box rather than overlapping it.
+    # start below the image's line box rather than overlapping it. The alt
+    # text sizes the placeholder, so its length is computed from the font's
+    # actual advance to guarantee an overflow whatever face is in use.
+    label_font = get_font(12, "normal", "roman")
+    fill = "x" * (int(1600 / _measure(label_font, "x")) + 1)
     tab._build(
         URL("https://example.com"),
-        '<p>one<img src=x alt="' + "x" * 140 + '">two</p>',
+        '<p>one<img src=x alt="' + fill + '">two</p>',
         "text/html")
     tops = {c.text: (c.top, c.bottom) for c in tab.display_list
             if isinstance(c, DrawText)}
@@ -570,13 +601,12 @@ def test_table_in_flex_does_not_overlap():
 def test_image_in_table_cell_sizes_column():
     """A decoded image must size its table column so it doesn't overlap the
     text in the neighbouring cell."""
-    import tkinter
     from feetbrowser.layout import DocumentLayout, DrawImage, DrawText
     html = ("<table><tr><td><img src='https://example.com/img.png'></td>"
             "<td>zzz</td></tr></table>")
     dom = HTMLParser(html).parse()
     style(dom, [])
-    photo = tkinter.PhotoImage(width=200, height=100)
+    photo = gui.PhotoImage(width=200, height=100)
     cache = {"https://example.com/img.png": photo}
     doc = DocumentLayout(dom, 620)
     doc.image_cache = cache
@@ -607,6 +637,43 @@ def test_url_redirect_adopt():
     # A non-redirected URL is untouched.
     v = URL("https://example.com/a")
     eq(str(v), "https://example.com/a")
+
+
+def test_a_bad_image_is_an_image_error():
+    """Image bytes come off the network, so every way a decoder can come
+    apart has to arrive as the one exception callers watch for."""
+    import struct
+    from feetbrowser import imagecodec
+    cases = {
+        "truncated png": b"\x89PNG\r\n\x1a\n" + b"\x00" * 9,
+        "truncated gif": b"GIF89a" + b"\x00" * 8,
+        "truncated pnm": b"P5 4 4 255 \x00",
+        "not an image": b"<html>",
+        # A header is a claim, not a fact: 1.6 billion pixels is 6GB of RGBA.
+        "absurd png": b"\x89PNG\r\n\x1a\n" + struct.pack(">I", 13) + b"IHDR"
+                      + struct.pack(">IIBBBBB", 40000, 40000, 8, 2, 0, 0, 0)
+                      + b"\x00\x00\x00\x00",
+    }
+    for name, data in cases.items():
+        try:
+            imagecodec.decode(data)
+        except imagecodec.ImageError:
+            continue
+        except Exception as exc:  # noqa: BLE001 - that is the point
+            raise AssertionError("%s raised %r, not ImageError" % (name, exc))
+        # A truncated file that still decodes to something is fine.
+
+
+def test_wide_netpbm_samples_scale_to_maxval():
+    """A 16-bit sample is two bytes and still scales against maxval; reading
+    only the high byte is right for maxval 65535 and nothing else."""
+    import struct
+    from feetbrowser import imagecodec
+    w, h, rgba = imagecodec.decode(b"P5 1 1 1023 " + struct.pack(">H", 512))
+    eq((w, h), (1, 1))
+    eq(rgba[0], 127, "roughly half brightness")
+    _w, _h, full = imagecodec.decode(b"P5 1 1 1023 " + struct.pack(">H", 1023))
+    eq(full[0], 255, "maxval is white")
 
 
 def test_webp_image_decode():
@@ -659,6 +726,106 @@ def test_float_text_wraps_and_clears():
     assert tops["FLOATBOX"] <= tops["left"] + 1, "float top at or above wrapping line"
     assert lefts["left"] > 145, "wrapping text indented past 150px-wide float"
     assert tops["below"] >= tops["FLOATBOX"] + 20, "clear pushed paragraph below float"
+
+
+def _boxes(html, css, width=620, tag="div"):
+    """(x, y, width, height) for every box of `tag`, in document order."""
+    from feetbrowser.layout import DocumentLayout
+    dom = HTMLParser(html).parse()
+    style(dom, CSSParser(css).parse())
+    doc = DocumentLayout(dom, width)
+    doc.layout()
+    found, stack = [], [doc]
+    while stack:
+        box = stack.pop()
+        node = getattr(box, "node", None)
+        if getattr(node, "tag", None) == tag:
+            found.append((box.x, box.y, box.width, box.height))
+        stack.extend(box.children)
+    return sorted(found, key=lambda b: (b[1], b[0]))
+
+
+def test_padding_is_counted_once():
+    """A block's children start below its padding-top, so the height measured
+    from its own top already includes it. Adding it again gave every padded
+    card an extra band of empty space and pushed the next one down."""
+    boxes = _boxes("<section><div>x</div></section>",
+                   "section { padding: 20px } div { height: 50px }",
+                   tag="section")
+    eq(boxes[0][3], 90.0, boxes)
+
+
+def test_css_does_arithmetic():
+    from feetbrowser.layout import _resolve_len
+    cases = [
+        ("calc(100% - 240px)", 1000, 760.0),
+        ("calc(10px + 18px + 0.25rem)", 0, 32.0),
+        ("calc(100%/3)", 900, 300.0),
+        ("calc(-1 * 32px)", 0, -32.0),
+        ("min(100%, 60rem)", 1600, 960.0),
+        ("max(50%, 200px)", 300, 200.0),
+        ("clamp(200px, 50%, 400px)", 1000, 400.0),
+    ]
+    for value, base, want in cases:
+        eq(_resolve_len(value, base, -1), want, value)
+
+
+def test_a_calculated_width_is_used():
+    """The value has to survive the parser, not just the resolver -- and a
+    page explains its arithmetic in the middle of it."""
+    boxes = _boxes("<div><p>x</p></div>",
+                   "p { width: calc(100% - /* the gutter */ 120px) }",
+                   width=620, tag="p")
+    # 620 less the body's own 8px margins is the containing block.
+    eq(boxes[0][2], 484.0, boxes)
+
+
+def test_a_float_starts_below_the_content_it_follows():
+    """A "Page 2" link floated at the foot of a listing belongs at the foot.
+    Laying every float out before the flow put it over the first story."""
+    boxes = _boxes(
+        '<article><div class=tall>one</div><div class=tall>two</div>'
+        '<div class=more>Page 2</div></article>',
+        ".tall { height: 60px } .more { float: left; width: 80px }")
+    more = [b for b in boxes if b[2] == 80][0]
+    assert more[1] >= 120, ("float sits after the two blocks", more, boxes)
+
+
+def test_floats_run_along_a_line_before_dropping():
+    """Floats are only interesting because they sit beside each other. Ours
+    stacked vertically, which turned every 2012 nav bar into a column."""
+    boxes = _boxes("<section><div>A</div><div>B</div><div>C</div></section>",
+                   "div { float: left; width: 100px; }")
+    eq([round(b[0]) for b in boxes], [8, 108, 208], "side by side")
+    eq(len({round(b[1]) for b in boxes}), 1, "all on one line")
+
+
+def test_floats_wrap_when_the_line_runs_out():
+    boxes = _boxes(
+        "<section><div>A</div><div>B</div><div>C</div></section>",
+        "div { float: left; width: 250px; }", width=616)
+    tops = [round(b[1]) for b in boxes]
+    eq([round(b[0]) for b in boxes], [8, 258, 8], "two fit, the third drops")
+    assert tops[0] == tops[1] < tops[2], tops
+
+
+def test_a_right_float_hugs_the_right_edge():
+    boxes = _boxes(
+        "<section><div id=l>A</div><div id=r>B</div></section>",
+        "#l { float: left; width: 100px } #r { float: right; width: 100px }")
+    eq([round(b[0]) for b in boxes], [8, 512], "one each side")
+    eq(len({round(b[1]) for b in boxes}), 1, "and both on the top line")
+
+
+def test_percentage_widths_on_floats_come_from_the_container():
+    """`width: 16.6667%` six times over is how a six-across nav bar was
+    built before flexbox, and it has to stay on one line."""
+    items = "".join("<li>%d</li>" % i for i in range(6))
+    boxes = _boxes("<ul>" + items + "</ul>",
+                   "li { float: left; width: 16.6667%; list-style: none }"
+                   "ul { margin: 0; padding: 0 }", width=1016, tag="li")
+    eq(len({round(b[1]) for b in boxes}), 1, "all six on one line")
+    eq([round(b[2]) for b in boxes], [167] * 6, "each a sixth of 1000px")
 
 
 def test_clear_left_only_clears_left_floats():
@@ -791,8 +958,12 @@ def test_flex_column_stacks_vertically():
     items = [b for b in tree_to_list(doc, []) if b.node.tag == "div"
              and b.node.attributes.get("class") != "f"]
     ys = sorted(b.y for b in items)
-    assert ys[1] - ys[0] >= 27, "second item starts below first (gap)"
-    assert ys[2] - ys[1] >= 27, "third item starts below second (gap)"
+    # One line of text plus the 5px gap. Derived from the font rather than
+    # hard-coded, because line height depends on whichever face the GUI
+    # backend resolved for the default family.
+    step = get_font(16, "normal", "roman").metrics("linespace") + 5
+    assert ys[1] - ys[0] >= step, "second item starts below first (gap)"
+    assert ys[2] - ys[1] >= step, "third item starts below second (gap)"
     # All column items span the full container width (stretch).
     for b in items:
         assert b.width == 604, f"column item width {b.width}"
@@ -1261,10 +1432,10 @@ def test_form_submit_collects_every_kind_of_field():
 def _key_stub(tab, clipboard=""):
     """A Browser stripped down to what _on_key touches, wired to `tab` and to
     a clipboard that either holds `clipboard` or, when that is None, refuses
-    to be read the way Tk does when nothing text-shaped is on it."""
+    to be read the way the real one does when nothing text-shaped is on it."""
     def read():
         if clipboard is None:
-            raise tkinter.TclError("CLIPBOARD selection doesn't exist")
+            raise gui.TclError("CLIPBOARD selection doesn't exist")
         return clipboard
 
     class Stub(Browser):
@@ -1378,6 +1549,493 @@ def test_resolve_color_handles_css_color_functions():
     eq(resolve_color("red"), "red", "named color passes through")
 
 
+def _paint_all(html, css="", width=620, ua=False):
+    """Lay a fragment out and collect every paint command in the tree."""
+    from feetbrowser.layout import DocumentLayout
+    rules = []
+    if ua:
+        from feetbrowser.browser import DEFAULT_STYLE_SHEET
+        rules += DEFAULT_STYLE_SHEET
+    if css:
+        rules += CSSParser(css).parse()
+    dom = HTMLParser(html).parse()
+    style(dom, rules)
+    doc = DocumentLayout(dom, width)
+    doc.layout()
+    cmds = []
+    stack = [doc]
+    while stack:
+        box = stack.pop()
+        cmds.extend(box.paint())
+        stack.extend(box.children)
+    return cmds
+
+
+def test_border_shorthand_paints_all_four_edges():
+    """`border: 2px solid` used to paint nothing at all -- borders were a
+    hardcoded grey outline on table cells and nowhere else."""
+    from feetbrowser.layout import DrawRect
+    cmds = _paint_all(
+        '<div style="border:2px solid #3b6ea5;width:100px;height:40px"></div>')
+    edges = [c for c in cmds
+             if isinstance(c, DrawRect) and c.color == "#3b6ea5"]
+    eq(len(edges), 4, "one filled rect per side")
+    for edge in edges:
+        assert min(edge.right - edge.left, edge.bottom - edge.top) == 2, \
+            f"edge is 2px thick: {edge.right - edge.left}x{edge.bottom - edge.top}"
+
+
+def test_border_is_painted_inside_the_box():
+    """Borders sit inside the box edge so adding one never shifts layout."""
+    from feetbrowser.layout import DrawRect
+    cmds = _paint_all(
+        '<div style="background:#eeeeee;border:4px solid #000000;'
+        'width:120px;height:50px"></div>')
+    bg = [c for c in cmds if isinstance(c, DrawRect) and c.color == "#eeeeee"][0]
+    for edge in [c for c in cmds
+                 if isinstance(c, DrawRect) and c.color == "#000000"]:
+        assert bg.left <= edge.left and edge.right <= bg.right, "inside x"
+        assert bg.top <= edge.top and edge.bottom <= bg.bottom, "inside y"
+
+
+def test_border_width_without_a_style_paints_nothing():
+    """`border-style` initially is `none`, so a width on its own is invisible.
+    Getting this wrong puts a black box around half the web."""
+    from feetbrowser.layout import DrawRect
+    cmds = _paint_all(
+        '<div style="border-width:6px;border-color:red;'
+        'width:80px;height:30px"></div>')
+    eq([c for c in cmds if isinstance(c, DrawRect) and c.color == "red"], [],
+       "no style means no border")
+
+
+def test_border_side_beats_the_shorthand():
+    """Declaration order does not decide this -- specificity within the
+    border family does: `border-left` always wins over `border`."""
+    from feetbrowser.layout import DrawRect
+    cmds = _paint_all(
+        '<div style="border-left:5px solid #ff0000;border:1px solid #000000;'
+        'width:90px;height:40px"></div>')
+    reds = [c for c in cmds if isinstance(c, DrawRect) and c.color == "#ff0000"]
+    eq(len(reds), 1, "just the left edge is red")
+    eq(reds[0].right - reds[0].left, 5, "and it keeps its own width")
+    eq(len([c for c in cmds
+            if isinstance(c, DrawRect) and c.color == "#000000"]), 3,
+       "the other three sides come from the shorthand")
+
+
+def test_border_clock_order_and_omitted_colour():
+    """`border-width: 1px 2px 3px 4px` runs top/right/bottom/left, and a
+    shorthand with no colour picks up `color`."""
+    from feetbrowser.layout import _border_box
+    sides = _border_box({"border-style": "solid",
+                         "border-width": "1px 2px 3px 4px",
+                         "color": "#123456"})
+    eq(sides["top"][0], 1.0)
+    eq(sides["right"][0], 2.0)
+    eq(sides["bottom"][0], 3.0)
+    eq(sides["left"][0], 4.0)
+    eq(sides["top"][1], "#123456", "currentColor fills in for the colour")
+    eq(_border_box({"border": "solid red"})["top"][0], 3.0,
+       "an omitted width is medium")
+
+
+def test_block_padding_insets_its_children():
+    """A padded card used to lay its text out flush against its own border,
+    because padding only ever applied to inline content."""
+    from feetbrowser.layout import DrawText
+    cmds = _paint_all('<div style="padding:20px"><p>Inside</p></div>')
+    word = [c for c in cmds if isinstance(c, DrawText) and c.text == "Inside"][0]
+    assert word.left >= 20, f"text starts past the left padding: {word.left}"
+    assert word.top >= 20, f"text starts below the top padding: {word.top}"
+
+
+def test_block_padding_narrows_the_content_box():
+    """Padding takes width away from children instead of letting them spill
+    over the right edge of the box."""
+    from feetbrowser.layout import DrawRect
+    cmds = _paint_all(
+        '<div style="padding:25px;width:300px">'
+        '<div style="background:#00ff00;height:10px"></div></div>')
+    fill = [c for c in cmds if isinstance(c, DrawRect) and c.color == "#00ff00"][0]
+    eq(fill.right - fill.left, 250, "300 wide minus 25 of padding each side")
+
+
+def test_block_inside_inline_lays_out_as_a_block():
+    """A card wrapped in a link -- <a><div>..</div><div>..</div></a> -- put
+    every div on one line, because the <a> looked inline to layout_mode."""
+    from feetbrowser.layout import DrawText
+    cmds = _paint_all(
+        '<div><a href="#"><div>First</div><div>Second</div></a></div>')
+    tops = {c.text: c.top for c in cmds if isinstance(c, DrawText)}
+    assert tops["Second"] > tops["First"], \
+        f"the two blocks stack: {tops}"
+
+
+def test_inline_wrapper_without_blocks_stays_inline():
+    """The flip side: a plain link keeps flowing with the text around it."""
+    from feetbrowser.layout import DrawText
+    cmds = _paint_all('<div>before <a href="#">link</a> after</div>')
+    tops = {c.text: c.top for c in cmds if isinstance(c, DrawText)}
+    eq(tops["before"], tops["link"], "same line")
+    eq(tops["link"], tops["after"], "same line")
+
+
+def test_ordered_list_numbers_honour_start_and_value():
+    from feetbrowser.layout import DrawText
+    cmds = _paint_all(
+        '<ol start="3"><li>a</li><li value="9">b</li><li>c</li></ol>',
+        ua=True)
+    markers = sorted(
+        (c.top, c.text) for c in cmds
+        if isinstance(c, DrawText) and c.text.endswith("."))
+    eq([text for _top, text in markers], ["3.", "9.", "10."],
+       "start seeds the count and value resets it")
+
+
+def test_list_style_type_covers_the_counting_styles():
+    from feetbrowser.layout import _marker_text
+    eq(_marker_text("decimal", 4), "4.")
+    eq(_marker_text("decimal-leading-zero", 4), "04.")
+    eq(_marker_text("lower-alpha", 27), "aa.")
+    eq(_marker_text("upper-alpha", 2), "B.")
+    eq(_marker_text("lower-roman", 14), "xiv.")
+    eq(_marker_text("upper-roman", 1990), "MCMXC.")
+    eq(_marker_text("disc", 1), None, "shapes are drawn, not written")
+
+
+def test_nested_bullets_change_shape():
+    """disc, then circle, then square -- what every default sheet does."""
+    from feetbrowser.layout import DrawOval, DrawRect
+    cmds = _paint_all(
+        '<ul><li>one<ul><li>two<ul><li>three</li></ul></li></ul></li></ul>',
+        ua=True)
+    ovals = [c for c in cmds if isinstance(c, DrawOval)]
+    eq(len([o for o in ovals if o.fill]), 1, "one filled disc")
+    eq(len([o for o in ovals if o.outline and not o.fill]), 1, "one ring")
+    marks = [c for c in cmds if isinstance(c, DrawRect)
+             and c.right - c.left == 6 and c.bottom - c.top == 6]
+    eq(len(marks), 1, "one square")
+
+
+def test_list_style_none_shorthand_reaches_the_items():
+    """`list-style` does not inherit, but the type it sets does -- so the
+    shorthand has to be expanded at cascade time or `list-style: none` on a
+    <ul> leaves every bullet in place."""
+    from feetbrowser.layout import DrawOval
+    cmds = _paint_all(
+        '<ul style="list-style:none"><li>one</li><li>two</li></ul>', ua=True)
+    eq([c for c in cmds if isinstance(c, DrawOval)], [], "no bullets left")
+
+
+def test_list_style_shorthand_keeps_its_position_component():
+    from feetbrowser.cssparser import _expand
+    eq(dict(_expand("list-style", "square outside")),
+       {"list-style": "square outside", "list-style-type": "square",
+        "list-style-position": "outside"})
+    eq(dict(_expand("color", "red")), {"color": "red"},
+       "other properties pass through untouched")
+
+
+def test_list_item_with_block_content_still_gets_a_marker():
+    """Markers were drawn on the inline path only, so an <li> holding a <div>
+    silently lost its bullet once block-in-inline started working."""
+    from feetbrowser.layout import DrawOval
+    cmds = _paint_all('<ul><li><div>boxed</div></li></ul>', ua=True)
+    eq(len([c for c in cmds if isinstance(c, DrawOval)]), 1, "bullet survives")
+
+
+def test_text_decoration_none_wins_over_the_ua_underline():
+    """text-decoration does not inherit; the nearest box that declares one
+    decides. That is the whole reason `a { text-decoration: none }` works."""
+    from feetbrowser.layout import DrawLine
+    underlined = _paint_all('<p><a href="#">plain</a></p>', ua=True)
+    assert [c for c in underlined if isinstance(c, DrawLine)], \
+        "links underline by default"
+    bare = _paint_all('<p><a href="#">plain</a></p>',
+                      css="a { text-decoration: none; }", ua=True)
+    eq([c for c in bare if isinstance(c, DrawLine)], [], "and the page can say no")
+
+
+def test_light_dark_resolves_to_the_light_side():
+    """Sites that theme themselves entirely through light-dark() used to come
+    out as a black slab, because the unparsed function fell through to the
+    canvas and the canvas falls back to black."""
+    from feetbrowser.layout import resolve_color
+    eq(resolve_color("light-dark(#ffffff, #18191b)"), "#ffffff")
+    eq(resolve_color("light-dark(rgb(255, 0, 0), #000)"), "#ff0000",
+       "nested commas do not split the arguments")
+    eq(resolve_color("light-dark(transparent, black)"), None)
+
+
+def test_unreadable_colours_paint_nothing_rather_than_black():
+    from feetbrowser.layout import resolve_color
+    eq(resolve_color("color-mix(in srgb, red, blue)"), None, "unknown function")
+    eq(resolve_color("initial #2d3034"), None, "two tokens is not a colour")
+    eq(resolve_color("#12345"), None, "malformed hex")
+    eq(resolve_color("rebeccapurple"), "rebeccapurple", "real names survive")
+    eq(resolve_color("gray50"), "gray50", "and so do the ones with digits")
+
+
+def test_media_query_answers_the_preference_features():
+    from feetbrowser.cssparser import media_matches
+    assert media_matches("(prefers-color-scheme: light)", 800, 600)
+    assert not media_matches("(prefers-color-scheme: dark)", 800, 600), \
+        "this browser has a light chrome and should say so"
+    assert media_matches("(min-width: 400px) and (prefers-color-scheme: light)",
+                         800, 600)
+    assert not media_matches("(prefers-reduced-motion: reduce)", 800, 600)
+    assert media_matches("(orientation: landscape)", 800, 600)
+    assert not media_matches("(orientation: portrait)", 800, 600)
+    assert media_matches("(min-resolution: 2dppx)", 800, 600), \
+        "features we cannot answer still match, so no rule is lost"
+
+
+def test_at_layer_rules_are_not_thrown_away():
+    """A modern stylesheet puts everything inside @layer. Skipping the block
+    left such a page with nothing but the UA sheet."""
+    rules = CSSParser(
+        "@layer base, components;"
+        "@layer base { p { color: red; } }"
+        "@layer components { .card { color: blue; } }"
+        "@supports (display: grid) { div { color: green; } }"
+        "@keyframes spin { from { color: pink; } }").parse()
+    colors = sorted(body.get("color") for _sel, body in rules)
+    eq(colors, ["blue", "green", "red"],
+       "layers and @supports come through, keyframes do not")
+
+
+def test_viewport_and_font_relative_units():
+    from feetbrowser.layout import parse_px
+    from feetbrowser.cssparser import set_viewport, get_viewport
+    before = get_viewport()
+    try:
+        set_viewport(1000, 800)
+        eq(parse_px("60vw"), 600.0)
+        eq(parse_px("15vh"), 120.0)
+        eq(parse_px("10vmin"), 80.0)
+        eq(parse_px("10vmax"), 100.0)
+    finally:
+        set_viewport(*before)
+    eq(parse_px("2em"), 32.0, "em falls back to the root size")
+    eq(parse_px("12pt"), 16.0, "points are 4/3 of a pixel")
+    eq(parse_px("nonsense", 7.0), 7.0, "and junk still takes the default")
+
+
+def test_overflow_hidden_clips_what_leaves_the_box():
+    from feetbrowser.layout import DocumentLayout, DrawRect, paint_tree
+    html = ('<div style="overflow:hidden;height:20px;width:200px">'
+            '<div style="background:#ff0000;height:400px"></div></div>')
+    dom = HTMLParser(html).parse()
+    style(dom, [])
+    doc = DocumentLayout(dom, 620)
+    doc.layout()
+    cmds = []
+    paint_tree(doc, cmds)
+    fill = [c for c in cmds if isinstance(c, DrawRect) and c.color == "#ff0000"]
+    eq(len(fill), 1, "the overflowing block still paints")
+    eq(fill[0].bottom - fill[0].top, 20, "but only as far as the box goes")
+
+
+def test_screen_reader_only_text_does_not_show():
+    """The visually-hidden recipe -- a 1px box with the content clipped away
+    -- is on nearly every accessible site, and its skip links were piling up
+    at the top of every page."""
+    from feetbrowser.layout import DocumentLayout, DrawText, paint_tree
+    html = ('<p>visible</p>'
+            '<span style="clip-path:inset(50%);width:1px;height:1px;'
+            'overflow:hidden;display:inline-block">skip to content</span>')
+    dom = HTMLParser(html).parse()
+    style(dom, [])
+    doc = DocumentLayout(dom, 620)
+    doc.layout()
+    cmds = []
+    paint_tree(doc, cmds)
+    words = {c.text for c in cmds if isinstance(c, DrawText)}
+    assert "visible" in words, words
+    assert "skip" not in words and "content" not in words, words
+
+
+def test_the_older_clip_property_hides_it_too():
+    """`clip: rect(1px,1px,1px,1px)` is the spelling `clip-path` replaced,
+    and half the sites using one still ship the other alongside it."""
+    from feetbrowser.layout import DocumentLayout, DrawText, paint_tree
+    html = ('<p>visible</p>'
+            '<span style="clip:rect(1px,1px,1px,1px);width:1px;height:1px;'
+            'overflow:hidden;display:inline-block">skip to content</span>')
+    dom = HTMLParser(html).parse()
+    style(dom, [])
+    doc = DocumentLayout(dom, 620)
+    doc.layout()
+    cmds = []
+    paint_tree(doc, cmds)
+    words = {c.text for c in cmds if isinstance(c, DrawText)}
+    assert "visible" in words, words
+    assert "skip" not in words, words
+
+
+def _painted(html, css="", ua=False):
+    """Every word the page actually draws."""
+    from feetbrowser.layout import DrawText
+    return {c.text for c in _paint_all(html, css, ua=ua)
+            if isinstance(c, DrawText)}
+
+
+def _reds(html, css):
+    """Which elements a `color: red` rule reached, by id."""
+    dom = HTMLParser(html).parse()
+    style(dom, CSSParser(css).parse())
+    found, stack = [], [dom]
+    while stack:
+        node = stack.pop()
+        if hasattr(node, "tag"):
+            # By id, because colour inherits and the children of a matched
+            # element are red too without the rule ever naming them.
+            if node.style.get("color") == "red" and node.attributes.get("id"):
+                found.append(node.attributes["id"])
+            stack.extend(reversed(node.children))
+    return sorted(found)
+
+
+def test_child_combinator_stops_at_the_first_generation():
+    """`>` is not a fancier space. A menu that styles `.menu > li` means the
+    top level only; reading it as a descendant reaches every submenu too."""
+    html = '<div><p id=own>a</p><section><p id=deep>b</p></section></div>'
+    eq(_reds(html, "div > p { color: red }"), ["own"], "spaced")
+    eq(_reds(html, "div>p { color: red }"), ["own"], "minified, no spaces")
+    eq(_reds(html, "div p { color: red }"), ["deep", "own"], "descendant")
+
+
+def test_sibling_combinators_look_backwards():
+    html = ('<div><h1 id=h>t</h1><p id=a>a</p><span id=s>s</span>'
+            '<p id=b>b</p></div>')
+    eq(_reds(html, "h1 + p { color: red }"), ["a"], "adjacent only")
+    eq(_reds(html, "h1 ~ p { color: red }"), ["a", "b"], "any later sibling")
+    eq(_reds(html, "ul > li + li { color: red }"),
+       [], "no list here to match")
+    eq(_reds('<ul><li id=x>1</li><li id=y>2</li><li id=z>3</li></ul>',
+             "ul>li+li{color:red}"), ["y", "z"], "all but the first")
+
+
+def test_has_still_takes_a_relative_selector():
+    """`:has(> img)` leads with a combinator, which is legal only in there."""
+    eq(_reds('<p id=with><img></p><p id=without>x</p>',
+             "p:has(> img) { color: red }"), ["with"])
+
+
+def test_a_container_query_stays_off():
+    """A container query is written to be off most of the time -- it is the
+    wide-column variant, not the rule. Flattening it made the variant
+    unconditional, and being later in the sheet it won."""
+    html = '<div><p id=p>x</p></div>'
+    css = ("p { color: green }"
+           "@container (min-width: 900px) { p { color: red } }")
+    eq(_reds(html, css), [], "the wide variant did not apply")
+    dom = HTMLParser(html).parse()
+    style(dom, CSSParser(css).parse())
+    eq(dom.children[0].children[0].children[0].style["color"], "green",
+       "and the unconditional rule still holds")
+    # @supports and @layer are still flattened: a page that wraps its whole
+    # stylesheet in a layer has to keep working.
+    eq(_reds(html, "@layer base { p { color: red } }"), ["p"], "@layer")
+    eq(_reds(html, "@supports (display: grid) { p { color: red } }"),
+       ["p"], "@supports")
+
+
+def test_a_rectangle_has_a_border_unless_told_otherwise():
+    """Tk draws create_rectangle with a black 1px outline by default, and
+    plugin code written against Tk relies on it. Declining is explicit."""
+    from feetbrowser import canvas as canvasmod
+    def corner(**opts):
+        c = canvasmod.Canvas(None, width=8, height=8, bg="white")
+        c.create_rectangle(1, 1, 7, 7, fill="white", **opts)
+        surface = c.render()
+        i = 1 * surface.stride + 1 * 3
+        return tuple(surface.pixels[i:i + 3])
+    eq(corner(), (0, 0, 0), "the default border is black")
+    eq(corner(outline=""), (255, 255, 255), 'outline="" declines it')
+    eq(corner(width=0), (255, 255, 255), "width=0 declines it")
+    eq(corner(outline="#ff0000"), (255, 0, 0), "and a colour is honoured")
+
+
+def test_a_closed_details_shows_only_its_summary():
+    """Dropdowns and "read more" panels are <details>; without the rule that
+    hides a closed one, every page spills them into the text."""
+    html = ('<details><summary>Caches</summary><a>Archive.org</a></details>'
+            '<details open><summary>Open</summary><a>Ghostarchive</a></details>')
+    words = _painted(html, ua=True)
+    assert "Archive.org" not in words, words
+    assert {"Caches", "Open", "Ghostarchive"} <= words, words
+
+
+def test_an_inline_block_keeps_its_blocks_to_itself():
+    """A byline is one line with a dropdown in the middle of it. The dropdown
+    is an inline-block full of blocks, and letting those blocks reach out
+    turns the whole byline into a word per line."""
+    from feetbrowser.layout import DrawText
+    html = ('<div>via <a href="#">seb</a> | '
+            '<span class=drop><div>one</div><div>two</div></span>'
+            ' | <a href="#">19 comments</a></div>')
+    cmds = [c for c in _paint_all(html, ".drop { display: inline-block }",
+                                 ua=True) if isinstance(c, DrawText)]
+    tops = {c.text: c.top for c in cmds}
+    eq(tops["via"], tops["seb"], "the byline is one line")
+    eq(tops["via"], tops["comments"], "still one line past the dropdown")
+    assert tops["one"] < tops["two"], "and the blocks inside it stack"
+    assert tops["one"] < tops["via"], "sitting on the line, not below it"
+
+
+def test_hidden_attribute_hides_the_element():
+    from feetbrowser.layout import DrawText
+    cmds = _paint_all('<p>shown</p><p hidden>gone</p>', ua=True)
+    words = {c.text for c in cmds if isinstance(c, DrawText)}
+    assert "shown" in words and "gone" not in words, words
+
+
+def test_link_underline_runs_under_its_spaces():
+    """One line under the whole link, not one per word with the spaces
+    showing through."""
+    from feetbrowser.layout import DrawLine, DrawText
+    cmds = _paint_all('<p><a href="#">Jump to content</a></p>', ua=True)
+    lines = [c for c in cmds if isinstance(c, DrawLine)]
+    eq(len(lines), 1, "one unbroken rule")
+    words = [c for c in cmds if isinstance(c, DrawText)]
+    eq(lines[0].left, min(w.left for w in words), "starts at the first word")
+    eq(lines[0].right, max(w.right for w in words), "ends at the last")
+
+
+def test_adjacent_links_do_not_share_an_underline():
+    """The gap between two separate links stays clear."""
+    from feetbrowser.layout import DrawLine
+    cmds = _paint_all('<p><a href="/a">one</a> <a href="/b">two</a></p>', ua=True)
+    lines = sorted((c.left, c.right)
+                   for c in cmds if isinstance(c, DrawLine))
+    eq(len(lines), 2, "one rule per link")
+    assert lines[0][1] < lines[1][0], "and a gap between them"
+
+
+def test_underline_restarts_on_the_next_line():
+    from feetbrowser.layout import DrawLine
+    cmds = _paint_all(
+        '<p><a href="#">wrapping link text here</a></p>', width=90, ua=True)
+    tops = {c.top for c in cmds if isinstance(c, DrawLine)}
+    assert len(tops) > 1, f"a wrapped link is ruled once per line: {tops}"
+
+
+def test_table_cell_padding_comes_from_css():
+    """Cells used to be pinned to a hardcoded 4px inset. Now the padding is
+    theirs, so a sheet can widen it and the column widens to match."""
+    from feetbrowser.layout import DrawText
+    tight = _paint_all('<table><tr><td>Cell</td><td>Two</td></tr></table>',
+                       ua=True)
+    roomy = _paint_all('<table><tr><td>Cell</td><td>Two</td></tr></table>',
+                       css="td { padding: 20px; }", ua=True)
+    def second(cmds):
+        return [c for c in cmds if isinstance(c, DrawText) and c.text == "Two"][0]
+    assert second(roomy).left > second(tight).left + 20, \
+        "the wider padding pushes the second column right"
+
+
 def _start_server(handler, **kw):
     """Serve `handler` on an ephemeral port in a background thread."""
     import http.server
@@ -1443,7 +2101,7 @@ def test_async_load_in_gui_mode():
             pass
 
     srv = _start_server(H)
-    root = tkinter.Tk(); root.withdraw()
+    root = gui.Tk(); root.withdraw()
     try:
         class FakeBrowser:
             window = root
@@ -1470,7 +2128,7 @@ def test_async_load_in_gui_mode():
 
 
 def main():
-    root = tkinter.Tk(); root.withdraw()
+    root = gui.Tk(); root.withdraw()
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0
     for t in tests:

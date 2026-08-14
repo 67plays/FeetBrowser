@@ -10,12 +10,37 @@
 
 `run.sh` builds the Rust JS engine (`feetbrowser_engine`) into a local `.venv`
 with maturin if it isn't importable yet, then runs the browser from that venv
-(first run needs the Rust toolchain; maturin is installed into the venv
-automatically). On NixOS it fetches a Python with Tk on the fly via
-`nix-shell`. On other distros install Tk first (`python3-tk` on
-Debian/Ubuntu, `python3-tkinter` on Fedora, `tk` on Arch). Once the extension
-is built and installed for your interpreter, `python3 -m feetbrowser <url>`
-works directly.
+(so a first run needs the Rust toolchain; maturin is installed into the venv
+automatically). Once the extension is built and installed for your
+interpreter, `python3 -m feetbrowser <url>` works directly.
+
+There is nothing else to install. The renderer is ours (see [the rendering
+engine](rendering.md)), so no GUI toolkit is needed — only Python 3 and at
+least one system font. The window is ours as well: AppKit on macOS, Xlib on
+Linux and on Wayland desktops through XWayland, both reached by ctypes with
+no bindings package in between.
+
+`FEETBROWSER_DISPLAY` decides which one, and normally wants leaving alone:
+
+| value | effect |
+| --- | --- |
+| unset | whichever backend this machine has |
+| `x11` | demand the X11 window; fail loudly if there is none |
+| `cocoa` | demand the macOS window; fail loudly if there is none |
+| `none` | stay headless even where a window is possible |
+
+With no display at all — no `$DISPLAY`, no server answering, or a platform
+with no backend — the browser says which of those it was and carries on
+headless, where `--screenshot` still works.
+
+To render a page without opening a window:
+
+```bash
+./run.sh --screenshot https://example.com page.png
+```
+
+This runs the whole browser — chrome, tabs, toolbar, page, scrollbar — waits
+for images to load, and writes a PNG.
 
 ## Keyboard shortcuts
 

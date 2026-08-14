@@ -2,13 +2,15 @@
 integration (script execution, console, click handlers).
 """
 import http.server
-import sys, os, threading, time, tkinter
+import sys, os, threading, time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from feetbrowser import gui
 
 from feetbrowser.net import URL
 from feetbrowser.browser import Tab
 from feetbrowser.layout import DrawText
-from feetbrowser.jsengine import Interpreter, UNDEFINED
+from feetbrowser.jsengine import Interpreter, JSException, UNDEFINED
 
 
 def eq(a, b, msg=""):
@@ -771,6 +773,123 @@ def test_js_dom_query_and_classlist():
     assert div.attributes.get("role") is None, "removeAttribute applied"
 
 
+def test_js_comma_operator_runs_every_operand():
+    """A minifier turns statements into commas wherever it can, so `return
+    f(x), y` and `for (i = 0, n = 5;;)` are all over real scripts."""
+    interp = Interpreter()
+    interp.run("""
+        var a;
+        var paren = (a = 5, a + 1);
+        function f() { return a += 1, "last"; }
+        var ret = f();
+        var seen = 0;
+        for (var i = 0, j = 3; i < j; i++, seen++) ;
+        var stmt1, stmt2;
+        stmt1 = 1, stmt2 = 2;
+    """)
+    g = interp.globals
+    eq(g["paren"], 6, "the value is the last operand")
+    eq(g["a"], 6, "and the earlier ones still happened")
+    eq(g["ret"], "last", "a comma in a return")
+    eq(g["seen"], 3, "a comma in a for header")
+    eq((g["stmt1"], g["stmt2"]), (1, 2), "a comma between statements")
+
+
+def test_js_else_after_a_semicolon():
+    """`if (a) b(); else c();` is how every minified if/else is written --
+    the semicolon ends the consequent, and the else still belongs to the if.
+    """
+    interp = Interpreter()
+    interp.run("""
+        var taken;
+        if (1) taken = "then"; else taken = "otherwise";
+        var missed;
+        if (0) missed = "then"; else missed = "otherwise";
+        var empty = "untouched";
+        if (0) ; else empty = "else ran";
+        var spun = 0;
+        for (var i = 0; i < 3; i++) ;
+    """)
+    g = interp.globals
+    eq(g["taken"], "then")
+    eq(g["missed"], "otherwise")
+    eq(g["empty"], "else ran", "an empty statement is still a statement")
+
+
+def test_js_labelled_break_and_continue():
+    interp = Interpreter()
+    interp.run("""
+        var inner = [];
+        outer: for (var i = 0; i < 3; i++) {
+            for (var j = 0; j < 3; j++) {
+                if (j == 1) continue outer;
+                inner.push(i * 10 + j);
+            }
+        }
+        var stopped = [];
+        out2: for (var a = 0; a < 3; a++) {
+            for (var b = 0; b < 3; b++) {
+                if (a == 1) break out2;
+                stopped.push(a * 10 + b);
+            }
+        }
+        var block = [];
+        done: { block.push(1); break done; block.push(2); }
+        block.push(3);
+        var plain = [];
+        for (var c = 0; c < 3; c++) { if (c == 1) continue; plain.push(c); }
+    """)
+    g = interp.globals
+    eq(g["inner"], [0, 10, 20], "continue skips to the outer loop's next turn")
+    eq(g["stopped"], [0, 1, 2], "break leaves both loops at once")
+    eq(g["block"], [1, 3], "a labelled block is breakable too")
+    eq(g["plain"], [0, 2], "an unlabelled continue is unaffected")
+
+
+def test_js_source_is_read_as_utf8_not_bytes():
+    # The lexer used to read one byte and call it a character, which is a
+    # Latin-1 misreading of UTF-8: a `×` scanned as `Ã` plus a control
+    # character. That mangled every non-ASCII literal, and because `Ã` is
+    # alphabetic the identifier scanner accepted it, stopped one byte in, and
+    # sliced through the middle of the character -- a Rust panic, which
+    # crosses the FFI boundary and kills the whole page load. python.org
+    # ships a `×` in an inline script and rendered nothing at all.
+    interp = Interpreter()
+    interp.run("""
+        var mul = "×";
+        var mullen = mul.length;
+        var jp = "日本語";
+        var jplen = jp.length;
+        var third = jp[2];
+        var café = 5;
+        var ident = café + 1;
+        var escaped = "\\u00d7";
+        var same = (escaped === mul);
+        var hit = /é+/.test("xée");
+        var up = "héllo".toUpperCase();
+        /* × in a comment */
+        var after = 1 + 1;
+    """)
+    g = interp.globals
+    eq(g["mul"], "×", "a multi-byte literal survives intact")
+    eq(g["mullen"], 1, "and counts as one character, not two bytes")
+    eq(g["jp"], "日本語", "three-byte characters too")
+    eq(g["jplen"], 3, "counted by character")
+    eq(g["third"], "語", "and indexable by character")
+    eq(g["ident"], 6, "a non-ASCII identifier is one name")
+    assert g["same"] is True, "\\u00d7 and a literal x are the same string"
+    assert g["hit"] is True, "a regex literal keeps its non-ASCII class"
+    eq(g["up"], "HÉLLO", "case mapping is per character")
+    eq(g["after"], 2, "and the scan carries on past a non-ASCII comment")
+
+    # A stray non-ASCII character is a syntax error, and reports itself as the
+    # character it is rather than the first byte of one.
+    try:
+        Interpreter().run("1 +× 2")
+    except JSException as e:
+        assert "'×'" in str(e), f"names the character it choked on: {e}"
+    else:
+        raise AssertionError("a stray character should not tokenize")
 def test_js_dom_nodelist_and_traversal():
     """NodeList length/item/index/forEach, element traversal and geometry."""
     tab = _make_tab(
@@ -896,7 +1015,7 @@ def _make_tab(body, url="https://example.com/page"):
 
 
 def main():
-    root = tkinter.Tk(); root.withdraw()
+    root = gui.Tk(); root.withdraw()
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0
     for t in tests:

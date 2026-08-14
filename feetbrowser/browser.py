@@ -2,19 +2,21 @@
 
 Pipeline per navigation:
     URL.request -> HTMLParser -> collect stylesheets -> CSSParser + cascade
-    -> DocumentLayout -> display list -> paint on a Tk canvas.
+    -> DocumentLayout -> display list -> paint on a canvas.
 
-Chrome (tabs, address bar, back/forward, scrollbar) is drawn by hand on a
-second canvas so the whole browser really is "from scratch".
+Chrome (tabs, address bar, back/forward, scrollbar) is drawn by hand onto the
+same canvas, and the canvas itself comes from gui.py -- by default our own
+rasteriser -- so the whole browser really is "from scratch", pixels included.
 """
 
 import os
 import re
 import sys
+import time
 import json
 import html
 import threading
-import tkinter
+from . import gui
 import urllib.parse
 from collections import deque
 
@@ -217,7 +219,7 @@ class Tab:
         self.base_url = None
         self.focused_input = None
         self.form_values = {}
-        # Absolute URL -> decoded tkinter.PhotoImage, shared with the layout
+        # Absolute URL -> decoded gui.PhotoImage, shared with the layout
         # so <img> elements render their actual pixels.
         self.image_cache = {}
         self._image_queue = []
@@ -1020,7 +1022,7 @@ class Tab:
         # Formats Tk decodes natively.
         if ctype in ("image/png", "image/gif", "image/x-xbitmap"):
             try:
-                return tkinter.PhotoImage(data=data)
+                return gui.PhotoImage(data=data)
             except Exception:  # noqa: BLE001 - bad bytes; try Pillow below
                 pass
         # Formats Pillow can convert to PNG (otherwise fall through to Tk
@@ -1036,7 +1038,7 @@ class Tab:
                 return photo
         # Unknown type: let Tk sniff the data (it may still decode).
         try:
-            return tkinter.PhotoImage(data=data)
+            return gui.PhotoImage(data=data)
         except Exception:  # noqa: BLE001 - undecodable data -> placeholder
             return None
 
@@ -1056,7 +1058,7 @@ class Tab:
             pil = pil.convert("RGBA")
             buf = io.BytesIO()
             pil.save(buf, format="PNG")
-            return tkinter.PhotoImage(data=buf.getvalue())
+            return gui.PhotoImage(data=buf.getvalue())
         except Exception:  # noqa: BLE001 - Pillow missing / bad data
             return None
 
@@ -1066,7 +1068,7 @@ class Tab:
         try:
             import cairosvg
             png = cairosvg.svg2png(bytestring=data)
-            return tkinter.PhotoImage(data=png)
+            return gui.PhotoImage(data=png)
         except Exception:  # noqa: BLE001 - cairosvg missing / bad data
             return None
 
@@ -1487,7 +1489,7 @@ class Tab:
                     x1, y1 - self.scroll + offset, text=cmd.text[s:e],
                     font=cmd.font, fill="white", anchor="nw",
                     tags=("selection",))
-            except tkinter.TclError:
+            except gui.TclError:
                 pass
 
 
@@ -1632,7 +1634,7 @@ class ContextMenu:
 
 
 class Browser:
-    def __init__(self):
+    def __init__(self, window=None):
         self.tabs = []
         self.active_tab = None
         self.focus = None  # "address" or None
@@ -1663,11 +1665,13 @@ class Browser:
             for btn in (ctx.call("buttons") or []):
                 self.toe_handlers[btn.id] = ctx
 
-        self.window = tkinter.Tk()
+        # A headless root by default, so tests and --screenshot never open
+        # anything; main() passes a real one from gui.new_window().
+        self.window = window if window is not None else gui.Tk()
         self.window.title("FeetBrowser")
         self.window.geometry(f"{WIDTH}x{HEIGHT}")
         self.window.minsize(480, 320)
-        self.canvas = tkinter.Canvas(
+        self.canvas = gui.Canvas(
             self.window, width=WIDTH, height=HEIGHT,
             bg="white", highlightthickness=0)
         self.canvas.pack(fill="both", expand=True)
@@ -2123,7 +2127,7 @@ class Browser:
         try:
             self.window.clipboard_clear()
             self.window.clipboard_append(text)
-        except tkinter.TclError:
+        except gui.TclError:
             pass
 
     def _view_source(self):
@@ -2393,7 +2397,7 @@ class Browser:
         try:
             self.window.clipboard_clear()
             self.window.clipboard_append(self.address_text[s:e])
-        except tkinter.TclError:
+        except gui.TclError:
             pass
 
     def _address_cut(self):
@@ -2403,12 +2407,12 @@ class Browser:
         self._address_delete_selection()
 
     def _clipboard_text(self):
-        """The clipboard's text, or "" when there is none to be had. Tk raises
-        for an empty clipboard and for one whose owner offers no text flavour,
-        and neither deserves a traceback in the user's face."""
+        """The clipboard's text, or "" when there is none to be had. Reading
+        raises for an empty clipboard and for one whose owner offers no text
+        flavour, and neither deserves a traceback in the user's face."""
         try:
             return self.window.clipboard_get()
-        except tkinter.TclError:
+        except gui.TclError:
             return ""
 
     def _address_paste(self):
@@ -3041,10 +3045,10 @@ class PopupWindow:
         self.browser = browser
         self.width = width
         self.height = height
-        self.window = tkinter.Toplevel(browser.window)
+        self.window = gui.Toplevel(browser.window)
         self.window.title("")
         self.window.geometry(f"{width}x{height}")
-        self.canvas = tkinter.Canvas(
+        self.canvas = gui.Canvas(
             self.window, width=width, height=height,
             bg="white", highlightthickness=0)
         self.canvas.pack(fill="both", expand=True)
@@ -3142,7 +3146,7 @@ class PopupWindow:
         try:
             self.window.clipboard_clear()
             self.window.clipboard_append(text)
-        except tkinter.TclError:
+        except gui.TclError:
             pass
 
     def _navigate(self, dest):
@@ -3739,11 +3743,75 @@ def shoes_html(theme, active):
 """
 
 
-def main():
+def screenshot(url, path, width=WIDTH, height=HEIGHT, settle=3.0):
+    """Load `url` and write the rendered window to `path` as a PNG.
+
+    No display is opened. The raster backend draws into an ordinary buffer,
+    so a full render -- chrome, page, images, whatever scripts produced -- is
+    just a file write, which makes the renderer inspectable from a shell and
+    diffable in a test.
+    """
+    if gui.backend() != "raster":
+        # Only our own canvas can hand back its pixels; a Tk one draws into a
+        # window we are not opening. Say so rather than failing on a missing
+        # method halfway through a page load.
+        raise RuntimeError(
+            "--screenshot needs the raster backend; this run is using "
+            "%r (set FEETBROWSER_BACKEND=raster)" % gui.backend())
     browser = Browser()
-    start = sys.argv[1] if len(sys.argv) > 1 else "about:blank"
+    browser.window.geometry("%dx%d" % (width, height))
+    browser.canvas.resize(width, height)
+    # Resizing the canvas normally reaches layout via a debounced <Configure>
+    # handler, which needs a timer flush that has not happened yet. Apply it
+    # now, or the page lays out for the default viewport and gets cropped.
+    browser._apply_resize()
+    browser.new_tab(url)
+    # Images and deferred scripts land on the timer queue; give them a
+    # bounded window to arrive before the frame is captured.
+    browser._poll_images()
+    deadline = time.time() + settle
+    while time.time() < deadline:
+        browser.window.flush_timers()
+        if not any(tab.loading for tab in browser.tabs):
+            break
+        time.sleep(0.02)
+    browser.window.flush_timers()  # final drain of decoded images
+    browser.draw()
+    browser.canvas.render().save_png(path)
+    return browser
+
+
+def main():
+    args = [a for a in sys.argv[1:] if a != "--screenshot"]
+    if "--screenshot" in sys.argv:
+        url = args[0] if args else "about:blank"
+        out = args[1] if len(args) > 1 else "feetbrowser.png"
+        screenshot(url, out)
+        print("wrote %s" % out)
+        return
+    try:
+        usable = gui.has_display()
+    except RuntimeError as exc:
+        # FEETBROWSER_DISPLAY named a backend that cannot run here. Asking for
+        # one by name and quietly getting a headless root is how you end up
+        # with a black screenshot and no idea why, so this is an error -- but
+        # a sentence, not a traceback.
+        print("FeetBrowser: %s." % exc, file=sys.stderr)
+        return 1
+    if not usable:
+        # Say why where we can. "No window available" on a Linux box that has
+        # a perfectly good X server two lines of setup away is a dead end;
+        # "$DISPLAY is not set" is a thing the user can act on.
+        problem = gui.display_problem()
+        print("FeetBrowser: no window available on this platform%s; "
+              "use --screenshot <url> [out.png] to render to a file."
+              % (" (%s)" % problem if problem else ""), file=sys.stderr)
+        return 1
+    browser = Browser(gui.new_window())
+    start = args[0] if args else "about:blank"
     browser.new_tab(start)
     browser.run()
+    return 0
 
 
 if __name__ == "__main__":
