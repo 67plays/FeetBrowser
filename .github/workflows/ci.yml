@@ -35,9 +35,12 @@ jobs:
       - name: Renderer tests
         run: .venv/bin/python tests/test_render.py
 
-      # Skips itself off macOS; here to prove the skip stays clean.
+      # Both skip themselves off their own platform; here to prove the skips
+      # stay clean.
       - name: Platform window tests
-        run: .venv/bin/python tests/test_cocoa.py
+        run: |
+          .venv/bin/python tests/test_cocoa.py
+          .venv/bin/python tests/test_win32.py
 
       - name: Unit tests
         run: .venv/bin/python tests/test_units.py
@@ -54,12 +57,79 @@ jobs:
       - name: Pseudo-toe (gh-scroll) tests
         run: .venv/bin/python tests/test_gh_scroll.py
 
+      # Into the workspace rather than /tmp, so the same two lines work on a
+      # runner whose temporary directory is spelled some other way.
       - name: Screenshot a page end to end
         run: |
-          .venv/bin/python -m feetbrowser --screenshot about:blank /tmp/blank.png
-          .venv/bin/python - <<'EOF'
-          import os
-          size = os.path.getsize("/tmp/blank.png")
-          assert size > 2000, f"screenshot suspiciously small: {size} bytes"
-          print(f"rendered /tmp/blank.png ({size} bytes)")
-          EOF
+          .venv/bin/python -m feetbrowser --screenshot about:blank blank.png
+          .venv/bin/python tests/check_screenshot.py blank.png
+
+  windows:
+    # The Windows platform layer is the one part of this browser that cannot
+    # be exercised anywhere else, so this job is where win32.py is actually
+    # verified: it opens real windows, sends real messages and reads pixels
+    # back out of GDI.
+    runs-on: windows-latest
+    defaults:
+      run:
+        # Git Bash, for -e: a failing line in a multi-line step has to fail
+        # the step, which the default PowerShell only guarantees for the last
+        # one. The paths below are the venv's Windows layout either way.
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # Windows ships its own fonts, so unlike the Linux job there is nothing
+      # to install for text. The Rust toolchain is preinstalled on this image.
+      - name: Show the toolchain
+        run: |
+          rustc --version
+          cargo --version
+
+      - name: Build the Rust JS engine
+        run: |
+          python -m venv .venv
+          .venv/Scripts/pip install maturin pyflakes
+          .venv/Scripts/maturin develop --release --manifest-path rust/Cargo.toml
+
+      - name: Lint (pyflakes)
+        run: .venv/Scripts/python -m pyflakes feetbrowser tests
+
+      - name: Renderer tests
+        run: .venv/Scripts/python tests/test_render.py
+
+      - name: Platform window tests
+        run: |
+          .venv/Scripts/python tests/test_win32.py
+          .venv/Scripts/python tests/test_cocoa.py
+
+      - name: Unit tests
+        run: .venv/Scripts/python tests/test_units.py
+
+      - name: JS engine tests
+        run: .venv/Scripts/python tests/test_js.py
+
+      - name: Shoes tests
+        run: .venv/Scripts/python tests/test_shoes.py
+
+      - name: Toe engine tests
+        run: .venv/Scripts/python tests/test_toes.py
+
+      - name: Pseudo-toe (gh-scroll) tests
+        run: .venv/Scripts/python tests/test_gh_scroll.py
+
+      - name: Screenshot a page end to end
+        run: |
+          .venv/Scripts/python -m feetbrowser --screenshot about:blank blank.png
+          .venv/Scripts/python tests/check_screenshot.py blank.png
+
+      # What a Windows user actually types. The venv and the engine are
+      # already there by now, so this exercises the short-circuit as well.
+      - name: The Windows entry point runs
+        shell: cmd
+        run: run.cmd --version

@@ -4,9 +4,11 @@
 # The renderer draws into its own framebuffer, so no display, no Tk and no
 # toolkit is needed. The JavaScript engine is the Rust extension
 # `feetbrowser_engine`, so the suite runs out of the local venv maturin builds
-# it into. Two suites step outside all that: test_cocoa.py opens real windows
-# on macOS (and skips everywhere else), and test_nav.py and smoke.py reach the
-# network.
+# it into. Three suites step outside all that: test_cocoa.py opens real
+# windows on macOS and test_win32.py opens them on Windows (each skipping
+# everywhere else), and test_nav.py and smoke.py reach the network.
+#
+# On Windows, run test.cmd instead; it runs the same suites in the same order.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -27,6 +29,7 @@ fi
 .venv/bin/python -m pyflakes feetbrowser tests
 .venv/bin/python tests/test_render.py
 .venv/bin/python tests/test_cocoa.py   # opens real windows on macOS, skips elsewhere
+.venv/bin/python tests/test_win32.py   # opens real windows on Windows, skips elsewhere
 .venv/bin/python tests/test_units.py
 .venv/bin/python tests/test_js.py
 .venv/bin/python tests/test_shoes.py
