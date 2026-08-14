@@ -469,12 +469,41 @@ def _parse_hue(v):
     return float(v)
 
 
+_COLOR_NAME_RE = re.compile(r"^[a-z][a-z0-9]*$")
+_COLOR_HEX_RE = re.compile(r"^#[0-9a-f]{6}$")
+
+
+def _color_function_args(name, func):
+    """The comma-separated arguments of `func(...)`, nesting respected."""
+    if not name.startswith(func + "(") or not name.endswith(")"):
+        return None
+    inner = name[len(func) + 1:-1]
+    args, depth, start = [], 0, 0
+    for i, ch in enumerate(inner):
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            args.append(inner[start:i].strip())
+            start = i + 1
+    args.append(inner[start:].strip())
+    return [a for a in args if a]
+
+
 def resolve_color(name):
     if not name:
         return None
     name = name.strip().lower()
     if name in ("transparent", "none", "currentcolor", "inherit", "initial"):
         return None
+    # light-dark() asks which scheme the browser is showing. This one has a
+    # light chrome and reports `prefers-color-scheme: light`, so it takes the
+    # first argument -- and taking it here is what keeps a site that themes
+    # itself entirely through light-dark() from rendering as a black slab.
+    if name.startswith("light-dark("):
+        args = _color_function_args(name, "light-dark")
+        return resolve_color(args[0]) if args else None
     # Gradients / image() / url() are not flat colors; hand them to the
     # caller (or ignore them) rather than paint an unreadable black box.
     if "gradient(" in name or name.startswith("url(") \
@@ -506,7 +535,15 @@ def resolve_color(name):
         if name[7:] == "00":
             return None  # #rrggbbaa with alpha 0
         return name[:7]
-    return name  # Tk understands names and #rrggbb
+    if name.startswith("#"):
+        return name if _COLOR_HEX_RE.match(name) else None
+    if not _COLOR_NAME_RE.match(name):
+        # Something we do not understand: a function we have no answer for, a
+        # malformed hex, or several tokens where one colour belongs. Saying
+        # "no colour" leaves the box unpainted, which is nearly always closer
+        # to the page's intent than the flat black the canvas falls back to.
+        return None
+    return name  # a colour name the canvas can look up
 
 
 _ROMAN_NUMERALS = ((1000, "m"), (900, "cm"), (500, "d"), (400, "cd"),
@@ -2230,6 +2267,7 @@ class BlockLayout(LayoutBox):
         self.cursor_y = self._cleared(clear, self.y) + pt
         self.cursor_x = self._line_bounds()[0]
         self.line = []  # pending words on the current line
+        self._underline_run = None  # (declaring element, DrawLine) being extended
 
         # List item bullet.
         if isinstance(self.node, Element) and \
@@ -2331,6 +2369,9 @@ class BlockLayout(LayoutBox):
         max_ascent = max(item.ascent for item in self.line)
         max_descent = max(item.descent for item in self.line)
         baseline = self.cursor_y + 1.25 * max_ascent
+        # Underlines join up word by word along a line; a new line starts a
+        # new run even if the same link continues onto it.
+        self._underline_run = None
         align = self.node.style.get("text-align", "left")
         line_width = (self.line[-1].x + self.line[-1].w) - self.x
         offset = 0
@@ -2369,6 +2410,10 @@ class BlockLayout(LayoutBox):
             if item.kind == "text":
                 self._maybe_underline(
                     item.x + offset, y, item.text, item.font, item.color, item.node)
+            else:
+                # An image or a form control breaks the run: browsers do not
+                # rule a line under a button that happens to sit in a link.
+                self._underline_run = None
         self.cursor_y = baseline + 1.25 * max_descent
         self.cursor_x = self._line_bounds()[0]
         self.line = []
@@ -2382,12 +2427,13 @@ class BlockLayout(LayoutBox):
         and settles the question. That is what makes `a { text-decoration:
         none }` work: without it the UA sheet's underline on every link
         could never be taken back.
-        """
-        def underline():
-            yb = y + _metrics(font, "ascent") + 1
-            self.display_list.append(
-                DrawLine(x, yb, x + _measure(font, word), yb, color, 1))
 
+        The box that declared it is also what decides where the line stops:
+        consecutive words belonging to the same one are ruled with a single
+        line, spaces included, while two links side by side keep the gap
+        between them clear.
+        """
+        owner = None
         n = node
         while n is not None:
             if isinstance(n, Element):
@@ -2395,14 +2441,27 @@ class BlockLayout(LayoutBox):
                     or n.style.get("text-decoration-line")
                 if decoration:
                     if "underline" in decoration.lower().split():
-                        underline()
-                    return
+                        owner = n
+                    break
                 if n.tag in ("a", "u"):
                     # No sheet loaded at all (some tests lay out bare DOMs);
                     # links and <u> are underlined by every browser's default.
-                    underline()
-                    return
+                    owner = n
+                    break
             n = n.parent
+        if owner is None:
+            self._underline_run = None
+            return
+        yb = y + _metrics(font, "ascent") + 1
+        right = x + _measure(font, word)
+        run = self._underline_run
+        if run is not None and run[0] is owner and run[1].top == yb \
+                and run[1].color == color and run[1].right <= right:
+            run[1].right = right
+            return
+        line = DrawLine(x, yb, right, yb, color, 1)
+        self.display_list.append(line)
+        self._underline_run = (owner, line)
 
     def _draw_bullet(self, top):
         """Draw the list item's marker in the margin to its left, level with

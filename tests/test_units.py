@@ -1469,6 +1469,77 @@ def test_text_decoration_none_wins_over_the_ua_underline():
     eq([c for c in bare if isinstance(c, DrawLine)], [], "and the page can say no")
 
 
+def test_light_dark_resolves_to_the_light_side():
+    """Sites that theme themselves entirely through light-dark() used to come
+    out as a black slab, because the unparsed function fell through to the
+    canvas and the canvas falls back to black."""
+    from feetbrowser.layout import resolve_color
+    eq(resolve_color("light-dark(#ffffff, #18191b)"), "#ffffff")
+    eq(resolve_color("light-dark(rgb(255, 0, 0), #000)"), "#ff0000",
+       "nested commas do not split the arguments")
+    eq(resolve_color("light-dark(transparent, black)"), None)
+
+
+def test_unreadable_colours_paint_nothing_rather_than_black():
+    from feetbrowser.layout import resolve_color
+    eq(resolve_color("color-mix(in srgb, red, blue)"), None, "unknown function")
+    eq(resolve_color("initial #2d3034"), None, "two tokens is not a colour")
+    eq(resolve_color("#12345"), None, "malformed hex")
+    eq(resolve_color("rebeccapurple"), "rebeccapurple", "real names survive")
+    eq(resolve_color("gray50"), "gray50", "and so do the ones with digits")
+
+
+def test_media_query_answers_the_preference_features():
+    from feetbrowser.cssparser import media_matches
+    assert media_matches("(prefers-color-scheme: light)", 800, 600)
+    assert not media_matches("(prefers-color-scheme: dark)", 800, 600), \
+        "this browser has a light chrome and should say so"
+    assert media_matches("(min-width: 400px) and (prefers-color-scheme: light)",
+                         800, 600)
+    assert not media_matches("(prefers-reduced-motion: reduce)", 800, 600)
+    assert media_matches("(orientation: landscape)", 800, 600)
+    assert not media_matches("(orientation: portrait)", 800, 600)
+    assert media_matches("(min-resolution: 2dppx)", 800, 600), \
+        "features we cannot answer still match, so no rule is lost"
+
+
+def test_hidden_attribute_hides_the_element():
+    from feetbrowser.layout import DrawText
+    cmds = _paint_all('<p>shown</p><p hidden>gone</p>', ua=True)
+    words = {c.text for c in cmds if isinstance(c, DrawText)}
+    assert "shown" in words and "gone" not in words, words
+
+
+def test_link_underline_runs_under_its_spaces():
+    """One line under the whole link, not one per word with the spaces
+    showing through."""
+    from feetbrowser.layout import DrawLine, DrawText
+    cmds = _paint_all('<p><a href="#">Jump to content</a></p>', ua=True)
+    lines = [c for c in cmds if isinstance(c, DrawLine)]
+    eq(len(lines), 1, "one unbroken rule")
+    words = [c for c in cmds if isinstance(c, DrawText)]
+    eq(lines[0].left, min(w.left for w in words), "starts at the first word")
+    eq(lines[0].right, max(w.right for w in words), "ends at the last")
+
+
+def test_adjacent_links_do_not_share_an_underline():
+    """The gap between two separate links stays clear."""
+    from feetbrowser.layout import DrawLine
+    cmds = _paint_all('<p><a href="/a">one</a> <a href="/b">two</a></p>', ua=True)
+    lines = sorted((c.left, c.right)
+                   for c in cmds if isinstance(c, DrawLine))
+    eq(len(lines), 2, "one rule per link")
+    assert lines[0][1] < lines[1][0], "and a gap between them"
+
+
+def test_underline_restarts_on_the_next_line():
+    from feetbrowser.layout import DrawLine
+    cmds = _paint_all(
+        '<p><a href="#">wrapping link text here</a></p>', width=90, ua=True)
+    tops = {c.top for c in cmds if isinstance(c, DrawLine)}
+    assert len(tops) > 1, f"a wrapped link is ruled once per line: {tops}"
+
+
 def test_table_cell_padding_comes_from_css():
     """Cells used to be pinned to a hardcoded 4px inset. Now the padding is
     theirs, so a sheet can widen it and the column widens to match."""

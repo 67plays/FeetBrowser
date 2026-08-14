@@ -27,11 +27,34 @@ def get_viewport():
     return _VIEWPORT
 
 
+# What this browser is, in the vocabulary media queries ask questions in.
+# Anything missing from here still matches, so an unfamiliar query never
+# silently drops a rule -- but the ones we can answer have to be answered.
+# `prefers-color-scheme` especially: assuming it matched meant every site
+# with a dark theme got the dark theme, and a site whose dark rules are all
+# custom properties we do not resolve came out as a black rectangle.
+_MEDIA_FEATURES = {
+    "prefers-color-scheme": "light",
+    "prefers-reduced-motion": "no-preference",
+    "prefers-reduced-transparency": "no-preference",
+    "prefers-contrast": "no-preference",
+    "forced-colors": "none",
+    "inverted-colors": "none",
+    "hover": "hover",
+    "any-hover": "hover",
+    "pointer": "fine",
+    "any-pointer": "fine",
+    "scripting": "enabled",
+    "display-mode": "browser",
+}
+
+
 def media_matches(prelude, width, height):
     """Evaluate a media-query prelude against a viewport. Handles `and`,
-    comma-OR lists, media types (all/screen/print) and the common
-    (min/max-width/height) features; unknown features are assumed to match so
-    rules aren't silently dropped."""
+    comma-OR lists, media types (all/screen/print), the common
+    (min/max-width/height) features and the preference features this browser
+    can answer for itself; anything else is assumed to match so rules aren't
+    silently dropped."""
     if not prelude or not prelude.strip():
         return True
     for alt in re.split(r"\s*,\s*", prelude):
@@ -61,6 +84,11 @@ def media_matches(prelude, width, height):
                     cond = False
                 elif prop == "max-height" and height > n:
                     cond = False
+            elif prop == "orientation":
+                if val != ("portrait" if height >= width else "landscape"):
+                    cond = False
+            elif prop in _MEDIA_FEATURES and val != _MEDIA_FEATURES[prop]:
+                cond = False
         if re.search(r"(?:^|\s)print(?:\s|$)", alt):
             cond = False
         if negated:
