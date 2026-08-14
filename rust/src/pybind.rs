@@ -257,6 +257,17 @@ impl PyJsValue {
         self.inner.repr(&self.value)
     }
 
+    /// Return the raw Python object a Host value wraps (JSElement,
+    /// JSNodeList, ...) so browser-provided host functions can get at it
+    /// directly; non-Host values come back unchanged.
+    fn js_unwrap(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        if let JsValue::Host(h) = &self.value {
+            Ok(h.clone_ref(py))
+        } else {
+            Ok(Py::new(py, self.clone())?.into_any())
+        }
+    }
+
     fn resolve(&self, py: Python<'_>, value: &Bound<'_, PyAny>) {
         if let JsValue::Promise(p) = &self.value {
             let v = py_to_js(&self.inner, py, value);

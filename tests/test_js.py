@@ -771,6 +771,116 @@ def test_js_dom_query_and_classlist():
     assert div.attributes.get("role") is None, "removeAttribute applied"
 
 
+def test_js_dom_nodelist_and_traversal():
+    """NodeList length/item/index/forEach, element traversal and geometry."""
+    tab = _make_tab(
+        '<div id="a" class="x"><span class="y">hi</span>'
+        '<span class="y">there</span></div>'
+        '<script>'
+        'var a = document.getElementById("a");'
+        'var ys = document.querySelectorAll(".y");'
+        'var acc = [];'
+        'ys.forEach(function(e, i) { acc.push(e.textContent + i); });'
+        'var out = {'
+        ' len: ys.length,'
+        ' first: a.firstElementChild.tagName,'
+        ' last: a.lastElementChild.textContent,'
+        ' nxt: ys[0].nextElementSibling.textContent,'
+        ' prv: ys[1].previousElementSibling.textContent,'
+        ' item: ys.item(1).textContent,'
+        ' idx: ys[0].textContent,'
+        ' fe: acc.join("|"),'
+        ' contains: a.contains(ys[0]),'
+        ' matches: a.matches(".x"),'
+        ' closest: ys[0].closest("#a").id,'
+        ' ohtml: a.outerHTML.slice(0, 12),'
+        ' cec: a.childElementCount,'
+        ' ecount: document.getElementsByTagName("span").length,'
+        ' ctn: document.createTextNode("zz").textContent,'
+        '};'
+        'window.__out = out;'
+        '</script>')
+    eq(tab.js_logs, [], "no js errors")
+    g = tab._js_interp.globals["__out"]
+    eq(g["len"], 2, "NodeList.length")
+    eq(g["first"], "SPAN", "firstElementChild")
+    eq(g["last"], "there", "lastElementChild")
+    eq(g["nxt"], "there", "nextElementSibling")
+    eq(g["prv"], "hi", "previousElementSibling")
+    eq(g["item"], "there", "NodeList.item(1)")
+    eq(g["idx"], "hi", "NodeList[0]")
+    eq(g["fe"], "hi0|there1", "NodeList.forEach indexes")
+    eq(g["contains"], True, "element.contains")
+    eq(g["matches"], True, "element.matches")
+    eq(g["closest"], "a", "element.closest")
+    eq(g["ohtml"], '<div id="a" ', "element.outerHTML")
+    eq(g["cec"], 2, "childElementCount")
+    eq(g["ecount"], 2, "getElementsByTagName")
+    eq(g["ctn"], "zz", "createTextNode")
+
+
+def test_js_window_environment_and_mutation():
+    """getComputedStyle (live), window/navigator globals, createElement +
+    appendChild, and element.remove()."""
+    tab = _make_tab(
+        '<div id="a"><span class="y">hi</span></div>'
+        '<script>'
+        'var s = document.querySelector(".y").style;'
+        's.color = "blue";'
+        'var cs = getComputedStyle(document.querySelector(".y"));'
+        'var e = document.createElement("em");'
+        'e.textContent = "NEW";'
+        'document.getElementById("a").appendChild(e);'
+        'var span = document.querySelector(".y");'
+        'span.remove();'
+        'var out = {'
+        ' color: cs.color,'
+        ' prop: cs.getPropertyValue("font-size"),'
+        ' app: document.getElementById("a").lastElementChild.textContent,'
+        ' removed: document.querySelectorAll(".y").length,'
+        ' ua: navigator.userAgent.indexOf("FeetBrowser") >= 0,'
+        ' raf: typeof requestAnimationFrame,'
+        ' caf: typeof cancelAnimationFrame,'
+        ' me: typeof matchMedia,'
+        ' wad: typeof addEventListener,'
+        ' dpr: devicePixelRatio,'
+        ' iw: innerWidth,'
+        '};'
+        'window.__out = out;'
+        '</script>')
+    eq(tab.js_logs, [], "no js errors")
+    g = tab._js_interp.globals["__out"]
+    eq(g["color"], "blue", "getComputedStyle reflects live style")
+    eq(g["prop"], "16px", "getPropertyValue resolves font-size")
+    eq(g["app"], "NEW", "createElement + appendChild")
+    eq(g["removed"], 0, "element.remove removes from DOM")
+    eq(g["ua"], True, "navigator.userAgent")
+    eq(g["raf"], "function", "requestAnimationFrame global")
+    eq(g["caf"], "function", "cancelAnimationFrame global")
+    eq(g["me"], "function", "matchMedia global")
+    eq(g["wad"], "function", "window.addEventListener global")
+    eq(g["dpr"], 1, "devicePixelRatio")
+    eq(g["iw"], 1000, "innerWidth matches browser WIDTH")
+
+
+def test_js_document_fragment():
+    tab = _make_tab(
+        '<div id="a"></div>'
+        '<script>'
+        'var frag = document.createDocumentFragment();'
+        'var e1 = document.createElement("b"); e1.textContent = "ONE";'
+        'var e2 = document.createElement("i"); e2.textContent = "TWO";'
+        'frag.appendChild(e1);'
+        'frag.appendChild(e2);'
+        'document.getElementById("a").appendChild(frag);'
+        'window.__n = document.getElementById("a").childElementCount;'
+        'window.__t = document.getElementById("a").textContent;'
+        '</script>')
+    eq(tab.js_logs, [], "no js errors")
+    eq(tab._js_interp.globals["__n"], 2, "fragment children land in body")
+    eq(tab._js_interp.globals["__t"], "ONETWO", "fragment text lands")
+
+
 def _walk_all(node):
     yield node
     for child in node.children:

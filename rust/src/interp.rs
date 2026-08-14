@@ -1434,6 +1434,58 @@ pub fn list_get(
                 })
             }));
         }
+        "flatMap" => {
+            let i0 = this.clone();
+            return JsValue::Callback(Rc::new(move |i: &Rc<Interpreter>, args: Vec<JsValue>| -> EvResult {
+                let i2 = i.clone();
+                let i3 = i0.clone();
+                let a2 = a.clone();
+                Box::pin(async move {
+                    let fn_ = args.first().cloned().unwrap_or(JsValue::Undefined);
+                    let items = a2.borrow().clone();
+                    let mut out: Vec<JsValue> = Vec::new();
+                    for (idx, item) in items.iter().enumerate() {
+                        let v = call_value(&i2, &fn_, vec![item.clone(), JsValue::Number(idx as f64), JsValue::Array(a2.clone())], JsValue::Undefined).await?;
+                        match v {
+                            JsValue::Array(inner) => out.extend(inner.borrow().clone()),
+                            other if !nullish(&other) => out.push(other),
+                            _ => {}
+                        }
+                    }
+                    Ok(JsValue::array(out))
+                })
+            }));
+        }
+        "fill" => {
+            return JsValue::Callback(Rc::new(move |_i: &Rc<Interpreter>, args: Vec<JsValue>| -> EvResult {
+                let a2 = a.clone();
+                Box::pin(async move {
+                    let value = args.first().cloned().unwrap_or(JsValue::Undefined);
+                    let mut arr = a2.borrow_mut();
+                    let n = arr.len() as i64;
+                    let start = match args.get(1) {
+                        Some(v) if !nullish(v) => {
+                            let v = to_int32(v) as i64;
+                            if v < 0 { n + v } else { v }
+                        }
+                        _ => 0,
+                    }
+                    .clamp(0, n);
+                    let end = match args.get(2) {
+                        Some(v) if !nullish(v) => {
+                            let v = to_int32(v) as i64;
+                            if v < 0 { n + v } else { v }
+                        }
+                        _ => n,
+                    }
+                    .clamp(0, n);
+                    for slot in arr.iter_mut().take(end as usize).skip(start as usize) {
+                        *slot = value.clone();
+                    }
+                    Ok(JsValue::Array(a2.clone()))
+                })
+            }));
+        }
         "at" => {
             return JsValue::Callback(Rc::new(move |_i: &Rc<Interpreter>, args: Vec<JsValue>| -> EvResult {
                 let a2 = a.clone();

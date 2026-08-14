@@ -429,6 +429,38 @@ def test_pre_whitespace_does_not_wrap():
     eq(len(texts), 1, "pre line kept on one line")
 
 
+def test_nowrap_cloud_wraps_as_unit():
+    """white-space:nowrap (Wikipedia's language cloud) must not spill past the
+    viewport: each link is one unbreakable token, but tokens still wrap to a
+    fresh line once the current line runs out of room."""
+    from feetbrowser.layout import DocumentLayout, DrawText
+    css = '.cloud { width: 200px; } .cloud a { white-space: nowrap; }'
+    rules = CSSParser(css).parse()
+    links = ' '.join(f'<a href="#{i}">languagename{i:02d}</a>' for i in range(30))
+    html = f'<div class="cloud">{links}</div>'
+    dom = HTMLParser(html).parse()
+    style(dom, rules)
+    doc = DocumentLayout(dom, 200)
+    doc.layout()
+    cmds = []
+    stack = [doc]
+    while stack:
+        b = stack.pop()
+        for c in b.paint():
+            cmds.append(c)
+        stack.extend(b.children)
+    texts = [c for c in cmds if isinstance(c, DrawText)]
+    assert texts, "cloud text drawn"
+    max_right = max(c.right for c in texts)
+    assert max_right <= 200, \
+        f"nowrap cloud overflowed viewport: right edge {max_right} > 200"
+    tops = {c.text: c.top for c in texts}
+    # The whole token moves to the next line, so line tops repeat.
+    first_top = tops["languagename00"]
+    later_lines = {t for t in tops.values() if t > first_top}
+    assert later_lines, "cloud wrapped to multiple lines"
+
+
 def test_css_data_uri_semicolon():
     css = ('p { background: url(data:image/png;base64,AAAA==);'
            ' color: red; }')
