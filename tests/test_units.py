@@ -675,6 +675,17 @@ def _boxes(html, css, width=620, tag="div"):
     return sorted(found, key=lambda b: (b[1], b[0]))
 
 
+def test_a_float_starts_below_the_content_it_follows():
+    """A "Page 2" link floated at the foot of a listing belongs at the foot.
+    Laying every float out before the flow put it over the first story."""
+    boxes = _boxes(
+        '<article><div class=tall>one</div><div class=tall>two</div>'
+        '<div class=more>Page 2</div></article>',
+        ".tall { height: 60px } .more { float: left; width: 80px }")
+    more = [b for b in boxes if b[2] == 80][0]
+    assert more[1] >= 120, ("float sits after the two blocks", more, boxes)
+
+
 def test_floats_run_along_a_line_before_dropping():
     """Floats are only interesting because they sit beside each other. Ours
     stacked vertically, which turned every 2012 nav bar into a column."""

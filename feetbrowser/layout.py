@@ -1208,6 +1208,12 @@ class BlockLayout(LayoutBox):
             self.display_list = []
             self._draw_bullet(
                 self.y + _padding_box(self.node.style)[0])
+        # Children are laid out as they are reached, not collected and laid
+        # out afterwards, because a float needs to know how far down the flow
+        # already reaches: one that follows two paragraphs starts below them,
+        # not at the top of the block. Laying every float out first is how a
+        # "Page 2" link at the foot of a listing ends up over the first story.
+        content_h = 0
         for child in self.node.children:
             if isinstance(child, Element) and child.style.get("display") == "none":
                 continue
@@ -1215,7 +1221,7 @@ class BlockLayout(LayoutBox):
                 continue
             if isinstance(child, Element) and \
                     child.style.get("float") in ("left", "right"):
-                fb = self._layout_float(child)
+                fb = self._layout_float(child, content_h)
                 float_boxes.append(fb)
                 continue
             if isinstance(child, Element) and \
@@ -1223,23 +1229,19 @@ class BlockLayout(LayoutBox):
                 # position:absolute/fixed boxes are out of flow: they don't
                 # push siblings or stretch the parent (e.g. hidden dropdowns
                 # and overlays that must not take up layout space).
-                self.children.append(self._layout_absolute(child))
+                box = self._layout_absolute(child)
+                self.children.append(box)
+                box.layout()
                 continue
             box = BlockLayout(child, self, previous)
             clear = child.style.get("clear") if isinstance(child, Element) else ""
             if clear:
                 box._y_floor = self._cleared(clear, getattr(box, "_y_floor", 0.0))
             self.children.append(box)
-            previous = box
-        content_h = 0
-        last_flow = None
-        for box in self.children:
             box.layout()
-            if getattr(box, "_absolute_pos", None) is None:
-                last_flow = box
-        if last_flow is not None:
-            content_h = (last_flow.y + last_flow.height
-                         + parse_px(last_flow.node.style.get("margin-bottom", "0"))
+            previous = box
+            content_h = (box.y + box.height
+                         + parse_px(box.node.style.get("margin-bottom", "0"))
                          - self.y)
         for f in self.float_regions:
             content_h = max(content_h, f["bottom"] - self.y)
@@ -1271,9 +1273,13 @@ class BlockLayout(LayoutBox):
         box._absolute_pos = (x, y, w)
         return box
 
-    def _layout_float(self, el):
+    def _layout_float(self, el, flow_top=0.0):
         """Position a `float: left/right` box out of flow, shrink-to-fit its
-        width, and record its region so inline content wraps around it."""
+        width, and record its region so inline content wraps around it.
+
+        `flow_top` is how far down this block the normal flow has already
+        reached: a float never rises above the content that precedes it.
+        """
         side = el.style.get("float")
         ml = _resolve_len(el.style.get("margin-left", "0"), self.width)
         mr = _resolve_len(el.style.get("margin-right", "0"), self.width)
@@ -1291,7 +1297,7 @@ class BlockLayout(LayoutBox):
             w = max(1.0, min(avail, _resolve_len(css_w, self.width, avail)))
 
         clear = el.style.get("clear")
-        top = max(self._cleared(clear, 0.0), self._float_min_top)
+        top = max(self._cleared(clear, 0.0), self._float_min_top, flow_top)
         # The slot is for the margin box; the border box starts ml inside it.
         if self.float_regions:
             # Which floats this one must sit beside or below depends on how
