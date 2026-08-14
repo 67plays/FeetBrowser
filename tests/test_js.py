@@ -391,6 +391,105 @@ def test_js_xhr_basic_get():
         srv.shutdown()
 
 
+def test_js_location_replace_redirect():
+    # DuckDuckGo-style redirect: a page whose inline script does
+    # `window.parent.location.replace(...)` must navigate to the target.
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            port = self.server.server_address[1]
+            if self.path == "/l":
+                body = ('<script>window.parent.location.replace("http://'
+                        f'127.0.0.1:{port}/target");</script>').encode()
+            else:
+                body = b"<title>Target</title><p>arrived</p>"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        port = srv.server_address[1]
+        tab = Tab(700)
+        tab.load(URL(f"http://127.0.0.1:{port}/l"))
+        assert str(tab.url) == f"http://127.0.0.1:{port}/target", \
+            f"location.replace did not navigate: {tab.url}"
+        texts = _texts(tab)
+        assert "arrived" in texts, f"redirect target not rendered: {texts}"
+    finally:
+        srv.shutdown()
+
+
+def test_js_location_href_assignment():
+    # Assigning `location.href` (and bare `location` on window) navigates too.
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            port = self.server.server_address[1]
+            if self.path == "/l":
+                body = (f'<script>location.href = "http://'
+                        f'127.0.0.1:{port}/target";</script>').encode()
+            else:
+                body = b"<p>assigned</p>"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        port = srv.server_address[1]
+        tab = Tab(700)
+        tab.load(URL(f"http://127.0.0.1:{port}/l"))
+        assert str(tab.url) == f"http://127.0.0.1:{port}/target", \
+            f"location.href assignment did not navigate: {tab.url}"
+        texts = _texts(tab)
+        assert "assigned" in texts, f"target not rendered: {texts}"
+    finally:
+        srv.shutdown()
+
+
+def test_meta_refresh_redirect():
+    # A zero-delay <meta http-equiv="refresh"> redirect navigates without JS.
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/l":
+                body = (b'<meta http-equiv="refresh" '
+                        b'content="0; url=/target">')
+            else:
+                body = b"<p>metaarrived</p>"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        port = srv.server_address[1]
+        tab = Tab(700)
+        tab.load(URL(f"http://127.0.0.1:{port}/l"))
+        assert str(tab.url) == f"http://127.0.0.1:{port}/target", \
+            f"meta refresh did not navigate: {tab.url}"
+        texts = _texts(tab)
+        assert "metaarrived" in texts, f"target not rendered: {texts}"
+    finally:
+        srv.shutdown()
+
+
 def test_js_logical_nullish_and_optional_chaining():
     interp = Interpreter()
     interp.run("""
