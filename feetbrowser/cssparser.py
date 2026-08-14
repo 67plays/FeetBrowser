@@ -20,6 +20,13 @@ def set_viewport(width, height):
     _VIEWPORT = (float(width), float(height))
 
 
+def get_viewport():
+    """Current (width, height) viewport. A module-level accessor (rather than
+    importing the `_VIEWPORT` tuple) so callers always see `set_viewport`
+    updates instead of a stale copy."""
+    return _VIEWPORT
+
+
 def media_matches(prelude, width, height):
     """Evaluate a media-query prelude against a viewport. Handles `and`,
     comma-OR lists, media types (all/screen/print) and the common
@@ -39,10 +46,13 @@ def media_matches(prelude, width, height):
             prop = prop.strip().lower()
             val = val.strip().lower()
             if prop in ("min-width", "max-width", "min-height", "max-height"):
-                m = re.match(r"([-.\d]+)", val)
+                m = re.match(r"([-.\d]+)\s*(px|em|rem)?", val)
                 if not m:
                     continue
                 n = float(m.group(1))
+                if m.group(2) in ("em", "rem"):
+                    # A 16px root size, matching layout.py's parse_px for rem.
+                    n *= 16.0
                 if prop == "min-width" and width < n:
                     cond = False
                 elif prop == "max-width" and width > n:

@@ -21,7 +21,7 @@ from collections import deque
 from .net import URL
 from .htmlparser import HTMLParser, Text, Element
 from .cssparser import CSSParser, style, parse_inline, set_viewport, \
-    media_matches, _VIEWPORT
+    media_matches, get_viewport
 from .layout import DocumentLayout, paint_tree, get_font, _measure
 from .jsdom import JSDocument
 from .jsengine import Interpreter, JSException, UNDEFINED
@@ -134,9 +134,10 @@ def _expand_imports(css, base_url, depth=0, seen=None, log=None):
         seen = set()
     out = []
     last = 0
-    width, height = _VIEWPORT
+    width, height = get_viewport()
     for m in _IMPORT_RE.finditer(css):
         out.append(css[last:m.start()])
+        out.append(m.group("lead"))
         last = m.end()
         url = (m.group("url") or "").strip().strip("\"'")
         media = (m.group("media") or "").strip()
@@ -145,12 +146,13 @@ def _expand_imports(css, base_url, depth=0, seen=None, log=None):
         if media and not media_matches(media, width, height):
             continue
         seen.add(url)
+        imp_url = None
         try:
             imp_url = base_url.resolve(url)
             _h, imported, _c = imp_url.request()
         except Exception as e:  # noqa: BLE001 - a broken import shouldn't stop the page
             if log is not None:
-                log(f"CSS {imp_url} ({type(e).__name__})")
+                log(f"CSS {imp_url or url} ({type(e).__name__})")
             continue
         out.append(_expand_imports(imported, imp_url, depth + 1, seen, log))
     out.append(css[last:])
@@ -199,7 +201,10 @@ class Tab:
         self.net_errors = []
         # Image URLs that failed to download, filled by background threads
         # and drained into net_errors on the UI thread.
-        self._image_failures = []
+        self._image_failures = deque()
+        # How much of the interpreter's append-only log has already been
+        # scanned for JS errors, so _capture_js_errors never double-counts.
+        self._js_log_cursor = 0
         # Stylesheet rules for the current document, kept so JS-driven DOM
         # mutations can be re-styled, and the live interpreter reused across
         # script runs and click-handler dispatch.
@@ -369,7 +374,8 @@ class Tab:
         self.form_values = {}
         self.js_logs = []
         self.net_errors = []
-        self._image_failures = []
+        self._image_failures = deque()
+        self._js_log_cursor = 0
         self._js_interp = None
         self._js_doc = None
         self._js_fetch_results.clear()
@@ -408,6 +414,7 @@ class Tab:
             except Exception:  # noqa: BLE001 - a broken sheet shouldn't stop the page
                 pass
         for href in find_links(self.nodes, []):
+            sheet_url = None
             try:
                 sheet_url = resolve_from.resolve(href)
                 _h, css_body, _c = sheet_url.request()
@@ -416,7 +423,7 @@ class Tab:
                 rules.extend(CSSParser(css_body).parse())
             except Exception as e:  # noqa: BLE001 - skip stylesheets that fail
                 self._add_error(
-                    f"CSS {sheet_url} ({type(e).__name__})")
+                    f"CSS {sheet_url or href} ({type(e).__name__})")
                 continue
 
         style(self.nodes, rules)
@@ -467,13 +474,14 @@ class Tab:
                 code = None
                 src = el.attributes.get("src")
                 if src:
+                    sheet_url = None
                     try:
                         sheet_url = self.base_url.resolve(src) \
                             if self.base_url else URL(src)
                         _h, code, _c = sheet_url.request()
                     except Exception as e:  # noqa: BLE001 - skip bad/unreachable src
                         self._add_error(
-                            f"JS {sheet_url} ({type(e).__name__})")
+                            f"JS {sheet_url or src} ({type(e).__name__})")
                         code = None
                 else:
                     code = "".join(ch.text for ch in el.children
@@ -499,7 +507,10 @@ class Tab:
             del self.net_errors[:len(self.net_errors) - 500]
 
     def _capture_js_errors(self, logs):
-        for line in logs:
+        """Append any not-yet-scanned JS error lines to net_errors."""
+        start = self._js_log_cursor
+        self._js_log_cursor = len(logs)
+        for line in logs[start:]:
             if line.startswith("JS error"):
                 msg = line[len("JS error: "):]
                 self._add_error(f"JS {msg}")
@@ -681,7 +692,7 @@ class Tab:
         """Called on the UI thread: decode any finished downloads and
         re-render when the last one arrives."""
         while self._image_failures:
-            url = self._image_failures.pop(0)
+            url = self._image_failures.popleft()
             self._add_error(f"IMG {url}")
         if not self._image_results:
             return
@@ -1594,22 +1605,30 @@ class Browser:
         img_src = self._enclosing_image(node)
         items = []
         if href:
-            resolved = tab.base_url.resolve(href) if tab.base_url \
-                else tab.url.resolve(href)
-            items.append(("Open Link",
-                          lambda r=resolved: self._navigate(tab, r), True))
-            items.append(("Open Link in New Tab",
-                          lambda r=resolved: self.new_tab(str(r)), True))
+            try:
+                resolved = tab.base_url.resolve(href) if tab.base_url \
+                    else tab.url.resolve(href)
+            except Exception:  # noqa: BLE001 - malformed href: skip link actions
+                resolved = None
+            if resolved is not None:
+                items.append(("Open Link",
+                              lambda r=resolved: self._navigate(tab, r), True))
+                items.append(("Open Link in New Tab",
+                              lambda r=resolved: self.new_tab(str(r)), True))
             items.append(("Copy Link Address",
                           lambda h=href: self._copy_text(h), True))
             items.append(None)
         if img_src:
-            img_url = tab.base_url.resolve(img_src) if tab.base_url \
-                else URL(img_src)
-            items.append(("Open Image",
-                          lambda u=img_url: self._navigate(tab, u), True))
-            items.append(("Copy Image URL",
-                          lambda u=str(img_url): self._copy_text(u), True))
+            try:
+                img_url = tab.base_url.resolve(img_src) if tab.base_url \
+                    else URL(img_src)
+            except Exception:  # noqa: BLE001 - malformed src: skip image actions
+                img_url = None
+            if img_url is not None:
+                items.append(("Open Image",
+                              lambda u=img_url: self._navigate(tab, u), True))
+                items.append(("Copy Image URL",
+                              lambda u=str(img_url): self._copy_text(u), True))
             items.append(None)
         items.extend([
             ("Back", self._back, bool(tab.history)),
@@ -2066,10 +2085,12 @@ class Browser:
         latest = tab.net_errors[-1]
         total = len(tab.net_errors)
         msg = f"[{total} load error{'s' if total != 1 else ''}] {latest}"
-        width = c.winfo_width() - 16
+        width = max(0, c.winfo_width() - 16)
         font = get_font(10, "normal", "roman", "Helvetica")
-        if len(msg) > width // 6:
-            msg = msg[:width // 6 - 1] + "\u2026"
+        if _measure(font, msg) > width:
+            while msg and _measure(font, msg + "\u2026") > width:
+                msg = msg[:-1]
+            msg += "\u2026"
         c.create_text(8, top + LOG_HEIGHT / 2, text=msg, anchor="w",
                       font=font, fill="#8a5a00")
 
