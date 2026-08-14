@@ -35,6 +35,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from feetbrowser import browser as browsermod
 from feetbrowser import imagecodec
 from feetbrowser.layout import DrawText
+from feetbrowser.net import URL
+from feetbrowser.window import Event
 
 from fixture_server import FixtureServer
 
@@ -209,6 +211,142 @@ def test_page_renders_every_layer():
           % (width, height, count[PAGE_BG], count[TEXT], count[BORDER],
              count[PNG_BODY] + count[PNG_MARK],
              count[GIF_BODY] + count[GIF_MARK], landed, jw * jh))
+
+
+# -- the address bar against pasted line breaks -----------------------------
+#
+# Every character that ends a line somewhere: LF, CR and CRLF from the three
+# families of text file, the vertical tab and form feed, the file/group/record
+# separators, NEL, and the Unicode line and paragraph separators that a copy
+# out of rendered text really can carry. The tab rides along because it is the
+# same kind of character -- no URL holds one, and the renderer has no glyph
+# for it. `str.splitlines` is the list Python agrees with.
+LINE_BREAKS = ("\n", "\r", "\r\n", "\v", "\f", "\x1c", "\x1d", "\x1e",
+               "\x85", "\u2028", "\u2029")
+BULLETS = "• first bullet%s• second bullet"
+FLAT_BULLETS = "• first bullet • second bullet"
+
+
+def _browser():
+    """A headless browser with one about: tab and the address bar focused."""
+    browser = browsermod.Browser()
+    browser.canvas.resize(browsermod.WIDTH, browsermod.HEIGHT)
+    browser._apply_resize()
+    browser.new_tab("about:blank")
+    browser.focus = "address"
+    browser.address_text = ""
+    browser.address_caret = 0
+    browser.address_sel = None
+    browser.address_view = 0
+    return browser
+
+
+def _paste(browser, text):
+    browser.address_text = ""
+    browser.address_caret = 0
+    browser.address_sel = None
+    browser.address_view = 0
+    browser.window.clipboard_clear()
+    browser.window.clipboard_append(text)
+    browser._address_paste()
+    return browser.address_text
+
+
+def test_address_bar_flattens_every_kind_of_line_break():
+    """Paste multi-line text into the address bar and it stays one line.
+
+    The bar is one box with one line of text in it and the renderer honours
+    a break wherever it finds one, so anything that survives to the draw is
+    painted outside the box. This drives the real paste handler on a real
+    browser, once per break character, and then the two other ways text
+    reaches the bar: a keystroke, and the programmatic reset that fills the
+    bar from the tab's URL.
+    """
+    browser = _browser()
+    for brk in LINE_BREAKS:
+        got = _paste(browser, BULLETS % brk)
+        assert got == FLAT_BULLETS, (
+            "pasting a %r between two bullets left %r" % (brk, got))
+        assert got.splitlines() == [got], (
+            "%r still breaks a line after %r was pasted" % (got, brk))
+        assert browser.address_caret == len(got), (
+            "the caret is at %d in %d characters after pasting %r"
+            % (browser.address_caret, len(got), brk))
+
+    # A break becomes a space rather than nothing: two bullets pasted
+    # together must not weld into one word.
+    assert "bullet•" not in _paste(browser, BULLETS % "\n")
+
+    # Runs of breaks, and the whitespace hugging them, are one space -- a
+    # blank line between paragraphs is not two words apart.
+    assert _paste(browser, "one\n\n\ntwo") == "one two"
+    assert _paste(browser, "one  \n  two") == "one two"
+    assert _paste(browser, "one\ttwo") == "one two"
+
+    # Whitespace around the whole paste goes: a URL copied off a page
+    # arrives with the line ending still attached to it.
+    assert _paste(browser, "\n  https://example.com/  \n") == \
+        "https://example.com/"
+    assert _paste(browser, "\r\n\r\n") == ""
+
+    # The typed path. A control character cannot be typed, but a space very
+    # much can, and flattening must not eat it.
+    browser.address_text = ""
+    browser.address_caret = 0
+    for ch in "a b":
+        browser._address_key(Event(char=ch, keysym=ch))
+    assert browser.address_text == "a b", (
+        "typing does not survive the flattening: %r" % browser.address_text)
+
+    # The programmatic path: the bar is refilled from the tab's URL when it
+    # takes focus, and a URL is quite capable of carrying a break.
+    browser.active_tab.url = URL("https://example.com/a\nb")
+    browser._address_reset_from_tab()
+    assert browser.address_text == "https://example.com/a b", (
+        "a URL with a break in it reached the bar: %r" % browser.address_text)
+    assert browser.address_caret == len(browser.address_text)
+    print("  %d break characters, all flattened to a space"
+          % len(LINE_BREAKS))
+
+
+def test_pasted_line_breaks_do_not_paint_outside_the_address_bar():
+    """The bug as the reporter saw it: pixels below the address bar.
+
+    Semantics are one thing and the screen is another, so this renders the
+    chrome twice -- once with an empty bar, once with a multi-line paste in
+    it -- and compares the band underneath the address box. Anything the
+    paste added down there is text that got away.
+    """
+    browser = _browser()
+    top = browsermod.toes.band_height(browser.chrome_bands())
+    box_bottom = top + 72
+    x0 = browser._address_bar_x() - 10
+    # From just under the box down past where a second line of chrome text
+    # would land, which is over the top of the page by then.
+    rows = range(box_bottom + 2, box_bottom + 40)
+
+    def band():
+        browser.draw()
+        surface = browser.canvas.render()
+        pixels, stride = bytes(surface.pixels), surface.stride
+        return [pixels[y * stride + x0 * 3:y * stride + surface.width * 3]
+                for y in rows]
+
+    empty = band()
+    pasted = _paste(browser, BULLETS % "\n")
+    # Only that the paste landed at all -- what it looks like afterwards is
+    # the other test's business, and this one has to reach its pixels even
+    # when the flattening is not there.
+    assert "second bullet" in pasted, "the paste did not reach the bar"
+    after = band()
+
+    dirty = [rows[i] for i in range(len(rows)) if after[i] != empty[i]]
+    assert not dirty, (
+        "a pasted line break painted %d rows of pixels below the address "
+        "bar (y=%d..%d, box ends at y=%d): the text escaped the box"
+        % (len(dirty), dirty[0], dirty[-1], box_bottom))
+    print("  %d rows below the address box, none of them repainted"
+          % len(rows))
 
 
 def main():
