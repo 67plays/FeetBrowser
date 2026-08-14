@@ -166,6 +166,34 @@ def test_fill_rect_alpha_blends_halfway():
         f"half-alpha blend gave {(r, g, b)}"
 
 
+def test_fill_rect_alpha_uses_the_span_kernels_when_they_exist():
+    """The translucent fill hands whole rows to asmblend where the raw
+    kernels are compiled in. Force that path on -- asmblend's own fallback
+    computes the same thing the assembly does -- and check the blend landed
+    in the surface's own bytes, in the right rows and nowhere else."""
+    from feetbrowser import asmblend
+    saved = raster._ASM_SPANS
+    raster._ASM_SPANS = True
+    try:
+        s = raster.Surface(6, 4, (40, 40, 40))
+        s.fill_rect(1, 1, 5, 3, (200, 100, 50), 128)
+    finally:
+        raster._ASM_SPANS = saved
+    inv = 255 - 128
+    expect = tuple((c * 128 + 40 * inv) >> 8 for c in (200, 100, 50))
+    assert _pixel(s, 1, 1) == expect, (_pixel(s, 1, 1), expect)
+    assert _pixel(s, 4, 2) == expect, "the last covered pixel blended too"
+    assert _pixel(s, 0, 1) == (40, 40, 40), "the blend escaped to the left"
+    assert _pixel(s, 5, 1) == (40, 40, 40), "the blend escaped to the right"
+    assert _pixel(s, 1, 0) == (40, 40, 40), "the blend escaped upwards"
+
+    # And the surface is still a plain bytearray afterwards: every ctypes
+    # view over it has to be gone or it cannot be resized or replaced again.
+    s.fill_all((1, 2, 3))
+    assert _pixel(s, 0, 0) == (1, 2, 3)
+    assert asmblend.using_assembly() in (True, False)
+
+
 def test_clip_confines_drawing():
     s = raster.Surface(20, 20, (0, 0, 0))
     saved = s.set_clip(5, 5, 10, 10)

@@ -16,7 +16,22 @@ interpreter, `python3 -m feetbrowser <url>` works directly.
 
 There is nothing else to install. The renderer is ours (see [the rendering
 engine](rendering.md)), so no GUI toolkit is needed — only Python 3 and at
-least one system font.
+least one system font. The window is ours as well: AppKit on macOS, Xlib on
+Linux and on Wayland desktops through XWayland, both reached by ctypes with
+no bindings package in between.
+
+`FEETBROWSER_DISPLAY` decides which one, and normally wants leaving alone:
+
+| value | effect |
+| --- | --- |
+| unset | whichever backend this machine has |
+| `x11` | demand the X11 window; fail loudly if there is none |
+| `cocoa` | demand the macOS window; fail loudly if there is none |
+| `none` | stay headless even where a window is possible |
+
+With no display at all — no `$DISPLAY`, no server answering, or a platform
+with no backend — the browser says which of those it was and carries on
+headless, where `--screenshot` still works.
 
 To render a page without opening a window:
 

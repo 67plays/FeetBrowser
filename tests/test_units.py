@@ -1,5 +1,6 @@
 """Fast, offline unit tests for URL parsing, HTML, CSS, and internal pages."""
 import http.server
+import urllib.parse
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -8,7 +9,7 @@ from feetbrowser import gui
 from feetbrowser.net import URL
 from feetbrowser.htmlparser import HTMLParser, Element, Text
 from feetbrowser.cssparser import CSSParser, style
-from feetbrowser.layout import DrawText, get_font, _measure, \
+from feetbrowser.layout import DrawText, get_font, _measure, field_checked, \
     selected_options, option_value, option_label, listbox_rows, \
     listbox_scroll, listbox_active, LISTBOX_ROW_H, LISTBOX_PAD
 from feetbrowser.browser import (
@@ -459,6 +460,38 @@ def test_pre_whitespace_does_not_wrap():
         stack.extend(b.children)
     texts = [c for c in cmds if isinstance(c, DrawText)]
     eq(len(texts), 1, "pre line kept on one line")
+
+
+def test_nowrap_cloud_wraps_as_unit():
+    """white-space:nowrap (Wikipedia's language cloud) must not spill past the
+    viewport: each link is one unbreakable token, but tokens still wrap to a
+    fresh line once the current line runs out of room."""
+    from feetbrowser.layout import DocumentLayout, DrawText
+    css = '.cloud { width: 200px; } .cloud a { white-space: nowrap; }'
+    rules = CSSParser(css).parse()
+    links = ' '.join(f'<a href="#{i}">languagename{i:02d}</a>' for i in range(30))
+    html = f'<div class="cloud">{links}</div>'
+    dom = HTMLParser(html).parse()
+    style(dom, rules)
+    doc = DocumentLayout(dom, 200)
+    doc.layout()
+    cmds = []
+    stack = [doc]
+    while stack:
+        b = stack.pop()
+        for c in b.paint():
+            cmds.append(c)
+        stack.extend(b.children)
+    texts = [c for c in cmds if isinstance(c, DrawText)]
+    assert texts, "cloud text drawn"
+    max_right = max(c.right for c in texts)
+    assert max_right <= 200, \
+        f"nowrap cloud overflowed viewport: right edge {max_right} > 200"
+    tops = {c.text: c.top for c in texts}
+    # The whole token moves to the next line, so line tops repeat.
+    first_top = tops["languagename00"]
+    later_lines = {t for t in tops.values() if t > first_top}
+    assert later_lines, "cloud wrapped to multiple lines"
 
 
 def test_css_data_uri_semicolon():
@@ -1163,7 +1196,8 @@ def _make_tab(body, url="https://example.com/page"):
 
 
 def _control_box(tab, **attrs):
-    # Unused in the current tests but handy for interactive debugging.
+    """The centre point and node of the first form control whose attributes
+    match, as (x, y, node) -- i.e. where a user would click it."""
     for lx, ty, rx, by, n in tab.document.input_boxes:
         if isinstance(n, Element) and all(
                 n.attributes.get(k) == v for k, v in attrs.items()):
@@ -1343,15 +1377,133 @@ def test_form_submit_merges_existing_query():
 
 def test_checkbox_toggle():
     tab = _make_tab(
-        '<form action="/r"><input type="checkbox" name="c"><input type="submit"></form>')
-    for lx, ty, rx, by, n in tab.document.input_boxes:
-        if isinstance(n, Element) and n.tag == "input" \
-                and n.attributes.get("type") == "checkbox":
-            tab.click((lx + rx) / 2, (ty + by) / 2)
-            eq(n.attributes["value"], "off", "checkbox toggled off")
-            break
-    else:
-        raise AssertionError("no checkbox box found")
+        '<form action="/r"><input type="checkbox" name="c" value="blue">'
+        '<input type="submit"></form>')
+    box = _control_box(tab, type="checkbox")
+    assert box is not None, "no checkbox box found"
+    cx, cy, node = box
+    assert not field_checked(node), "unticked until clicked"
+    tab.click(cx, cy)
+    assert field_checked(node), "click ticks the box"
+    eq(node.attributes.get("value"), "blue", "the submitted value survives")
+    tab.click(cx, cy)
+    assert not field_checked(node), "a second click unticks it"
+
+
+def test_form_controls_do_not_stack_on_one_another():
+    """Controls paint straight into the display list, so the line they sit on
+    has to grow to fit them -- otherwise every control on the page lands at
+    the same y and a click reaches whichever hit box happens to be first."""
+    tab = _make_tab(
+        '<form action="/a"><input name="q"><input type="submit" value="Go">'
+        '</form>'
+        '<form method="post" action="/b"><input name="w">'
+        '<input type="submit" value="Send"></form>')
+    boxes = tab.document.input_boxes
+    eq(len(boxes), 4, "one hit box per control")
+    for i, a in enumerate(boxes):
+        for b in boxes[i + 1:]:
+            assert (a[2] <= b[0] or b[2] <= a[0]
+                    or a[3] <= b[1] or b[3] <= a[1]), \
+                f"controls overlap: {a[:4]} and {b[:4]}"
+    # The point that draws "Send" must submit the form "Send" belongs to.
+    cx, cy, _ = _control_box(tab, value="Send")
+    act = tab.click(cx, cy)
+    assert isinstance(act, FormAction), type(act)
+    eq(str(act.url), "https://example.com/b", "second form's action")
+
+
+def test_form_submit_collects_every_kind_of_field():
+    tab = _make_tab(
+        '<form method="post" action="/save">'
+        '<input name="user" value="ada">'
+        '<input type="hidden" name="csrf" value="t0ken">'
+        '<input type="checkbox" name="cc" value="yes">'
+        '<input type="checkbox" name="news" value="daily" checked>'
+        '<input type="text" name="ghost" value="x" disabled>'
+        '<textarea name="body">from markup</textarea>'
+        '<select name="colour"><option>red<option selected>blue</select>'
+        '<input type="submit" name="do" value="Save">'
+        '<input type="submit" name="do" value="Delete"></form>')
+    cx, cy, _ = _control_box(tab, value="Save")
+    act = tab.click(cx, cy)
+    assert isinstance(act, FormAction), type(act)
+    fields = urllib.parse.parse_qsl(act.payload, keep_blank_values=True)
+    eq(fields, [("user", "ada"), ("csrf", "t0ken"), ("news", "daily"),
+                ("body", "from markup"), ("colour", "blue"), ("do", "Save")],
+       "submitted fields")
+
+
+def _key_stub(tab, clipboard=""):
+    """A Browser stripped down to what _on_key touches, wired to `tab` and to
+    a clipboard that either holds `clipboard` or, when that is None, refuses
+    to be read the way the real one does when nothing text-shaped is on it."""
+    def read():
+        if clipboard is None:
+            raise gui.TclError("CLIPBOARD selection doesn't exist")
+        return clipboard
+
+    class Stub(Browser):
+        def __init__(self):
+            self.focus = None
+            self.active_tab = tab
+            self.toe_contexts = []
+            self.context_menu = type("Menu", (), {"open_": False})()
+            self.select_popup = SelectPopup()
+            self.window = type("Win", (), {"clipboard_get": staticmethod(read)})()
+            self.painted = 0
+
+        def _draw_page(self):
+            self.painted += 1
+
+    return Stub()
+
+
+def _key_event(keysym, char="", ctrl=False):
+    return type("Event", (), {"keysym": keysym, "char": char,
+                              "state": 0x4 if ctrl else 0})()
+
+
+def test_paste_into_page_field():
+    tab = _make_tab('<form action="/s"><input name="q"></form>')
+    cx, cy, node = _control_box(tab, name="q")
+    tab.click(cx, cy)
+    assert tab.focused_input is node, "click focused the field"
+
+    browser = _key_stub(tab, "hello from the clipboard")
+    Browser._on_key(browser, _key_event("v", "\x16", ctrl=True))
+    eq(node.attributes["value"], "hello from the clipboard", "pasted value")
+    eq(browser.painted, 1, "the page was repainted once")
+
+    # Typing still appends after a paste, and pastes accumulate.
+    Browser._on_key(browser, _key_event("exclam", "!"))
+    Browser._on_key(browser, _key_event("v", "\x16", ctrl=True))
+    eq(node.attributes["value"],
+       "hello from the clipboard!hello from the clipboard", "paste appends")
+
+
+def test_paste_folds_newlines_only_in_single_line_fields():
+    tab = _make_tab('<form action="/s"><input name="q">'
+                    '<textarea name="body"></textarea></form>')
+    _cx, _cy, field = _control_box(tab, name="q")
+    tab.focused_input = field
+    assert tab.insert_text("one\ntwo")
+    eq(field.attributes["value"], "one two", "single-line field folds breaks")
+
+    _cx, _cy, area = _control_box(tab, name="body")
+    tab.focused_input = area
+    assert tab.insert_text("one\ntwo")
+    eq(area.attributes["value"], "one\ntwo", "a textarea keeps them")
+
+
+def test_paste_without_a_clipboard_is_a_no_op():
+    tab = _make_tab('<form action="/s"><input name="q" value="kept"></form>')
+    _cx, _cy, node = _control_box(tab, name="q")
+    tab.focused_input = node
+    browser = _key_stub(tab, clipboard=None)
+    Browser._on_key(browser, _key_event("v", "\x16", ctrl=True))
+    eq(node.attributes["value"], "kept", "unreadable clipboard changes nothing")
+    eq(browser.painted, 0, "and costs no repaint")
 
 
 def test_about_blank_typed():
@@ -2415,6 +2567,46 @@ def test_resetting_a_form_puts_a_listbox_back():
     node = _select_node(tab)
     eq(node.attributes.get("data-active"), None,
        "and the keyboard goes back to where the markup left it")
+
+
+def test_submitting_a_select_carries_every_choice():
+    """What is submitted has to equal what the control was showing.
+
+    A `multiple` select is one name with several values, and an <option>
+    inside an <optgroup> is not a child of the select at all, so a scan of
+    the select's own children submits neither correctly.
+    """
+    tab = _make_tab(
+        '<form method="post" action="/save">'
+        '<input name="who" value="ada">'
+        '<select name="lang" multiple>'
+        '<option selected>Rust<option>Python<option selected>Zig</select>'
+        '<select name="city">'
+        '<optgroup label="DE"><option value="b">Berlin</option></optgroup>'
+        '<optgroup label="IE"><option value="d" selected>Dublin</option>'
+        '</optgroup></select>'
+        '<input type="submit" name="go" value="Save"></form>')
+    cx, cy, _ = _control_box(tab, value="Save")
+    act = tab.click(cx, cy)
+    assert isinstance(act, FormAction), type(act)
+    fields = urllib.parse.parse_qsl(act.payload, keep_blank_values=True)
+    eq(fields, [("who", "ada"), ("lang", "Rust"), ("lang", "Zig"),
+                ("city", "d"), ("go", "Save")],
+       "every choice submitted, alongside the ordinary fields")
+
+
+def test_an_untouched_select_submits_its_fallback_choice():
+    """Marking nothing `selected` still submits: a single-choice select
+    falls back to the first option the reader could have picked, which is
+    the one the closed control was showing all along."""
+    tab = _make_tab(
+        '<form method="post" action="/save">'
+        '<select name="size"><option disabled>--<option>M<option>L</select>'
+        '<input type="submit" value="Go"></form>')
+    cx, cy, _ = _control_box(tab, value="Go")
+    act = tab.click(cx, cy)
+    fields = urllib.parse.parse_qsl(act.payload, keep_blank_values=True)
+    eq(fields, [("size", "M")], "the first choosable option, not the disabled one")
 
 
 def main():

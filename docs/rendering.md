@@ -177,11 +177,64 @@ registry maps each `NSWindow` back to its Python window and the root's loop
 feeds any popups. `[NSApp sendEvent:]` runs before translation — without it the
 close button, titlebar drag and live resize do not work.
 
+## x11.py — the same idea on Linux
+
+Xlib is a C library too, so this is ctypes again: `libX11.so.6` by soname,
+`XOpenDisplay`, `XCreateSimpleWindow`, `XSelectInput`, `XMapWindow`, and a
+pump over `XPending`/`XNextEvent`. No python-xlib, no compiled shim, and no
+XCB — the same rule the rest of the repo lives by. XWayland means this covers
+most Wayland desktops as well; a native Wayland backend is not written.
+
+Translation is *lighter* here than on macOS, because Tk is an X11 program and
+it shows. Tk's `event.state` bits are literally X's modifier mask, and Tk's
+keysym names — `Return`, `Left`, `ISO_Left_Tab` — are X's keysym names. So
+`XLookupString` (which applies the user's keyboard layout, and is the reason
+a shifted `a` arrives as the keysym `A`) plus `XKeysymToString` is nearly the
+whole job. Two habits of Tk's are added back: a printable key is named by its
+character, and a modifier pressed on its own is not a keypress, which X thinks
+it is. The binding rules themselves — which sequences a keypress tries, most
+specific first — live in `window.py` and are shared with `cocoa.py` rather
+than written twice. The wheel is buttons 4 and 5 on X, translated to
+`<MouseWheel>` with a delta small enough that `browser.py` reads it as pixels.
+
+Presenting is where X asks for real work. The server names its pixel format
+rather than agreeing to ours, so the visual's `red_mask`/`green_mask`/
+`blue_mask` and `XImageByteOrder` are read once at startup and turned into
+byte offsets: a mask of `0x00FF0000` is byte 2 on an LSBFirst server and byte
+1 on an MSBFirst one, and getting that backwards swaps red and blue on
+exactly the machines nobody tests on. 24- and 32-bit TrueColor in either byte
+order convert with three strided slice assignments over the whole frame;
+depth 15 and 16 fall to a slower per-pixel path with a scaling table per
+channel, so white stays white on five bits of red. A server whose format is
+byte-for-byte ours — 24bpp, RGB order — gets the framebuffer handed to
+`XPutImage` with no copy at all. Rows are padded to the server's
+`scanline_pad`, which is invisible at a round width and shears the picture at
+an odd one.
+
+`XShmPutImage` is deliberately not used. Shared memory is faster and does not
+exist over a network socket, and a browser that only works when the server is
+on the same machine is a worse browser than a slightly slower one.
+
+There is no close event in X: the window manager asks through a
+`WM_DELETE_WINDOW` client message, and a client that ignores it gets killed
+instead of asked. `XSetWMProtocols` opts in, and the message runs the same
+`protocol()` handler Tk would. Xlib's default error handler calls `exit()`,
+which would take the browser down over a stale window id, so ours records the
+error and returns. As on macOS there is one event queue per *connection*, so
+a module-level registry maps each window id back to its Python window and the
+root's loop feeds any popups.
+
 `gui.py` picks all of this up: `gui.Tk()` is always the headless root, so tests
 and `--screenshot` never open anything, and only `gui.new_window()` asks for a
-real one. `FEETBROWSER_DISPLAY=none` forces headless even on macOS -- it selects
-among *our* windows, so it has nothing to say to `FEETBROWSER_BACKEND=tk`, which
-opens whatever tkinter opens.
+real one. Backends declare themselves in one table and answer `available()`
+for themselves, so Cocoa is tried and then X11 and the first that can run
+wins. `FEETBROWSER_DISPLAY=x11` or `=cocoa` demands one by name and fails
+loudly rather than falling back to a headless root that renders a black
+screenshot; `FEETBROWSER_DISPLAY=none` forces headless even where a window is
+possible. All of that selects among *our* windows, so it has nothing to say to
+`FEETBROWSER_BACKEND=tk`, which opens whatever tkinter opens. With no
+`$DISPLAY`, or an X server that will not answer, the browser says which of
+those it was and renders headless instead of raising.
 
 ## Testing it
 
@@ -205,3 +258,7 @@ settles the image loads, and writes a PNG. CI does this on every push.
 - No right-to-left or complex-script shaping. Characters advance
   left-to-right, one glyph each.
 - Animated GIFs show their first frame.
+- No native Wayland backend. Wayland desktops get the X11 window through
+  XWayland, which is how nearly all of them run X clients today.
+- X11 needs a TrueColor visual, which is every server since about 2005;
+  PseudoColor and its colormaps are not implemented.

@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, 'feat/**' ]
   pull_request:
 
 jobs:
@@ -32,12 +32,22 @@ jobs:
       - name: Lint (pyflakes)
         run: .venv/bin/python -m pyflakes feetbrowser tests
 
+      # Warnings are kept at zero deliberately. Denying them here is the only
+      # thing that keeps it true; 84 of them accumulated the other way.
+      - name: Rust warnings
+        env:
+          RUSTFLAGS: -D warnings
+        run: cargo check --manifest-path rust/Cargo.toml --all-targets
+
       - name: Renderer tests
         run: .venv/bin/python tests/test_render.py
 
-      # Skips itself off macOS; here to prove the skip stays clean.
+      # Both skip themselves off their own platform; here to prove the skips
+      # stay clean, and test_x11 still runs its whole offline half.
       - name: Platform window tests
-        run: .venv/bin/python tests/test_cocoa.py
+        run: |
+          .venv/bin/python tests/test_cocoa.py
+          .venv/bin/python tests/test_x11.py
 
       - name: Unit tests
         run: .venv/bin/python tests/test_units.py
@@ -51,8 +61,10 @@ jobs:
       - name: Toe engine tests
         run: .venv/bin/python tests/test_toes.py
 
-      - name: Pseudo-toe (gh-scroll) tests
-        run: .venv/bin/python tests/test_gh_scroll.py
+      # Linux/x86-64 assembles and runs the real kernels here; everywhere
+      # else the module's pure-Python fallback is what gets checked.
+      - name: Assembly span kernels
+        run: .venv/bin/python tests/test_asmblend.py
 
       - name: Screenshot a page end to end
         run: |
@@ -63,3 +75,54 @@ jobs:
           assert size > 2000, f"screenshot suspiciously small: {size} bytes"
           print(f"rendered /tmp/blank.png ({size} bytes)")
           EOF
+
+  # The job above proves the browser needs no display. This one proves it can
+  # use one: a real X server, a real window, real events, and a photograph of
+  # the result taken with XGetImage.
+  x11:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install fonts and an X server
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fonts-dejavu-core fonts-liberation xvfb
+
+      - name: Build the Rust JS engine
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install maturin
+          .venv/bin/maturin develop --release --manifest-path rust/Cargo.toml
+
+      # 24-bit TrueColor: what every desktop actually runs, and the format
+      # the backend converts to with no per-pixel work.
+      - name: X11 tests at depth 24
+        run: |
+          xvfb-run -a --server-args="-screen 0 1600x1200x24" \
+            .venv/bin/python tests/test_x11.py
+
+      # 16-bit 5-6-5, which no byte layout can describe, so this is the only
+      # thing that ever runs the slow per-channel path against a real server.
+      - name: X11 tests at depth 16
+        run: |
+          xvfb-run -a --server-args="-screen 0 1600x1200x16" \
+            .venv/bin/python tests/test_x11.py
+
+      - name: Photograph a real X11 window
+        run: |
+          xvfb-run -a --server-args="-screen 0 1600x1200x24" \
+            .venv/bin/python tests/x11_shot.py artifacts/x11-window.png
+
+      - name: Upload the window
+        uses: actions/upload-artifact@v4
+        with:
+          name: x11-window
+          path: artifacts/x11-window.png
+          if-no-files-found: error
+

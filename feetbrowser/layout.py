@@ -1157,6 +1157,35 @@ def _gradient_rects(box, direction, stops):
     return rects
 
 
+def field_value(node):
+    """The text a form field currently holds.
+
+    The `value` attribute is the live store once anything has written to it,
+    but a field that has never been touched still has to report what the
+    markup gave it -- and for <textarea> that initial text is the element's
+    content, not an attribute, so reading `value` alone loses a server-filled
+    textarea on submit.
+    """
+    if "value" in node.attributes:
+        return node.attributes["value"]
+    if node.tag == "textarea":
+        return "".join(c.text for c in node.children if isinstance(c, Text))
+    return ""
+
+
+def field_checked(node):
+    """Whether a checkbox or radio is ticked right now.
+
+    Clicks are recorded in `data-checked` rather than in `value`, so that the
+    value the form wants submitted survives being toggled and the markup's
+    own `checked` attribute still says what the initial state was.
+    """
+    state = node.attributes.get("data-checked")
+    if state is not None:
+        return state != "off"
+    return "checked" in node.attributes
+
+
 # -- <select> ---------------------------------------------------------------
 #
 # The painter here and the drop-down list in browser.py have to agree on what
@@ -2700,6 +2729,10 @@ class BlockLayout(LayoutBox):
         self.cursor_x = self._line_bounds()[0]
         self.line = []  # pending words on the current line
         self._underline_run = None  # (declaring element, DrawLine) being extended
+        # Tallest form control painted on the current line. Controls paint
+        # straight into the display list instead of queuing a _LineItem, so
+        # flush() has to be told how far down they reach.
+        self.line_control_h = 0.0
 
         # List item bullet.
         if isinstance(self.node, Element) and \
@@ -2761,16 +2794,26 @@ class BlockLayout(LayoutBox):
                     self.flush(force=True)
                 self._place_word(line, font, color, node, measure=False, nowrap=True)
             return
-        nowrap = white_space == "nowrap"
+        if white_space == "nowrap":
+            # white-space:nowrap collapses spaces but forbids wrapping inside
+            # the element: the whole run is one unbreakable token. It still
+            # moves to the next line as a unit when the current one runs out
+            # of room (e.g. Wikipedia's language cloud of <a> links), instead
+            # of one-word-per-line forever overflowing the viewport.
+            words = content.split()
+            if words:
+                self._place_word(" ".join(words), font, color, node,
+                                 nowrap=True)
+            return
         for word in content.split():
-            self._place_word(word, font, color, node, nowrap=nowrap)
+            self._place_word(word, font, color, node)
 
     def _place_word(self, word, font, color, node, measure=True, nowrap=False):
         if not word:
             return
         w = _measure(font, word)
         x0, x1 = self._line_bounds()
-        if not nowrap and x0 >= x1:
+        if x0 >= x1:
             # A float covers the whole line (e.g. a full-width floated table):
             # don't draw the word on top of the float, drop below it first.
             # Flush any words already queued so their baseline isn't dragged
@@ -2785,7 +2828,11 @@ class BlockLayout(LayoutBox):
                 self.cursor_y = bottom
             self.cursor_x = self._line_bounds()[0]
             x0, x1 = self._line_bounds()
-        if not nowrap and self.cursor_x + w > x1:
+        if self.cursor_x + w > x1 and self.cursor_x > x0:
+            # The token doesn't fit on the remaining space: break before it.
+            # A nowrap token breaks here as a whole unit (never inside); a
+            # pre line (measure=False) starts a fresh line and simply
+            # overflows when wider than the line.
             if self.line:
                 self.flush()
             self.cursor_x = self._line_bounds()[0]
@@ -2793,13 +2840,22 @@ class BlockLayout(LayoutBox):
         self.cursor_x += w + (_measure(font, " ") if measure else 0)
 
     def flush(self, force=False):
+        line_top = self.cursor_y
+        control_h, self.line_control_h = self.line_control_h, 0.0
         if not self.line:
-            if not force:
+            if not force and not control_h:
                 return
             # A bare <br> (or <br><br>) still has to advance the line; advance
-            # by one line box using the current font metrics.
-            font = _node_font(self.node)
-            self.cursor_y += 1.25 * (_metrics(font, "ascent") + _metrics(font, "descent"))
+            # by one line box using the current font metrics. A line holding
+            # nothing but form controls advances past the controls instead --
+            # leaving it at zero height stacks the next line, and every hit
+            # box on it, on top of this one.
+            advance = 0.0
+            if force:
+                font = _node_font(self.node)
+                advance = 1.25 * (_metrics(font, "ascent")
+                                  + _metrics(font, "descent"))
+            self.cursor_y = line_top + max(advance, control_h)
             self.cursor_x = self._line_bounds()[0]
             return
 
@@ -2865,7 +2921,8 @@ class BlockLayout(LayoutBox):
                 # An image or a form control breaks the run: browsers do not
                 # rule a line under a button that happens to sit in a link.
                 self._underline_run = None
-        self.cursor_y = baseline + 1.25 * max_descent
+        self.cursor_y = max(baseline + 1.25 * max_descent,
+                            line_top + control_h)
         self.cursor_x = self._line_bounds()[0]
         self.line = []
 
@@ -3030,6 +3087,7 @@ class BlockLayout(LayoutBox):
         for tx, ty, text, tfont, color in texts:
             self.display_list.append(DrawText(tx, ty, text, tfont, color, node))
         self.input_boxes.append((x, y, x + w, y + h, node))
+        self.line_control_h = max(self.line_control_h, (y - self.cursor_y) + h)
         self.cursor_x = x + w + _measure(font, " ")
 
     def _paint_control(self, node, label, wpad, hpad, rect, outline,
@@ -3055,7 +3113,7 @@ class BlockLayout(LayoutBox):
             return self._inline_button(node)
         font = get_font(13, "normal", "roman")
         bull = _linespace(font)
-        value = node.attributes.get("value", "")
+        value = field_value(node)
         placeholder = node.attributes.get("placeholder", "")
         label = value
         if node.tag == "textarea":
@@ -3071,15 +3129,15 @@ class BlockLayout(LayoutBox):
             h = bull + 2
             if self.cursor_x + w > self._line_bounds()[1] and self.line:
                 self.flush()
-            checked = value == "on"
             self.display_list.append(DrawOutline(
                 self.cursor_x, y, self.cursor_x + w - 4, y + h, "#666666", 1))
-            if checked:
+            if field_checked(node):
                 self.display_list.append(DrawText(
                     self.cursor_x + 1, y - 1, "✓", get_font(12, "bold", "roman"),
                     "#1a73e8", node))
             self.input_boxes.append(
                 (self.cursor_x, y, self.cursor_x + w, y + h, node))
+            self.line_control_h = max(self.line_control_h, h)
             self.cursor_x += w
             return
         w = 160
