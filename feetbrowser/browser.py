@@ -3007,6 +3007,10 @@ class Browser:
         url = str(self.active_tab.url) if \
             (self.active_tab and self.active_tab.url and
              not isinstance(self.active_tab.url, _AboutURL)) else ""
+        # Nothing should put a break in a URL, but this is the one route into
+        # the bar that does not go through _address_insert, and a URL that
+        # came in over the wire is not ours to trust.
+        url = self._flatten_address_text(url).strip()
         self.address_text = url
         self.address_caret = len(url)
         self.address_sel = None
@@ -3045,7 +3049,46 @@ class Browser:
         self.address_sel = None
         return True
 
+    @staticmethod
+    def _flatten_address_text(text):
+        """`text` with everything that breaks a line folded away.
+
+        The address bar is one line of text drawn inside one box, and the
+        renderer honours a line break wherever it finds one: paste a couple
+        of bullet points in and the second line is painted below the box,
+        floating over the page. A URL cannot hold a break either, so there
+        is nothing to preserve.
+
+        The break family is bigger than "\\n". A copy out of rendered text
+        can carry CR and CRLF from a Windows or classic-Mac source, the
+        vertical tab and form feed, NEL (U+0085) and the Unicode line and
+        paragraph separators U+2028/U+2029 -- `str.splitlines` knows all of
+        them, so the split is delegated to it rather than spelled out here
+        and left to rot. The tab goes the same way: not valid in a URL, and
+        drawn as a missing glyph.
+
+        A break becomes a *space*, not nothing. This bar is a search box as
+        much as it is a URL bar, and welding "...bullet one" onto "bullet
+        two..." quietly corrupts the query, where a space is what the line
+        break meant in the first place. Blank lines and the whitespace
+        hugging each break collapse into that one space, so a wrapped
+        paragraph does not arrive full of gaps.
+
+        Text with no break in it is returned as it stands, spaces included:
+        this runs on every inserted character, and a bar that eats the
+        space bar is worse than the bug it fixes.
+        """
+        lines = text.replace("\t", " ").splitlines()
+        if len(lines) <= 1:
+            return lines[0] if lines else ""
+        return " ".join(part for part in (line.strip() for line in lines)
+                        if part)
+
     def _address_insert(self, text):
+        # Every route into the address text -- typing, pasting, whatever a
+        # future one is -- lands here, so this is where a line break is
+        # stopped rather than at each caller.
+        text = self._flatten_address_text(text)
         self._address_delete_selection()
         self.address_text = (self.address_text[:self.address_caret] + text
                              + self.address_text[self.address_caret:])
@@ -3115,7 +3158,10 @@ class Browser:
             return ""
 
     def _address_paste(self):
-        data = self._clipboard_text()
+        # A paste arrives as a block, so the whitespace around the block goes
+        # too -- a URL copied off a page usually brings a trailing newline
+        # with it, and one typed space is not what the user asked for.
+        data = self._flatten_address_text(self._clipboard_text()).strip()
         if data:
             self._address_insert(data)
 
@@ -3570,7 +3616,11 @@ class Browser:
         else:
             url = ""
             if tab and tab.url and not isinstance(tab.url, _AboutURL):
-                url = str(tab.url)
+                # The unfocused bar echoes the tab's URL rather than the text
+                # the user typed, and a link href can carry a literal break
+                # (`&#10;` survives the parser and the URL), so it is flattened
+                # here too or it escapes the box by the back door.
+                url = self._flatten_address_text(str(tab.url))
             c.create_text(addr_x + 10, top + 60, text=url, anchor="w",
                           font=self.chrome_font, fill=self.c("addr_text"))
 
