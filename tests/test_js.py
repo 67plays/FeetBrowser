@@ -5,7 +5,7 @@ import http.server
 import sys, os, threading, time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from feetbrowser import gui
+from feetbrowser.window import Tk
 
 from feetbrowser.net import URL
 from feetbrowser.browser import Tab, tree_to_list
@@ -1118,7 +1118,7 @@ def test_a_multiple_listbox_reads_its_first_chosen_value():
 
 
 def main():
-    root = gui.Tk(); root.withdraw()
+    root = Tk(); root.withdraw()
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0
     for t in tests:

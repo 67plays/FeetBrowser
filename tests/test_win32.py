@@ -19,9 +19,6 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from feetbrowser import gui
-
-
 def _skip(reason):
     print("SKIP test_win32.py: %s" % reason)
     sys.exit(0)
@@ -29,8 +26,6 @@ def _skip(reason):
 
 if sys.platform != "win32":
     _skip("not Windows")
-if gui.backend() != "raster":
-    _skip("needs FEETBROWSER_BACKEND=raster")
 
 from feetbrowser import browser as browsermod  # noqa: E402
 from feetbrowser import win32  # noqa: E402

@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # Run the FeetBrowser test suite.
 #
-# The renderer draws into its own framebuffer, so no display, no Tk and no
-# toolkit is needed. There are two JavaScript engines and the suite builds
-# both: the Zig one is a dynamic library loaded with ctypes, the Rust one is
-# a CPython extension maturin builds into the local venv. The JS suite then
-# runs against each in turn, because two engines behind one contract are only
-# worth having if both are held to it.
+# The renderer draws into its own framebuffer, so no display and no toolkit is
+# needed. There are two JavaScript engines and the suite builds both: the Zig
+# one is a dynamic library loaded with ctypes, the Rust one is a CPython
+# extension maturin builds into the local venv. The JS suite then runs against
+# each in turn, because two engines behind one contract are only worth having
+# if both are held to it.
 #
 # Four suites step outside all that: test_cocoa.py, test_x11.py and
 # test_win32.py open real windows wherever their platform has one and skip

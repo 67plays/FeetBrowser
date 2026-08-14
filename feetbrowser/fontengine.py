@@ -1,7 +1,7 @@
 """TrueType font parsing: metrics, character mapping, and glyph outlines.
 
-This replaces the font half of Tk. Everything the layout engine needs from a
-font comes from tables in the file itself:
+We read the font ourselves. Everything the layout engine needs from a font
+comes from tables in the file itself:
 
     ascent / descent / linespace   <- hhea (or OS/2 when hhea is degenerate)
     advance width per glyph        <- hmtx
