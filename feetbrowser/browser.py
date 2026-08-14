@@ -266,20 +266,44 @@ class Tab:
             self._start_async_load(url, payload, push, refresh, pending_scroll)
             return
         try:
+            body, ctype, doc_error = self._fetch_document(url, payload, refresh)
+        except TypeError:
+            # Internal URL objects (about:blank, bookmarks, history) expose a
+            # simpler request(); retry without the refresh flag.
+            body, ctype, doc_error = self._fetch_document(url, payload, False)
+        self._complete_load(url, payload, push, pending_scroll, body, ctype,
+                            doc_error=doc_error)
+
+    def _fetch_document(self, url, payload, refresh):
+        """Fetch a document body, surfacing load errors and retrying through a
+        Chrome-impersonating transport when a JS-gated site (Google) serves an
+        'enable JavaScript' wall instead of its real application."""
+        try:
             _headers, body, ctype = url.request(payload=payload,
                                                 refresh=refresh)
             doc_error = None
         except TypeError:
-            # Internal URL objects (about:blank, bookmarks, history) expose a
-            # simpler request(); retry without the refresh flag.
             _headers, body, ctype = url.request(payload=payload)
             doc_error = None
         except Exception as e:  # noqa: BLE001 - surface any network error in-page
             body = f"<h1>Could not load page</h1><pre>{type(e).__name__}: {e}</pre>"
             doc_error = f"DOC {url} ({type(e).__name__})"
             ctype = "text/html"
-        self._complete_load(url, payload, push, pending_scroll, body, ctype,
-                            doc_error=doc_error)
+        if doc_error is None and self._is_google_js_wall(url, body) \
+                and isinstance(url, URL) and url.scheme in ("http", "https"):
+            try:
+                _headers, body, ctype = url.request_impersonated()
+            except Exception:  # noqa: BLE001 - keep the walled response
+                pass
+        return body, ctype, doc_error
+
+    def _is_google_js_wall(self, url, body):
+        host = (getattr(url, "host", "") or "").lower()
+        if "google.com" not in host:
+            return False
+        low = (body or "").lower()
+        return ("enablejs" in low or "/httpservice/retry/" in low
+                or "isn't supported anymore" in low)
 
     def _gui_mode(self):
         return self.browser is not None \
@@ -296,8 +320,8 @@ class Tab:
 
         def worker():
             try:
-                _headers, body, ctype = url.request(payload=payload,
-                                                    refresh=refresh)
+                body, ctype, _err = self._fetch_document(url, payload,
+                                                         refresh)
                 exc = None
             except Exception as e:  # noqa: BLE001 - surfaced as an error page
                 body, ctype, exc = None, None, e
