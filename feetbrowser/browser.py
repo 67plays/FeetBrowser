@@ -1278,8 +1278,11 @@ class Browser:
         if self.focus == "address":
             self._address_key(e)
             return
-        # Toes get first crack at keys when no address bar has focus.
-        if toes.dispatch(self.toe_contexts, "on_keypress", e):
+        # Toes get first crack at keys when no address bar has focus, but
+        # only consume the key when a toe explicitly returns True (a False
+        # return means "not handled").
+        if any(r is True for r in toes.dispatch(
+                self.toe_contexts, "on_keypress", e)):
             return
         # Typing into a focused form field.
         if self.active_tab and self.active_tab.focused_input and \
