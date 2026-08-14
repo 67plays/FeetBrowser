@@ -654,6 +654,35 @@ def _gradient_rects(box, direction, stops):
     return rects
 
 
+def field_value(node):
+    """The text a form field currently holds.
+
+    The `value` attribute is the live store once anything has written to it,
+    but a field that has never been touched still has to report what the
+    markup gave it -- and for <textarea> that initial text is the element's
+    content, not an attribute, so reading `value` alone loses a server-filled
+    textarea on submit.
+    """
+    if "value" in node.attributes:
+        return node.attributes["value"]
+    if node.tag == "textarea":
+        return "".join(c.text for c in node.children if isinstance(c, Text))
+    return ""
+
+
+def field_checked(node):
+    """Whether a checkbox or radio is ticked right now.
+
+    Clicks are recorded in `data-checked` rather than in `value`, so that the
+    value the form wants submitted survives being toggled and the markup's
+    own `checked` attribute still says what the initial state was.
+    """
+    state = node.attributes.get("data-checked")
+    if state is not None:
+        return state != "off"
+    return "checked" in node.attributes
+
+
 class LayoutBox:
     """Base class carrying geometry."""
 
@@ -1911,6 +1940,10 @@ class BlockLayout(LayoutBox):
         self.cursor_y = self._cleared(clear, self.y)
         self.cursor_x = self._line_bounds()[0]
         self.line = []  # pending words on the current line
+        # Tallest form control painted on the current line. Controls paint
+        # straight into the display list instead of queuing a _LineItem, so
+        # flush() has to be told how far down they reach.
+        self.line_control_h = 0.0
 
         # List item bullet.
         if isinstance(self.node, Element) and \
@@ -2014,13 +2047,22 @@ class BlockLayout(LayoutBox):
         self.cursor_x += w + (_measure(font, " ") if measure else 0)
 
     def flush(self, force=False):
+        line_top = self.cursor_y
+        control_h, self.line_control_h = self.line_control_h, 0.0
         if not self.line:
-            if not force:
+            if not force and not control_h:
                 return
             # A bare <br> (or <br><br>) still has to advance the line; advance
-            # by one line box using the current font metrics.
-            font = _node_font(self.node)
-            self.cursor_y += 1.25 * (_metrics(font, "ascent") + _metrics(font, "descent"))
+            # by one line box using the current font metrics. A line holding
+            # nothing but form controls advances past the controls instead --
+            # leaving it at zero height stacks the next line, and every hit
+            # box on it, on top of this one.
+            advance = 0.0
+            if force:
+                font = _node_font(self.node)
+                advance = 1.25 * (_metrics(font, "ascent")
+                                  + _metrics(font, "descent"))
+            self.cursor_y = line_top + max(advance, control_h)
             self.cursor_x = self._line_bounds()[0]
             return
 
@@ -2065,7 +2107,8 @@ class BlockLayout(LayoutBox):
             if item.kind == "text":
                 self._maybe_underline(
                     item.x + offset, y, item.text, item.font, item.color, item.node)
-        self.cursor_y = baseline + 1.25 * max_descent
+        self.cursor_y = max(baseline + 1.25 * max_descent,
+                            line_top + control_h)
         self.cursor_x = self._line_bounds()[0]
         self.line = []
 
@@ -2147,6 +2190,7 @@ class BlockLayout(LayoutBox):
         for tx, ty, text, tfont, color in texts:
             self.display_list.append(DrawText(tx, ty, text, tfont, color, node))
         self.input_boxes.append((x, y, x + w, y + h, node))
+        self.line_control_h = max(self.line_control_h, (y - self.cursor_y) + h)
         self.cursor_x = x + w + _measure(font, " ")
 
     def _paint_control(self, node, label, wpad, hpad, rect, outline,
@@ -2170,7 +2214,7 @@ class BlockLayout(LayoutBox):
             return self._inline_button(node)
         font = get_font(13, "normal", "roman")
         bull = _linespace(font)
-        value = node.attributes.get("value", "")
+        value = field_value(node)
         placeholder = node.attributes.get("placeholder", "")
         label = value
         if node.tag == "textarea":
@@ -2186,15 +2230,15 @@ class BlockLayout(LayoutBox):
             h = bull + 2
             if self.cursor_x + w > self._line_bounds()[1] and self.line:
                 self.flush()
-            checked = value == "on"
             self.display_list.append(DrawOutline(
                 self.cursor_x, y, self.cursor_x + w - 4, y + h, "#666666", 1))
-            if checked:
+            if field_checked(node):
                 self.display_list.append(DrawText(
                     self.cursor_x + 1, y - 1, "✓", get_font(12, "bold", "roman"),
                     "#1a73e8", node))
             self.input_boxes.append(
                 (self.cursor_x, y, self.cursor_x + w, y + h, node))
+            self.line_control_h = max(self.line_control_h, h)
             self.cursor_x += w
             return
         w = 160
