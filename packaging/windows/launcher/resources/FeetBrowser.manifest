@@ -35,8 +35,15 @@
            it exists and stepping down where it does not; a dpiAware entry
            here would settle the question before that code runs and make its
            call fail. Marking a process DPI-aware from a manifest is normally
-           the right answer -- it just is not when the window backend already
-           has a better one. -->
+           the right answer; it just is not the right answer when the window
+           backend already has a better one.
+
+           Note for anyone editing these comments: a double hyphen cannot
+           appear inside an XML comment. An application manifest that is not
+           well-formed does not get ignored, it stops the program from
+           starting at all, with "the side-by-side configuration is
+           incorrect" and nothing else. build.ps1 parses this file before it
+           builds anything so that the mistake is a build error instead. -->
       <longPathAware xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">true</longPathAware>
     </windowsSettings>
   </application>

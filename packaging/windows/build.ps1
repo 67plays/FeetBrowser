@@ -250,6 +250,15 @@ if ($SkipLauncher) {
     Step "building FeetBrowser.exe"
     $launcher = Join-Path $PSScriptRoot 'launcher'
     $target = Join-Path $launcher 'target'
+    # An application manifest that is not well-formed XML is not ignored: the
+    # loader refuses to start the process at all, and all the user gets is
+    # "the side-by-side configuration is incorrect", which says nothing about
+    # XML and nothing about which file. rc.exe embeds the bytes without
+    # looking at them, so nothing downstream of here would notice either.
+    # Parse it now, while there is still a line number to report.
+    $manifest = Join-Path $launcher 'resources\FeetBrowser.manifest'
+    try { [void][xml](Get-Content -Raw $manifest) }
+    catch { Fail "$manifest is not well-formed XML: $($_.Exception.Message)" }
     # No build-machine paths in the shipped binary. There are no dependencies
     # to leak a home directory, but the crate's own path would otherwise be
     # embedded in panic locations.

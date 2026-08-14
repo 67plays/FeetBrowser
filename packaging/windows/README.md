@@ -28,8 +28,14 @@ Three things in one directory:
    top of `build.ps1` and the hash is checked on every build.
 2. **`feetbrowser/`**, copied in verbatim. It is pure Python; there is nothing
    to do to it.
-3. **`feetbrowser_engine.pyd`**, taken out of a maturin wheel — the Rust
-   rasteriser, font engine, image decoders and JavaScript engine.
+3. **`feetbrowser_engine\`**, taken out of a maturin wheel — the Rust
+   rasteriser, font engine, image decoders and JavaScript engine. Current
+   maturin wraps the extension in a package of its own: a directory holding
+   `feetbrowser_engine.cp313-win_amd64.pyd` and a three-line `__init__.py`
+   that re-exports it. `build.ps1` copies whatever shape the wheel has
+   rather than assuming one, so a future maturin that goes back to a bare
+   `.pyd` at the root of the wheel will bundle just as happily; what it
+   insists on is that there is exactly one engine `.pyd` in there.
 
 Plus `FeetBrowser.exe`, which is the subject of most of this document.
 
@@ -59,7 +65,7 @@ FeetBrowser\
     vcruntime140.dll, vcruntime140_1.dll
     python.cat                 Microsoft's signature catalogue for the above
     LICENSE.txt                the PSF license, for all of the above
-    feetbrowser_engine*.pyd    the engine
+    feetbrowser_engine\        the engine, as maturin packages it
     feetbrowser\               the browser
     toes\                      where extensions get installed
     LICENSE, README.md, README-FIRST.txt
@@ -93,7 +99,7 @@ resolved relative to the directory the file is in.
 
 For us, those two lines already say the right thing. `python313.zip` is the
 standard library; `.` is the bundle directory, which is where `feetbrowser\`
-and `feetbrowser_engine.pyd` are. So the "how do we get our package
+and `feetbrowser_engine\` are. So the "how do we get our package
 importable given that the embeddable package has no pip and no site-packages"
 problem has a one-word answer: we don't need to, they are already on the
 path.
@@ -253,6 +259,15 @@ is the one thing about this project genuinely worth protecting.
 Without an SDK, `build.rs` warns and produces a working but unadorned binary;
 `build.ps1` sets `FEETBROWSER_REQUIRE_RESOURCES=1`, which turns that warning
 into a hard error, so the thing users download always has its icon.
+
+The manifest is parsed by `build.ps1` before anything is compiled, which
+looks like belt and braces and is not. `rc.exe` embeds the file without
+reading it, and a manifest that is not well-formed XML does not degrade
+gracefully at run time: the loader refuses to create the process, and the
+only thing anybody sees is a message box saying "the side-by-side
+configuration is incorrect", which mentions neither XML nor the file. This
+cost a CI run to a double hyphen inside an XML comment, where it is illegal.
+Now it is a build error with a line number.
 
 `make-icon.py` draws the `.ico` — standard library only, seven sizes, PNG
 entries. It exists so that the one binary file in this directory is

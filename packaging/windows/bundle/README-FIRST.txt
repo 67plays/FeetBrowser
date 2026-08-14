@@ -76,7 +76,7 @@ WHAT IS IN HERE
 
     FeetBrowser.exe         the launcher
     feetbrowser\            the browser, in Python
-    feetbrowser_engine*.pyd the rasteriser, font engine, image decoders and
+    feetbrowser_engine\     the rasteriser, font engine, image decoders and
                             JavaScript engine, compiled from Rust
     python3NN.dll           CPython, from python.org's embeddable package
     python3NN.zip           its standard library
