@@ -207,18 +207,18 @@ to writing a regex engine.
 
 ## maturin, pyo3, and the ctypes question
 
-`maturin` is installed and invoked in three places: `run.sh:92-93`,
-`test.sh:36-37`, and `.github/actions/build/action.yml:72-73`. It exists to
+`maturin` is installed and invoked in three places: `run.sh:97-98`,
+`test.sh:47-48`, and `.github/actions/build/action.yml:72-73`. It exists to
 build `feetbrowser_engine` as a CPython extension module and install it into a
-virtualenv. Most of `run.sh`'s 108 lines are in service of that: locating the
+virtualenv. Most of `run.sh`'s 120 lines are in service of that: locating the
 extension, comparing its mtime against `rust/src`, creating the venv,
 unsealing a venv made before `--system-site-packages` was added, and printing
 the three different failure messages the process can produce.
 
-The Zig JavaScript engine, on `feat/zig-js-engine`, is the existence proof that
-this is not the only shape available. It builds with `cd zig && zig build` —
-`build.zig` is 50 lines — and loads through plain `ctypes.CDLL`. No build tool,
-no extension module, no pyo3, no venv, and nothing tied to the Python version.
+The Zig JavaScript engine, now on main, is the existence proof that this is not
+the only shape available. It builds with `cd zig && zig build` — `build.zig` is
+50 lines — and loads through plain `ctypes.CDLL`. No build tool, no extension
+module, no pyo3, no venv, and nothing tied to the Python version.
 Its FFI layer, `feetbrowser/jszig.py`, is 716 lines: 39 C functions, one
 24-byte tagged-union struct crossing the boundary, and five `CFUNCTYPE`
 callbacks so the engine can call back into Python for property reads, writes
@@ -244,26 +244,33 @@ None of that survives a ctypes boundary. `getattr`, refcounting, `PyDict`
 casts and constructing Python classes *are* the CPython C API, which is
 precisely what ctypes does not give you.
 
-The number that shows the difference is that `jsdom.py` is **284 lines on main
-and 109 on the Zig branch**. In the Zig design the DOM stays in Python and the
-engine reaches it only through five generic callbacks on opaque handles. That
-is not a smaller version of the Rust design; it is a different one.
+Main now carries both arrangements side by side, which is the clearest look at
+the difference there is going to be: `jsdom_rust.py` is **214 lines** of shims
+that forward every `js_get`/`js_set` into `dom.rs`, while `jsdom_py.py` is
+**886 lines** that hold the entire DOM in Python and let the engine reach it
+through five generic callbacks on opaque handles. `jsdom.py`, 109 lines,
+picks between them. The Zig side is not a smaller version of the Rust design;
+it is a different one, and it is four times the Python.
 
-So dropping pyo3 means moving the DOM back into Python — rewriting `dom.rs` as
-perhaps 700-1,100 lines of Python, porting `capi.zig`'s C ABI to Rust, and
-writing a `jsrust.py` alongside `jszig.py`. **Roughly 1,500-2,500 lines
-touched, two to four weeks**, and the risk is not the FFI. It is that every DOM
-operation changes from "Rust reaches into a Python object" to "Rust asks
-Python through a handle table", which moves behaviour at the edges — identity,
-exception propagation, mutation ordering — and `tests/test_js.py` is the only
-thing standing between that and a class of quiet regressions.
+That also means half of what dropping pyo3 would cost is already paid.
+`jsdom_py.py` is the Python DOM `dom.rs` would have to be rewritten as — the
+700-1,100 lines this section used to estimate — and it is written, wired up
+and under test. What is left is porting `capi.zig`'s C ABI to Rust and writing
+a `jsrust.py` alongside `jszig.py`: **roughly 800-1,400 lines touched**, and
+the risk is not the FFI. It is that every DOM operation changes from "Rust
+reaches into a Python object" to "Rust asks Python through a handle table",
+which moves behaviour at the edges — identity, exception propagation, mutation
+ordering — and `tests/test_js.py` is the only thing standing between that and
+a class of quiet regressions. That suite now runs against both engines, which
+is exactly the check this change would need.
 
 What it would return is real, and the last item is the strongest argument:
 
 - 8 crates, and `Cargo.toml` down to nothing at all if the other three go too.
-- `run.sh` from 108 lines to something near 40, and no virtualenv on a user's
-  machine. Today `run.sh` cannot start the browser without creating one.
-- `test.sh` from 66 lines to about 40, with `.venv/bin/python` becoming
+- `run.sh` from 120 lines to something near 50, and no virtualenv on a user's
+  machine. Today `run.sh` cannot start the browser without creating one for
+  the default engine; `FEETBROWSER_JS=zig` already skips it.
+- `test.sh` from 78 lines to about 50, with `.venv/bin/python` becoming
   `python3` throughout.
 - **CI Rust builds from 8 per run to 2.** The matrix covers six Python versions
   on Linux and two on macOS, and a pyo3 extension has to be compiled against
@@ -388,7 +395,7 @@ renderer is not a dependency-removal task; it is the next project.
 
 ## pyflakes
 
-Installed conditionally in `test.sh:40-41` and unconditionally in
+Installed conditionally in `test.sh:51-52` and unconditionally in
 `.github/actions/build/action.yml:72`, and run in exactly two places with the
 same arguments: `python -m pyflakes feetbrowser tests`. There is no
 configuration file anywhere, so it runs at its defaults.
@@ -422,8 +429,8 @@ are self-documenting comments and nothing more.
 `go.mod` is three lines with no `require` block, and `net/net.go` imports 24
 standard-library packages and nothing else, so the Go code has zero
 dependencies of its own. What it has is a **Go toolchain** on the build side:
-`test.sh:60-66` runs `go vet` and `go test` where one is on `PATH`, and
-`.github/workflows/ci.yml:177-193` installs Go 1.22 and runs build, vet and
+`test.sh:70-78` runs `go vet` and `go test` where one is on `PATH`, and
+`.github/workflows/ci.yml:225-241` installs Go 1.22 and runs build, vet and
 test.
 
 `net/net.go` is 1,091 lines and its own header calls it a port of
