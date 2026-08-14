@@ -712,6 +712,16 @@ def _boxes(html, css, width=620, tag="div"):
     return sorted(found, key=lambda b: (b[1], b[0]))
 
 
+def test_padding_is_counted_once():
+    """A block's children start below its padding-top, so the height measured
+    from its own top already includes it. Adding it again gave every padded
+    card an extra band of empty space and pushed the next one down."""
+    boxes = _boxes("<section><div>x</div></section>",
+                   "section { padding: 20px } div { height: 50px }",
+                   tag="section")
+    eq(boxes[0][3], 90.0, boxes)
+
+
 def test_css_does_arithmetic():
     from feetbrowser.layout import _resolve_len
     cases = [

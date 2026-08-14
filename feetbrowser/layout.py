@@ -1390,7 +1390,11 @@ class BlockLayout(LayoutBox):
         for f in self.float_regions:
             content_h = max(content_h, f["bottom"] - self.y)
         self.children.extend(float_boxes)
-        self.height = content_h + _block_padding(self.node)
+        # Only the bottom padding is still missing: the first child was placed
+        # below this box's padding-top, so the height measured down from
+        # self.y has counted it once already.
+        self.height = content_h + _padding_box(
+            getattr(self.node, "style", {}) or {})[2]
 
     # -- floats ----------------------------------------------------------
 
