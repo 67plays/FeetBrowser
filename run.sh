@@ -5,11 +5,9 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-# Ensure the Rust JS engine is built and importable.
-if ! python3 -c "import feetbrowser_engine" 2>/dev/null; then
-  if [ ! -x .venv/bin/python ]; then
-    python3 -m venv .venv
-  fi
+# Ensure the Rust JS engine is built and importable in the venv.
+if [ ! -x .venv/bin/python ] || ! .venv/bin/python -c "import feetbrowser_engine" 2>/dev/null; then
+  python3 -m venv .venv
   .venv/bin/pip install -q maturin
   .venv/bin/maturin develop --release --manifest-path rust/Cargo.toml
 fi
