@@ -20,7 +20,7 @@ raster.py            Surface: spans, scanline AA, glyph cache, PNG out
      |     \            -> rust/src/raster.rs
      |      \
 fontengine.py         imagecodec.py
-  discovery, index      PNG / GIF / PNM -> RGBA
+  discovery, index      PNG / GIF / JPEG / PNM -> RGBA
   -> rust/src/font.rs   -> rust/src/image.rs
 ```
 
@@ -157,7 +157,36 @@ Everything returns `(width, height, rgba)`.
 - **GIF**: a hand-written variable-width LZW decoder, global and local colour
   tables, transparency index, and interlacing. First frame only: an animated
   GIF shows its first frame and does not move.
+- **JPEG**: Huffman-coded 8-bit frames, baseline (SOF0), extended sequential
+  (SOF1) and progressive (SOF2), one component or three, any sampling factors
+  the file declares, and restart intervals. The inverse transform is the AAN
+  one libjpeg calls `jidctflt`, with the scale factors folded into the
+  dequantisation table so the per-block cost is the transform and nothing
+  else; halved chroma is reconstructed with libjpeg's triangle filter rather
+  than by repeating samples, which on our own fixtures is the difference
+  between agreeing with libjpeg to within a level or two and being 87 levels
+  out along a hard edge.
 - **PNM**: P1–P6, because it is four lines of code and makes tests easy.
+
+What JPEG does not do it says so about, and the image draws as its alt text:
+arithmetic coding, CMYK and YCCK, 12-bit samples, lossless and hierarchical
+frames, and any component count other than one or three. Those are the modes a
+decoder cannot approximate — guessing at them produces a picture that looks
+like a picture and is wrong, which is worse than no picture at all. A JPEG cut
+short mid-scan is not in that list: it keeps the blocks that arrived, the same
+way a truncated PNG keeps its rows.
+
+The decoder was written against libjpeg's output rather than against its own.
+Over 77 JPEGs pulled off the web, decoded both here and through libjpeg, the
+largest per-channel difference is 3 and the largest mean difference is 0.040 —
+the margin two conforming inverse transforms are entitled to disagree by. That
+comparison is not in the suite, because keeping it there would mean keeping
+libjpeg installed to run the tests, which is the thing this decoder exists to
+stop. What the suite carries instead is the result of it: `test_units.py` pins
+four exact pixel values it produced, and requires the progressive and
+restart-marker fixtures to decode byte-identically to the baseline one, since
+all three are the same photograph coded three ways. An 800x600 photograph
+decodes in about 6.5 ms.
 
 Scaling is nearest-neighbour, matching the `subsample`/`zoom` semantics the
 browser already relied on.
@@ -174,8 +203,9 @@ stay background, exactly as the Python decompressobj behaved.
 The decoders are exercised deliberately badly. `tests/test_render.py` feeds
 them truncated chunks, bad CRCs, headers no decoder can honour, absurd
 dimensions, compressed data that expands without end, LZW code sizes that
-cannot exist, and a few thousand rounds of randomly corrupted real images, and
-asserts `ImageError` rather than a crash — a distinction that matters more
+cannot exist, Huffman tables naming symbols no 8-bit frame can use, and a few
+thousand rounds of randomly corrupted real images, and asserts `ImageError`
+rather than a crash — a distinction that matters more
 now, because the layer
 that used to raise `IndexError` in Python would panic here, and a panic
 crossing the extension boundary would kill the page load rather than the
@@ -315,8 +345,8 @@ headless instead of raising.
 `tests/test_render.py` covers the layers directly and offline: font metrics and
 the additive-measure invariant, span fills and clipping, antialiased partial
 coverage, nonzero winding, the glyph cache, PNG round-tripping, every PNG
-filter type, Adam7, hand-built GIF LZW, scene-graph ordering and tag deletion,
-and the timer and binding model.
+filter type, Adam7, hand-built GIF LZW, JPEG against corrupted photographs,
+scene-graph ordering and tag deletion, and the timer and binding model.
 
 The end-to-end check is a screenshot: `python3 -m feetbrowser --screenshot
 <url> out.png` runs the real browser — chrome, tabs, toolbar, page, scrollbar —
@@ -338,6 +368,9 @@ argued about with.
 - No right-to-left or complex-script shaping. Characters advance
   left-to-right, one glyph each.
 - Animated GIFs show their first frame.
+- No SVG, and no WebP, BMP, ICO or TIFF. Those draw as their alt text.
+- The JPEG modes listed above — arithmetic coding, CMYK, 12-bit, lossless,
+  hierarchical — are refused rather than approximated.
 - No native Wayland backend. Wayland desktops get the X11 window through
   XWayland, which is how nearly all of them run X clients today.
 - X11 needs a TrueColor visual, which is every server since about 2005;

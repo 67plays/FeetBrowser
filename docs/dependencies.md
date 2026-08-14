@@ -13,14 +13,17 @@ person to pick one of these up starts from a real number.
 ## Where it stands
 
 No Python package is *required*. `feetbrowser/` imports the standard library
-and `feetbrowser_engine`, which is our own code in another language. Three
-Python packages are optional, and the browser runs without all three:
+and `feetbrowser_engine`, which is our own code in another language. One
+Python package is optional, and the browser runs without it:
 
 | package | what it buys | without it |
 | --- | --- | --- |
-| Pillow | JPEG, WebP, BMP, ICO, TIFF decoding | those images draw as the `[img]` placeholder |
-| cairosvg | SVG rendering | SVG draws as the `[img]` placeholder |
 | curl_cffi | Chrome's TLS fingerprint for sites that block ours | falls back to our own transport |
+
+There were three. Pillow and cairosvg are gone: JPEG is decoded in
+`rust/src/image.rs` now, and SVG is not decoded at all. The sections below
+that argued about both are kept because the reasoning is what the next removal
+will need, but they describe finished work rather than open questions.
 
 The build side is heavier than the run side, and that is where most of the
 cost actually is: Rust with five crates, `maturin` and a virtualenv to install
@@ -287,67 +290,63 @@ architecture. Doing the others first also makes the pyo3 conversation much
 shorter, because "why does a crate with no dependencies of its own need a
 build tool and a virtualenv" answers itself.
 
-## Pillow, and a JPEG decoder
+## Pillow, and the JPEG decoder that replaced it
 
-The decoders moved into Rust with the renderer, so this is a different job
-than it was. `feetbrowser/imagecodec.py` is now a 22-line shim and the real
-code is `rust/src/image.rs`, 950 lines: PNG with all five colour types, bit
-depths 1 through 16, all five filters, `tRNS` and Adam7; GIF including a
-hand-written LZW decoder; and the Netpbm family. Pillow is reached for only in
-`Tab._photo_from_pillow` (`browser.py`), for JPEG, WebP, BMP, ICO and TIFF.
+**Done.** `Tab._photo_from_pillow` is gone from `browser.py` and the decoder
+is in `image.rs`, beside the others. What follows is what it cost against what
+this section estimated, because an estimate nobody checks afterwards teaches
+nobody anything.
 
-A detail worth fixing whatever else happens: Pillow decodes a JPEG and then
-**re-encodes it to PNG so our own decoder can decode it again**. Two full
-codec passes per photograph, and the re-encode is a `zlib.compress` at level 6
-over the full RGBA image.
+The estimate was 700 lines for a baseline decoder and the JPEG block in
+`image.rs` is **1,137**, which is less the estimate being wrong than the scope
+changing: 215 of those lines are the four progressive coefficient passes and
+their scan manager, which this section had put out of scope and which was
+written anyway, and much of the remainder is the guard on every table index
+and shift count that the section itself demanded two paragraphs later. The
+line-by-line breakdown was close where the scope matched. Byte stuffing and
+the MCU interleave were the two places the first draft was wrong, exactly as
+predicted.
 
-A baseline sequential-DCT JFIF decoder belongs beside the others in
-`image.rs`. In Rust, in the style of the PNG decoder already there, it is
-roughly **700 lines** — 100-130 for marker parsing, 50-70 for Huffman table
-construction, 60-90 for the bit reader, 130-170 for the entropy-coded scan,
-30-40 for dequantise and inverse zigzag, 70-100 for the IDCT, 60-80 for chroma
-upsampling, 50-70 for YCbCr to RGBA, and 30-40 to wire it into `decode` and
-`sniff`. Add 150-250 lines of tests and a few small checked-in fixtures, the
-way `tests/fixtures/` already works.
+What it decodes: baseline (SOF0), extended sequential (SOF1) and progressive
+(SOF2), Huffman-coded, 8-bit, one or three components, any sampling factors,
+restart intervals. What it refuses, with `ImageError` and the `[img]`
+placeholder: arithmetic coding, CMYK and YCCK, 12-bit samples, lossless and
+hierarchical frames, and any other component count. EXIF orientation is
+ignored, so a photograph relying on it appears rotated — the same as before,
+since nothing ever honoured it. The inverse transform is libjpeg's AAN one and
+chroma is reconstructed with its triangle filter; against libjpeg over 77
+JPEGs off the web the largest per-channel difference is 3.
 
-**Estimate: 3-6 days for someone who has written one before, 1.5-3 weeks
-otherwise.** ITU-T T.81 is public and complete. The two things everyone gets
-wrong first are byte stuffing and restart markers in the bit reader, and the
-MCU interleave bookkeeping when the sampling factors are not 1x1.
+Performance was never the interesting number in Rust and is not: 800x600 in
+6.5 ms, 1800x1200 in 27 ms, 60-90 Mpixel/s. The two-codec-pass absurdity this
+section flagged — Pillow decoding a JPEG and re-encoding it to PNG so our own
+decoder could decode it again — went away with the branch that did it.
 
-Being in Rust changes the calculus twice over. Performance stops being an
-argument at all: the same work that would have taken seconds per photograph in
-CPython lands in tens of milliseconds, which is why the decoders were moved in
-the first place — `imagecodec.py`'s own docstring records the PNG decoder
-getting about forty times faster in the move. But safety stops being free.
-The Python decoder could only raise `IndexError` on a malformed file; Rust can
-panic, and a panic crosses into Python as `PanicException` and takes the page
-load down. `image.rs` already answers this — `at()`, `slice()`, `be16()` and
-`be32()` are the bounds-checked accessors every read goes through, and
-`docs/rendering.md` states the rule — so a JPEG decoder must be written to the
-same discipline rather than in whatever style the spec pseudocode suggests.
-That is not extra work if it is done from the start, and it is a rewrite if it
-is not.
+Safety was the part that was not free, as predicted. Two failure modes exist
+in Rust that did not exist in the Python this was ported from, and both come
+from a file being allowed to name a number: a Huffman table can name a
+magnitude category of 200, which asks the bit reader for a shift the machine
+does not have, and a progressive scan header can name a point transform that
+shifts a coefficient out of range. Both are checked at the point the number is
+read rather than where it is used. The suite corrupts the real fixtures 1,500
+times a run and asserts `ImageError` every time.
 
-Out of scope, and the decoder should fail cleanly rather than pretend:
-progressive JPEG (another 300-400 lines and a whole second scan-management
-layer — this is the one that hurts, because progressive is common on the web),
-arithmetic coding, CMYK/YCCK and the Adobe APP14 transform, 12-bit and
-lossless and hierarchical modes, and EXIF orientation. Failing cleanly means
-`ImageError` and the `[img]` placeholder, which is exactly today's behaviour
-without Pillow.
-
-One thing to fix alongside it: image *fetching* is off the UI thread
-(`Tab._fetch_image`) but image *decoding* is not — `_drain_images` calls
-`_decode_image` synchronously. That mattered more when decoding was Python and
-slow, and a Rust decoder makes it much less urgent, but it also means the
-decode holds the GIL, so it is still the right shape and still a small change.
+Still open, and unchanged by any of this: image *fetching* is off the UI
+thread (`Tab._fetch_image`) but image *decoding* is not — `_drain_images`
+calls `_decode_image` synchronously, which holds the GIL for the length of the
+decode. At 6.5 ms a photograph this is no longer urgent, but it is still the
+right shape and still a small change.
 
 ## cairosvg, and why SVG is a different project
 
-The recommendation is to **drop cairosvg without replacing it** and let SVG
-draw as the `[img]` placeholder, which is already what happens on every
-machine that does not have it installed, including every CI job but one.
+**Done, by taking the recommendation below rather than by writing anything.**
+cairosvg is no longer imported and SVG draws as the `[img]` placeholder
+everywhere, which is what it already did on every machine that did not have
+the library installed, including every CI job but one. The reasoning is kept
+in full because it is the argument for not revisiting this casually.
+
+The recommendation was to **drop cairosvg without replacing it** and let SVG
+draw as the `[img]` placeholder.
 
 The rasteriser is better placed for this than it might look. `rasterize()` in
 `rust/src/raster.rs` does nonzero-winding scan conversion with 4x vertical
@@ -413,9 +412,9 @@ without false positives needs full scope analysis — module, class, function
 and comprehension scopes, `global`/`nonlocal`, star imports, `del`,
 conditional imports, `__all__` — which is the bulk of pyflakes and the part
 that makes people switch a linter off when it gets it wrong. Undefined names
-are also the high-value catch here, because `browser.py` is 4,555 lines with
-lazy imports scattered through it (Pillow at 1083, cairosvg at 1102,
-`curl_cffi` at `net.py:348`) and a name used outside the branch that defines
+are also the high-value catch here, because `browser.py` is 4,510 lines and
+lazy imports still hide in branches nothing routinely takes (`curl_cffi` at
+`net.py:348` is the last one), and a name used outside the branch that defines
 it is exactly what a test suite finds late and a linter finds instantly.
 
 One oddity worth knowing: there are 41 `# noqa` markers across 9 files, 38 of
@@ -479,10 +478,10 @@ continued drift.
    best ratio available by a wide margin.
 4. `serde_json`. Six crates for 180-250 lines, or 350-500 to make
    `JSON.stringify` correct as well.
-5. A baseline JPEG decoder in `image.rs`, about 700 lines, which removes
-   Pillow and ends the decode-then-re-encode round trip.
-6. Drop `cairosvg` without replacing it, and record SVG as deliberately out of
-   scope.
+5. ~~A JPEG decoder in `image.rs`, which removes Pillow and ends the
+   decode-then-re-encode round trip.~~ Done, with progressive as well.
+6. ~~Drop `cairosvg` without replacing it, and record SVG as deliberately out
+   of scope.~~ Done.
 7. `regex`. The largest item at 1,050-1,500 lines and one to two weeks, and the
    largest correctness win in the list.
 8. Decide about Go: wire it in or delete it.

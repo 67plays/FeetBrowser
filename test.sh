@@ -17,15 +17,17 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 if [ ! -x .venv/bin/python ]; then
-  # Same venv run.sh builds, and for the same reason it is not sealed: the
-  # optional image decoders (Pillow, cairosvg) live in the system python, and
-  # tests that run without them are not testing what a user runs.
+  # Same venv run.sh builds, and for the same reason it is not sealed. That
+  # reason used to be the image decoders and is not any more -- we decode our
+  # own -- but curl_cffi is still optional and still lives in the system
+  # python, and the impersonating fetch in net.py is the one thing a sealed
+  # venv would quietly take away from the tests that exercise it.
   python3 -m venv --system-site-packages .venv
 elif grep -qi '^include-system-site-packages *= *false' .venv/pyvenv.cfg 2>/dev/null; then
   # A venv from before that flag was added is sealed, and a venv is only ever
-  # created once, so the tests would keep running without the decoders on
-  # every machine that already has one. Re-running venv over it rewrites
-  # pyvenv.cfg and leaves what is installed inside untouched.
+  # created once, so those tests would keep running without curl_cffi on every
+  # machine that already has one. Re-running venv over it rewrites pyvenv.cfg
+  # and leaves what is installed inside untouched.
   python3 -m venv --system-site-packages .venv
 fi
 
