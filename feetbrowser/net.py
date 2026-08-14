@@ -189,18 +189,21 @@ class URL:
 
     # -- Fetching --------------------------------------------------------
 
-    def request(self, redirects_left=MAX_REDIRECTS, payload=None, raw=False):
+    def request(self, redirects_left=MAX_REDIRECTS, payload=None, raw=False,
+                refresh=False):
         """Return (headers_dict, body, content_type).
 
         `raw=True` skips text decoding and returns the body as bytes (used by
         image fetches). The flag is threaded through redirects so an image
         served from a redirect location still comes back undecoded.
+        `refresh=True` bypasses the response cache so callers (e.g. the
+        reload button) always get a fresh copy.
         """
         if self.scheme == "file":
             return self._request_file(raw)
         if self.scheme == "data":
             return self._request_data(raw)
-        return self._request_http(redirects_left, payload, raw)
+        return self._request_http(redirects_left, payload, raw, refresh)
 
     def request_bytes(self, redirects_left=MAX_REDIRECTS):
         """Return (headers_dict, body_bytes, content_type) for binary data
@@ -240,10 +243,10 @@ class URL:
             body = decoded.encode("utf8", "replace") if raw else decoded
         return {}, body, ctype
 
-    def _request_http(self, redirects_left, payload, raw=False):
+    def _request_http(self, redirects_left, payload, raw=False, refresh=False):
         # Two documents that differ only by fragment are the same resource.
         cache_key = str(self).split("#", 1)[0]
-        if payload is None and cache_key in _CACHE:
+        if not refresh and payload is None and cache_key in _CACHE:
             expires, entry = _CACHE[cache_key]
             if expires is None or expires > time.time():
                 return entry
@@ -263,6 +266,9 @@ class URL:
         headers = dict(DEFAULT_HEADERS)
         headers["Host"] = self.netloc()  # brackets IPv6, includes the port
         headers["Connection"] = "close"
+        if refresh:
+            # Ask intermediaries to revalidate too.
+            headers["Cache-Control"] = "no-cache"
         body_bytes = b""
         if payload is not None:
             body_bytes = payload.encode("utf8")
@@ -293,8 +299,9 @@ class URL:
                 # serves HTML instead of the image.
                 self._adopt(new_url)
                 return self._request_http(redirects_left - 1, follow_payload,
-                                          raw=raw)
-            return new_url.request(redirects_left - 1, follow_payload, raw=raw)
+                                          raw=raw, refresh=refresh)
+            return new_url.request(redirects_left - 1, follow_payload, raw=raw,
+                                   refresh=refresh)
 
         # Decode transfer-encoding and content-encoding.
         body = self._decode_body(body, resp_headers)

@@ -134,6 +134,7 @@ class Tab:
         # so <img> elements render their actual pixels.
         self.image_cache = {}
         self._image_queue = []
+        self._image_results = deque()
         self._image_root = None
         self._image_done = None
         # Console output accumulated from JS (errors + console.log lines).
@@ -143,10 +144,18 @@ class Tab:
         # script runs and click-handler dispatch.
         self._last_rules = None
         self._js_interp = None
+        # Async page loading (GUI mode): a generation counter discards stale
+        # fetches if the user navigates again mid-load, and the result queue
+        # hands bytes from the fetch thread back to the UI thread.
+        self.loading = False
+        self._load_gen = 0
+        self._load_queue = deque()
+        self._load_meta = None
 
     # -- navigation ------------------------------------------------------
 
-    def load(self, url, payload=None, push=True):
+    def load(self, url, payload=None, push=True, refresh=False,
+             pending_scroll=0):
         if isinstance(url, str):
             base = self.url
             url = base.resolve(url) if (base and "://" not in url
@@ -158,29 +167,99 @@ class Tab:
             self.status = "Loading source..."
         self.focused_input = None
         self.form_values = {}
+
+        # Toe-handled (internal) URLs are cheap and stay synchronous. The
+        # built-in ToeHub handles toehub:// and framework toe:// pages before
+        # any installed toe gets a say.
+        handled = None
+        if self.browser and isinstance(url, URL):
+            from . import toehub
+            handled = toehub.handle(url, self)
+            if handled is None:
+                handled = toes.first(self.browser.toe_contexts, "handle",
+                                     url, self)
+        if handled is not None:
+            _headers, body, ctype = handled
+            self._complete_load(url, payload, push, pending_scroll, body, ctype)
+            return
+        # In the GUI, fetch http(s) off the UI thread so the loading spinner
+        # can animate while the network is slow.
+        if self._gui_mode() and isinstance(url, URL) \
+                and url.scheme in ("http", "https"):
+            self._start_async_load(url, payload, push, refresh, pending_scroll)
+            return
         try:
-            handled = None
-            if self.browser and isinstance(url, URL):
-                # The built-in ToeHub handles toehub:// and framework toe://
-                # pages before any installed toe gets a say.
-                from . import toehub
-                handled = toehub.handle(url, self)
-                if handled is None:
-                    handled = toes.first(self.browser.toe_contexts, "handle",
-                                         url, self)
-            if handled is not None:
-                _headers, body, ctype = handled
-            else:
-                _headers, body, ctype = url.request(payload=payload)
+            _headers, body, ctype = url.request(payload=payload,
+                                                refresh=refresh)
+        except TypeError:
+            # Internal URL objects (about:blank, bookmarks, history) expose a
+            # simpler request(); retry without the refresh flag.
+            _headers, body, ctype = url.request(payload=payload)
         except Exception as e:  # noqa: BLE001 - surface any network error in-page
             body = f"<h1>Could not load page</h1><pre>{type(e).__name__}: {e}</pre>"
             ctype = "text/html"
+        self._complete_load(url, payload, push, pending_scroll, body, ctype)
 
+    def _gui_mode(self):
+        return self.browser is not None \
+            and getattr(self.browser, "window", None) is not None
+
+    def _start_async_load(self, url, payload, push, refresh, pending_scroll):
+        """Fetch the page body on a background thread; the UI thread applies
+        it in `_poll_async` so Tk/DOM work never leaves the main loop."""
+        self.loading = True
+        self._load_gen += 1
+        gen = self._load_gen
+        self._load_meta = {"gen": gen, "url": url, "payload": payload,
+                           "push": push, "pending_scroll": pending_scroll}
+
+        def worker():
+            try:
+                _headers, body, ctype = url.request(payload=payload,
+                                                    refresh=refresh)
+                exc = None
+            except Exception as e:  # noqa: BLE001 - surfaced as an error page
+                body, ctype, exc = None, None, e
+            self._load_queue.append((gen, body, ctype, exc))
+
+        threading.Thread(target=worker, daemon=True).start()
+        # Self-schedule the drain on the UI thread so the load completes even
+        # for tabs not owned by the main window (e.g. popups).
+        self.browser.window.after(60, self._poll_async)
+
+    def _poll_async(self):
+        """UI thread: apply a finished background fetch, keep polling while
+        the load is still in flight."""
+        self._drain_async_load()
+        if self.loading and self.browser is not None \
+                and getattr(self.browser, "window", None) is not None:
+            self.browser.window.after(60, self._poll_async)
+
+    def _drain_async_load(self):
+        """UI thread: apply a finished background fetch, if it's still the
+        current load. Stale results (a newer navigation started meanwhile)
+        are discarded."""
+        if not self._load_queue:
+            return
+        gen, body, ctype, exc = self._load_queue.popleft()
+        meta = self._load_meta
+        if meta is None or gen != meta["gen"]:
+            return  # stale load from before the latest navigation
+        self._load_meta = None
+        if exc is not None:
+            body = (f"<h1>Could not load page</h1>"
+                    f"<pre>{type(exc).__name__}: {exc}</pre>")
+            ctype = "text/html"
+        self._complete_load(meta["url"], meta["payload"], meta["push"],
+                            meta["pending_scroll"], body, ctype)
+
+    def _complete_load(self, url, payload, push, pending_scroll, body, ctype):
+        """Shared tail of load(): apply a fetched body to the tab."""
         if push and self.url is not None:
             self.history.append((self.url, self.scroll))
             self.future.clear()
         self.url = url
-        self.scroll = 0
+        self.scroll = pending_scroll or 0
 
         if url.view_source or ctype.startswith("text/plain"):
             escaped = (body.replace("&", "&amp;")
@@ -196,9 +275,14 @@ class Tab:
             self.title = "Error"
             self._build(url, err, "text/html")
 
+        self.loading = False
         self.status = str(url)
         if getattr(url, "fragment", ""):
             self.scroll_to_fragment(url.fragment)
+        self._clamp_scroll()
+        # With the DOM ready, start image loading and repaint.
+        if self._gui_mode():
+            self.load_images(self.browser.window, done=self.browser.draw)
 
     def _build(self, url, body, ctype="text/html"):
         """Parse, collect stylesheets, cascade, and lay out `body`."""
@@ -522,18 +606,14 @@ class Tab:
             return
         self.future.append((self.url, self.scroll))
         url, scroll = self.history.pop()
-        self.load(url, push=False)
-        self.scroll = scroll
-        self._clamp_scroll()
+        self.load(url, push=False, pending_scroll=scroll)
 
     def go_forward(self):
         if not self.future:
             return
         self.history.append((self.url, self.scroll))
         url, scroll = self.future.pop()
-        self.load(url, push=False)
-        self.scroll = scroll
-        self._clamp_scroll()
+        self.load(url, push=False, pending_scroll=scroll)
 
     # -- interaction -----------------------------------------------------
 
@@ -783,6 +863,8 @@ class Browser:
         self.address_view = 0  # horizontal scroll offset in px
         self._resize_after = None
         self._last_size = (WIDTH, HEIGHT)
+        # Chrome-style loading spinner: current arc start angle (degrees).
+        self._loading_angle = 0
 
         # Toes: one Context per loaded toe, all optional hooks.
         self.toes = toes.discover_toes()
@@ -886,7 +968,6 @@ class Browser:
         self.tabs.append(tab)
         self.active_tab = tab
         toes.dispatch(self.toe_contexts, "on_new_tab")
-        tab.load_images(self.window, done=self.draw)
         self.draw()
 
     def close_tab(self):
@@ -1462,28 +1543,26 @@ class Browser:
     def _back(self):
         if self.active_tab:
             self.active_tab.go_back()
-            self.active_tab.load_images(self.window, done=self.draw)
             self.draw()
 
     def _forward(self):
         if self.active_tab:
             self.active_tab.go_forward()
-            self.active_tab.load_images(self.window, done=self.draw)
             self.draw()
 
     def _reload(self):
         # Pass the URL object (not its string) so internal pages like the
         # about:blank welcome page reload without being re-parsed as a URL.
+        # `refresh=True` bypasses the response cache so the page actually
+        # re-fetches.
         if self.active_tab and self.active_tab.url:
-            self.active_tab.load(self.active_tab.url, push=False)
-            self.active_tab.load_images(self.window, done=self.draw)
+            self.active_tab.load(self.active_tab.url, push=False, refresh=True)
             self.draw()
 
     def _home(self):
         if self.active_tab:
             self.active_tab.load(_AboutURL())
             self.active_tab.status = "Type a URL and press Enter"
-            self.active_tab.load_images(self.window, done=self.draw)
             self.draw()
 
     def _next_tab(self, direction):
@@ -1494,9 +1573,9 @@ class Browser:
         self.draw()
 
     def _navigate(self, tab, url, payload=None):
-        """Load `url` on `tab` and kick off async image fetching."""
+        """Load `url` on `tab`; image fetching + repaint happen when the
+        document is ready (see Tab._complete_load)."""
         tab.load(url, payload=payload)
-        tab.load_images(self.window, done=self.draw)
         self.draw()
 
     # -- painting --------------------------------------------------------
@@ -1521,6 +1600,7 @@ class Browser:
         self._draw_toe_buttons()
         self._draw_status()
         self._draw_scrollbar()
+        self._draw_spinner()
         self.window.title(
             (self.active_tab.title if self.active_tab else "FeetBrowser")
             + " — FeetBrowser")
@@ -1697,11 +1777,34 @@ class Browser:
 
     def _poll_images(self):
         """Periodic UI-thread sweep: pick up decoded image bytes left by the
-        fetch threads and re-render. The `after` chain lives for the whole
-        session, which keeps the loop alive across navigations."""
+        fetch threads, re-render, and spin the loading indicator while any
+        tab is still fetching. The `after` chain lives for the whole session,
+        which keeps the loop alive across navigations."""
+        loading = False
         for tab in self.tabs:
             tab._drain_images()
-        self.window.after(150, self._poll_images)
+            if tab.loading:
+                loading = True
+        if loading:
+            self._loading_angle = (self._loading_angle + 18) % 360
+            self.canvas.delete("spinner")
+            self._draw_spinner()
+        self.window.after(60, self._poll_images)
+
+    def _draw_spinner(self):
+        """Chrome-style spinning arc at the left of the address bar."""
+        tab = self.active_tab
+        if not tab or not tab.loading:
+            return
+        c = self.canvas
+        top = toes.band_height(self.chrome_bands())
+        addr_x = 136 + self._toe_buttons_offset() + 30
+        cx = addr_x + 16
+        cy = top + 60
+        c.create_arc(cx - 6, cy - 6, cx + 6, cy + 6,
+                     start=self._loading_angle, extent=250,
+                     style="arc", outline="#1a73e8", width=2,
+                     tags=("spinner",))
 
 
 class PopupWindow:
