@@ -33,23 +33,20 @@ run.cmd                  :: Windows: the same script for cmd.exe
 run.cmd https://example.com
 ```
 
-No GUI toolkit to install — the window is ours too, straight ctypes into
-AppKit on macOS and into user32/gdi32 on Windows. What you do need is Python
-3, a system font, and a Rust toolchain, because the JavaScript engine is a
-compiled extension and there is no Python fallback for it: `run.sh` and
-`run.cmd` build `feetbrowser_engine` into a local `.venv` when it isn't
-importable (installing `maturin` into the venv for you). Once the extension
-is built and installed for the interpreter you're invoking, `python3 -m
-feetbrowser <url>` works directly.
+No GUI toolkit to install — the window is ours too. macOS gets one through
+AppKit, Linux one through Xlib, and Windows one through user32/gdi32, all by
+ctypes, so there is nothing to install for any of them, and X11 covers
+Wayland desktops through XWayland. What you do need is Python 3, a system
+font, and a Rust toolchain, because the JavaScript engine is a compiled
+extension and there is no Python fallback for it: `run.sh` and `run.cmd`
+build `feetbrowser_engine` into a local `.venv` when it isn't importable
+(installing `maturin` into the venv for you). Once the extension is built and
+installed for the interpreter you're invoking, `python3 -m feetbrowser <url>`
+works directly.
 
-A real window opens on **macOS** and **Windows**. Elsewhere the browser runs
-headless — `--screenshot` and the tests work everywhere.
-
-The window itself is ours too. macOS gets one through AppKit and Linux gets
-one through Xlib — both by ctypes, so there is nothing to install for either,
-and X11 covers Wayland desktops through XWayland. Anywhere else, and anywhere
-with no display, the browser still renders: `--screenshot` writes the page to
-a PNG without opening anything.
+Anywhere else, and anywhere with no display, the browser still renders:
+`--screenshot` writes the page to a PNG without opening anything, and the
+whole test suite runs headless.
 
 To render a page to a PNG without opening a window:
 
