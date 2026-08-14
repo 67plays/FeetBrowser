@@ -20,6 +20,39 @@ import zlib
 _CACHE = {}
 CACHE_MAX_SIZE = 1000
 
+# Bounded cache of resolved host addresses. Image-heavy pages fetch dozens of
+# resources from the same host; without this, every request pays a fresh
+# getaddrinfo (a blocking, sometimes multi-second DNS round-trip). Entries are
+# the first (family, socktype, proto, sockaddr) tuple; a failed connect drops
+# the entry and falls back to the full resolver.
+_DNS_CACHE = {}
+_DNS_CACHE_MAX = 512
+
+
+def _connect(host, port):
+    """Open a TCP socket to (host, port), reusing a cached address when one
+    is available and falling back to socket.create_connection (which retries
+    across all resolved addresses) otherwise."""
+    key = (host, port)
+    info = _DNS_CACHE.get(key)
+    if info is None:
+        infos = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
+        if not infos:
+            raise socket.gaierror(socket.EAI_NONAME, "Name or service not known")
+        info = infos[0][:3] + (infos[0][4],)
+        if len(_DNS_CACHE) < _DNS_CACHE_MAX:
+            _DNS_CACHE[key] = info
+    try:
+        s = socket.socket(info[0], info[1], info[2])
+        s.settimeout(20)
+        s.connect(info[3])
+        return s
+    except OSError:
+        # Cached address unreachable (rotated DNS / load balancer): drop it
+        # and let the full resolver try every address the host reports.
+        _DNS_CACHE.pop(key, None)
+        return socket.create_connection((host, port), timeout=20)
+
 DEFAULT_HEADERS = {
     "User-Agent": "FeetBrowser/0.1.1 (https://github.com/JuiceyDew/FeetBrowser)",
     "Accept": "text/html,application/xhtml+xml,text/css,*/*;q=0.8",
@@ -253,8 +286,7 @@ class URL:
             else:
                 del _CACHE[cache_key]
 
-        # create_connection handles both IPv4 and IPv6 hosts.
-        s = socket.create_connection((self.host, self.port), timeout=20)
+        s = _connect(self.host, self.port)
         if self.scheme == "https":
             ctx = ssl.create_default_context()
             s = ctx.wrap_socket(s, server_hostname=self.host)
