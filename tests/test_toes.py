@@ -73,6 +73,13 @@ def test_unknown_scheme_parses():
     assert str(u) == "toe://hello"
 
 
+def test_unknown_scheme_empty_host_parses():
+    u = URL("toehub://")
+    assert u.scheme == "toehub"
+    assert u.host == ""
+    assert str(u) == "toehub://"
+
+
 def test_hub_renders_with_zero_toes():
     stub = StubBrowser()
     tab = Tab(700, stub)
