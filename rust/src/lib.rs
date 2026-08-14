@@ -1,4 +1,5 @@
 mod ast;
+mod css;
 mod dom;
 mod font;
 mod image;
@@ -44,6 +45,9 @@ fn feetbrowser_engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(raster::glyph_bitmap, m)?)?;
     m.add_function(wrap_pyfunction!(raster::draw_text, m)?)?;
     m.add_function(wrap_pyfunction!(raster::measure_text, m)?)?;
+
+    // -- css cascade --
+    m.add_function(wrap_pyfunction!(css::style, m)?)?;
 
     // -- fonts --
     m.add_class::<font::Font>()?;

@@ -1976,6 +1976,187 @@ def test_async_load_in_gui_mode():
         root.destroy()
 
 
+def _lis(dom):
+    return [n for n in tree_to_list(dom, [])
+            if isinstance(n, Element) and n.tag == "li"]
+
+
+def test_nth_child_with_a_zero_step_is_one_child():
+    # `0n+3` used to divide by the step and take the whole page down with a
+    # ZeroDivisionError raised from the middle of the cascade. It selects the
+    # third child and nothing else.
+    rules = CSSParser("li:nth-child(0n+3) { color: red }").parse()
+    dom = HTMLParser("<ul><li>a</li><li>b</li><li>c</li><li>d</li></ul>").parse()
+    style(dom, rules)
+    colors = [li.style["color"] for li in _lis(dom)]
+    eq(colors, ["black", "black", "red", "black"], "0n+3 is the third child")
+
+
+def test_nth_child_expression_forms():
+    rules = CSSParser(
+        "li:nth-child(odd) { color: red } "
+        "li:nth-child(even) { font-weight: bold } "
+        "li:nth-child(-n+2) { font-style: italic } "
+        "li:nth-child(3) { white-space: pre } "
+        "li:nth-child(  4  ) { text-align: right } "
+        "li:nth-child(banana) { font-family: serif } "
+        "li:nth-last-child(1) { list-style-type: square }"
+    ).parse()
+    dom = HTMLParser(
+        "<ul><li>a</li><li>b</li><li>c</li><li>d</li><li>e</li></ul>").parse()
+    style(dom, rules)
+    lis = _lis(dom)
+    eq([li.style["color"] for li in lis],
+       ["red", "black", "red", "black", "red"], "odd is 1, 3, 5")
+    eq([li.style["font-weight"] for li in lis],
+       ["normal", "bold", "normal", "bold", "normal"], "even is 2 and 4")
+    # `-n+2` should be the first two children. It is the first one, because
+    # the step count has always had to be at least 1, which drops the n=0
+    # term of every an+b expression. Kept as it is: the pages the renderer is
+    # checked against are pixel-identical with this behaviour and would not be
+    # without it. Recorded here so the next person finds it deliberately.
+    eq([li.style["font-style"] for li in lis][:3],
+       ["italic", "normal", "normal"], "-n+2 drops its n=0 term")
+    eq(lis[2].style["white-space"], "pre", "a bare number is that child")
+    eq(lis[3].style["text-align"], "right", "spaces around the number are fine")
+    eq([li.style["font-family"] for li in lis].count("serif"), 0,
+       "an unparseable expression matches nothing rather than raising")
+    eq([li.style["list-style-type"] for li in lis],
+       ["disc", "disc", "disc", "disc", "square"],
+       "nth-last-child counts from the end")
+
+
+def test_of_type_pseudo_classes_count_by_tag():
+    rules = CSSParser(
+        "p:first-of-type { color: red } p:last-of-type { font-weight: bold } "
+        "span:only-of-type { font-style: italic } "
+        "p:nth-of-type(2) { white-space: pre } "
+        "p:nth-last-of-type(1) { text-align: right }"
+    ).parse()
+    dom = HTMLParser(
+        "<div><p>a</p><span>s</span><p>b</p><p>c</p></div>").parse()
+    style(dom, rules)
+    ps = [n for n in tree_to_list(dom, [])
+          if isinstance(n, Element) and n.tag == "p"]
+    span = [n for n in tree_to_list(dom, [])
+            if isinstance(n, Element) and n.tag == "span"][0]
+    eq(ps[0].style["color"], "red", "the span between does not shift the count")
+    eq([p.style["font-weight"] for p in ps],
+       ["normal", "normal", "bold"], "last-of-type is the third p")
+    eq(span.style["font-style"], "italic", "the only span is only-of-type")
+    eq(ps[1].style["white-space"], "pre", "nth-of-type counts p's only")
+    eq(ps[2].style["text-align"], "right", "nth-last-of-type counts back")
+
+
+def test_attribute_operators():
+    rules = CSSParser(
+        'a[href] { color: red } a[href="/x"] { font-weight: bold } '
+        'a[class~="two"] { font-style: italic } a[lang|="en"] { white-space: pre } '
+        'a[href^="/x"] { text-align: right } a[href$="z"] { line-height: 3 } '
+        'a[href*="y"] { text-decoration: underline }'
+    ).parse()
+    dom = HTMLParser(
+        '<div><a href="/x" class="one two" lang="en-GB">a</a>'
+        '<a href="/xyz" lang="ends">b</a><a>c</a></div>').parse()
+    style(dom, rules)
+    a, b, c = [n for n in tree_to_list(dom, [])
+               if isinstance(n, Element) and n.tag == "a"]
+    eq(a.style["color"], "red", "presence matches")
+    eq(c.style["color"], "black", "presence does not match an absent attribute")
+    eq(a.style["font-weight"], "bold", "= is exact")
+    eq(b.style["font-weight"], "normal", "= is not a prefix")
+    eq(a.style["font-style"], "italic", "~= matches a whitespace-separated word")
+    eq(a.style["white-space"], "pre", "|= matches the hyphenated prefix")
+    eq(b.style["white-space"], "normal", "|= is not a bare prefix")
+    eq(b.style["text-align"], "right", "^= is a prefix")
+    eq(b.style["line-height"], "3", "$= is a suffix")
+    eq(b.style["text-decoration"], "underline", "*= is a substring")
+
+
+def test_is_and_where_match_their_argument():
+    rules = CSSParser(
+        "p:is(.x) { color: red } p:where(.y) { font-weight: bold } "
+        "p:not(:is(.x)) { font-style: italic }"
+    ).parse()
+    dom = HTMLParser(
+        '<div><p class="x">a</p><p id="keep">b</p><p class="y">c</p>'
+        '<p>d</p></div>').parse()
+    style(dom, rules)
+    ps = [n for n in tree_to_list(dom, [])
+          if isinstance(n, Element) and n.tag == "p"]
+    eq([p.style["color"] for p in ps], ["red", "black", "black", "black"],
+       ":is matches its argument")
+    eq([p.style["font-weight"] for p in ps],
+       ["normal", "normal", "bold", "normal"], ":where matches its argument")
+    eq([p.style["font-style"] for p in ps],
+       ["normal", "italic", "italic", "italic"], ":not(:is(...)) inverts it")
+    # A comma inside the parentheses is read as the end of the selector by the
+    # tokeniser, so the rule is dropped rather than matching either argument.
+    eq(len(CSSParser("p:is(.x, #keep) { color: red }").parse()), 0,
+       "a selector list inside :is() does not parse")
+
+
+def test_a_non_string_attribute_does_not_lose_the_page():
+    # Script can put anything in the attribute table. Splitting a number into
+    # class names used to raise out of the cascade, which cost the whole page
+    # rather than the one rule that asked.
+    rules = CSSParser(".skip { color: red } #five { font-weight: bold } "
+                      "p { font-style: italic }").parse()
+    dom = HTMLParser("<div><p>a</p></div>").parse()
+    p = [n for n in tree_to_list(dom, [])
+         if isinstance(n, Element) and n.tag == "p"][0]
+    p.attributes["class"] = 5
+    p.attributes["id"] = 5
+    style(dom, rules)
+    eq(p.style["color"], "black", "a number has no class names")
+    eq(p.style["font-weight"], "normal", "a number is not an id either")
+    eq(p.style["font-style"], "italic", "the rest of the cascade still runs")
+
+
+def test_styling_a_subtree_starts_its_ancestor_sets_empty():
+    # Script mutates one node and the tab restyles that subtree. The ancestor
+    # feature sets a descendant selector consults are built from the styling
+    # root down, so an ancestor above it is invisible to the fast path: a
+    # subtree restyle can drop `div.outer p` that a full restyle applies.
+    # Faithful to the Python this replaced, and load-bearing -- the corpus
+    # renders the same only because it still behaves this way.
+    rules = CSSParser("div.outer p { color: red } :root p { font-weight: bold } "
+                      "p { font-style: italic }").parse()
+    dom = HTMLParser('<div class="outer"><section><p>a</p></section></div>').parse()
+    style(dom, rules)
+    section = [n for n in tree_to_list(dom, [])
+               if isinstance(n, Element) and n.tag == "section"][0]
+    p = [n for n in tree_to_list(dom, [])
+         if isinstance(n, Element) and n.tag == "p"][0]
+    eq(p.style["color"], "red", "a full restyle sees the outer div")
+    style(section, rules)
+    eq(p.style["color"], "black", "a subtree restyle starts its ancestors empty")
+    eq(p.style["font-weight"], "bold",
+       ":root is still the document's root, not the subtree's")
+    eq(p.style["font-style"], "italic", "the subtree is restyled at all")
+
+
+def test_a_selector_nested_past_the_limit_matches_nothing():
+    # Absurd nesting compiles to a selector that never matches instead of
+    # raising a RecursionError from inside the cascade.
+    rules = CSSParser(" ".join(["div"] * 600) + " p { color: red }").parse()
+    dom = HTMLParser("<div><p>a</p></div>").parse()
+    style(dom, rules)
+    p = [n for n in tree_to_list(dom, [])
+         if isinstance(n, Element) and n.tag == "p"][0]
+    eq(p.style["color"], "black", "the page survives the selector")
+
+
+def test_a_deeply_nested_document_styles_without_recursing():
+    depth = 400
+    rules = CSSParser("div p { color: red }").parse()
+    dom = HTMLParser("<div>" * depth + "<p>x</p>" + "</div>" * depth).parse()
+    style(dom, rules)
+    p = [n for n in tree_to_list(dom, [])
+         if isinstance(n, Element) and n.tag == "p"][0]
+    eq(p.style["color"], "red", "a 400-deep document still cascades")
+
+
 def main():
     root = gui.Tk(); root.withdraw()
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
