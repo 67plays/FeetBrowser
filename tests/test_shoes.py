@@ -99,6 +99,32 @@ def test_about_resolve_handles_shoes():
     eq(applied.name, "Classic Sneaker", "apply URL keeps the shoe name")
 
 
+def test_apply_provider_threads_from_welcome():
+    # The welcome page is the entry point: clicking a shoe there must reach
+    # the apply provider (regression: it was dropped, so themes never applied
+    # when Shoes was opened from the home page).
+    calls = []
+    welcome = _AboutURL(apply=lambda n: calls.append(n),
+                        active=lambda: "Classic Sneaker")
+    picker = welcome.resolve("about:shoes")
+    assert picker.apply is not None, "apply provider survives resolve"
+    apply_url = picker.resolve("about:shoes/Ocean Slipper")
+    _h, body, _ct = apply_url.request()
+    eq(calls, ["Ocean Slipper"], "welcome-opened picker applies shoes")
+
+
+def test_apply_page_back_link_does_not_crash():
+    # The 'Back to Shoes' link on the apply page resolves against the apply
+    # URL itself, which must implement resolve() (regression: AttributeError
+    # '_ShoesApplyURL' object has no attribute 'resolve').
+    apply_url = _ShoesApplyURL("Midnight Boot")
+    back = apply_url.resolve("about:shoes")
+    assert isinstance(back, _ShoesURL), "apply page can resolve back links"
+    another = apply_url.resolve("about:shoes/Sunset Heel")
+    assert isinstance(another, _ShoesApplyURL), "apply page can chain apply"
+    eq(another.name, "Sunset Heel")
+
+
 def main():
     root = tkinter.Tk(); root.withdraw()
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

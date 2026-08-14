@@ -2216,7 +2216,8 @@ class Browser:
             self.focus = None
             query = self.address_text.strip()
             if query == "about:blank":
-                dest = _AboutURL(theme=self.theme)
+                dest = _AboutURL(theme=self.theme, apply=self.apply_shoe,
+                                 active=lambda: self.shoe)
             else:
                 if not self._looks_like_url(query):
                     query = "https://duckduckgo.com/html/?q=" + \
@@ -2320,19 +2321,24 @@ class Browser:
         if not isinstance(raw, str):
             return raw
         text = raw.strip().lower()
+        active = lambda: self.shoe
         if text in ("about:blank", "about:newtab"):
-            return _AboutURL(lambda: list(self.bookmarks), theme=self.theme)
+            return _AboutURL(lambda: list(self.bookmarks), theme=self.theme,
+                             apply=self.apply_shoe, active=active)
         if text == "about:bookmarks":
             return _BookmarksURL(lambda: list(self.bookmarks),
-                                 theme=self.theme)
+                                 theme=self.theme, apply=self.apply_shoe,
+                                 active=active)
         if text == "about:history":
-            return _HistoryURL(self._history_snapshot, theme=self.theme)
+            return _HistoryURL(self._history_snapshot, theme=self.theme,
+                               apply=self.apply_shoe, active=active)
         if text == "about:shoes":
             return _ShoesURL(apply=self.apply_shoe, theme=self.theme,
-                             active=lambda: self.shoe)
+                             active=active)
         if text.startswith("about:shoes/"):
             return _ShoesApplyURL(text[len("about:shoes/"):],
-                                  apply=self.apply_shoe, theme=self.theme)
+                                  apply=self.apply_shoe, theme=self.theme,
+                                  active=active)
         return raw
 
     @staticmethod
@@ -2389,7 +2395,8 @@ class Browser:
 
     def _home(self):
         if self.active_tab:
-            self.active_tab.load(_AboutURL(theme=self.theme))
+            self.active_tab.load(_AboutURL(theme=self.theme, apply=self.apply_shoe,
+                                     active=lambda: self.shoe))
             self.active_tab.status = "Type a URL and press Enter"
             self.draw()
 
@@ -3118,24 +3125,29 @@ class _AboutURL:
     view_source = False
     fragment = ""
 
-    def __init__(self, bookmarks_provider=None, theme=None):
+    def __init__(self, bookmarks_provider=None, theme=None, apply=None,
+                 active=None):
         self.bookmarks_provider = bookmarks_provider
         self.theme = theme
+        self.apply = apply
+        self.active = active
 
     def resolve(self, url):
         if url == "about:blank":
-            return _AboutURL(self.bookmarks_provider, self.theme)
+            return _AboutURL(self.bookmarks_provider, self.theme,
+                             self.apply, self.active)
         if url == "about:bookmarks":
-            return _BookmarksURL(self.bookmarks_provider, self.theme)
+            return _BookmarksURL(self.bookmarks_provider, self.theme,
+                                 self.apply, self.active)
         if url == "about:history":
             return _HistoryURL(
                 lambda: {"back": [], "current": "", "forward": []},
-                self.theme)
+                self.theme, self.apply, self.active)
         if url == "about:shoes":
-            return _ShoesURL(apply=None, theme=self.theme)
+            return _ShoesURL(self.apply, self.theme, self.active)
         if url.startswith("about:shoes/"):
             return _ShoesApplyURL(url[len("about:shoes/"):],
-                                  apply=None, theme=self.theme)
+                                  self.apply, self.theme, self.active)
         return URL(url) if "://" in url else URL("https://" + url)
 
     def request(self, payload=None):
@@ -3150,24 +3162,29 @@ class _BookmarksURL:
     view_source = False
     fragment = ""
 
-    def __init__(self, bookmarks_provider=None, theme=None):
+    def __init__(self, bookmarks_provider=None, theme=None, apply=None,
+                 active=None):
         self.bookmarks_provider = bookmarks_provider or (lambda: [])
         self.theme = theme
+        self.apply = apply
+        self.active = active
 
     def resolve(self, url):
         if url == "about:blank":
-            return _AboutURL(self.bookmarks_provider, self.theme)
+            return _AboutURL(self.bookmarks_provider, self.theme,
+                             self.apply, self.active)
         if url == "about:bookmarks":
-            return _BookmarksURL(self.bookmarks_provider, self.theme)
+            return _BookmarksURL(self.bookmarks_provider, self.theme,
+                                 self.apply, self.active)
         if url == "about:history":
             return _HistoryURL(
                 lambda: {"back": [], "current": "", "forward": []},
-                self.theme)
+                self.theme, self.apply, self.active)
         if url == "about:shoes":
-            return _ShoesURL(apply=None, theme=self.theme)
+            return _ShoesURL(self.apply, self.theme, self.active)
         if url.startswith("about:shoes/"):
             return _ShoesApplyURL(url[len("about:shoes/"):],
-                                  apply=None, theme=self.theme)
+                                  self.apply, self.theme, self.active)
         return URL(url) if "://" in url else URL("https://" + url)
 
     def request(self, payload=None):
@@ -3183,23 +3200,29 @@ class _HistoryURL:
     view_source = False
     fragment = ""
 
-    def __init__(self, snapshot_provider=None, theme=None):
+    def __init__(self, snapshot_provider=None, theme=None, apply=None,
+                 active=None):
         self.snapshot_provider = snapshot_provider or (
             lambda: {"back": [], "current": "", "forward": []})
         self.theme = theme
+        self.apply = apply
+        self.active = active
 
     def resolve(self, url):
         if url == "about:blank":
-            return _AboutURL(theme=self.theme)
+            return _AboutURL(theme=self.theme, apply=self.apply,
+                             active=self.active)
         if url == "about:bookmarks":
-            return _BookmarksURL(theme=self.theme)
+            return _BookmarksURL(theme=self.theme, apply=self.apply,
+                                 active=self.active)
         if url == "about:history":
-            return _HistoryURL(self.snapshot_provider, self.theme)
+            return _HistoryURL(self.snapshot_provider, self.theme,
+                               self.apply, self.active)
         if url == "about:shoes":
-            return _ShoesURL(apply=None, theme=self.theme)
+            return _ShoesURL(self.apply, self.theme, self.active)
         if url.startswith("about:shoes/"):
             return _ShoesApplyURL(url[len("about:shoes/"):],
-                                  apply=None, theme=self.theme)
+                                  self.apply, self.theme, self.active)
         return URL(url) if "://" in url else URL("https://" + url)
 
     def request(self, payload=None):
@@ -3225,13 +3248,16 @@ class _ShoesURL:
             return _ShoesURL(self.apply, self.theme, self.active)
         if url.startswith("about:shoes/"):
             return _ShoesApplyURL(url[len("about:shoes/"):],
-                                  apply=self.apply, theme=self.theme)
+                                  self.apply, self.theme, self.active)
         if url == "about:blank":
-            return _AboutURL(theme=self.theme)
+            return _AboutURL(theme=self.theme, apply=self.apply,
+                             active=self.active)
         if url == "about:bookmarks":
-            return _BookmarksURL(theme=self.theme)
+            return _BookmarksURL(theme=self.theme, apply=self.apply,
+                                 active=self.active)
         if url == "about:history":
-            return _HistoryURL(theme=self.theme)
+            return _HistoryURL(theme=self.theme, apply=self.apply,
+                               active=self.active)
         return URL(url) if "://" in url else URL("https://" + url)
 
     def request(self, payload=None):
@@ -3247,10 +3273,28 @@ class _ShoesApplyURL:
     view_source = False
     fragment = ""
 
-    def __init__(self, name, apply=None, theme=None):
+    def __init__(self, name, apply=None, theme=None, active=None):
         self.name = name
         self.apply = apply
         self.theme = theme
+        self.active = active
+
+    def resolve(self, url):
+        if url == "about:shoes":
+            return _ShoesURL(self.apply, self.theme, self.active)
+        if url.startswith("about:shoes/"):
+            return _ShoesApplyURL(url[len("about:shoes/"):],
+                                  self.apply, self.theme, self.active)
+        if url == "about:blank":
+            return _AboutURL(theme=self.theme, apply=self.apply,
+                             active=self.active)
+        if url == "about:bookmarks":
+            return _BookmarksURL(theme=self.theme, apply=self.apply,
+                                 active=self.active)
+        if url == "about:history":
+            return _HistoryURL(theme=self.theme, apply=self.apply,
+                               active=self.active)
+        return URL(url) if "://" in url else URL("https://" + url)
 
     def request(self, payload=None):
         canonical = shoes.find(self.name)
@@ -3393,7 +3437,7 @@ def welcome_html(theme=None):
         <li><a href="https://en.wikipedia.org/wiki/Web_browser">Wikipedia: Web browser</a></li>
         <li><a href="about:bookmarks">about:bookmarks</a> — your saved pages</li>
         <li><a href="about:history">about:history</a> — back/forward timeline</li>
-        <li><a href="about:shoes">about:shoes</a> — pick a pair of Shoes</li>
+        <li><a href="about:shoes">about:shoes</a> — satisfy your sole with a fitting theme</li>
         <li><a href="view-source:https://example.com">view-source:example.com</a></li>
       </ul>
       <h3>Your toes</h3>
