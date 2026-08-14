@@ -1,12 +1,16 @@
 """Check that every suite in tests/ is actually run by something.
 
 A test file that nothing invokes is worse than no test file: it looks like
-coverage in the directory listing and reports nothing. All three places that
-run the suite name their files one at a time -- `test.sh` and `test.cmd` so a
-developer can see the order and the comments, the workflow so a red job says
-which suite went red -- and a list written out three times is a list that
-drifts. This is the fourth copy, and the only one that is derived rather than
-typed, so a suite added to one and forgotten in another fails here by name.
+coverage in the directory listing and reports nothing. Every place that runs
+the suite names its files one at a time -- `test.sh` so a developer can see
+the order and the comments, `test.cmd` because cmd.exe cannot read `test.sh`,
+the workflow so a red job says which suite went red -- and a list written out
+three times is a list that drifts. This is the fourth copy, and the only one
+that is derived rather than typed, so a suite added to one and forgotten in
+another fails here by name.
+
+`test.cmd` is the one most likely to drift, because it is the only runner
+nobody developing on Unix ever executes.
 """
 import os
 import sys
@@ -32,9 +36,10 @@ def _suites():
 def _text(relative):
     """Everything in a file, or everything in every file in a directory.
 
-    Backslashes come back as forward slashes, because test.cmd writes
-    `tests\\test_units.py` and everything else writes `tests/test_units.py`,
-    and the difference is not one this file has any reason to care about.
+    Backslashes become forward slashes on the way out, because test.cmd
+    writes `tests\\test_render.py` and everything else writes
+    `tests/test_render.py`, and the difference is not one worth checking for
+    twice.
     """
     path = os.path.join(ROOT, relative)
     if os.path.isfile(path):
@@ -59,7 +64,8 @@ def test_every_suite_is_run():
                 missing.append("%s is not run by %s" % (suite, description))
     assert not missing, (
         "a test file exists that nothing runs:\n  " + "\n  ".join(missing)
-        + "\nAdd it to test.sh and to .github/workflows/ci.yml, or delete it.")
+        + "\nAdd it to test.sh, test.cmd and .github/workflows/ci.yml,"
+        " or delete it.")
     print("  %d suites, all named in test.sh, test.cmd and the workflow"
           % len(suites))
 
