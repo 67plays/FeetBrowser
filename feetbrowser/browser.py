@@ -2078,9 +2078,7 @@ WELCOME_HTML = """
   </ul>
   <h3>Your toes</h3>
   <ul>
-    <li><a href="toe://toebar">toe://toebar</a> — the Toe Bar settings</li>
-    <li><a href="toe://gallery">toe://gallery</a> — every installed toe</li>
-    <li><a href="toe://sock">toe://sock</a> — the Sock Detective's case file</li>
+    <li><a href="toe://hub">toe://hub</a> — browse and install toes</li>
   </ul>
   <h3>Shortcuts</h3>
   <ul>
