@@ -62,6 +62,13 @@ hand, though one the network interrupts is resumed with a `Range` request
 where the server allows it. Nothing is opened after it is saved, and there is
 no history of past downloads across runs: the list is what this session did.
 
+**Video, barely:** a `<video>` element lays out, decodes and plays AVI files
+carrying uncompressed `BI_RGB` or run-length `BI_RLE8`, and toggles on click.
+MP4 and WebM are identified and measured but not decoded — no H.264, no VP9,
+no MJPEG — and an element carrying one draws a correctly sized box saying so.
+There is **no audio** anywhere in the browser. The design, the exact
+unsupported list and the ordered next steps are in [media.md](media.md).
+
 **Doesn't (yet):** flexbox wrapping, `<textarea>`/`<select>` selection (beyond
 read-only), or the full ECMAScript feature set (see below). Shoes themes are
 preset solid-color palettes only — there's no custom color editor, and page

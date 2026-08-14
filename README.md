@@ -89,6 +89,7 @@ To render a page to a PNG without opening a window:
 - [Architecture — how the engine works](docs/architecture.md)
 - [The rendering engine — fonts, rasteriser, pixels](docs/rendering.md)
 - [The Zig JavaScript engine](docs/jszig.md)
+- [Video — what decodes, and what a real codec would need](docs/media.md)
 - [Extensions (Toes & ToeHub)](docs/toes.md)
 - [What it does and doesn't do](docs/limitations.md)
 - [Running the tests](docs/testing.md)

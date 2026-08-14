@@ -6,14 +6,20 @@ serve it from a loopback server they start themselves -- but they do need at
 least one installed font, which every platform we support has.
 """
 import os
+import shutil
 import struct
 import sys
+import tempfile
+import time
 import zlib
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import media_fixtures
 from feetbrowser import canvas as canvasmod
-from feetbrowser import fontengine, gui, imagecodec, raster
+from feetbrowser import fontengine, gui, imagecodec, media, mediacodec, raster
+from feetbrowser.net import URL
 from feetbrowser.window import Event, Window
 
 _FIXTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
@@ -1824,6 +1830,577 @@ def test_a_press_in_the_scrollbar_gutter_starts_no_selection():
         browser._on_drag(Event(x=x, y=chrome + 400))
         assert tab.selected_text() == "", \
             "dragging the scrollbar selected page text"
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+# -- video: containers and codecs ------------------------------------------
+#
+# Everything below reads bytes this file wrote, so an assertion about a pixel
+# is an assertion about a decoder and not about a fixture nobody can open.
+# The scheduling tests all drive a ManualClock, so what they measure is the
+# scheduler and not how busy the machine was when they ran.
+
+def _clip(count=10, width=8, height=6, fps=10.0, top_down=False):
+    """An uncompressed AVI whose frame `i` is the flat colour (i, 0, 0)
+    everywhere except pixel (1, 2), which is (0, 200, i). The frame index is
+    written into the pixels, so "which frame is on screen" is a question the
+    screen itself answers."""
+    def painter(i):
+        def pixel(x, y):
+            return (0, 200, i) if (x, y) == (1, 2) else (i, 0, 0)
+        return pixel
+    frames = [media_fixtures.rgb24_frame(width, height, painter(i), top_down)
+              for i in range(count)]
+    return media_fixtures.avi(frames, width, height, fps=fps,
+                              top_down=top_down)
+
+
+def _rgba_at(frame, x, y):
+    offset = (y * frame.width + x) * 4
+    return tuple(frame.rgba[offset:offset + 4])
+
+
+def test_avi_header_reports_geometry_rate_and_frame_count():
+    track = mediacodec.open_video(_clip(count=7, width=12, height=5, fps=20.0))
+    assert track.container == "AVI"
+    assert track.codec_name == "BI_RGB"
+    assert (track.width, track.height) == (12, 5)
+    assert track.frame_count == 7
+    assert abs(track.frame_rate - 20.0) < 1e-9
+    assert abs(track.duration - 0.35) < 1e-9
+    assert track.info.supported
+
+
+def test_avi_rgb24_frames_decode_to_the_exact_pixels_written():
+    track = mediacodec.open_video(_clip(count=4))
+    for index in range(4):
+        frame = track.frame(index)
+        assert frame.index == index
+        assert (frame.width, frame.height) == (8, 6)
+        assert len(frame.rgba) == 8 * 6 * 4
+        assert _rgba_at(frame, 0, 0) == (index, 0, 0, 255)
+        assert _rgba_at(frame, 1, 2) == (0, 200, index, 255)
+        # Every codec in this module writes opaque alpha; the player relies
+        # on it to take the surface's row-copy blit.
+        assert frame.rgba[3::4].count(255) == 8 * 6
+
+
+def test_avi_rows_come_out_the_same_way_up_whichever_way_they_went_in():
+    """A DIB is bottom-up unless biHeight is negative. Getting this wrong
+    produces a picture that is upside down but otherwise perfect, which is
+    exactly the bug that survives a "does it look like video" check."""
+    up = mediacodec.open_video(_clip(count=2, top_down=False)).frame(1)
+    down = mediacodec.open_video(_clip(count=2, top_down=True)).frame(1)
+    assert _rgba_at(up, 1, 2) == (0, 200, 1, 255)
+    assert _rgba_at(down, 1, 2) == (0, 200, 1, 255)
+    assert bytes(up.rgba) == bytes(down.rgba)
+
+
+def test_avi_decodes_32_bit_and_8_bit_palettised_frames():
+    def pixel(x, y):
+        return (10 + x, 20 + y, 30)
+    raw32 = media_fixtures.avi([media_fixtures.rgb32_frame(4, 3, pixel)],
+                               4, 3, bit_count=32)
+    frame = mediacodec.open_video(raw32).frame(0)
+    assert _rgba_at(frame, 3, 2) == (13, 22, 30, 255)
+
+    palette = media_fixtures.grey_palette()
+    raw8 = media_fixtures.avi(
+        [media_fixtures.pal8_frame(4, 3, lambda x, y: x + y * 4)],
+        4, 3, bit_count=8, palette=palette)
+    frame = mediacodec.open_video(raw8).frame(0)
+    assert _rgba_at(frame, 2, 1) == (6, 6, 6, 255)
+    assert _rgba_at(frame, 0, 0) == (0, 0, 0, 255)
+
+
+def test_avi_frame_times_follow_the_declared_rate():
+    track = mediacodec.open_video(_clip(count=5, fps=8.0))
+    times = [track.frame(i).pts for i in range(5)]
+    assert times == [0.0, 0.125, 0.25, 0.375, 0.5]
+    assert all(abs(track.frame(i).duration - 0.125) < 1e-9 for i in range(5))
+    # dwRate/dwScale is exact; dwMicroSecPerFrame is rounded to whole
+    # microseconds and must not be the one we believe.
+    assert abs(track.frame_rate - 8.0) < 1e-9
+
+
+def test_rle8_keyframes_decode_and_delta_frames_composite_on_the_last():
+    """The inter-frame case, and the reason decoding is stateful: frames 1
+    and 2 carry only the pixels that changed."""
+    palette = media_fixtures.grey_palette()
+    key = media_fixtures.rle8_keyframe(4, 3, lambda x, y: 5)
+    # Bottom-up: opcode row 0 is image row 2, so (delta 1,1) lands on image
+    # row 1 at x=1, where two pixels become index 99.
+    delta = media_fixtures.rle8_delta([("delta", 1, 1), ("run", 2, 99),
+                                       ("eob",)])
+    data = media_fixtures.avi([key, delta], 4, 3, bit_count=8, compression=1,
+                              palette=palette, handler="MRLE",
+                              keyframes=[1, 0])
+    track = mediacodec.open_video(data)
+    assert track.codec_name == "BI_RLE8"
+    assert [track.is_keyframe(i) for i in range(2)] == [True, False]
+
+    first = track.frame(0)
+    assert all(_rgba_at(first, x, y) == (5, 5, 5, 255)
+               for x in range(4) for y in range(3))
+    second = track.frame(1)
+    assert [_rgba_at(second, x, 1)[0] for x in range(4)] == [5, 99, 99, 5]
+    # Untouched rows kept the previous picture, which is the whole point.
+    assert [_rgba_at(second, x, 0)[0] for x in range(4)] == [5, 5, 5, 5]
+
+
+def test_seeking_an_inter_frame_stream_replays_from_the_keyframe():
+    palette = media_fixtures.grey_palette()
+    key = media_fixtures.rle8_keyframe(4, 3, lambda x, y: 5)
+    delta = media_fixtures.rle8_delta([("delta", 1, 1), ("run", 2, 99),
+                                       ("eob",)])
+    grow = media_fixtures.rle8_delta([("delta", 0, 1), ("run", 4, 77),
+                                      ("eob",)])
+    data = media_fixtures.avi([key, delta, grow], 4, 3, bit_count=8,
+                              compression=1, palette=palette,
+                              handler="MRLE", keyframes=[1, 0, 0])
+    track = mediacodec.open_video(data)
+    forwards = [bytes(track.frame(i).rgba) for i in range(3)]
+    assert track.keyframe_before(2) == 0
+    # Jump backwards: the decoder must rewind to frame 0 and replay, not hand
+    # back whatever plane it happened to be holding.
+    assert bytes(track.frame(1).rgba) == forwards[1]
+    assert bytes(track.frame(2).rgba) == forwards[2]
+    track.reset()
+    assert bytes(track.frame(2).rgba) == forwards[2]
+
+
+def test_truncated_avi_files_fail_cleanly_instead_of_hanging():
+    """A media parser fed half a file is the classic place a browser hangs.
+    Every prefix of a real AVI must come back as a MediaError or a working
+    track -- never an IndexError, never a struct error, never a wait."""
+    good = _clip(count=4)
+    deadline = time.monotonic() + 20.0
+    for cut in range(0, len(good), 7):
+        chopped = good[:cut]
+        try:
+            track = mediacodec.open_video(chopped)
+        except mediacodec.MediaError:
+            pass
+        else:
+            for index in range(track.frame_count):
+                try:
+                    track.frame(index)
+                except mediacodec.MediaError:
+                    break
+        assert time.monotonic() < deadline, "truncated AVI took too long"
+
+
+def test_hostile_chunk_sizes_terminate_the_walk():
+    """Sizes that point at themselves, at zero, or past the end of the file.
+    Each one is a loop that does not advance if the walker trusts it."""
+    good = _clip(count=2)
+    at = good.index(b"LIST")
+    for size in (0xFFFFFFFF, 0, 4, 8):
+        broken = bytearray(good)
+        broken[at + 4:at + 8] = struct.pack("<I", size)
+        start = time.monotonic()
+        try:
+            mediacodec.open_video(bytes(broken))
+        except mediacodec.MediaError:
+            pass
+        assert time.monotonic() - start < 5.0, \
+            "a LIST size of %d took too long" % size
+
+    # A RIFF header that claims the file is enormous.
+    broken = bytearray(good)
+    broken[4:8] = struct.pack("<I", 0xFFFFFFFF)
+    try:
+        mediacodec.open_video(bytes(broken))
+    except mediacodec.MediaError:
+        pass
+
+
+def test_rle8_opcodes_that_leave_the_frame_are_rejected():
+    palette = media_fixtures.grey_palette()
+    key = media_fixtures.rle8_keyframe(4, 3, lambda x, y: 1)
+    for ops in (
+            [("run", 200, 9), ("eob",)],                 # run past the row
+            [("delta", 0, 60), ("run", 1, 9), ("eob",)],  # delta off the end
+            [("literal", list(range(40))), ("eob",)],     # literals past it
+    ):
+        data = media_fixtures.avi([key, media_fixtures.rle8_delta(ops)],
+                                  4, 3, bit_count=8, compression=1,
+                                  palette=palette, handler="MRLE",
+                                  keyframes=[1, 0])
+        track = mediacodec.open_video(data)
+        assert track.frame(0) is not None
+        try:
+            track.frame(1)
+        except mediacodec.MediaError:
+            continue
+        raise AssertionError("bad RLE8 opcodes %r were accepted" % (ops,))
+
+
+def test_an_rle8_stream_that_never_ends_is_stopped():
+    """No end-of-bitmap and no advance: the decoder has to give up on its
+    own rather than run until the process is killed."""
+    palette = media_fixtures.grey_palette()
+    key = media_fixtures.rle8_keyframe(2, 2, lambda x, y: 1)
+    endless = b"\x00\x02\x00\x00" * 200000        # delta of (0, 0), for ever
+    data = media_fixtures.avi([key, endless], 2, 2, bit_count=8,
+                              compression=1, palette=palette,
+                              handler="MRLE", keyframes=[1, 0])
+    track = mediacodec.open_video(data)
+    start = time.monotonic()
+    try:
+        track.frame(1)
+    except mediacodec.MediaError:
+        pass
+    assert time.monotonic() - start < 10.0
+
+
+def test_probe_reports_mp4_and_webm_without_pretending_to_decode_them():
+    info = mediacodec.probe(media_fixtures.mp4(1280, 720, 4.5))
+    assert info.container == "MP4"
+    assert (info.width, info.height) == (1280, 720)
+    assert abs(info.duration - 4.5) < 0.01
+    assert info.codec == "avc1"
+    assert not info.supported and "H.264" in info.reason
+
+    info = mediacodec.probe(media_fixtures.webm(640, 360, 2.5))
+    assert info.container == "WebM"
+    assert (info.width, info.height) == (640, 360)
+    assert abs(info.duration - 2.5) < 0.01
+    assert info.codec == "V_VP9"
+    assert not info.supported
+
+    for payload in (b"", b"not a video at all", b"RIFF\x04\x00\x00\x00WAVE"):
+        try:
+            mediacodec.probe(payload)
+        except mediacodec.MediaError:
+            continue
+        raise AssertionError("probe accepted %r" % payload)
+
+
+def test_an_avi_carrying_a_codec_we_lack_names_it_rather_than_guessing():
+    """MJPEG demuxes perfectly and decodes not at all. The file's geometry
+    and frame count are still real, which is what lets the element reserve
+    the right box and say something true."""
+    data = media_fixtures.avi([b"\xff\xd8\xff\xe0stub"] * 3, 320, 240,
+                              bit_count=24,
+                              compression=int.from_bytes(b"MJPG", "little"),
+                              handler="MJPG")
+    info = mediacodec.probe(data)
+    assert info.codec == "MJPG"
+    assert (info.width, info.height) == (320, 240)
+    assert info.frame_count == 3
+    assert not info.supported
+    assert "JPEG" in info.reason
+    try:
+        mediacodec.open_video(data)
+    except mediacodec.MediaError as exc:
+        assert "JPEG" in str(exc)
+    else:
+        raise AssertionError("open_video decoded MJPEG")
+
+
+# -- video: scheduling against a clock we control ---------------------------
+
+def test_frames_are_presented_against_the_clock_not_counted_off():
+    clock = media.ManualClock()
+    player = media.VideoPlayer(data=_clip(count=20, fps=10.0), clock=clock,
+                               threaded=False, decode_budget=8)
+    assert player.info.supported
+    player.play()
+    shown = []
+    for step in range(20):
+        clock.set(step * 0.1)
+        if player.tick():
+            shown.append(player.scheduler.current.index)
+    assert shown == list(range(20))
+    assert player.stats()["dropped"] == 0
+    assert abs(player.position() - 1.9) < 1e-9
+
+
+def test_a_slow_decoder_drops_frames_instead_of_drifting():
+    """The load-bearing test. The decoder is given one frame of budget per
+    tick while the clock moves four frames per tick, so it cannot keep up by
+    construction. What must not happen is playback sliding further and
+    further behind: the lag has to stay bounded and the position has to stay
+    exactly on the clock."""
+    clock = media.ManualClock()
+    player = media.VideoPlayer(data=_clip(count=200, fps=10.0), clock=clock,
+                               threaded=False, decode_budget=1)
+    player.play()
+    lags = []
+    for step in range(1, 41):
+        clock.set(step * 0.4)
+        player.tick()
+        current = player.scheduler.current
+        assert current is not None
+        lags.append(player.scheduler.due_index() - current.index)
+    assert abs(player.position() - 16.0) < 1e-9, "the clock is the position"
+    assert max(lags) <= 4 * media.RESYNC_FRAMES, \
+        "playback drifted: lag grew to %d frames" % max(lags)
+    assert lags[-1] <= max(lags), "lag is bounded, not monotonic"
+    stats = player.stats()
+    assert stats["dropped"] > 50, stats
+    assert stats["resyncs"] > 0, stats
+    # And it really did skip: far fewer frames were decoded than were due.
+    assert stats["decoded"] < 60, stats
+
+
+def test_pause_freezes_the_position_and_resume_carries_on_from_it():
+    clock = media.ManualClock()
+    player = media.VideoPlayer(data=_clip(count=40, fps=10.0), clock=clock,
+                               threaded=False)
+    player.play()
+    clock.set(1.0)
+    player.tick()
+    player.pause()
+    assert abs(player.position() - 1.0) < 1e-9
+    clock.set(9.0)                      # eight seconds pass with it paused
+    assert abs(player.position() - 1.0) < 1e-9
+    assert player.tick() is False
+    player.play()
+    clock.set(9.5)
+    assert abs(player.position() - 1.5) < 1e-9
+
+
+def test_seek_moves_the_playhead_and_the_decoder_with_it():
+    clock = media.ManualClock()
+    player = media.VideoPlayer(data=_clip(count=40, fps=10.0), clock=clock,
+                               threaded=False, decode_budget=4)
+    player.play()
+    player.seek(2.0)
+    assert abs(player.position() - 2.0) < 1e-9
+    # seek() re-bases the clock, so the position is 2.0 plus whatever has
+    # elapsed *since the seek* -- not 2.0 plus the whole session.
+    clock.set(0.05)
+    assert abs(player.position() - 2.05) < 1e-9
+    assert player.tick()
+    assert player.scheduler.current.index == 20
+    player.seek(-5.0)
+    assert player.position() == 0.0
+    player.seek(1e6)
+    assert abs(player.position() - player.scheduler.duration) < 1e-9
+
+
+def test_playback_stops_at_the_end_and_loops_when_asked():
+    clock = media.ManualClock()
+    player = media.VideoPlayer(data=_clip(count=10, fps=10.0), clock=clock,
+                               threaded=False, decode_budget=4)
+    player.play()
+    clock.set(1.5)                      # past the 1.0s end
+    player.tick()
+    assert not player.playing and player.ended
+
+    clock = media.ManualClock()
+    looping = media.VideoPlayer(data=_clip(count=10, fps=10.0), clock=clock,
+                                threaded=False, decode_budget=4, loop=True)
+    looping.play()
+    clock.set(1.5)
+    looping.tick()
+    assert looping.playing and not looping.ended
+    assert looping.position() < 1.0
+
+
+def test_the_player_scales_frames_to_the_size_the_layout_asked_for():
+    player = media.VideoPlayer(data=_clip(count=3, width=8, height=6),
+                               clock=media.ManualClock(), threaded=False)
+    player.first_frame()
+    assert (player.photo.width(), player.photo.height()) == (8, 6)
+    assert player.set_display_size(16, 12)
+    assert (player.photo.width(), player.photo.height()) == (16, 12)
+    assert len(player.photo.rgba) == 16 * 12 * 4
+    # Nearest neighbour: the flat background survives the scale exactly.
+    assert tuple(player.photo.rgba[0:4]) == (0, 0, 0, 255)
+    assert not player.set_display_size(16, 12), "no-op resize rebuilt buffer"
+
+
+def test_a_file_we_cannot_decode_still_makes_a_usable_player():
+    player = media.VideoPlayer(data=media_fixtures.mp4(1920, 1080, 3.0))
+    assert player.track is None
+    assert (player.width, player.height) == (1920, 1080)
+    assert "H.264" in player.error
+    assert player.play() is False and not player.playing
+    assert player.tick() is False
+    assert "1920x1080" in player.status()
+
+
+def test_the_decode_worker_runs_off_the_ticking_thread():
+    """Threaded mode: `tick()` must never be the thing that decodes. The
+    proof is that frames appear in the queue while the caller is doing
+    nothing at all."""
+    player = media.VideoPlayer(data=_clip(count=60, fps=25.0))
+    try:
+        player.play()
+        deadline = time.monotonic() + 3.0
+        while player.decoded < media.QUEUE_DEPTH \
+                and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert player.decoded >= media.QUEUE_DEPTH, \
+            "the worker decoded nothing without a tick"
+        started = time.monotonic()
+        for _ in range(50):
+            player.tick()
+        assert time.monotonic() - started < 0.5, "tick() blocked"
+    finally:
+        player.close()
+    assert player._thread is None
+
+
+# -- video: the element on the page ----------------------------------------
+
+def _video_page(directory, markup, clip=None):
+    """Write a page and the AVI it points at, and return the file:// URL."""
+    with open(os.path.join(directory, "clip.avi"), "wb") as handle:
+        handle.write(clip if clip is not None else _clip(count=10, width=16,
+                                                         height=12))
+    with open(os.path.join(directory, "far.mp4"), "wb") as handle:
+        handle.write(media_fixtures.mp4(320, 180, 3.0))
+    page = os.path.join(directory, "video.html")
+    with open(page, "w", encoding="utf8") as handle:
+        handle.write("<html><body>%s</body></html>" % markup)
+    return "file://" + page
+
+
+def test_a_video_element_lays_out_and_paints_decoded_frames():
+    from feetbrowser.browser import Browser
+    from feetbrowser.layout import DrawVideo
+    work = tempfile.mkdtemp()
+    try:
+        url = _video_page(work, "<p>before</p><video src='clip.avi'></video>"
+                                "<p>after</p>")
+        browser = Browser()
+        browser.new_tab(url)
+        browser.settle(20.0)
+        tab = browser.active_tab
+        assert len(tab.video_players) == 1
+        player = tab.video_players[0]
+        assert player.track is not None
+        assert (player.width, player.height) == (16, 12)
+
+        drawn = [c for c in tab.display_list if isinstance(c, DrawVideo)]
+        assert len(drawn) == 1, tab.display_list
+        box = drawn[0]
+        assert (box.right - box.left, box.bottom - box.top) == (16, 12)
+
+        # Frame zero is on screen before anyone pressed play.
+        browser.draw()
+        surface = browser.canvas.render()
+        top = browser.chrome_height()
+        assert _pixel(surface, int(box.left) + 2,
+                      int(box.top) + 2 + top) == (0, 0, 0)
+        assert _pixel(surface, int(box.left) + 1,
+                      int(box.top) + 2 + top) == (0, 200, 0)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def test_clicking_a_video_plays_it_and_the_picture_changes():
+    from feetbrowser.browser import Browser
+    from feetbrowser.layout import DrawVideo
+    work = tempfile.mkdtemp()
+    try:
+        url = _video_page(work, "<video src='clip.avi'></video>")
+        browser = Browser()
+        browser.new_tab(url)
+        browser.settle(20.0)
+        tab = browser.active_tab
+        player = tab.video_players[0]
+        box = [c for c in tab.display_list if isinstance(c, DrawVideo)][0]
+
+        assert tab.click(int(box.left) + 3, int(box.top) + 3) is None
+        assert player.playing
+
+        # Drive the browser's own frame timer, not the player directly.
+        deadline = time.monotonic() + 3.0
+        while player.scheduler.presented < 3 and time.monotonic() < deadline:
+            browser.window.flush_timers()
+            time.sleep(0.005)
+        assert player.scheduler.presented >= 3, player.stats()
+        assert player.scheduler.current.index >= 1
+
+        browser.draw()
+        surface = browser.canvas.render()
+        top = browser.chrome_height()
+        shown = _pixel(surface, int(box.left) + 2, int(box.top) + 2 + top)
+        assert shown == (player.scheduler.current.index, 0, 0), shown
+
+        tab.click(int(box.left) + 3, int(box.top) + 3)
+        assert not player.playing
+        where = player.position()
+        time.sleep(0.05)
+        assert player.position() == where
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def test_two_video_tags_on_one_file_are_two_independent_playheads():
+    from feetbrowser.browser import Browser
+    work = tempfile.mkdtemp()
+    try:
+        url = _video_page(work, "<video src='clip.avi'></video>"
+                                "<video width='32' height='24' "
+                                "src='clip.avi'></video>")
+        browser = Browser()
+        browser.new_tab(url)
+        browser.settle(20.0)
+        tab = browser.active_tab
+        assert len(tab.video_players) == 2
+        first, second = tab.video_players
+        assert first is not second
+        assert (first.photo.width(), first.photo.height()) == (16, 12)
+        assert (second.photo.width(), second.photo.height()) == (32, 24)
+        first.play()
+        assert first.playing and not second.playing
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def test_a_video_we_cannot_play_reserves_its_real_size_and_says_why():
+    from feetbrowser.browser import Browser
+    from feetbrowser.layout import DrawVideo
+    work = tempfile.mkdtemp()
+    try:
+        url = _video_page(
+            work, "<video><source src='far.mp4' type='video/mp4'></video>")
+        browser = Browser()
+        browser.new_tab(url)
+        browser.settle(20.0)
+        tab = browser.active_tab
+        assert len(tab.video_players) == 1
+        player = tab.video_players[0]
+        assert player.track is None and "H.264" in player.error
+        assert not [c for c in tab.display_list if isinstance(c, DrawVideo)]
+        # The box is the size the *container* declared, not a 300x150 guess.
+        boxes = [c for c in tab.display_list
+                 if getattr(c, "color", "") == "#1a1a1a"]
+        assert boxes, tab.display_list
+        assert (boxes[0].right - boxes[0].left,
+                boxes[0].bottom - boxes[0].top) == (320, 180)
+        labels = [c.text for c in tab.display_list
+                  if hasattr(c, "text") and "video" in str(c.text)]
+        assert labels and "H.264" in labels[0], labels
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def test_navigating_away_stops_the_decode_threads():
+    from feetbrowser.browser import Browser
+    work = tempfile.mkdtemp()
+    try:
+        url = _video_page(work, "<video src='clip.avi'></video>")
+        plain = os.path.join(work, "plain.html")
+        with open(plain, "w", encoding="utf8") as handle:
+            handle.write("<p>nothing here</p>")
+        browser = Browser()
+        browser.new_tab(url)
+        browser.settle(20.0)
+        tab = browser.active_tab
+        player = tab.video_players[0]
+        player.play()
+        tab.load(URL("file://" + plain))
+        browser.settle(20.0)
+        assert tab.video_players == []
+        assert player._thread is None
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
