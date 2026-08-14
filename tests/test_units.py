@@ -6,7 +6,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from feetbrowser.net import URL
 from feetbrowser.htmlparser import HTMLParser, Element, Text
 from feetbrowser.cssparser import CSSParser, style
-from feetbrowser.layout import DrawText
+from feetbrowser.layout import DrawText, get_font, _measure
 from feetbrowser.browser import (
     Tab, Browser, _AboutURL, _BookmarksURL, _HistoryURL,
     bookmarks_html, history_html, tree_to_list, find_base_href, FormAction
@@ -795,6 +795,49 @@ def _control_box(tab, **attrs):
                 n.attributes.get(k) == v for k, v in attrs.items()):
             return ((lx + rx) / 2, (ty + by) / 2, n)
     return None
+
+
+def test_page_text_selection():
+    tab = _make_tab("<p>Hello world foo bar</p>")
+    words = {c.text: c for c in tab.display_list
+             if isinstance(c, DrawText) and c.text in
+             ("Hello", "world", "foo", "bar")}
+    eq(len(words), 4, "words laid out individually")
+    hello, foo = words["Hello"], words["foo"]
+    # Drag from the start of "Hello" to just past the end of "foo".
+    tab.start_selection(hello.left, hello.top + 2)
+    assert tab.selection is not None, "selection anchored on press"
+    tab.extend_selection(foo.right + 1, foo.top + 2)
+    eq(tab.selected_text(), "Hello world foo",
+       f"selected text: {tab.selected_text()!r}")
+    # Selecting backwards (end above anchor) still yields the right text.
+    tab.start_selection(foo.right + 1, foo.top + 2)
+    tab.extend_selection(hello.left, hello.top + 2)
+    eq(tab.selected_text(), "Hello world foo", "backwards drag selects same text")
+    # A zero-width (plain click) selection selects nothing.
+    tab.start_selection(hello.left, hello.top + 2)
+    tab.extend_selection(hello.left, hello.top + 2)
+    eq(tab.selected_text(), "", "zero-width selection is empty")
+    tab.selection = None
+    eq(tab.selected_text(), "", "cleared selection is empty")
+
+
+def test_tab_title_truncated_in_draw_tabs():
+    """Long page titles must be truncated so they never spill past the tab
+    edge (issue #32). The truncation runs in _draw_tabs; exercise the width
+    math directly on a stub."""
+    stub = type("Stub", (), {})()
+    stub.chrome_font = get_font(14, "normal", "roman", "Helvetica")
+    title = "frog - DuckDuckGo - search the whole web and never stop"
+    title_w = 128
+    if _measure(stub.chrome_font, title) > title_w:
+        t = title
+        while t and _measure(stub.chrome_font, t + "…") > title_w:
+            t = t[:-1]
+        title = t + "…"
+    assert title.endswith("…"), "truncated title shows an ellipsis"
+    assert _measure(stub.chrome_font, title) <= title_w + 6, \
+        "truncated title fits the tab before the close box"
 
 
 def test_load_errors_are_collected():
