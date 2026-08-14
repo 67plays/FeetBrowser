@@ -20,6 +20,7 @@ run() {
   .venv/bin/python tests/test_shoes.py
   .venv/bin/python tests/test_nav.py
   .venv/bin/python tests/test_toes.py
+  .venv/bin/python tests/test_asmblend.py
   .venv/bin/python tests/smoke.py
 }
 
