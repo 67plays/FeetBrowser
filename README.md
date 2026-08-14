@@ -37,8 +37,10 @@ No GUI toolkit to install — the window is ours too. macOS gets one through
 AppKit, Linux one through Xlib, and Windows one through user32/gdi32, all by
 ctypes, so there is nothing to install for any of them, and X11 covers
 Wayland desktops through XWayland. What you do need is Python 3, a system
-font, and a Rust toolchain, because the engine is a compiled extension and
-there is no Python fallback for it: `run.sh` and `run.cmd`
+font, and a Rust toolchain — on Windows a C++ linker as well, which rustup
+does not bring with it ([usage.md](docs/usage.md) has the one download and
+the one checkbox) — because the engine is a compiled extension and there is
+no Python fallback for it: `run.sh` and `run.cmd`
 build `feetbrowser_engine` into a local `.venv` when it isn't importable
 (installing `maturin` into the venv for you). Once the extension is built and
 installed for the interpreter you're invoking, `python3 -m feetbrowser <url>`

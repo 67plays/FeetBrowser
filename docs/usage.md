@@ -42,11 +42,31 @@ With no display at all — no `$DISPLAY`, no server answering, or a platform
 with no backend — the browser says which of those it was and carries on
 headless, where `--screenshot` still works.
 
-On Windows the Rust toolchain wants the MSVC build tools, which is what
-rustup installs by default (`stable-x86_64-pc-windows-msvc`). If `python`
-isn't on your `PATH` — a fresh install from the Microsoft Store often leaves
-only the launcher — use `py -3` in place of `python` in the two commands
-`run.cmd` runs.
+On Windows, "a Rust toolchain" is two installs rather than one, and the
+second is the one that catches people out. rustup selects the MSVC toolchain
+by default (`stable-x86_64-pc-windows-msvc`), but selecting it is not the
+same as having it: `rustc` compiles the code and then hands it to a C++
+linker, and Windows does not ship one. Without it the first `run.cmd` gets a
+long way — venv made, maturin installed, crates downloaded — and then stops
+with
+
+```
+error: linker `link.exe` not found
+```
+
+Install **Build Tools for Visual Studio** from
+<https://visualstudio.microsoft.com/downloads/> and tick the **Desktop
+development with C++** workload in its installer. Ticking that workload is
+the step that gets missed, and the Build Tools installed without it give the
+identical error, so it is worth checking rather than assuming. A full Visual
+Studio installation with the same workload does just as well. Open a new
+command prompt afterwards so the linker is on `PATH`, then run `run.cmd`
+again. `run.cmd` and `test.cmd` both say all of this themselves if the build
+fails, so nobody has to find this page first.
+
+If `python` isn't on your `PATH` — a fresh install from the Microsoft Store
+often leaves only the launcher — use `py -3` in place of `python` in the two
+commands `run.cmd` runs.
 
 To render a page without opening a window:
 

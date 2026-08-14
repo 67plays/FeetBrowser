@@ -21,18 +21,25 @@ browser runs but does not open.
 **Needs building:** the JavaScript engine is a Rust extension
 (`feetbrowser_engine`), and there is no Python fallback, so a Rust toolchain
 is a hard prerequisite on every platform. `run.sh` and `run.cmd` build it
-into a local `.venv` on first run. On Windows that means the MSVC build tools
-(the `stable-x86_64-pc-windows-msvc` toolchain rustup installs by default);
-the GNU toolchain works too if that is what you already have, but do not mix
-the two in one `.venv`.
+into a local `.venv` on first run. Windows needs a second install that the
+other two platforms do not: rustup selects the MSVC toolchain but does not
+provide the linker it calls, and Windows ships no linker of its own, so the
+first `run.cmd` stops at `error: linker \`link.exe\` not found` until the
+Visual Studio build tools are installed. See [usage.md](usage.md) for the
+exact download and the one workload to tick. Whether the GNU toolchain can
+stand in for it here is untested and not claimed: official CPython is built
+with MSVC, and MinGW does not read the import-library format that produces,
+so MSVC is the only toolchain this has been built with.
 
 **Windows, specifically:** the process asks for per-monitor-v2 DPI awareness,
 so Windows hands over the real pixels rather than scaling a 96-DPI frame up.
 Nothing scales the *page*, though, so one CSS pixel is one device pixel and a
-site on a 200% display renders correspondingly small. There is no
-`WM_DPICHANGED` handling for dragging a window between monitors of different
-scale, no IME support for composed input, no drag-and-drop, no printing, and
-no jump list or taskbar integration. `cargo` builds under a deep checkout can
+site on a 200% display renders correspondingly small. A window dragged
+between monitors of different scale is resized to the rectangle
+`WM_DPICHANGED` supplies, so the frame and the client area stay in agreement,
+but that path has never run anywhere except by reading: CI's runners are
+headless and 96 DPI. There is no IME support for composed input, no
+drag-and-drop, no printing, and no jump list or taskbar integration. `cargo` builds under a deep checkout can
 run into the 260-character path limit; keep the repo somewhere short, or turn
 long paths on.
 

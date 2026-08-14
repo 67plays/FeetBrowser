@@ -5,10 +5,12 @@ rem
 rem The renderer draws into its own framebuffer, so nothing here needs a
 rem display or a toolkit. The JavaScript engine is the Rust extension
 rem feetbrowser_engine, so the suite runs out of the local venv maturin builds
-rem it into, which needs a Rust toolchain installed. A few suites step outside
-rem all that: test_win32.py opens real windows here (test_cocoa.py and
-rem test_x11.py skip, as they do everywhere but their own platform), and
-rem test_nav.py and smoke.py reach the network.
+rem it into, which needs a Rust toolchain and, on Windows only, a C++ linker
+rem to go with it -- see the messages at the bottom of this file.
+rem
+rem A few suites step outside all that: test_win32.py opens real windows here
+rem (test_cocoa.py and test_x11.py skip, as they do everywhere but their own
+rem platform), and test_nav.py and smoke.py reach the network.
 setlocal
 cd /d "%~dp0"
 
@@ -35,10 +37,13 @@ set PY=.venv\Scripts\python.exe
 
 rem Ensure the Rust JS engine (feetbrowser_engine) is built in the local venv.
 "%PY%" -c "import feetbrowser_engine" >nul 2>&1
-if errorlevel 1 (
-  "%PY%" -m pip install -q maturin || exit /b 1
-  ".venv\Scripts\maturin.exe" develop --release --manifest-path rust/Cargo.toml || exit /b 1
-)
+if not errorlevel 1 goto built
+where /q cargo
+if errorlevel 1 goto norust
+"%PY%" -m pip install -q maturin || exit /b 1
+".venv\Scripts\maturin.exe" develop --release --manifest-path rust/Cargo.toml
+if errorlevel 1 goto nolinker
+:built
 
 "%PY%" -c "import pyflakes" >nul 2>&1
 if errorlevel 1 (
@@ -78,3 +83,40 @@ goto :done
 :nogo
 echo skipping the Go net tests: no go toolchain on PATH
 :done
+exit /b 0
+
+rem The same two toolchain failures run.cmd explains, said shorter because
+rem anyone running the tests has already been through run.cmd once. Written to
+rem stderr by redirecting the whole subroutine rather than every line in it.
+:norust
+call :say_norust 1>&2
+exit /b 1
+
+:nolinker
+call :say_nolinker 1>&2
+exit /b 1
+
+:say_norust
+echo The tests need a Rust toolchain, and there is not one on this machine.
+echo The JavaScript engine is a Rust extension rather than Python, so it has
+echo to be compiled before anything can import it. Install rustup-init.exe
+echo from https://rustup.rs, then read on -- Windows needs one more thing.
+echo.
+goto :say_linker
+
+:say_nolinker
+echo.
+echo The JavaScript engine did not build. The compiler's own output is above.
+echo If it mentions link.exe, or a missing linker, that is the system side of
+echo a Rust install rather than anything about this repository.
+echo.
+
+:say_linker
+echo Rust compiles the code but does not link it, and Windows ships no linker
+echo for it to use. Install Build Tools for Visual Studio, from
+echo https://visualstudio.microsoft.com/downloads/, and tick the "Desktop
+echo development with C++" workload in its installer. Ticking it is the part
+echo that gets missed: the Build Tools without that workload leave you with no
+echo link.exe at all, and the error is identical to never having installed
+echo them. Open a new command prompt afterwards, then run this script again.
+goto :eof
