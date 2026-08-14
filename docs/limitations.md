@@ -39,9 +39,9 @@ between monitors of different scale is resized to the rectangle
 `WM_DPICHANGED` supplies, so the frame and the client area stay in agreement,
 but that path has never run anywhere except by reading: CI's runners are
 headless and 96 DPI. There is no IME support for composed input, no
-drag-and-drop, no printing, and no jump list or taskbar integration. `cargo` builds under a deep checkout can
-run into the 260-character path limit; keep the repo somewhere short, or turn
-long paths on.
+drag-and-drop, no printing, and no jump list or taskbar integration. `cargo`
+builds under a deep checkout can run into the 260-character path limit; keep
+the repo somewhere short, or turn long paths on.
 
 **Doesn't (yet):** flexbox wrapping, `<textarea>`/`<select>` selection (beyond
 read-only), or the full ECMAScript feature set (see below). Shoes themes are
