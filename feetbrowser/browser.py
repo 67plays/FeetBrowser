@@ -9,6 +9,7 @@ second canvas so the whole browser really is "from scratch".
 """
 
 import os
+import re
 import sys
 import json
 import html
@@ -19,8 +20,9 @@ from collections import deque
 
 from .net import URL
 from .htmlparser import HTMLParser, Text, Element
-from .cssparser import CSSParser, style, parse_inline
-from .layout import DocumentLayout, paint_tree, get_font
+from .cssparser import CSSParser, style, parse_inline, set_viewport, \
+    media_matches, _VIEWPORT
+from .layout import DocumentLayout, paint_tree, get_font, _measure
 from .jsdom import JSDocument
 from .jsengine import Interpreter, JSException, UNDEFINED
 from . import toes as toes
@@ -28,8 +30,15 @@ from . import toes as toes
 WIDTH, HEIGHT = 1000, 720
 SCROLL_STEP = 80
 CHROME_HEIGHT = 80  # tabs + address bar
+LOG_HEIGHT = 16  # slim strip under the toolbar reporting load errors
 BOOKMARKS_FILE = os.path.expanduser("~/.feetbrowser_bookmarks.json")
 MAX_CACHED_IMAGES = 300
+# Cap the number of concurrent image fetches across the whole browser.
+# Without a bound, a photo-heavy page spawns hundreds of threads and sockets
+# at once; a small pool keeps memory and file-descriptor use flat while
+# still fetching far faster than the layout can paint.
+MAX_CONCURRENT_IMAGE_FETCHES = 6
+_image_fetch_sem = threading.Semaphore(MAX_CONCURRENT_IMAGE_FETCHES)
 
 # Deeply nested documents walk DOM/layout trees recursively; give Python a
 # comfortable margin so pathological pages degrade gracefully instead of
@@ -102,6 +111,52 @@ def get_title(node):
     return None
 
 
+# @import url("..."); / @import "..." [media]; — matched at a statement
+# boundary so a bare "@import" mention inside a rule can't be grabbed.
+_IMPORT_RE = re.compile(
+    r"(?P<lead>(?:^|[\s{};]))@import\s+"
+    r"(?:url\(\s*)?(?P<url>[^'\";\s()]+|'[^']*'|\"[^\"]*\")"
+    r"(?:\s*\))?\s*(?P<media>[^;]*);",
+    re.IGNORECASE)
+
+
+def _expand_imports(css, base_url, depth=0, seen=None, log=None):
+    """Inline `@import`ed stylesheets so pages that ship their CSS via
+    @import don't come out unstyled.
+
+    Imported sheets are fetched relative to `base_url`, nested imports are
+    expanded (bounded depth), and the import's own media query is honored
+    against the current viewport. A `seen` set guards against cycles.
+    """
+    if depth > 4 or "@import" not in css:
+        return css
+    if seen is None:
+        seen = set()
+    out = []
+    last = 0
+    width, height = _VIEWPORT
+    for m in _IMPORT_RE.finditer(css):
+        out.append(css[last:m.start()])
+        last = m.end()
+        url = (m.group("url") or "").strip().strip("\"'")
+        media = (m.group("media") or "").strip()
+        if not url or url in seen:
+            continue
+        if media and not media_matches(media, width, height):
+            continue
+        seen.add(url)
+        try:
+            imp_url = base_url.resolve(url)
+            _h, imported, _c = imp_url.request()
+        except Exception as e:  # noqa: BLE001 - a broken import shouldn't stop the page
+            if log is not None:
+                log(f"CSS {imp_url} ({type(e).__name__})")
+            continue
+        out.append(_expand_imports(imported, imp_url, depth + 1, seen, log))
+    out.append(css[last:])
+    return "".join(out)
+
+
 class FormAction:
     """Returned by Tab.click() when a <form> is submitted: load url+payload."""
 
@@ -139,6 +194,12 @@ class Tab:
         self._image_done = None
         # Console output accumulated from JS (errors + console.log lines).
         self.js_logs = []
+        # Network/load failures worth surfacing in the browser's log strip
+        # (CSS/script/image fetches that failed or were dropped).
+        self.net_errors = []
+        # Image URLs that failed to download, filled by background threads
+        # and drained into net_errors on the UI thread.
+        self._image_failures = []
         # Stylesheet rules for the current document, kept so JS-driven DOM
         # mutations can be re-styled, and the live interpreter reused across
         # script runs and click-handler dispatch.
@@ -196,14 +257,18 @@ class Tab:
         try:
             _headers, body, ctype = url.request(payload=payload,
                                                 refresh=refresh)
+            doc_error = None
         except TypeError:
             # Internal URL objects (about:blank, bookmarks, history) expose a
             # simpler request(); retry without the refresh flag.
             _headers, body, ctype = url.request(payload=payload)
+            doc_error = None
         except Exception as e:  # noqa: BLE001 - surface any network error in-page
             body = f"<h1>Could not load page</h1><pre>{type(e).__name__}: {e}</pre>"
+            doc_error = f"DOC {url} ({type(e).__name__})"
             ctype = "text/html"
-        self._complete_load(url, payload, push, pending_scroll, body, ctype)
+        self._complete_load(url, payload, push, pending_scroll, body, ctype,
+                            doc_error=doc_error)
 
     def _gui_mode(self):
         return self.browser is not None \
@@ -254,11 +319,16 @@ class Tab:
         if exc is not None:
             body = (f"<h1>Could not load page</h1>"
                     f"<pre>{type(exc).__name__}: {exc}</pre>")
+            doc_error = f"DOC {meta['url']} ({type(exc).__name__})"
             ctype = "text/html"
+        else:
+            doc_error = None
         self._complete_load(meta["url"], meta["payload"], meta["push"],
-                            meta["pending_scroll"], body, ctype)
+                            meta["pending_scroll"], body, ctype,
+                            doc_error=doc_error)
 
-    def _complete_load(self, url, payload, push, pending_scroll, body, ctype):
+    def _complete_load(self, url, payload, push, pending_scroll, body, ctype,
+                       doc_error=None):
         """Shared tail of load(): apply a fetched body to the tab."""
         if push and self.url is not None:
             self.history.append((self.url, self.scroll))
@@ -280,6 +350,9 @@ class Tab:
             self.title = "Error"
             self._build(url, err, "text/html")
 
+        if doc_error is not None:
+            self._add_error(doc_error)
+
         self.loading = False
         self.status = str(url)
         if getattr(url, "fragment", ""):
@@ -295,6 +368,8 @@ class Tab:
         self.focused_input = None
         self.form_values = {}
         self.js_logs = []
+        self.net_errors = []
+        self._image_failures = []
         self._js_interp = None
         self._js_doc = None
         self._js_fetch_results.clear()
@@ -328,6 +403,7 @@ class Tab:
                     pass
         for sheet in inline_styles(self.nodes, []):
             try:
+                sheet = _expand_imports(sheet, resolve_from, log=self._add_error)
                 rules.extend(CSSParser(sheet).parse())
             except Exception:  # noqa: BLE001 - a broken sheet shouldn't stop the page
                 pass
@@ -335,8 +411,12 @@ class Tab:
             try:
                 sheet_url = resolve_from.resolve(href)
                 _h, css_body, _c = sheet_url.request()
+                css_body = _expand_imports(css_body, sheet_url,
+                                           log=self._add_error)
                 rules.extend(CSSParser(css_body).parse())
-            except Exception:  # noqa: BLE001 - skip stylesheets that fail to load
+            except Exception as e:  # noqa: BLE001 - skip stylesheets that fail
+                self._add_error(
+                    f"CSS {sheet_url} ({type(e).__name__})")
                 continue
 
         style(self.nodes, rules)
@@ -391,7 +471,9 @@ class Tab:
                         sheet_url = self.base_url.resolve(src) \
                             if self.base_url else URL(src)
                         _h, code, _c = sheet_url.request()
-                    except Exception:  # noqa: BLE001 - skip bad/unreachable src
+                    except Exception as e:  # noqa: BLE001 - skip bad/unreachable src
+                        self._add_error(
+                            f"JS {sheet_url} ({type(e).__name__})")
                         code = None
                 else:
                     code = "".join(ch.text for ch in el.children
@@ -401,6 +483,7 @@ class Tab:
             except JSException as e:
                 self._js_interp.logs.append(f"JS error: {e}")
         self.js_logs.extend(self._js_interp.logs)
+        self._capture_js_errors(self._js_interp.logs)
         # Run microtasks/timers the scripts scheduled (promise .then chains,
         # setTimeout(0), ...) before deciding whether anything changed.
         self._drain_js()
@@ -409,6 +492,17 @@ class Tab:
         # full restyle+layout for them dominates page-load time.
         if doc._flag["dirty"]:
             self._js_mutated()
+
+    def _add_error(self, msg):
+        self.net_errors.append(msg)
+        if len(self.net_errors) > 500:
+            del self.net_errors[:len(self.net_errors) - 500]
+
+    def _capture_js_errors(self, logs):
+        for line in logs:
+            if line.startswith("JS error"):
+                msg = line[len("JS error: "):]
+                self._add_error(f"JS {msg}")
 
     def _js_mutated(self):
         """Re-style the tree with the stored rules and re-render after a
@@ -484,6 +578,7 @@ class Tab:
             interp.drain()
         except JSException as e:
             self.js_logs.append(f"JS error: {e}")
+            self._add_error(f"JS {e}")
         if self._js_doc is not None and self._js_doc._flag["dirty"]:
             self._js_mutated()
 
@@ -515,6 +610,7 @@ class Tab:
             cur = cur.parent
         if handled:
             self.js_logs.extend(interp.logs)
+            self._capture_js_errors(interp.logs)
             self._drain_js()
             self._js_mutated()
             return True
@@ -571,16 +667,22 @@ class Tab:
 
     def _fetch_image(self, key, url):
         """Background thread: fetch bytes, hand them back to the UI thread via
-        the results queue. Never touches Tk directly."""
+        the results queue. Never touches Tk directly. The semaphore bounds
+        how many image fetches run at once browser-wide."""
         try:
-            _headers, data, ctype = url.request_bytes()
-        except Exception:  # noqa: BLE001 - failed image fetch: keep placeholder
+            with _image_fetch_sem:
+                _headers, data, ctype = url.request_bytes()
+        except Exception as e:  # noqa: BLE001 - failed image fetch: keep placeholder
             data, ctype = None, None
+            self._image_failures.append(f"{url} ({type(e).__name__})")
         self._image_results.append((key, data, ctype))
 
     def _drain_images(self):
         """Called on the UI thread: decode any finished downloads and
         re-render when the last one arrives."""
+        while self._image_failures:
+            url = self._image_failures.pop(0)
+            self._add_error(f"IMG {url}")
         if not self._image_results:
             return
         pending = []
@@ -722,11 +824,15 @@ class Tab:
             for lx, ty, rx, by, node in self.document.input_boxes:
                 if lx <= x < rx and ty <= y < by:
                     return node
-        hit = None
-        for cmd in self.display_list:
-            if hasattr(cmd, "hit") and cmd.node is not None and cmd.hit(x, y):
-                hit = cmd.node  # last match wins (painted on top)
-        return hit
+        # The display list is in paint order, so the topmost command under a
+        # point is the *last* match. Scanning in reverse returns the same node
+        # as the old full scan but exits on the first hit, which matters on
+        # text-heavy pages where this runs on every mouse-move for hover.
+        for cmd in reversed(self.display_list):
+            if getattr(cmd, "node", None) is not None and hasattr(cmd, "hit") \
+                    and cmd.hit(x, y):
+                return cmd.node
+        return None
 
     @staticmethod
     def _enclosing_link(node):
@@ -921,6 +1027,130 @@ class Tab:
             cmd.execute(self.scroll - offset, canvas)
 
 
+class ContextMenu:
+    """A hand-drawn context menu painted on the browser canvas.
+
+    Stays true to the "chrome is drawn by hand" design: no native Tk menu
+    widgets, just rectangles and text, so it looks and behaves like the rest
+    of the UI. Items are None (a separator) or (label, callback, enabled).
+
+    It renders on top of everything in Browser.draw() and tracks its own
+    hover state; the browser feeds it mouse/keyboard events while open.
+    """
+
+    ITEM_H = 26
+    PAD = 4
+    PAD_X = 10
+    SEP = 8
+
+    def __init__(self):
+        self.items = []
+        self.x = self.y = 0
+        self.width = self.height = 0
+        self.hover = -1
+        self.open_ = False
+
+    def open(self, x, y, items, canvas_w, canvas_h):
+        self.items = items
+        self.hover = -1
+        font = get_font(12, "normal", "roman", "Helvetica")
+        width = 170
+        for item in items:
+            if item is not None:
+                width = max(width, _measure(font, item[0])
+                            + 2 * self.PAD_X + 8)
+        height = self.PAD
+        for item in items:
+            height += self.SEP if item is None else self.ITEM_H
+        height += self.PAD
+        self.width = max(120, min(width, canvas_w - 4))
+        self.height = height
+        self.x = max(2, min(x, canvas_w - self.width - 2))
+        self.y = max(2, min(y, canvas_h - self.height - 2))
+        self.open_ = True
+
+    def close(self):
+        self.open_ = False
+        self.items = []
+        self.hover = -1
+
+    def point_in_menu(self, x, y):
+        return (self.open_ and self.x <= x <= self.x + self.width
+                and self.y <= y <= self.y + self.height)
+
+    def hit(self, x, y):
+        """Index of the item under (x, y), or -1 (separators never hit)."""
+        if not self.point_in_menu(x, y):
+            return -1
+        y0 = self.y + self.PAD
+        for i, item in enumerate(self.items):
+            if item is None:
+                y0 += self.SEP
+                continue
+            if y0 <= y < y0 + self.ITEM_H:
+                return i
+            y0 += self.ITEM_H
+        return -1
+
+    def set_hover(self, x, y):
+        idx = self.hit(x, y)
+        changed = idx != self.hover
+        self.hover = idx
+        return changed
+
+    def _enabled_indices(self):
+        return [i for i, item in enumerate(self.items)
+                if item is not None and item[2]]
+
+    def move(self, delta):
+        """Move keyboard focus to the next/previous enabled item."""
+        enabled = self._enabled_indices()
+        if not enabled:
+            return
+        if self.hover in enabled:
+            pos = enabled.index(self.hover)
+        else:
+            pos = -1 if delta > 0 else 0
+        self.hover = enabled[(pos + delta) % len(enabled)]
+
+    def activate(self):
+        """Return the callback of the hovered enabled item, else None."""
+        if 0 <= self.hover < len(self.items):
+            item = self.items[self.hover]
+            if item is not None and item[2]:
+                return item[1]
+        return None
+
+    def draw(self, canvas):
+        if not self.open_:
+            return
+        c = canvas
+        x, y = self.x, self.y
+        c.create_rectangle(x - 1, y - 1, x + self.width + 1,
+                           y + self.height + 1, fill="#d0d0d0", width=0)
+        c.create_rectangle(x, y, x + self.width, y + self.height,
+                           fill="white", outline="#666666", width=1)
+        y0 = y + self.PAD
+        for i, item in enumerate(self.items):
+            if item is None:
+                y0 += self.SEP / 2
+                c.create_line(x + 8, y0, x + self.width - 8, y0,
+                              fill="#dddddd", width=1)
+                y0 += self.SEP / 2
+                continue
+            label, _callback, enabled = item
+            if i == self.hover and enabled:
+                c.create_rectangle(x + 1, y0, x + self.width - 1,
+                                   y0 + self.ITEM_H, fill="#1a73e8", width=0)
+                color = "white"
+            else:
+                color = "#111111" if enabled else "#aaaaaa"
+            c.create_text(x + self.PAD_X, y0 + self.ITEM_H / 2, text=label,
+                          anchor="w", font=get_font(12, "normal", "roman",
+                                                    "Helvetica"), fill=color)
+            y0 += self.ITEM_H
+
+
 class Browser:
     def __init__(self):
         self.tabs = []
@@ -956,6 +1186,8 @@ class Browser:
         self.chrome_font = get_font(14, "normal", "roman", "Helvetica")
         self.bold_font = get_font(14, "bold", "roman", "Helvetica")
 
+        self.context_menu = ContextMenu()
+
         self._bind()
 
     def _bind(self):
@@ -976,6 +1208,7 @@ class Browser:
         w.bind("<Button-1>", self._on_click)
         w.bind("<B1-Motion>", self._on_drag)
         w.bind("<Button-2>", self._on_middle_click)
+        w.bind("<Button-3>", self._on_context_menu)
         w.bind("<Motion>", self._on_motion)
         w.bind("<Key>", self._on_key)
         w.bind("<Return>", self._on_enter)
@@ -1018,8 +1251,9 @@ class Browser:
         self.draw()
 
     def chrome_height(self):
-        """Total chrome height: the fixed chrome plus any toe bands."""
-        return CHROME_HEIGHT + toes.band_height(self.chrome_bands())
+        """Total chrome height: the fixed chrome, the log strip, and any toe
+        bands."""
+        return CHROME_HEIGHT + LOG_HEIGHT + toes.band_height(self.chrome_bands())
 
     def tab_height(self):
         h = self.canvas.winfo_height()
@@ -1072,6 +1306,7 @@ class Browser:
         global WIDTH, HEIGHT
         WIDTH = self.canvas.winfo_width()
         HEIGHT = self.canvas.winfo_height()
+        set_viewport(WIDTH, HEIGHT)
         for tab in self.tabs:
             tab.tab_height = self.tab_height()
             if tab.nodes:
@@ -1157,6 +1392,9 @@ class Browser:
             self.draw()
 
     def _on_click(self, e):
+        if self.context_menu.open_:
+            self._context_menu_click(e.x, e.y)
+            return
         was_address = self.focus == "address"
         self.focus = None
         if e.y < self.chrome_height():
@@ -1175,6 +1413,10 @@ class Browser:
         self.draw()
 
     def _on_middle_click(self, e):
+        if self.context_menu.open_:
+            self.context_menu.close()
+            self.draw()
+            return
         if not self.active_tab or e.y < self.chrome_height():
             return
         dest = self.active_tab.click(e.x, e.y - self.chrome_height())
@@ -1260,6 +1502,11 @@ class Browser:
             self.draw()
 
     def _on_motion(self, e):
+        if self.context_menu.open_:
+            if self.context_menu.set_hover(e.x, e.y):
+                # Redraw just the menu, not the whole page, on hover moves.
+                self.context_menu.draw(self.canvas)
+            return
         if not self.active_tab:
             return
         if e.y >= self.chrome_height():
@@ -1274,7 +1521,129 @@ class Browser:
         else:
             self.canvas.config(cursor="")
 
+    # -- context menu ----------------------------------------------------
+
+    def _on_context_menu(self, e):
+        items = self._context_items(e.x, e.y)
+        self.context_menu.open(e.x, e.y, items,
+                               self.canvas.winfo_width(),
+                               self.canvas.winfo_height())
+        self.draw()
+
+    def _context_menu_click(self, x, y):
+        menu = self.context_menu
+        if not menu.point_in_menu(x, y):
+            menu.close()
+            self.draw()
+            return
+        idx = menu.hit(x, y)
+        if idx < 0:
+            menu.close()
+            self.draw()
+            return
+        menu.hover = idx
+        cb = menu.activate()
+        menu.close()
+        self.draw()
+        if cb:
+            cb()
+
+    @staticmethod
+    def _enclosing_image(node):
+        while node is not None:
+            if isinstance(node, Element) and node.tag == "img" \
+                    and node.attributes.get("src"):
+                return node.attributes["src"]
+            node = node.parent
+        return None
+
+    def _copy_text(self, text):
+        try:
+            self.window.clipboard_clear()
+            self.window.clipboard_append(text)
+        except tkinter.TclError:
+            pass
+
+    def _view_source(self):
+        tab = self.active_tab
+        if tab and isinstance(tab.url, URL):
+            self._navigate(tab, URL("view-source:" + str(tab.url)))
+
+    def _context_items(self, x, y):
+        """Build the context-menu entries for a right-click at (x, y)."""
+        tab = self.active_tab
+        if not tab or y < self.chrome_height():
+            return [
+                ("Back", self._back, bool(tab and tab.history)),
+                ("Forward", self._forward, bool(tab and tab.future)),
+                ("Reload", self._reload, bool(tab)),
+                None,
+                ("New Tab", lambda: self.new_tab("about:blank"), True),
+                ("Close Tab", self.close_tab, len(self.tabs) > 1),
+                None,
+                ("Home", self._home, bool(tab)),
+                ("Bookmark This Page", self._toggle_bookmark,
+                 bool(tab and self._bookmark_key(tab.url))),
+                ("View Source", self._view_source,
+                 bool(tab and isinstance(tab.url, URL))),
+                ("History", self._open_history_page, bool(tab)),
+            ]
+        doc_y = y - self.chrome_height()
+        node = tab._node_at(x, doc_y)
+        href = tab._enclosing_link(node)
+        img_src = self._enclosing_image(node)
+        items = []
+        if href:
+            resolved = tab.base_url.resolve(href) if tab.base_url \
+                else tab.url.resolve(href)
+            items.append(("Open Link",
+                          lambda r=resolved: self._navigate(tab, r), True))
+            items.append(("Open Link in New Tab",
+                          lambda r=resolved: self.new_tab(str(r)), True))
+            items.append(("Copy Link Address",
+                          lambda h=href: self._copy_text(h), True))
+            items.append(None)
+        if img_src:
+            img_url = tab.base_url.resolve(img_src) if tab.base_url \
+                else URL(img_src)
+            items.append(("Open Image",
+                          lambda u=img_url: self._navigate(tab, u), True))
+            items.append(("Copy Image URL",
+                          lambda u=str(img_url): self._copy_text(u), True))
+            items.append(None)
+        items.extend([
+            ("Back", self._back, bool(tab.history)),
+            ("Forward", self._forward, bool(tab.future)),
+            ("Reload", self._reload, True),
+            None,
+            ("Bookmark This Page", self._toggle_bookmark,
+             bool(self._bookmark_key(tab.url))),
+            ("View Source", self._view_source, isinstance(tab.url, URL)),
+            ("Copy Page URL",
+             lambda u=str(tab.url): self._copy_text(u),
+             bool(tab.url and not isinstance(tab.url, _AboutURL))),
+            None,
+            ("New Tab", lambda: self.new_tab("about:blank"), True),
+            ("Close Tab", self.close_tab, len(self.tabs) > 1),
+        ])
+        return items
+
     def _on_key(self, e):
+        if self.context_menu.open_:
+            keysym = getattr(e, "keysym", "")
+            if keysym == "Up":
+                self.context_menu.move(-1)
+                self.context_menu.draw(self.canvas)
+            elif keysym == "Down":
+                self.context_menu.move(1)
+                self.context_menu.draw(self.canvas)
+            elif keysym in ("Return", "KP_Enter"):
+                cb = self.context_menu.activate()
+                self.context_menu.close()
+                self.draw()
+                if cb:
+                    cb()
+            return
         if self.focus == "address":
             self._address_key(e)
             return
@@ -1350,7 +1719,7 @@ class Browser:
         text = self.address_text
         rel = max(0.0, x - self._address_bar_x() + self.address_view)
         i = 0
-        while i < len(text) and font.measure(text[:i + 1]) <= rel:
+        while i < len(text) and _measure(font, text[:i + 1]) <= rel:
             i += 1
         return i
 
@@ -1448,7 +1817,7 @@ class Browser:
     def _address_ensure_visible(self):
         """Horizontal scroll of the address text so the caret stays in view."""
         font = self.chrome_font
-        caret_x = font.measure(self.address_text[:self.address_caret])
+        caret_x = _measure(font, self.address_text[:self.address_caret])
         box_w = max(40, self.canvas.winfo_width() - 8 - self._address_bar_x() - 8)
         if caret_x < self.address_view:
             self.address_view = max(0, caret_x - 8)
@@ -1456,7 +1825,10 @@ class Browser:
             self.address_view = caret_x - box_w + 8
 
     def _on_escape(self, e):
-        if self.focus == "address":
+        if self.context_menu.open_:
+            self.context_menu.close()
+            self.draw()
+        elif self.focus == "address":
             self.focus = None
             self.draw()
         elif self.active_tab and self.active_tab.focused_input:
@@ -1667,13 +2039,36 @@ class Browser:
                           self.canvas, bands)
         self._draw_tabs()
         self._draw_toolbar()
+        self._draw_log()
         self._draw_toe_buttons()
         self._draw_status()
         self._draw_scrollbar()
         self._draw_spinner()
+        self.context_menu.draw(self.canvas)
         self.window.title(
             (self.active_tab.title if self.active_tab else "FeetBrowser")
             + " — FeetBrowser")
+
+    def _draw_log(self):
+        """Draw the load-error strip under the toolbar: the most recent
+        network/JS failure (if any) for the active tab, plus a count."""
+        c = self.canvas
+        tab = self.active_tab
+        top = toes.band_height(self.chrome_bands()) + CHROME_HEIGHT
+        c.create_rectangle(0, top, c.winfo_width(), top + LOG_HEIGHT,
+                           fill="#fff4e6", width=0)
+        c.create_line(0, top, c.winfo_width(), top, fill="#e0cda8")
+        if not tab or not tab.net_errors:
+            return
+        latest = tab.net_errors[-1]
+        total = len(tab.net_errors)
+        msg = f"[{total} load error{'s' if total != 1 else ''}] {latest}"
+        width = c.winfo_width() - 16
+        font = get_font(10, "normal", "roman", "Helvetica")
+        if len(msg) > width // 6:
+            msg = msg[:width // 6 - 1] + "\u2026"
+        c.create_text(8, top + LOG_HEIGHT / 2, text=msg, anchor="w",
+                      font=font, fill="#8a5a00")
 
     def _draw_tabs(self):
         c = self.canvas
@@ -1749,14 +2144,14 @@ class Browser:
             return
 
         def char_x(i):
-            return x0 + (font.measure(text[:i]) - view)
+            return x0 + (_measure(font, text[:i]) - view)
 
         # Visible slice of the text.
         start = 0
-        while start < len(text) and font.measure(text[:start + 1]) <= view:
+        while start < len(text) and _measure(font, text[:start + 1]) <= view:
             start += 1
         end = start
-        while end < len(text) and font.measure(text[start:end + 1]) <= (x1 - x0):
+        while end < len(text) and _measure(font, text[start:end + 1]) <= (x1 - x0):
             end += 1
         if self.address_caret < start:
             start = self.address_caret
@@ -1911,6 +2306,7 @@ class PopupWindow:
         self.canvas.pack(fill="both", expand=True)
         self.tab = Tab(height - self.TITLE_BAR, browser)
         self.tab.load(URL(str(url)) if isinstance(url, str) else url)
+        self.context_menu = ContextMenu()
         self._bind()
         self.draw()
 
@@ -1919,6 +2315,9 @@ class PopupWindow:
         self.window.bind("<Button-4>", lambda e: self._scroll(-SCROLL_STEP))
         self.window.bind("<Button-5>", lambda e: self._scroll(SCROLL_STEP))
         self.window.bind("<Button-1>", self._on_click)
+        self.window.bind("<Button-3>", self._on_context_menu)
+        self.window.bind("<Motion>", self._on_motion)
+        self.window.bind("<Escape>", self._on_escape)
 
     def _on_wheel(self, e):
         self._scroll(-e.delta if abs(e.delta) < 30
@@ -1929,6 +2328,9 @@ class PopupWindow:
         self.draw()
 
     def _on_click(self, e):
+        if self.context_menu.open_:
+            self._context_menu_click(e.x, e.y)
+            return
         if e.y < self.TITLE_BAR:
             if e.x >= self.width - 20:
                 self.window.destroy()
@@ -1937,6 +2339,67 @@ class PopupWindow:
         if dest:
             self._navigate(dest)
         self.draw()
+
+    # -- context menu ----------------------------------------------------
+
+    def _on_context_menu(self, e):
+        items = self._context_items(e.x, e.y)
+        self.context_menu.open(e.x, e.y, items, self.width, self.height)
+        self.draw()
+
+    def _context_menu_click(self, x, y):
+        menu = self.context_menu
+        if not menu.point_in_menu(x, y):
+            menu.close()
+            self.draw()
+            return
+        idx = menu.hit(x, y)
+        if idx < 0:
+            menu.close()
+            self.draw()
+            return
+        menu.hover = idx
+        cb = menu.activate()
+        menu.close()
+        self.draw()
+        if cb:
+            cb()
+
+    def _on_motion(self, e):
+        if self.context_menu.open_ and self.context_menu.set_hover(e.x, e.y):
+            self.context_menu.draw(self.canvas)
+
+    def _on_escape(self, e):
+        if self.context_menu.open_:
+            self.context_menu.close()
+            self.draw()
+
+    def _context_items(self, x, y):
+        if y < self.TITLE_BAR:
+            return [
+                ("Reload", lambda: self.tab.load(self.tab.url, push=False),
+                 True),
+                None,
+                ("Close Popup", self.window.destroy, True),
+            ]
+        items = [
+            ("Back", self.tab.go_back, bool(self.tab.history)),
+            ("Forward", self.tab.go_forward, bool(self.tab.future)),
+            ("Reload", lambda: self.tab.load(self.tab.url, push=False), True),
+            None,
+            ("Copy Page URL",
+             lambda u=str(self.tab.url): self._copy_text(u),
+             bool(self.tab.url)),
+            ("Close Popup", self.window.destroy, True),
+        ]
+        return items
+
+    def _copy_text(self, text):
+        try:
+            self.window.clipboard_clear()
+            self.window.clipboard_append(text)
+        except tkinter.TclError:
+            pass
 
     def _navigate(self, dest):
         if isinstance(dest, FormAction):
@@ -1989,6 +2452,7 @@ class PopupWindow:
             c.create_rectangle(self.width - 6, thumb_top,
                                 self.width - 2, thumb_top + thumb_h,
                                 fill="#9aa0a6", width=0)
+        self.context_menu.draw(self.canvas)
 
 
 class JSResponse:
