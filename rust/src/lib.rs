@@ -1,5 +1,6 @@
 mod ast;
 mod dom;
+mod font;
 mod image;
 mod interp;
 mod parser;
@@ -40,5 +41,13 @@ fn feetbrowser_engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // -- rasteriser --
     m.add_class::<raster::Surface>()?;
     m.add_function(wrap_pyfunction!(raster::rasterize, m)?)?;
+    m.add_function(wrap_pyfunction!(raster::glyph_bitmap, m)?)?;
+    m.add_function(wrap_pyfunction!(raster::draw_text, m)?)?;
+    m.add_function(wrap_pyfunction!(raster::measure_text, m)?)?;
+
+    // -- fonts --
+    m.add_class::<font::Font>()?;
+    m.add("FontError", py.get_type::<font::FontError>())?;
+    m.add_function(wrap_pyfunction!(font::flatten, m)?)?;
     Ok(())
 }

@@ -13,11 +13,12 @@
 //! are clipped in i64 before anything becomes an offset, and each offset is
 //! range-checked once per row rather than trusted.
 
+use crate::font::{flatten_contours, Font};
 use crate::pyutil::{bytes_arg, rgb, to_int};
 use pyo3::exceptions::{PyMemoryError, PyValueError};
 use pyo3::ffi;
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyMemoryView};
+use pyo3::types::{PyBytes, PyMemoryView, PyTuple};
 use std::os::raw::c_int;
 
 /// An RGB pixel buffer with a clip rectangle.
@@ -324,46 +325,7 @@ impl Surface {
         let cov = bytes_arg(cov)?;
         let c = rgb(color)?;
         let (x, y) = (to_int(x)?, to_int(y)?);
-        let (cx0, cy0, cx1, cy1) = self.clip;
-        let sx0 = 0.max(cx0 - x);
-        let sy0 = 0.max(cy0 - y);
-        let sx1 = cw.min(cx1 - x);
-        let sy1 = ch.min(cy1 - y);
-        if sx0 >= sx1 || sy0 >= sy1 {
-            return Ok(());
-        }
-        for row in sy0..sy1 {
-            let src = (row * cw) as usize;
-            let dst = ((y + row) * self.stride + (x + sx0) * 3) as usize;
-            let count = (sx1 - sx0) as usize;
-            let line = match self.px.get_mut(dst..dst + count * 3) {
-                Some(l) => l,
-                None => continue,
-            };
-            for col in 0..count {
-                // A coverage bitmap shorter than it claims is not something
-                // our own rasteriser produces, but reading past it would be a
-                // panic, so a missing byte simply means no coverage.
-                let a = match cov.get(src + sx0 as usize + col) {
-                    Some(&a) => a as i64,
-                    None => continue,
-                };
-                if a == 0 {
-                    continue;
-                }
-                let d = col * 3;
-                if a >= 255 {
-                    line[d] = c[0];
-                    line[d + 1] = c[1];
-                    line[d + 2] = c[2];
-                } else {
-                    let inv = 255 - a;
-                    line[d] = blend(line[d], c[0], a, inv);
-                    line[d + 1] = blend(line[d + 1], c[1], a, inv);
-                    line[d + 2] = blend(line[d + 2], c[2], a, inv);
-                }
-            }
-        }
+        self.blit_cov(&cov, cw, ch, x, y, c);
         Ok(())
     }
 
@@ -490,6 +452,55 @@ impl Surface {
             }
         }
     }
+
+    /// The body of `blit_coverage`, shared with the text drawing below so a
+    /// glyph does not make the round trip through Python to reach it.
+    fn blit_cov(&mut self, cov: &[u8], cw: i64, ch: i64, x: i64, y: i64,
+                c: [u8; 3]) {
+        if cw <= 0 || ch <= 0 {
+            return;
+        }
+        let (cx0, cy0, cx1, cy1) = self.clip;
+        let sx0 = 0.max(cx0 - x);
+        let sy0 = 0.max(cy0 - y);
+        let sx1 = cw.min(cx1 - x);
+        let sy1 = ch.min(cy1 - y);
+        if sx0 >= sx1 || sy0 >= sy1 {
+            return;
+        }
+        let count = (sx1 - sx0) as usize;
+        for row in sy0..sy1 {
+            let src = (row * cw) as usize;
+            let dst = ((y + row) * self.stride + (x + sx0) * 3) as usize;
+            let line = match self.px.get_mut(dst..dst + count * 3) {
+                Some(l) => l,
+                None => continue,
+            };
+            for col in 0..count {
+                // A coverage bitmap shorter than it claims is not something
+                // our own rasteriser produces, but reading past it would be a
+                // panic, so a missing byte simply means no coverage.
+                let a = match cov.get(src + sx0 as usize + col) {
+                    Some(&a) => a as i64,
+                    None => continue,
+                };
+                if a == 0 {
+                    continue;
+                }
+                let d = col * 3;
+                if a >= 255 {
+                    line[d] = c[0];
+                    line[d + 1] = c[1];
+                    line[d + 2] = c[2];
+                } else {
+                    let inv = 255 - a;
+                    line[d] = blend(line[d], c[0], a, inv);
+                    line[d + 1] = blend(line[d + 1], c[1], a, inv);
+                    line[d + 2] = blend(line[d + 2], c[2], a, inv);
+                }
+            }
+        }
+    }
 }
 
 // -- outline rasterisation ------------------------------------------------
@@ -528,6 +539,22 @@ pub fn rasterize<'py>(
     offset_x: f64,
     offset_y: f64,
 ) -> PyResult<Bound<'py, PyBytes>> {
+    let mut shapes: Vec<Vec<(f64, f64)>> = Vec::new();
+    for poly in polys.try_iter()? {
+        shapes.push(poly?.extract()?);
+    }
+    let cov = rasterize_polys(&shapes, width, height, offset_x, offset_y)?;
+    Ok(PyBytes::new(py, &cov))
+}
+
+/// The rasteriser proper, on plain numbers.
+pub fn rasterize_polys(
+    polys: &[Vec<(f64, f64)>],
+    width: i64,
+    height: i64,
+    offset_x: f64,
+    offset_y: f64,
+) -> PyResult<Vec<u8>> {
     let area = width.saturating_mul(height);
     if area < 0 {
         return Err(PyValueError::new_err("negative count"));
@@ -536,12 +563,11 @@ pub fn rasterize<'py>(
         .map_err(|_| PyMemoryError::new_err("coverage bitmap too large"))?;
     let mut cov = vec![0u8; size];
     if width <= 0 || height <= 0 {
-        return Ok(PyBytes::new(py, &cov));
+        return Ok(cov);
     }
 
     let mut edges: Vec<Edge> = Vec::new();
-    for poly in polys.try_iter()? {
-        let points: Vec<(f64, f64)> = poly?.extract()?;
+    for points in polys {
         let n = points.len();
         for i in 0..n {
             let (mut x0, mut y0) = points[i];
@@ -563,7 +589,7 @@ pub fn rasterize<'py>(
         }
     }
     if edges.is_empty() {
-        return Ok(PyBytes::new(py, &cov));
+        return Ok(cov);
     }
 
     let mut lo = f64::INFINITY;
@@ -623,7 +649,146 @@ pub fn rasterize<'py>(
             }
         }
     }
-    Ok(PyBytes::new(py, &cov))
+    Ok(cov)
+}
+
+// -- text ------------------------------------------------------------------
+
+/// The most glyph bitmaps one face will hold before it stops caching.
+///
+/// Cached glyphs are kept on the face that produced them, so the cache lives
+/// and dies with it. Keying a shared cache on the font's address instead would
+/// let a collected face hand its address -- and its glyph shapes -- to the
+/// next one allocated there.
+const GLYPH_CACHE_MAX: usize = 20000;
+
+/// Coverage bitmap for one glyph: `(cov, w, h, left, top)`.
+///
+/// `left`/`top` are offsets from the pen position on the baseline to the
+/// bitmap's top-left corner, so callers place it without re-reading the
+/// outline. The tuple is cached and handed back as it is, which is what keeps
+/// drawing a repeated character down to one blend per pixel.
+#[pyfunction]
+pub fn glyph_bitmap(
+    py: Python<'_>,
+    font: &Bound<'_, Font>,
+    size: f64,
+    gid: u32,
+) -> PyResult<Py<PyTuple>> {
+    // Two floats that are equal key the same entry, which is what Python's
+    // tuple key did; a size arriving as 24 and as 24.0 is one cache line.
+    let key = (size.to_bits(), gid);
+    if let Some(hit) = font.borrow().bitmaps.get(&key) {
+        return Ok(hit.clone_ref(py));
+    }
+
+    let polys = {
+        let mut f = font.borrow_mut();
+        let scale = f.scale_of(size);
+        let contours = f.contours(gid, 0);
+        flatten_contours(&contours, scale, 8)
+    };
+
+    let empty = || (PyBytes::new(py, &[]), 0i64, 0i64, 0i64, 0i64).into_pyobject(py);
+    let result: Bound<'_, PyTuple> = if polys.is_empty() {
+        empty()?
+    } else {
+        let mut lo_x = f64::INFINITY;
+        let mut lo_y = f64::INFINITY;
+        let mut hi_x = f64::NEG_INFINITY;
+        let mut hi_y = f64::NEG_INFINITY;
+        for poly in &polys {
+            for &(x, y) in poly {
+                lo_x = lo_x.min(x);
+                lo_y = lo_y.min(y);
+                hi_x = hi_x.max(x);
+                hi_y = hi_y.max(y);
+            }
+        }
+        let left = trunc_i64(lo_x) - 1;
+        let top = trunc_i64(lo_y) - 1;
+        let w = trunc_i64(hi_x) - left + 2;
+        let h = trunc_i64(hi_y) - top + 2;
+        // A glyph bigger than 4096 pixels a side is a font bug or a size no
+        // page needs; drawing nothing beats allocating for it.
+        if w <= 0 || h <= 0 || w > 4096 || h > 4096 {
+            empty()?
+        } else {
+            let cov = rasterize_polys(&polys, w, h, -left as f64, -top as f64)?;
+            (PyBytes::new(py, &cov), w, h, left, top).into_pyobject(py)?
+        }
+    };
+
+    let result: Py<PyTuple> = result.unbind();
+    let mut f = font.borrow_mut();
+    if f.bitmaps.len() < GLYPH_CACHE_MAX {
+        f.bitmaps.insert(key, result.clone_ref(py));
+    }
+    Ok(result)
+}
+
+/// Draw a string, returning the advance in pixels.
+///
+/// Advances are summed per character with no kerning, which keeps the layout
+/// engine's per-character width cache exact.
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+pub fn draw_text(
+    py: Python<'_>,
+    surface: &Bound<'_, Surface>,
+    font: &Bound<'_, Font>,
+    size: f64,
+    text: &str,
+    x: f64,
+    baseline: f64,
+    color: &Bound<'_, PyAny>,
+) -> PyResult<f64> {
+    let c = rgb(color)?;
+    let scale = font.borrow().scale_of(size);
+    let mut pen = x;
+    for ch in text.chars() {
+        let gid = font.borrow_mut().glyph_of(ch);
+        let adv = font.borrow().advance_of(gid as i64) as f64 * scale;
+        if ch != ' ' && ch != '\t' {
+            let bitmap = glyph_bitmap(py, font, size, gid)?;
+            let bitmap = bitmap.bind(py);
+            let w: i64 = bitmap.get_item(1)?.extract()?;
+            if w != 0 {
+                // Borrowed out of the cached tuple rather than extracted: a
+                // page of text is tens of thousands of these, and copying each
+                // bitmap on its way to the blitter would undo the cache.
+                let cov = bitmap.get_item(0)?;
+                let cov = cov.cast::<PyBytes>()?;
+                let h: i64 = bitmap.get_item(2)?.extract()?;
+                let left: i64 = bitmap.get_item(3)?.extract()?;
+                let top: i64 = bitmap.get_item(4)?.extract()?;
+                surface.borrow_mut().blit_cov(
+                    cov.as_bytes(),
+                    w,
+                    h,
+                    trunc_i64(pen) + left,
+                    trunc_i64(baseline) + top,
+                    c,
+                );
+            }
+        }
+        pen += adv;
+    }
+    Ok(pen - x)
+}
+
+/// Advance width of a string in pixels.
+#[pyfunction]
+pub fn measure_text(font: &Bound<'_, Font>, size: f64, text: &str) -> f64 {
+    let mut total: i64 = 0;
+    {
+        let mut f = font.borrow_mut();
+        for ch in text.chars() {
+            let gid = f.glyph_of(ch);
+            total += f.advance_of(gid as i64);
+        }
+    }
+    total as f64 * font.borrow().scale_of(size)
 }
 
 /// Add one subsample row's coverage for the span [x0, x1).
