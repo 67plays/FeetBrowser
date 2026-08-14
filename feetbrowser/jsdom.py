@@ -107,11 +107,15 @@ class JSDocument:
             return self._get_title()
         if name == "documentElement":
             return JSElement(self.root, self._flag)
+        if name == "cookie":
+            return ""
         return UNDEFINED
 
     def js_set(self, name, value):
         if name == "title":
             self._set_title(value)
+            self._flag["dirty"] = True
+        elif name == "cookie":
             self._flag["dirty"] = True
 
     def _find(self, pred):

@@ -8,7 +8,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from feetbrowser.net import URL
 from feetbrowser.browser import Tab
 from feetbrowser.layout import DrawText
-from feetbrowser.jsengine import Interpreter
+from feetbrowser.jsengine import Interpreter, UNDEFINED
 
 
 def eq(a, b, msg=""):
@@ -389,6 +389,177 @@ def test_js_xhr_basic_get():
         assert "xhr-body" in texts, f"XHR result not rendered: {texts}"
     finally:
         srv.shutdown()
+
+
+def test_js_logical_nullish_and_optional_chaining():
+    interp = Interpreter()
+    interp.run("""
+        var orv = window.nope || "fallback";
+        var andv = 0 && 99;
+        var andt = 1 && 42;
+        var qq = null ?? 7;
+        var qq2 = 0 ?? 7;
+        var ch = ({a:{b:5}}).a?.b;
+        var noch = ({a:null}).a?.b;
+    """)
+    g = interp.globals
+    eq(g["orv"], "fallback", "|| falls through on undefined")
+    eq(g["andv"], 0, "&& returns the falsy operand")
+    eq(g["andt"], 42, "&& returns the last truthy operand")
+    eq(g["qq"], 7, "?? uses the fallback for null")
+    eq(g["qq2"], 0, "?? keeps a non-nullish 0")
+    eq(g["ch"], 5, "?. short-circuits member access")
+    assert g["noch"] is UNDEFINED, "?. yields undefined on nullish base"
+
+
+def test_js_template_literals():
+    interp = Interpreter()
+    interp.run(r"""
+        var t1 = `x${1+1}y`;
+        var t2 = `a${`b${3}c`}d`;
+        var t3 = `sum:${1+2+3}`;
+    """)
+    g = interp.globals
+    eq(g["t1"], "x2y", "interpolates expressions")
+    eq(g["t2"], "ab3cd", "supports nested templates")
+    eq(g["t3"], "sum:6", "templates join literal text and values")
+
+
+def test_js_arrow_functions_lexical_this():
+    interp = Interpreter()
+    interp.run("""
+        var v = 5;
+        var obj = { v: 10, getV: function(){ return (() => this.v)(); } };
+        var lex = obj.getV();
+        var sq = ((x) => x * x)(7);
+    """)
+    g = interp.globals
+    eq(g["lex"], 10, "arrow captures the enclosing this")
+    eq(g["sq"], 49, "expression-body arrow returns its expression")
+
+
+def test_js_classes_extends_and_super():
+    interp = Interpreter()
+    interp.run("""
+        function Base(n) { this.n = n; }
+        Base.prototype.double = function () { return this.n * 2; };
+        var Klass = class extends Base {
+            constructor(n) { super(n); }
+            quad() { return this.double() * 2; }
+        };
+        var inst = new Klass(21);
+        var dbl = inst.double();
+        var quad = inst.quad();
+        var isKlass = inst instanceof Klass;
+        var isBase = inst instanceof Base;
+        var isArr = [] instanceof Array;
+        var isRe = /a/ instanceof RegExp;
+        var isObj = {} instanceof Object;
+    """)
+    g = interp.globals
+    eq(g["dbl"], 42, "inherited prototype method runs")
+    eq(g["quad"], 84, "subclass method calls inherited method")
+    assert g["isKlass"] is True, "instanceof own class"
+    assert g["isBase"] is True, "instanceof function-based parent"
+    assert g["isArr"] is True, "instanceof Array"
+    assert g["isRe"] is True, "instanceof RegExp"
+    assert g["isObj"] is True, "instanceof Object"
+
+
+def test_js_spread_rest_and_bitwise():
+    interp = Interpreter()
+    interp.run("""
+        var sp = [...[1,2],3,4];
+        var rest = (function(a, ...b){ return b; })(1,2,3,4);
+        var pow = 2 ** 8;
+        var ur = -1 >>> 1;
+        var shl = 3 << 2;
+        var shr = -1 >> 1;
+        var not = ~5;
+        var band = 6 & 3;
+        var bor = 4 | 1;
+        var bxor = 5 ^ 3;
+        var acc = 5; acc += 3; acc *= 2;
+    """)
+    g = interp.globals
+    eq(g["sp"], [1, 2, 3, 4], "spread expands array literals")
+    eq(g["rest"], [2, 3, 4], "rest collects extra arguments")
+    eq(g["pow"], 256, "exponentiation operator")
+    eq(g["ur"], 2147483647, "unsigned right shift")
+    eq(g["shl"], 12, "left shift")
+    eq(g["shr"], -1, "arithmetic right shift keeps sign")
+    eq(g["not"], -6, "bitwise not")
+    eq(g["band"], 2, "bitwise and")
+    eq(g["bor"], 5, "bitwise or")
+    eq(g["bxor"], 6, "bitwise xor")
+    eq(g["acc"], 16, "compound assignment chain")
+
+
+def test_js_regex_and_string_methods():
+    interp = Interpreter()
+    interp.run(r"""
+        var rx = /a+/;
+        var rxt = rx.test("caaa");
+        var rex = rx.exec("caaa")[0];
+        var rxr = "abc".replace(/b/, "X");
+        var rxm = "a1b2".match(/\d/g).length;
+        var spl = "a,b,c".split(",").length;
+        var idx = "hello world".indexOf("world");
+    """)
+    g = interp.globals
+    assert g["rxt"] is True, "regex test matches"
+    eq(g["rex"], "aaa", "regex exec returns the match")
+    eq(g["rxr"], "aXc", "string replace with regex")
+    eq(g["rxm"], 2, "global match counts occurrences")
+    eq(g["spl"], 3, "string split")
+    eq(g["idx"], 6, "string indexOf")
+
+
+def test_js_builtin_globals_map_set_json_math():
+    interp = Interpreter()
+    interp.run(r"""
+        var m = [1,2,3].map(function(x){ return x * 10; });
+        var f = [4,9,16].find(function(x){ return x > 5; });
+        var flt = [1,2,3,4].filter(function(x){ return x % 2 === 0; });
+        var js = JSON.stringify({a:1});
+        var po = JSON.parse('{"x":9}').x;
+        var mx = Math.max(1, 7, 3);
+        var rnd = Math.floor(3.9);
+        var mp = new Map([["a",1],["b",2]]);
+        var mpg = mp.get("b");
+        var st = new Set([1,2,2,3]);
+        var sts = st.size;
+        var sth = st.has(3);
+        var ok = Object.keys({p:1,q:2}).length;
+    """)
+    g = interp.globals
+    eq(g["m"], [10, 20, 30], "array map")
+    eq(g["f"], 9, "array find")
+    eq(g["flt"], [2, 4], "array filter")
+    eq(g["js"], '{"a":1}', "JSON stringify")
+    eq(g["po"], 9, "JSON parse")
+    eq(g["mx"], 7, "Math.max")
+    eq(g["rnd"], 3, "Math.floor")
+    eq(g["mpg"], 2, "Map get after seeded constructor")
+    eq(g["sts"], 3, "Set dedupes values")
+    assert g["sth"] is True, "Set.has"
+    eq(g["ok"], 2, "Object.keys length")
+
+
+def test_js_for_of_and_for_in():
+    interp = Interpreter()
+    interp.run("""
+        var sos = 0;
+        for (var z of [1,2,3]) { sos += z; }
+        var foic = 0;
+        for (var k in {p:1, q:2}) { foic++; }
+        var sos2 = 0;
+        for (var w of "ab") { sos2++; }
+    """)
+    g = interp.globals
+    eq(g["sos"], 6, "for...of iterates array elements")
+    eq(g["foic"], 2, "for...in counts own keys")
+    eq(g["sos2"], 2, "for...of iterates a string")
 
 
 def _make_tab(body, url="https://example.com/page"):

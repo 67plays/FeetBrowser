@@ -8,6 +8,7 @@ weight / style, colors, backgrounds, list bullets, and horizontal rules.
 Coordinates are in CSS px == canvas px. Fonts are Tk fonts, cached.
 """
 
+import copy
 import re
 import tkinter.font
 
@@ -144,6 +145,39 @@ def _prewarm(root_node):
         _measure_batch(font, chars)
 
 
+# Map common web font-family names to the three generics Tk resolves well.
+# We can't know which fonts are actually installed, so we walk the whole
+# family stack and stop at the first name we can map; unknown first names are
+# still handed to Tk verbatim (it falls back if absent).
+_FAMILY_GENERICS = {
+    # sans-serif
+    "sans-serif": "Helvetica", "system-ui": "Helvetica",
+    "-apple-system": "Helvetica", "blinkmacsystemfont": "Helvetica",
+    "segoe ui": "Helvetica", "roboto": "Helvetica", "open sans": "Helvetica",
+    "arial": "Helvetica", "helvetica": "Helvetica", "helvetica neue": "Helvetica",
+    "verdana": "Helvetica", "tahoma": "Helvetica", "trebuchet ms": "Helvetica",
+    "dejavu sans": "Helvetica", "liberation sans": "Helvetica",
+    "noto sans": "Helvetica", "source sans": "Helvetica", "calibri": "Helvetica",
+    "candara": "Helvetica", "century gothic": "Helvetica", "gill sans": "Helvetica",
+    "futura": "Helvetica", "lucida grande": "Helvetica",
+    "lucida sans unicode": "Helvetica", "pt sans": "Helvetica",
+    "ui-sans-serif": "Helvetica",
+    # serif
+    "serif": "Times", "times": "Times", "times new roman": "Times",
+    "georgia": "Times", "palatino linotype": "Times", "book antiqua": "Times",
+    "linux libertine": "Times", "garamond": "Times", "dejavu serif": "Times",
+    "bitstream vera serif": "Times", "cambria": "Times", "noto serif": "Times",
+    "charter": "Times", "hoefler text": "Times", "source serif": "Times",
+    "ui-serif": "Times", "liberation serif": "Times",
+    # monospace
+    "monospace": "Courier", "courier": "Courier", "courier new": "Courier",
+    "consolas": "Courier", "menlo": "Courier", "monaco": "Courier",
+    "dejavu sans mono": "Courier", "liberation mono": "Courier",
+    "bitstream vera sans mono": "Courier", "source code pro": "Courier",
+    "fira mono": "Courier", "inconsolata": "Courier", "ui-monospace": "Courier",
+}
+
+
 def _node_font(node):
     style = getattr(node, "style", {}) or {}
     size = int(round(parse_px(style.get("font-size", "16px"), 16)))
@@ -153,13 +187,18 @@ def _node_font(node):
     slant = "italic" if style.get("font-style") in ("italic", "oblique") else "roman"
     fam = style.get("font-family", "")
     if fam:
-        fam = fam.split(",")[0].strip().strip("'\"")
-        if fam.lower() in ("monospace", "courier"):
-            fam = "Courier"
-        elif fam.lower() in ("serif", "times"):
-            fam = "Times"
-        elif fam.lower() in ("sans-serif", "arial", "helvetica"):
-            fam = "Helvetica"
+        resolved = None
+        for part in fam.split(","):
+            name = part.strip().strip("'\"")
+            if not name:
+                continue
+            generic = _FAMILY_GENERICS.get(name.lower())
+            if generic:
+                resolved = generic
+                break
+        fam = resolved if resolved else fam.split(",")[0].strip().strip("'\"")
+        if fam.lower() in ("inherit", "initial", "unset"):
+            fam = ""
     return get_font(size, weight, slant, fam)
 
 
@@ -177,15 +216,16 @@ class DrawText:
     def hit(self, x, y):
         return self.left <= x < self.right and self.top <= y < self.bottom
 
-    def execute(self, scroll, canvas):
+    def execute(self, scroll, canvas, tags=()):
         try:
             canvas.create_text(
                 self.left, self.top - scroll, text=self.text,
-                font=self.font, fill=self.color or "black", anchor="nw")
+                font=self.font, fill=self.color or "black", anchor="nw",
+                tags=tags)
         except tkinter.TclError:
             canvas.create_text(
                 self.left, self.top - scroll, text=self.text,
-                font=self.font, fill="black", anchor="nw")
+                font=self.font, fill="black", anchor="nw", tags=tags)
 
 
 class _DrawShape:
@@ -198,39 +238,51 @@ class _DrawShape:
 
 
 class DrawRect(_DrawShape):
-    def execute(self, scroll, canvas):
+    def execute(self, scroll, canvas, tags=()):
         try:
             canvas.create_rectangle(
                 self.left, self.top - scroll, self.right, self.bottom - scroll,
-                width=0, fill=self.color)
+                width=0, fill=self.color, tags=tags)
         except tkinter.TclError:
             canvas.create_rectangle(
                 self.left, self.top - scroll, self.right, self.bottom - scroll,
-                width=0, fill="black")
+                width=0, fill="black", tags=tags)
 
 
 class DrawLine(_DrawShape):
-    def execute(self, scroll, canvas):
+    def execute(self, scroll, canvas, tags=()):
         try:
             canvas.create_line(
                 self.left, self.top - scroll, self.right, self.bottom - scroll,
-                fill=self.color, width=self.thickness)
+                fill=self.color, width=self.thickness, tags=tags)
         except tkinter.TclError:
             canvas.create_line(
                 self.left, self.top - scroll, self.right, self.bottom - scroll,
-                fill="black", width=self.thickness)
+                fill="black", width=self.thickness, tags=tags)
 
 
 class DrawOutline(_DrawShape):
-    def execute(self, scroll, canvas):
+    def execute(self, scroll, canvas, tags=()):
         try:
             canvas.create_rectangle(
                 self.left, self.top - scroll, self.right, self.bottom - scroll,
-                width=self.thickness, outline=self.color)
+                width=self.thickness, outline=self.color, tags=tags)
         except tkinter.TclError:
             canvas.create_rectangle(
                 self.left, self.top - scroll, self.right, self.bottom - scroll,
-                width=self.thickness, outline="black")
+                width=self.thickness, outline="black", tags=tags)
+
+
+class DrawShadow(_DrawShape):
+    """A dithered (semi-transparent-looking) rectangle used for box-shadow."""
+
+    def execute(self, scroll, canvas, tags=()):
+        try:
+            canvas.create_rectangle(
+                self.left, self.top - scroll, self.right, self.bottom - scroll,
+                width=0, fill=self.color, stipple="gray50", tags=tags)
+        except tkinter.TclError:
+            pass
 
 
 class DrawImage:
@@ -241,9 +293,10 @@ class DrawImage:
         self.photo = photo
         self.node = node  # source <img>, for hit-testing links
 
-    def execute(self, scroll, canvas):
+    def execute(self, scroll, canvas, tags=()):
         canvas.create_image(
-            self.left, self.top - scroll, anchor="nw", image=self.photo)
+            self.left, self.top - scroll, anchor="nw", image=self.photo,
+            tags=tags)
 
 
 def parse_px(value, default=0.0):
@@ -257,6 +310,40 @@ def parse_px(value, default=0.0):
         return float(value)
     except (ValueError, AttributeError):
         return default
+
+
+def _resolve_len(value, base, default=0.0):
+    """Parse a CSS length for a horizontal axis: px/rem/bare numbers via
+    parse_px, and percentages resolved against `base` (the containing width)."""
+    v = (value or "").strip()
+    if v.endswith("%"):
+        try:
+            return float(v[:-1]) / 100.0 * base
+        except ValueError:
+            return default
+    return parse_px(v, default)
+
+
+def _margin_side(style, side):
+    """Resolve one horizontal margin (longhand or the `margin` shorthand,
+    which the cascade stores un-expanded) to (px, is_auto)."""
+    v = style.get("margin-left" if side == "left" else "margin-right", "")
+    if not v:
+        sh = style.get("margin", "")
+        if sh:
+            parts = sh.split()
+            if len(parts) == 1:
+                v = parts[0]
+            elif len(parts) in (2, 3):
+                v = parts[1]
+            else:
+                v = parts[1] if side == "right" else parts[3]
+    v = v.strip()
+    if not v:
+        return 0.0, False
+    if v.lower() == "auto":
+        return 0.0, True
+    return parse_px(v, 0.0), False
 
 
 def _padding_box(style):
@@ -366,6 +453,11 @@ def resolve_color(name):
     name = name.strip().lower()
     if name in ("transparent", "none", "currentcolor", "inherit", "initial"):
         return None
+    # Gradients / image() / url() are not flat colors; hand them to the
+    # caller (or ignore them) rather than paint an unreadable black box.
+    if "gradient(" in name or name.startswith("url(") \
+            or name.startswith("image("):
+        return None
     parsed = _color_channels(name)
     if parsed:
         kind, parts = parsed
@@ -419,14 +511,147 @@ def _dispatch_layout(box):
 
 
 def _paint_bg(box, cmds, require_size=True):
-    """Emit a DrawRect for `box`'s resolved background color, if any."""
+    """Emit background paint for `box`: box-shadow (behind), then either a
+    linear-gradient (bands) or the resolved flat background color."""
     node = box.node
-    if isinstance(node, Element):
-        bg = resolve_color(node.style.get("background-color")) or \
-            resolve_color(node.style.get("background"))
-        if bg and (not require_size or box.width > 0 and box.height > 0):
-            cmds.append(DrawRect(box.x, box.y, box.x + box.width,
-                                 box.y + box.height, bg))
+    if not isinstance(node, Element):
+        return
+    if require_size and not (box.width > 0 and box.height > 0):
+        return
+    _paint_box_shadow(box, cmds)
+    grad = _gradient_spec(node)
+    if grad is not None:
+        cmds.extend(_gradient_rects(box, *grad))
+        return
+    bg = resolve_color(node.style.get("background-color")) or \
+        resolve_color(node.style.get("background"))
+    if bg:
+        cmds.append(DrawRect(box.x, box.y, box.x + box.width,
+                             box.y + box.height, bg))
+
+
+def _paint_box_shadow(box, cmds):
+    """Draw a dithered rectangle for a simple `box-shadow: x y [blur] [spread] color`."""
+    node = box.node
+    shadow = node.style.get("box-shadow") or ""
+    if not shadow or shadow.strip() == "none" \
+            or shadow.strip().startswith("inset"):
+        return
+    nums = []
+    rest = []
+    for tok in shadow.split():
+        m = re.match(r"^([+-]?[\d.]+)(?:px)?$", tok)
+        if m:
+            nums.append(float(m.group(1)))
+        else:
+            rest.append(tok)
+    if len(nums) < 2:
+        return
+    ox, oy = nums[0], nums[1]
+    blur = nums[2] if len(nums) > 2 else 0
+    color = resolve_color(" ".join(rest)) if rest else "#9a9a9a"
+    if color is None:
+        color = "#9a9a9a"
+    cmds.append(DrawShadow(
+        box.x + ox - blur, box.y + oy - blur,
+        box.x + box.width + ox + blur, box.y + box.height + oy + blur,
+        color))
+
+
+def _gradient_spec(node):
+    """Return (direction, [(color, pos%), ...]) from a linear-gradient
+    background, or None. Direction is 'bottom'/'top'/'left'/'right'."""
+    style = node.style
+    spec = style.get("background-image") or ""
+    if "linear-gradient(" not in spec:
+        spec = style.get("background") or ""
+    if "linear-gradient(" not in spec:
+        return None
+    inner = spec.split("linear-gradient(", 1)[1].rsplit(")", 1)[0]
+    parts = [p.strip() for p in inner.split(",")]
+    if not parts:
+        return None
+    direction = "bottom"
+    first = parts[0].lower()
+    if first.startswith("to "):
+        direction = first[3:]
+        parts = parts[1:]
+    elif first.endswith("deg"):
+        return None
+    if direction not in ("top", "bottom", "left", "right"):
+        return None
+    stops = []
+    for p in parts:
+        m = re.match(r"^(.*?)\s+(\d+(?:\.\d+)?)%$", p)
+        if m:
+            color, pos = m.group(1).strip(), float(m.group(2))
+        else:
+            color, pos = p, None
+        rc = resolve_color(color)
+        if rc is None:
+            return None
+        stops.append((rc, pos))
+    if len(stops) < 2:
+        return None
+    if stops[0][1] is None:
+        stops[0] = (stops[0][0], 0.0)
+    if stops[-1][1] is None:
+        stops[-1] = (stops[-1][0], 100.0)
+    for i in range(1, len(stops) - 1):
+        if stops[i][1] is not None:
+            continue
+        lo = stops[i - 1][1]
+        hi = next((s[1] for s in stops[i + 1:] if s[1] is not None), 100.0)
+        if lo is None:
+            lo = 0.0
+        stops[i] = (stops[i][0], lo + (hi - lo) / 2.0)
+    return direction, stops
+
+
+def _interp_color(c1, c2, t):
+    def rgb(h):
+        h = h.lstrip("#")
+        return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+    r1, g1, b1 = rgb(c1)
+    r2, g2, b2 = rgb(c2)
+    return "#%02x%02x%02x" % (
+        int(r1 + (r2 - r1) * t),
+        int(g1 + (g2 - g1) * t),
+        int(b1 + (b2 - b1) * t))
+
+
+def _gradient_rects(box, direction, stops):
+    """Turn a parsed gradient into a small set of solid bands."""
+    w, h = box.width, box.height
+    if w <= 0 or h <= 0:
+        return []
+    rects = []
+    total = h if direction in ("top", "bottom") else w
+    for i in range(len(stops) - 1):
+        c1, p1 = stops[i]
+        c2, p2 = stops[i + 1]
+        a0 = total * p1 / 100.0
+        a1 = total * p2 / 100.0
+        n = max(1, min(8, int(abs(a1 - a0))))
+        for b in range(n):
+            t0 = b / n
+            t1 = (b + 1) / n
+            ba0 = a0 + (a1 - a0) * t0
+            ba1 = a0 + (a1 - a0) * t1
+            col = _interp_color(c1, c2, (t0 + t1) / 2)
+            if direction == "bottom":
+                rects.append(DrawRect(box.x, box.y + ba0,
+                                      box.x + w, box.y + ba1, col))
+            elif direction == "top":
+                rects.append(DrawRect(box.x, box.y + total - ba1,
+                                      box.x + w, box.y + total - ba0, col))
+            elif direction == "left":
+                rects.append(DrawRect(box.x + ba0, box.y,
+                                      box.x + ba1, box.y + h, col))
+            else:
+                rects.append(DrawRect(box.x + total - ba1, box.y,
+                                      box.x + total - ba0, box.y + h, col))
+    return rects
 
 
 class LayoutBox:
@@ -492,9 +717,45 @@ class BlockLayout(LayoutBox):
 
     def layout(self):
         node = self.node
-        self.x = self.parent.x + parse_px(node.style.get("margin-left", "0"))
-        self.width = self.parent.width - parse_px(node.style.get("margin-left", "0")) \
-            - parse_px(node.style.get("margin-right", "0"))
+        style = getattr(node, "style", {}) or {}
+        ml, ml_auto = _margin_side(style, "left")
+        mr, mr_auto = _margin_side(style, "right")
+        base = max(0.0, self.parent.width - ml - mr)
+
+        # CSS 2.1 §10.3.3 for block-level, non-replaced elements in normal
+        # flow: resolve the used width (auto fills the parent), clamp it with
+        # max-width, THEN re-resolve auto margins against the clamped width so
+        # `margin: 0 auto` centers the final (not the tentative) width.
+        css_w = style.get("width", "")
+        if css_w.strip().lower() not in ("", "auto", "fit-content",
+                                         "min-content", "max-content"):
+            content_width = max(0.0, _resolve_len(css_w, self.parent.width, base))
+        else:
+            content_width = base
+        mw = style.get("max-width", "")
+        if mw.strip().lower() not in ("", "none"):
+            content_width = min(
+                content_width,
+                max(0.0, _resolve_len(mw, self.parent.width, content_width)))
+        mnw = style.get("min-width", "")
+        if mnw.strip().lower() not in ("", "auto"):
+            content_width = max(
+                content_width,
+                max(0.0, _resolve_len(mnw, self.parent.width, content_width)))
+
+        remaining = self.parent.width - content_width - ml - mr
+        if ml_auto and mr_auto:
+            ml = mr = (remaining / 2) if remaining > 0 else 0
+        elif ml_auto:
+            ml = max(0.0, remaining + mr)
+        elif mr_auto:
+            mr = max(0.0, remaining + ml)
+        elif remaining < 0:
+            # Over-constrained in LTR: margin-right absorbs the shortfall.
+            mr = max(0.0, mr + remaining)
+
+        self.x = self.parent.x + ml
+        self.width = content_width
         if self.previous:
             # margin-bottom is "0" for text nodes, so this is safe for them too.
             self.y = self.previous.y + self.previous.height \
@@ -516,6 +777,14 @@ class BlockLayout(LayoutBox):
             # containing block; it never pushes siblings or grows the parent.
             self.x, self.y, self.width = self._absolute_pos
         _dispatch_layout(self)
+        # CSS 2.1 §10.6: explicit `height` and `min-height` act as a floor on
+        # the content height computed by the dispatcher (no overflow handling
+        # means content that would overflow simply grows the box instead).
+        css_h = _resolve_len(style.get("height", ""), 0, 0)
+        min_h = _resolve_len(style.get("min-height", ""), 0, 0)
+        floor = max(css_h, min_h)
+        if floor:
+            self.height = max(self.height, floor)
 
     def layout_mode(self):
         node = self.node
@@ -977,13 +1246,26 @@ class BlockLayout(LayoutBox):
 
     def _layout_flex(self):
         """Subset flexbox: `flex-direction: row/column`, `gap`, flex item
-        `flex-grow` (and `flex-basis` in px), `justify-content` and
-        `align-items`. No wrapping (nowrap only)."""
+        `flex-grow` (and `flex-basis` in px), `justify-content`, `align-items`,
+        and `flex-wrap: wrap/wrap-reverse` (rows, plus columns when the
+        container has an explicit height)."""
         node = self.node
         direction = (node.style.get("flex-direction", "row")
                      if isinstance(node, Element) else "row")
         if direction not in ("row", "column"):
             direction = "row"
+        wrap = (node.style.get("flex-wrap", "nowrap")
+                if isinstance(node, Element) else "nowrap")
+        if wrap not in ("wrap", "wrap-reverse", "nowrap"):
+            wrap = "nowrap"
+        flex_flow = (node.style.get("flex-flow", "")
+                     if isinstance(node, Element) else "")
+        if flex_flow:
+            for tok in flex_flow.split():
+                if tok in ("row", "column"):
+                    direction = tok
+                elif tok in ("wrap", "wrap-reverse", "nowrap"):
+                    wrap = tok
         row_gap, column_gap = self._gaps(node)
         justify = (node.style.get("justify-content", "flex-start")
                    if isinstance(node, Element) else "flex-start")
@@ -1039,9 +1321,11 @@ class BlockLayout(LayoutBox):
                 return b
             return max(mi, min(ma, self.width))
 
-        def distra_leftover(extra, widths):
+        def distra_leftover(extra, widths, grow_items=None):
             """Grow flex items proportionally to their `flex-grow`."""
-            gs = [grows(el) for el in items]
+            if grow_items is None:
+                grow_items = items
+            gs = [grows(el) for el in grow_items]
             gsum = sum(gs)
             if gsum > 0 and extra > 0:
                 out = list(widths)
@@ -1050,129 +1334,289 @@ class BlockLayout(LayoutBox):
                 return out, 0.0
             return widths, extra
 
-        def justify_start(start, leftover, end_alias):
+        def justify_start(start, leftover, end_alias, count=None):
             """First-item cursor for justify-content plus the per-gap amount
-            to add between space-between items."""
+            to add between space-separated items."""
+            n = len(items) if count is None else count
             cursor = start
             gap = 0.0
             if justify in ("center", "middle"):
                 cursor = start + leftover / 2
             elif justify in ("flex-end", "end", end_alias):
                 cursor = start + leftover
-            elif justify == "space-between" and len(items) > 1:
-                cursor = start
-                gap = leftover / (len(items) - 1)
+            elif justify == "space-between" and n > 1:
+                gap = leftover / (n - 1)
             elif justify in ("space-around", "space-evenly"):
-                parts = leftover / len(items) if justify == "space-around" \
-                    else leftover / (len(items) + 1)
+                parts = leftover / (2 * n) if justify == "space-around" \
+                    else leftover / (n + 1)
                 cursor = start + parts
+                gap = parts * 2 if justify == "space-around" else parts
             return cursor, gap
 
         if direction == "row":
-            widths = [natural_width(el) for el in items]
-            margin_w = sum(ml + mr for ml, mr, _, _ in (margins(el) for el in items))
-            gap_total = column_gap * (len(items) - 1)
-            avail = self.width
-            total = sum(widths) + margin_w + gap_total
-            if total > avail:
-                leftover = 0.0
-                available = max(0.0, avail - gap_total - margin_w)
-                if sum(widths) > 0:
-                    factor = available / sum(widths)
-                    widths = [w * factor for w in widths]
+            if wrap in ("wrap", "wrap-reverse"):
+                nw = [natural_width(el) for el in items]
+
+                # Pack items into lines, honoring margins and column-gap.
+                lines = []
+                line = []
+                used = 0.0
+                for i, el in enumerate(items):
+                    ml, mr, _, _ = margins(el)
+                    item_w = ml + nw[i] + mr
+                    if line and used + column_gap + item_w > self.width:
+                        lines.append(line)
+                        line = []
+                        used = 0.0
+                    line.append(i)
+                    used += (column_gap if used else 0.0) + item_w
+                if line:
+                    lines.append(line)
+
+                # Lay each line out like the nowrap row: leftover space
+                # distributed by flex-grow, justify-content per line.
+                line_results = []
+                for indices in lines:
+                    line_items = [items[i] for i in indices]
+                    widths = [nw[i] for i in indices]
+                    margin_w = sum(ml + mr for ml, mr, _, _ in
+                                   (margins(el) for el in line_items))
+                    gap_total = column_gap * (len(indices) - 1)
+                    total = sum(widths) + margin_w + gap_total
+                    if total > self.width:
+                        leftover = 0.0
+                        available = max(0.0, self.width - gap_total - margin_w)
+                        if sum(widths) > 0:
+                            factor = available / sum(widths)
+                            widths = [w * factor for w in widths]
+                        else:
+                            widths = [0.0] * len(widths)
+                    else:
+                        widths, leftover = distra_leftover(
+                            self.width - total, widths, line_items)
+                    cursor, extra = justify_start(self.x, leftover, "right",
+                                                  len(indices))
+                    placement = []
+                    for j, idx in enumerate(indices):
+                        el = items[idx]
+                        ml, mr, mt, mb = margins(el)
+                        w = widths[j]
+                        if j > 0 and justify in \
+                                ("space-between", "space-around", "space-evenly"):
+                            cursor += extra
+                        x = cursor + ml
+                        box, ch = self._layout_item(el, w)
+                        placement.append((box, ch, mt, mb, x))
+                        cursor += ml + w + mr + column_gap
+                    cross = max(ch + mt + mb for _, ch, mt, mb, _ in placement) or 0.0
+                    line_results.append((placement, cross))
+
+                css_h = parse_px(node.style.get("height", ""), 0)
+                content_h = sum(cross for _, cross in line_results) \
+                    + row_gap * (len(lines) - 1)
+                self.height = css_h if css_h else content_h
+
+                # align-content distributes leftover vertical space.
+                align_content = (node.style.get("align-content", "flex-start")
+                                 if isinstance(node, Element) else "flex-start")
+                free = max(0.0, self.height - content_h)
+                n = len(lines)
+                if align_content == "stretch" and free > 0 and n > 0:
+                    grow = free / n
+                    line_results = [(pl, cross + grow) for pl, cross in line_results]
+                    free = 0.0
+                if align_content == "center":
+                    top, gap = self.y + free / 2, row_gap
+                elif align_content in ("flex-end", "end", "bottom"):
+                    top, gap = self.y + free, row_gap
+                elif align_content == "space-between" and n > 1:
+                    top, gap = self.y, row_gap + free / (n - 1)
+                elif align_content in ("space-around", "space-evenly"):
+                    parts = free / n if align_content == "space-around" \
+                        else free / (n + 1)
+                    top = self.y + parts
+                    gap = row_gap + (parts * 2 if align_content == "space-around"
+                                     else parts)
                 else:
-                    widths = [0.0] * len(widths)
+                    top, gap = self.y, row_gap
+
+                line_tops = []
+                y = top
+                for _, cross in line_results:
+                    line_tops.append(y)
+                    y += cross + gap
+                if wrap == "wrap-reverse":
+                    line_tops = [self.y + self.height - (t - self.y) - cross
+                                 for t, (_, cross) in zip(line_tops, line_results)]
+
+                for (placement, cross), line_top in zip(line_results, line_tops):
+                    for box, ch, mt, mb, x in placement:
+                        if align == "stretch":
+                            box.height = cross - mt - mb
+                            y = line_top + mt
+                        elif align in ("flex-end", "end"):
+                            box.height = ch
+                            y = line_top + cross - mb - ch
+                        elif align in ("center", "middle"):
+                            box.height = ch
+                            y = line_top + mt + (cross - mt - ch - mb) / 2
+                        else:
+                            box.height = ch
+                            y = line_top + mt
+                        self._translate(box, x, y)
+                        self.children.append(box)
             else:
-                widths, leftover = distra_leftover(avail - total, widths)
-            total = sum(widths) + margin_w + gap_total + leftover
-
-            # justify-content places the leftover space.
-            cursor, extra = justify_start(self.x, leftover, "right")
-
-            placement = []
-            for i, el in enumerate(items):
-                ml, mr, mt, mb = margins(el)
-                w = widths[i]
-                extra_gap = (extra if (justify == "space-between" and i > 0) else 0.0) \
-                    if justify == "space-between" else 0.0
-                x = cursor + ml
-                box, ch = self._layout_item(el, w)
-                placement.append((box, ch, mt, mb, x))
-                cursor += ml + w + mr + column_gap + extra_gap
-
-            max_h = max(ch + mt + mb for _, ch, mt, mb, _ in placement) or 0.0
-            stretch_h = parse_px(node.style.get("height", ""), 0)
-            if stretch_h:
-                self.height = stretch_h
-                max_h = max(max_h, stretch_h)
-            else:
-                self.height = max_h
-            for box, ch, mt, mb, x in placement:
-                if align == "stretch":
-                    box.height = max_h - mt - mb
-                    y = self.y + mt
-                elif align in ("flex-end", "end"):
-                    box.height = ch
-                    y = self.y + self.height - mb - ch
-                elif align in ("center", "middle"):
-                    box.height = ch
-                    y = self.y + mt + (self.height - mt - ch - mb) / 2
+                widths = [natural_width(el) for el in items]
+                margin_w = sum(ml + mr for ml, mr, _, _ in (margins(el) for el in items))
+                gap_total = column_gap * (len(items) - 1)
+                avail = self.width
+                total = sum(widths) + margin_w + gap_total
+                if total > avail:
+                    leftover = 0.0
+                    available = max(0.0, avail - gap_total - margin_w)
+                    if sum(widths) > 0:
+                        factor = available / sum(widths)
+                        widths = [w * factor for w in widths]
+                    else:
+                        widths = [0.0] * len(widths)
                 else:
-                    box.height = ch
-                    y = self.y + mt
-                self._translate(box, x, y)
-                self.children.append(box)
+                    widths, leftover = distra_leftover(avail - total, widths)
+                total = sum(widths) + margin_w + gap_total + leftover
+
+                # justify-content places the leftover space.
+                cursor, extra = justify_start(self.x, leftover, "right")
+
+                placement = []
+                for i, el in enumerate(items):
+                    ml, mr, mt, mb = margins(el)
+                    w = widths[i]
+                    if i > 0 and justify in \
+                            ("space-between", "space-around", "space-evenly"):
+                        cursor += extra
+                    x = cursor + ml
+                    box, ch = self._layout_item(el, w)
+                    placement.append((box, ch, mt, mb, x))
+                    cursor += ml + w + mr + column_gap
+
+                max_h = max(ch + mt + mb for _, ch, mt, mb, _ in placement) or 0.0
+                stretch_h = parse_px(node.style.get("height", ""), 0)
+                if stretch_h:
+                    self.height = stretch_h
+                    max_h = max(max_h, stretch_h)
+                else:
+                    self.height = max_h
+                for box, ch, mt, mb, x in placement:
+                    if align == "stretch":
+                        box.height = max_h - mt - mb
+                        y = self.y + mt
+                    elif align in ("flex-end", "end"):
+                        box.height = ch
+                        y = self.y + self.height - mb - ch
+                    elif align in ("center", "middle"):
+                        box.height = ch
+                        y = self.y + mt + (self.height - mt - ch - mb) / 2
+                    else:
+                        box.height = ch
+                        y = self.y + mt
+                    self._translate(box, x, y)
+                    self.children.append(box)
 
         else:  # column
-            avails = []
-            for el in items:
-                b = basis(el)
-                if b is not None:
-                    avails.append(min(self.width, b))
-                else:
-                    mi, ma = self._measure_width(el)
-                    if align == "stretch":
-                        avails.append(self.width)
-                    else:
-                        avails.append(max(mi, min(ma, self.width)))
-
-            placement = []
-            for el, w in zip(items, avails):
-                ml, mr, mt, mb = margins(el)
-                box, ch = self._layout_item(el, w)
-                placement.append((el, box, ch, ml, mr, mt, mb))
-
-            gap_total = row_gap * (len(items) - 1)
-            margin_h = sum(mt + mb for _, _, _, _, _, mt, mb in placement)
-            content_h = sum(ch for _, _, ch, _, _, _, _ in placement)
-            total = content_h + gap_total + margin_h
             css_h = parse_px(node.style.get("height", ""), 0)
-            extra = max(0.0, css_h - total) if css_h else 0.0
+            if wrap in ("wrap", "wrap-reverse") and css_h:
+                # Basic column wrapping: pack items into columns that fit the
+                # explicit height, then place the columns side by side.
+                nw = [natural_width(el) for el in items]
+                boxes = []
+                heights = []
+                for el, w in zip(items, nw):
+                    box, ch = self._layout_item(el, w)
+                    boxes.append(box)
+                    heights.append(ch)
 
-            heights = [ch for _, _, ch, _, _, _, _ in placement]
-            if extra > 0:
-                heights, extra = distra_leftover(extra, heights)
+                cols = []
+                col = []
+                used = 0.0
+                for i, el in enumerate(items):
+                    _, _, mt, mb = margins(el)
+                    item_h = heights[i] + mt + mb
+                    if col and used + row_gap + item_h > css_h:
+                        cols.append(col)
+                        col = []
+                        used = 0.0
+                    col.append(i)
+                    used += (row_gap if used else 0.0) + item_h
+                if col:
+                    cols.append(col)
+                if wrap == "wrap-reverse":
+                    cols.reverse()
 
-            cursor, extra_gap = justify_start(self.y, extra, "bottom")
+                cursor_x = self.x
+                for indices in cols:
+                    col_w = 0.0
+                    for i in indices:
+                        ml, mr, _, _ = margins(items[i])
+                        col_w = max(col_w, nw[i] + ml + mr)
+                    col_w = min(col_w, self.width)
+                    y = self.y
+                    for i in indices:
+                        ml, _, mt, mb = margins(items[i])
+                        self._translate(boxes[i], cursor_x + ml, y + mt)
+                        self.children.append(boxes[i])
+                        y += heights[i] + mt + mb + row_gap
+                    cursor_x += col_w + column_gap
+                self.height = css_h
+            else:
+                avails = []
+                for el in items:
+                    b = basis(el)
+                    if b is not None:
+                        avails.append(min(self.width, b))
+                    else:
+                        mi, ma = self._measure_width(el)
+                        if align == "stretch":
+                            avails.append(self.width)
+                        else:
+                            avails.append(max(mi, min(ma, self.width)))
 
-            for i, (el, box, ch, ml, mr, mt, mb) in enumerate(placement):
-                h = heights[i]
-                if align == "stretch" and not (
-                        isinstance(el, Element) and el.style.get("width")):
-                    x = self.x
-                elif align in ("flex-end", "end", "right"):
-                    x = self.x + (self.width - ml - mr - box.width)
-                elif align in ("center", "middle"):
-                    x = self.x + ml + ((self.width - ml - mr - box.width) / 2)
-                else:
-                    x = self.x + ml
-                y = cursor + mt
-                self._translate(box, x, y)
-                cursor += mt + h + mb + row_gap + (
-                    extra_gap if justify == "space-between" and i > 0 else 0.0)
-                self.children.append(box)
+                placement = []
+                for el, w in zip(items, avails):
+                    ml, mr, mt, mb = margins(el)
+                    box, ch = self._layout_item(el, w)
+                    placement.append((el, box, ch, ml, mr, mt, mb))
 
-            self.height = max(css_h, cursor - self.y) if css_h else cursor - self.y
+                gap_total = row_gap * (len(items) - 1)
+                margin_h = sum(mt + mb for _, _, _, _, _, mt, mb in placement)
+                content_h = sum(ch for _, _, ch, _, _, _, _ in placement)
+                total = content_h + gap_total + margin_h
+                extra = max(0.0, css_h - total) if css_h else 0.0
+
+                heights = [ch for _, _, ch, _, _, _, _ in placement]
+                if extra > 0:
+                    heights, extra = distra_leftover(extra, heights)
+
+                cursor, extra_gap = justify_start(self.y, extra, "bottom")
+
+                for i, (el, box, ch, ml, mr, mt, mb) in enumerate(placement):
+                    h = heights[i]
+                    if align == "stretch" and not (
+                            isinstance(el, Element) and el.style.get("width")):
+                        x = self.x
+                    elif align in ("flex-end", "end", "right"):
+                        x = self.x + (self.width - ml - mr - box.width)
+                    elif align in ("center", "middle"):
+                        x = self.x + ml + ((self.width - ml - mr - box.width) / 2)
+                    else:
+                        x = self.x + ml
+                    if i > 0 and justify in \
+                            ("space-between", "space-around", "space-evenly"):
+                        cursor += extra_gap
+                    y = cursor + mt
+                    self._translate(box, x, y)
+                    cursor += mt + h + mb + row_gap
+                    self.children.append(box)
+
+                self.height = max(css_h, cursor - self.y) if css_h else cursor - self.y
 
         self.height += _block_padding(node)
 
@@ -1885,18 +2329,92 @@ class DocumentLayout(LayoutBox):
         return []
 
 
-def paint_tree(layout_box, display_list, hidden=False):
+def paint_tree(layout_box, display_list, hidden=False, scroll=0):
     """Flatten a box tree into paint commands, honouring `visibility`: a box
     with `visibility:hidden` (or one nested under a hidden box, unless it
-    explicitly opts back in with `visibility:visible`) is not painted."""
-    node = getattr(layout_box, "node", None)
+    explicitly opts back in with `visibility:visible`) is not painted.
+
+    Also applies, in tree order:
+      * `position: sticky` — offsets the box (and descendants) so it stays in
+        view when the page has scrolled past its natural spot;
+      * `z-index` — a numeric z-index lifts the box (and its paint) above
+        lower stacking content. None/auto keeps document order (stable sort).
+    """
+    items = []
+    _collect_paint(layout_box, items, hidden, scroll, 0, None)
+    items.sort(key=lambda pair: pair[0] if pair[0] is not None else 0)
+    for _z, cmd in items:
+        display_list.append(cmd)
+
+
+def _sticky_dy(node, natural_top, height, parent, scroll):
+    """Extra vertical offset for a `position:sticky` element so it pins to its
+    `top` when scrolling would otherwise carry it off-screen, clamped so it
+    never leaves its containing block."""
+    top = parse_px(node.style.get("top", ""), 0)
+    dy = scroll + top - natural_top
+    if dy <= 0:
+        return 0
+    if parent is not None:
+        max_y = parent.y + parent.height - height
+        max_dy = max(0.0, max_y - natural_top)
+        dy = min(dy, max_dy)
+    return dy if dy > 0 else 0
+
+
+def _fixed_dy(node, natural_top, scroll):
+    """Extra vertical offset for a `position:fixed` element: it pins to the
+    viewport, so its screen position stays constant no matter how far the
+    page has scrolled (the offset can be negative to pull it up above its
+    natural spot)."""
+    top = parse_px(node.style.get("top", ""), 0)
+    return scroll + top - natural_top
+
+
+def _shift_cmd(cmd, dy):
+    """Return `cmd` shifted down by `dy`, leaving the original untouched.
+
+    Paint commands are often cached on their box (inline content, table cell
+    content) and re-emitted on every repaint; mutating them would accumulate
+    the shift across scroll ticks, so a copy is made whenever a shift is
+    actually needed."""
+    if dy == 0:
+        return cmd
+    cmd = copy.copy(cmd)
+    for attr in ("top", "bottom"):
+        value = getattr(cmd, attr, None)
+        if isinstance(value, (int, float)):
+            setattr(cmd, attr, value + dy)
+    return cmd
+
+
+def _collect_paint(box, items, hidden, scroll, dy, z):
+    node = getattr(box, "node", None)
     if isinstance(node, Element):
         vis = node.style.get("visibility")
         if vis == "hidden":
             hidden = True
         elif vis == "visible":
             hidden = False
+    own_dy = dy
+    if isinstance(node, Element):
+        pos = node.style.get("position")
+        if pos == "sticky":
+            own_dy += _sticky_dy(node, box.y, box.height, box.parent, scroll)
+        elif pos == "fixed":
+            own_dy += _fixed_dy(node, box.y, scroll)
+    # A numeric z-index establishes a stacking context: the box's own paint
+    # AND everything beneath it paint together at that level, so the box's
+    # background can never cover its own text.
+    if isinstance(node, Element):
+        zs = node.style.get("z-index")
+        if zs:
+            try:
+                z = int(zs)
+            except ValueError:
+                pass
     if not hidden:
-        display_list.extend(layout_box.paint())
-    for child in layout_box.children:
-        paint_tree(child, display_list, hidden)
+        for cmd in box.paint():
+            items.append((z, _shift_cmd(cmd, own_dy)))
+    for child in box.children:
+        _collect_paint(child, items, hidden, scroll, own_dy, z)

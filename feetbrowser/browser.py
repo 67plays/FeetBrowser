@@ -31,6 +31,11 @@ WIDTH, HEIGHT = 1000, 720
 SCROLL_STEP = 80
 CHROME_HEIGHT = 80  # tabs + address bar
 LOG_HEIGHT = 16  # slim strip under the toolbar reporting load errors
+TAB_LEFT = 8  # first tab's left edge on the tab strip
+TAB_WIDTH = 158  # each tab's drawn width
+TAB_GAP = 160  # stride between tab left edges (TAB_WIDTH + 2px gutter)
+TAB_CLOSE_W = 20  # hit width of the per-tab "×" close box
+NEW_TAB_W = 34  # hit width of the "+" new-tab button
 BOOKMARKS_FILE = os.path.expanduser("~/.feetbrowser_bookmarks.json")
 MAX_CACHED_IMAGES = 300
 # Cap the number of concurrent image fetches across the whole browser.
@@ -83,6 +88,19 @@ def inline_styles(node, out):
         for child in reversed(n.children):
             stack.append(child)
     return out
+
+
+_JS_MIME_TYPES = {"text/javascript", "application/javascript",
+                  "application/ecmascript", "text/ecmascript", "module"}
+
+
+def _is_js_script_type(typ):
+    """True when a <script> element should be executed: no `type` attribute
+    (HTML4 default) or a JavaScript MIME type. Structured-data blocks like
+    `application/ld+json` are data, not code, and must not be interpreted."""
+    if not typ:
+        return True
+    return typ.strip().lower() in _JS_MIME_TYPES
 
 
 def find_base_href(node):
@@ -236,6 +254,21 @@ class Tab:
                                         and not url.startswith(("data:", "file:",
                                                                 "view-source:"))) \
                 else URL(url)
+
+        # Remote pages must not navigate into the local filesystem: a link to
+        # file:///etc/passwd (or view-source:file://...) would be a one-click
+        # local-file disclosure. Local pages may still browse locally, and a
+        # fresh tab (about:blank) may still open a local file.
+        if isinstance(url, URL) and getattr(url, "scheme", "") == "file":
+            origin = getattr(self.url, "scheme", "") if self.url else ""
+            if origin in ("http", "https"):
+                self._complete_load(
+                    url, payload, push, pending_scroll,
+                    "<h1>Blocked</h1><p>Cannot open a local file while "
+                    "viewing a remote page.</p>", "text/html")
+                self.status = ("Blocked: local files are not reachable from "
+                               "a remote page")
+                return
         self.status = f"Loading {url}..."
         if url.view_source:
             self.status = "Loading source..."
@@ -370,6 +403,10 @@ class Tab:
         # With the DOM ready, start image loading and repaint.
         if self._gui_mode():
             self.load_images(self.browser.window, done=self.browser.draw)
+        else:
+            # Headless (tests / no Browser): fetch and decode synchronously so
+            # the display list shows real images instead of placeholders.
+            self.load_images()
 
     def _build(self, url, body, ctype="text/html"):
         """Parse, collect stylesheets, cascade, and lay out `body`."""
@@ -453,8 +490,22 @@ class Tab:
         self.document.image_cache = self.image_cache
         self.document.layout()
         self.document.input_boxes = self.document.collect_inputs([])
+        self.repaint()
+        # Content changed: flag the repaint loop so the canvas is redrawn even
+        # when no event handler happens to call draw() directly (e.g. JS DOM
+        # mutations and background image completion funnel through here).
+        if self.browser is not None:
+            self.browser._repaint_needed = True
+
+    def repaint(self):
+        """Recompute the display list for the current scroll. Layout is
+        unchanged; only the positions of `position:sticky/fixed` elements
+        depend on the scroll offset, so this is cheap enough to run on every
+        scroll tick (see Tab.set_scroll)."""
+        if not self.document:
+            return
         self.display_list = []
-        paint_tree(self.document, self.display_list)
+        paint_tree(self.document, self.display_list, scroll=self.scroll)
 
     # -- scripting ------------------------------------------------------
 
@@ -462,7 +513,8 @@ class Tab:
         """Execute every <script> (inline or external) against a fresh
         interpreter bridged to the document, then restyle and re-render."""
         scripts = [el for el in tree_to_list(self.nodes, [])
-                   if isinstance(el, Element) and el.tag == "script"]
+                   if isinstance(el, Element) and el.tag == "script"
+                   and _is_js_script_type(el.attributes.get("type"))]
         if not scripts:
             return
         self._js_interp = Interpreter()
@@ -470,7 +522,6 @@ class Tab:
                          mark_dirty=self._js_mutated)
         self._js_doc = doc
         self._js_interp.globals["document"] = doc
-        self._js_interp.globals["window"] = doc
         # Browser-provided host APIs (network + nothing Tk).
         self._js_interp.globals["fetch"] = self._js_fetch
         self._js_interp.globals["XMLHttpRequest"] = self._js_xhr_ctor()
@@ -545,6 +596,26 @@ class Tab:
 
     # -- JS host APIs (fetch, XMLHttpRequest) ------------------------------
 
+    def _js_scheme_allowed(self, target):
+        """Which schemes page-context JS may fetch. Remote pages may only
+        reach http(s)/data; `file:` is reserved for pages that were
+        themselves loaded from a local file, and even then only within the
+        page's own directory — a hostile local HTML file cannot wander the
+        whole filesystem. Everything else (toehub:, toe:, ...) is off-limits
+        so a hostile site cannot read arbitrary local files and exfiltrate
+        them."""
+        if target.scheme in ("http", "https", "data"):
+            return True
+        if target.scheme == "file":
+            base = self.base_url
+            if base is None or base.scheme != "file":
+                return False
+            base_path = base.path
+            base_dir = base_path if base_path.endswith("/") \
+                else os.path.dirname(base_path) + "/"
+            return target.path.startswith(base_dir)
+        return False
+
     def _js_fetch(self, url, options=UNDEFINED):
         """Host `fetch()`: resolve relative to the document, fetch on a
         background thread, and settle the returned Promise on the UI thread."""
@@ -555,6 +626,10 @@ class Tab:
                 else URL(str(url))
         except Exception as e:  # noqa: BLE001 - malformed URL
             promise.reject(str(e))
+            return promise
+        if not self._js_scheme_allowed(target):
+            promise.reject(
+                f"Blocked fetch of '{target.scheme}:' scheme from a page")
             return promise
 
         def worker():
@@ -767,6 +842,10 @@ class Tab:
         try:
             from PIL import Image as PILImage
             import io
+            # Refuse giant images (decompression bombs): Pillow raises
+            # DecompressionBombWarning/Error past this pixel count, and both
+            # subclass Exception so the fallback placeholder is used.
+            PILImage.MAX_IMAGE_PIXELS = 20_000_000
             pil = PILImage.open(io.BytesIO(data))
             pil.load()
             pil = pil.convert("RGBA")
@@ -806,8 +885,15 @@ class Tab:
     # -- interaction -----------------------------------------------------
 
     def scroll_by(self, delta):
-        self.scroll += delta
+        self.set_scroll(self.scroll + delta)
+
+    def set_scroll(self, value):
+        """Change the scroll offset and re-flatten the display list so pinned
+        (sticky/fixed) elements are repositioned for the new offset. Every
+        scroll mutation funnels through here (or render/repaint)."""
+        self.scroll = value
         self._clamp_scroll()
+        self.repaint()
 
     def _clamp_scroll(self):
         max_y = max(0, self.content_height() - self.tab_height)
@@ -1116,18 +1202,38 @@ class Tab:
         new_url.path = base_path + ("?" + "&".join(parts) if parts else "")
         return FormAction(new_url, None)
 
-    def draw(self, canvas, offset):
-        for cmd in self.display_list:
-            if cmd.top > self.scroll + self.tab_height:
-                continue
-            if cmd.bottom < self.scroll:
-                continue
-            cmd.execute(self.scroll - offset, canvas)
+    def draw(self, canvas, offset, region=None):
+        """Paint the page. `region` is an optional (x0, y0, x1, y1) rect in
+        viewport space (y relative to the page top, i.e. after scroll): when
+        given, only commands intersecting it are deleted and repainted, so a
+        small change (a text selection drag, a single mutated node) does not
+        repaint the whole page."""
+        view_bottom = self.scroll + self.tab_height
+        if region is None:
+            canvas.delete("page")
+            for cmd in self.display_list:
+                if cmd.top > view_bottom or cmd.bottom < self.scroll:
+                    continue
+                cmd.execute(self.scroll - offset, canvas,
+                            (f"c{id(cmd)}", "page"))
+        else:
+            x0, y0, x1, y1 = region
+            ry0, ry1 = y0 + self.scroll, y1 + self.scroll
+            for cmd in self.display_list:
+                if cmd.top > view_bottom or cmd.bottom < self.scroll:
+                    continue
+                if cmd.bottom <= ry0 or cmd.top > ry1 \
+                        or cmd.right <= x0 or cmd.left > x1:
+                    continue
+                canvas.delete(f"c{id(cmd)}")
+                cmd.execute(self.scroll - offset, canvas,
+                            (f"c{id(cmd)}", "page"))
         self._draw_selection(canvas, offset)
 
     def _draw_selection(self, canvas, offset):
         """Paint the text-selection highlight (blue fill + white text) over
         whatever was already drawn."""
+        canvas.delete("selection")
         for cmd, s, e in self._selection_spans():
             x1 = cmd.left + _measure(cmd.font, cmd.text[:s])
             x2 = cmd.left + _measure(cmd.font, cmd.text[:e])
@@ -1138,10 +1244,11 @@ class Tab:
                 canvas.create_rectangle(
                     x1, y1 - self.scroll + offset,
                     x2, y2 - self.scroll + offset,
-                    fill="#1a73e8", width=0)
+                    fill="#1a73e8", width=0, tags=("selection",))
                 canvas.create_text(
                     x1, y1 - self.scroll + offset, text=cmd.text[s:e],
-                    font=cmd.font, fill="white", anchor="nw")
+                    font=cmd.font, fill="white", anchor="nw",
+                    tags=("selection",))
             except tkinter.TclError:
                 pass
 
@@ -1285,6 +1392,11 @@ class Browser:
         self._last_size = (WIDTH, HEIGHT)
         # Chrome-style loading spinner: current arc start angle (degrees).
         self._loading_angle = 0
+        # Dirty flag for the repaint loop: set by render() whenever page
+        # content changes, cleared by draw(). Lets the repaint timer skip the
+        # canvas entirely while the page is idle instead of repainting every
+        # 120ms forever.
+        self._repaint_needed = True
 
         # Toes: one Context per loaded toe, all optional hooks.
         self.toes = toes.discover_toes()
@@ -1383,6 +1495,16 @@ class Browser:
             h = HEIGHT
         return max(50, h - self.chrome_height())
 
+    def _tab_x(self, i):
+        """Left edge of tab `i` on the strip (tabs flow left-to-right)."""
+        return TAB_LEFT + i * TAB_GAP
+
+    def _new_tab_x(self):
+        """Left edge of the "+" new-tab button, after the last tab but kept
+        on-screen when many tabs overflow the window width."""
+        return min(TAB_LEFT + len(self.tabs) * TAB_GAP,
+                   max(TAB_LEFT, self.canvas.winfo_width() - NEW_TAB_W))
+
     def new_tab(self, url, focus_address=False):
         tab = Tab(self.tab_height(), self)
         page = self._coerce_url(url)
@@ -1473,15 +1595,14 @@ class Browser:
     def _on_home(self, e):
         if self.focus == "address" or not self.active_tab:
             return
-        self.active_tab.scroll = 0
+        self.active_tab.set_scroll(0)
         self.draw()
         return "break"
 
     def _on_end(self, e):
         if self.focus == "address" or not self.active_tab:
             return
-        self.active_tab.scroll = self.active_tab.content_height()
-        self.active_tab._clamp_scroll()
+        self.active_tab.set_scroll(self.active_tab.content_height())
         self.draw()
         return "break"
 
@@ -1491,17 +1612,20 @@ class Browser:
     def _scroll(self, delta):
         if self.active_tab:
             self.active_tab.scroll_by(delta)
-            self.draw()
+            self._draw_page()
+            # Page content scrolls up underneath the chrome; redraw the chrome
+            # on top so its background covers the overlap (see _draw_chrome).
+            self._draw_chrome()
 
     def _on_home_key(self, e):
         if self.focus == "address":
             self.address_caret = 0
             self.address_sel = None
             self._address_ensure_visible()
-            self.draw()
+            self._draw_chrome()
             return
         if self.active_tab:
-            self.active_tab.scroll = 0
+            self.active_tab.set_scroll(0)
             self.draw()
 
     def _on_end_key(self, e):
@@ -1509,7 +1633,7 @@ class Browser:
             self.address_caret = len(self.address_text)
             self.address_sel = None
             self._address_ensure_visible()
-            self.draw()
+            self._draw_chrome()
             return
         if self.active_tab:
             self.active_tab.scroll_by(10 ** 9)
@@ -1539,12 +1663,21 @@ class Browser:
             self.active_tab.selection = None
             self._navigate(self.active_tab, dest)
         else:
-            # Clicking plain text (or blank space) anchors a selection; it is
-            # cleared again by a plain click in `_on_release`.
             node = self.active_tab._node_at(e.x, e.y - self.chrome_height())
-            if not self.active_tab._hit_control(node):
-                self.active_tab.start_selection(e.x, e.y - self.chrome_height())
-        self.draw()
+            if self.active_tab._hit_control(node):
+                # A form control activation (checkbox, field focus, select)
+                # already re-rendered the page; repaint the page layer now
+                # instead of waiting for the repaint tick.
+                self._draw_page()
+                return
+            # Anchoring a text selection changes nothing visible yet (the
+            # highlight grows during the drag), so no full canvas wipe is
+            # needed here — that wipe is what blanked the page on heavy pages.
+            self.canvas.delete("selection")
+            self.active_tab.start_selection(e.x, e.y - self.chrome_height())
+            if was_address:
+                # Dropping the address-bar focus ring is a chrome-only change.
+                self._draw_chrome()
 
     def _on_middle_click(self, e):
         if self.context_menu.open_:
@@ -1555,13 +1688,9 @@ class Browser:
         if e.y < band_h + 40:
             # Tab bar: middle-click a tab to close it, empty space (or the
             # "+" zone) to open a fresh one.
-            if e.x < 34:
-                self.new_tab("about:blank", focus_address=True)
-                self.draw()
-                return
             for i, tab in enumerate(self.tabs):
-                x0 = 40 + i * 160
-                if x0 <= e.x < x0 + 158:
+                x0 = self._tab_x(i)
+                if x0 <= e.x < x0 + TAB_WIDTH:
                     self.active_tab = tab
                     self.close_tab()
                     return
@@ -1586,7 +1715,12 @@ class Browser:
             # A plain click (press + release, no drag) clears the selection.
             tab.selection = None
         self._drag_moved = False
-        self.draw()
+        # Refresh only the highlight layer; a full canvas wipe here would
+        # blank the page after every selection.
+        c = self.canvas
+        c.delete("selection")
+        if tab.selection is not None:
+            tab._draw_selection(c, self.chrome_height())
 
     def _on_drag(self, e):
         if self.focus == "address" and e.x >= self._address_bar_x() - 10:
@@ -1597,13 +1731,13 @@ class Browser:
             self.address_caret = self._caret_from_x(e.x)
             self.address_sel = (anchor, self.address_caret)
             self._address_ensure_visible()
-            self.draw()
+            self._draw_chrome()
             return
         # Dragging on the page extends the text selection.
         if self.active_tab and e.y >= self.chrome_height():
             self._drag_moved = True
             self.active_tab.extend_selection(e.x, e.y - self.chrome_height())
-            self.draw()
+            self._repaint_selection()
 
     def _chrome_click(self, x, y, was_address=False):
         # Toe chrome bands (above the tabs).
@@ -1615,21 +1749,21 @@ class Browser:
                 return
         # Tab bar (top 40px).
         if y < band_h + 40:
-            # New-tab button.
-            if x < 34:
-                self.new_tab("about:blank", focus_address=True)
-                return
             for i, tab in enumerate(self.tabs):
-                x0 = 40 + i * 160
-                if x0 <= x < x0 + 158:
+                x0 = self._tab_x(i)
+                if x0 <= x < x0 + TAB_WIDTH:
                     # close box
-                    if x >= x0 + 158 - 20:
+                    if x >= x0 + TAB_WIDTH - TAB_CLOSE_W:
                         self.active_tab = tab
                         self.close_tab()
                         return
                     self.active_tab = tab
                     self.draw()
                     return
+            # New-tab button (right of the last tab).
+            nx = self._new_tab_x()
+            if nx <= x < nx + NEW_TAB_W:
+                self.new_tab("about:blank", focus_address=True)
             return
         # Toolbar (40..80).
         if 8 <= x < 34 and band_h + 48 <= y < band_h + 72:
@@ -1669,7 +1803,7 @@ class Browser:
                 self._set_address_caret_from_x(x)
                 self.address_sel = None
             self._address_ensure_visible()
-            self.draw()
+            self._draw_chrome()
 
     def _on_motion(self, e):
         if self.context_menu.open_:
@@ -1839,20 +1973,20 @@ class Browser:
         if self.active_tab and self.active_tab.focused_input and \
                 len(e.char) == 1 and e.char.isprintable():
             self.active_tab.type_char(e.char)
-            self.draw()
+            self._draw_page()
 
     def _on_backspace(self, e):
         if self.focus == "address":
             self._address_backspace()
-            self.draw()
+            self._draw_chrome()
             return
         if self.active_tab and self.active_tab.delete_char():
-            self.draw()
+            self._draw_page()
 
     def _on_delete(self, e):
         if self.focus == "address":
             self._address_forward_delete()
-            self.draw()
+            self._draw_chrome()
 
     def _address_key(self, e):
         ctrl = bool(getattr(e, "state", 0) & 0x4)
@@ -1860,29 +1994,29 @@ class Browser:
             k = getattr(e, "keysym", "").lower()
             if k == "a":
                 self._address_select_all()
-                self.draw()
+                self._draw_chrome()
                 return
             if k == "c":
                 self._address_copy()
                 return
             if k == "x":
                 self._address_cut()
-                self.draw()
+                self._draw_chrome()
                 return
             if k == "v":
                 self._address_paste()
-                self.draw()
+                self._draw_chrome()
                 return
             if k == "u":
                 self.address_text = ""
                 self.address_caret = 0
                 self.address_sel = None
                 self._address_ensure_visible()
-                self.draw()
+                self._draw_chrome()
                 return
         if len(e.char) == 1 and ord(e.char) >= 32 and e.char.isprintable():
             self._address_insert(e.char)
-            self.draw()
+            self._draw_chrome()
 
     def _copy_selection(self):
         """Copy the active tab's selected text to the system clipboard."""
@@ -2025,10 +2159,10 @@ class Browser:
             self.draw()
         elif self.focus == "address":
             self.focus = None
-            self.draw()
+            self._draw_chrome()
         elif self.active_tab and self.active_tab.focused_input:
             self.active_tab.blur_input()
-            self.draw()
+            self._draw_page()
 
     def _on_enter(self, e):
         if self.focus == "address":
@@ -2098,7 +2232,7 @@ class Browser:
         key = self._bookmark_key(self.active_tab.url)
         if not key:
             self.active_tab.status = "This page can't be bookmarked"
-            self.draw()
+            self._draw_chrome()
             return
         if key in self.bookmarks:
             self.bookmarks.remove(key)
@@ -2107,7 +2241,7 @@ class Browser:
             self.bookmarks.append(key)
             self.active_tab.status = "Bookmarked"
         self._save_bookmarks()
-        self.draw()
+        self._draw_chrome()
 
     def _history_snapshot(self):
         tab = self.active_tab
@@ -2218,20 +2352,74 @@ class Browser:
     # -- painting --------------------------------------------------------
 
     def draw(self):
+        """Full repaint: wipe the canvas and redraw page + chrome. Used for
+        things that invalidate everything (navigation, resize, tab switches);
+        cheaper layered paths exist for common cases (see _draw_page,
+        _draw_page_region, _draw_chrome)."""
+        self._repaint_needed = False
         self.canvas.delete("all")
+        c = self.canvas
         chrome = self.chrome_height()
         if self.active_tab:
             self.active_tab.tab_height = self.tab_height()
-            self.active_tab.draw(self.canvas, chrome)
-        toes.dispatch(self.toe_contexts, "on_draw", self.canvas, chrome)
+            self.active_tab.draw(c, chrome)
+        # Toe page overlays: tagged so _draw_page can clear + re-run them on
+        # scroll instead of leaving stale copies behind.
+        before = set(c.find_all())
+        toes.dispatch(self.toe_contexts, "on_draw", c, chrome)
+        for item_id in c.find_all():
+            if item_id not in before:
+                c.addtag_withtag("toe-draw", item_id)
+        self._draw_chrome()
+        self.context_menu.draw(self.canvas)
+        self._update_title()
+
+    def _update_title(self):
+        self.window.title(
+            (self.active_tab.title if self.active_tab else "FeetBrowser")
+            + " — FeetBrowser")
+
+    def _draw_page(self):
+        """Repaint the page layer only, leaving the chrome intact. Correct
+        whenever the page content changed (a new display list from render())
+        but no chrome element did."""
+        self._repaint_needed = False
+        c = self.canvas
+        c.delete("toe-draw")
+        if self.active_tab:
+            self.active_tab.tab_height = self.tab_height()
+            self.active_tab.draw(c, self.chrome_height())
+        chrome = self.chrome_height()
+        before = set(c.find_all())
+        toes.dispatch(self.toe_contexts, "on_draw", c, chrome)
+        for item_id in c.find_all():
+            if item_id not in before:
+                c.addtag_withtag("toe-draw", item_id)
+        self._update_title()
+
+    def _draw_page_region(self, rect):
+        """Repaint only the damaged rectangle `rect` (viewport page-space
+        coords) of the page, plus whatever selection overlaps it."""
+        if self.active_tab:
+            self.active_tab.draw(self.canvas, self.chrome_height(), rect)
+
+    def _draw_chrome(self):
+        """Repaint only the chrome (tabs, toolbar, address bar, status,
+        scrollbar, spinner), leaving the page layer intact. The chrome items
+        created here are tagged "chrome" afterwards so a later chrome repaint
+        can drop the stale ones."""
+        self._repaint_needed = False
+        c = self.canvas
+        c.delete("chrome")
+        before = set(c.find_all())
+        chrome = self.chrome_height()
         # Chrome background covers page content that scrolled up under it.
-        self.canvas.create_rectangle(0, 0, self.canvas.winfo_width(),
-                                     chrome, fill="#e8e8e8", width=0)
+        c.create_rectangle(0, 0, c.winfo_width(), chrome,
+                           fill="#e8e8e8", width=0)
         # Toe chrome bands paint on top of the chrome background.
         bands = self.chrome_bands()
         if bands:
-            toes.dispatch(self.toe_contexts, "on_chrome_draw",
-                          self.canvas, bands)
+            toes.dispatch(self.toe_contexts, "on_chrome_draw", c, bands)
         self._draw_tabs()
         self._draw_toolbar()
         self._draw_log()
@@ -2239,10 +2427,22 @@ class Browser:
         self._draw_status()
         self._draw_scrollbar()
         self._draw_spinner()
-        self.context_menu.draw(self.canvas)
-        self.window.title(
-            (self.active_tab.title if self.active_tab else "FeetBrowser")
-            + " — FeetBrowser")
+        for item_id in c.find_all():
+            if item_id not in before:
+                c.addtag_withtag("chrome", item_id)
+
+    def _repaint_selection(self):
+        """Redraw just the selection highlight layer. The page behind the
+        highlight never changes while dragging to select, so re-executing page
+        commands (the old approach) only slowed the drag and could blank the
+        canvas on heavy pages."""
+        tab = self.active_tab
+        if not tab or not tab.selection:
+            self._draw_page()
+            return
+        c = self.canvas
+        c.delete("selection")
+        tab._draw_selection(c, self.chrome_height())
 
     def _draw_log(self):
         """Draw the load-error strip under the toolbar: the most recent
@@ -2272,19 +2472,17 @@ class Browser:
         top = toes.band_height(self.chrome_bands())
         c.create_rectangle(0, top, c.winfo_width(), top + 40, fill="#d0d0d0",
                            width=0)
-        # New-tab button.
-        c.create_text(17, top + 20, text="+", font=self.bold_font, fill="#333")
         for i, tab in enumerate(self.tabs):
-            x0 = 40 + i * 160
+            x0 = self._tab_x(i)
             active = tab is self.active_tab
-            c.create_rectangle(x0, top + 4, x0 + 158, top + 40,
+            c.create_rectangle(x0, top + 4, x0 + TAB_WIDTH, top + 40,
                                fill="white" if active else "#c4c4c4",
                                width=0)
             title = tab.title or "New Tab"
-            # Tabs are 158px wide; fit the title in the space before the
-            # close box (which starts at x0 + 148) so long page titles never
-            # spill out past the tab edge.
-            title_w = 128
+            # Tabs are TAB_WIDTH wide; fit the title in the space before the
+            # close box (which starts at x0 + TAB_WIDTH - TAB_CLOSE_W) so long
+            # page titles never spill out past the tab edge.
+            title_w = TAB_WIDTH - 20
             if _measure(self.chrome_font, title) > title_w:
                 t = title
                 while t and _measure(self.chrome_font, t + "…") > title_w:
@@ -2292,8 +2490,14 @@ class Browser:
                 title = t + "…"
             c.create_text(x0 + 10, top + 20, text=title, anchor="w",
                           font=self.chrome_font, fill="#222")
-            c.create_text(x0 + 148, top + 20, text="×", font=self.bold_font,
-                          fill="#666")
+            c.create_text(x0 + TAB_WIDTH - 10, top + 20, text="×",
+                          font=self.bold_font, fill="#666")
+        # New-tab button, to the right of the last tab (browser convention).
+        nx = self._new_tab_x()
+        c.create_rectangle(nx, top + 4, nx + NEW_TAB_W, top + 40,
+                           fill="#c4c4c4", width=0)
+        c.create_text(nx + NEW_TAB_W / 2, top + 20, text="+",
+                      font=self.bold_font, fill="#333")
 
     def _draw_toolbar(self):
         c = self.canvas
@@ -2409,14 +2613,16 @@ class Browser:
 
     def _draw_status(self):
         c = self.canvas
+        c.delete("statusbar")
         h = c.winfo_height()
         c.create_rectangle(0, h - 22, c.winfo_width(), h,
-                           fill="#efefef", width=0)
-        c.create_line(0, h - 22, c.winfo_width(), h - 22, fill="#ccc")
+                           fill="#efefef", width=0, tags=("statusbar",))
+        c.create_line(0, h - 22, c.winfo_width(), h - 22, fill="#ccc",
+                      tags=("statusbar",))
         status = self.active_tab.status if self.active_tab else ""
         c.create_text(8, h - 11, text=status[:200], anchor="w",
                       font=get_font(11, "normal", "roman", "Helvetica"),
-                      fill="#444")
+                      fill="#444", tags=("statusbar",))
 
     def _draw_scrollbar(self):
         tab = self.active_tab
@@ -2424,9 +2630,10 @@ class Browser:
             return
         view = self.tab_height()
         total = tab.content_height()
+        c = self.canvas
+        c.delete("scrollbar")
         if total <= view:
             return
-        c = self.canvas
         track_x = c.winfo_width() - 10
         track_top = self.chrome_height()
         track_h = view
@@ -2434,15 +2641,24 @@ class Browser:
         thumb_h = max(30, track_h * frac)
         thumb_top = track_top + (track_h - thumb_h) * (tab.scroll / (total - view))
         c.create_rectangle(track_x, thumb_top, track_x + 6, thumb_top + thumb_h,
-                           fill="#9aa0a6", width=0)
+                           fill="#9aa0a6", width=0, tags=("scrollbar",))
 
     def run(self):
         self.window.update_idletasks()
         self.draw()
-        # Redraw once the window is actually mapped and sized.
-        self.window.after(120, self.draw)
+        # Coalesced repaint: only redraw when a page marked itself dirty
+        # (render()) or an event handler drew directly — never on a bare
+        # timer. Previously this loop repainted the whole canvas every 120ms
+        # forever, which burned CPU for idle pages.
+        self.window.after(120, self._repaint_tick)
         self._poll_images()
         self.window.mainloop()
+
+    def _repaint_tick(self):
+        if self._repaint_needed:
+            self._repaint_needed = False
+            self._draw_page()
+        self.window.after(120, self._repaint_tick)
 
     def _poll_images(self):
         """Periodic UI-thread sweep: pick up decoded image bytes left by the
@@ -2752,10 +2968,17 @@ class _JSXHR:
     def open(self, method, url, async_=True):
         self._method = str(method).upper()
         try:
-            self._url = self._tab.base_url.resolve(str(url)) \
+            target = self._tab.base_url.resolve(str(url)) \
                 if self._tab.base_url else URL(str(url))
-        except Exception:  # noqa: BLE001 - keep the raw string for the error
-            self._url = str(url)
+        except Exception:  # noqa: BLE001 - malformed URL
+            self._url = None
+            self._ready = 0
+            return
+        if not self._tab._js_scheme_allowed(target):
+            self._url = None
+            self._ready = 0
+            return
+        self._url = target
         self._ready = 1
 
     def set_request_header(self, name, value):
@@ -2819,7 +3042,7 @@ class _AboutURL:
         return URL(url) if "://" in url else URL("https://" + url)
 
     def request(self, payload=None):
-        return {}, WELCOME_HTML, "text/html"
+        return {}, welcome_html(), "text/html"
 
     def __str__(self):
         return "about:blank"
@@ -2935,51 +3158,56 @@ def history_html(snapshot):
 """
 
 
-WELCOME_HTML = """
+def welcome_html():
+    """Render the New Tab page: a clean centered card on a light backdrop."""
+    return """
 <!doctype html>
 <html><head><title>New Tab</title>
 <style>
-  body { font-family: Helvetica; margin: 60px; color: #222; }
-  h1 { font-size: 40px; color: #1a73e8; }
-  .sub { color: #666; font-size: 18px; }
-  ul { margin-top: 20px; }
+  body { font-family: Helvetica; margin: 0; color: #222; background: #f5f7fa; }
+  .stage { display: flex; justify-content: center; }
+  .shell { width: 540px; margin-top: 70px; background: #ffffff;
+            padding: 36px 44px; box-shadow: 2px 3px 12px #c8cdd4; }
+  h1 { font-size: 42px; color: #1a73e8; margin-top: 0; }
+  .tagline { color: #666; font-size: 17px; }
+  h3 { margin-top: 26px; color: #333; }
+  ul { margin-left: 24px; }
   li { margin-top: 6px; }
-  code { background: #f0f0f0; }
   a { color: #1a73e8; }
+  .foot { margin-top: 30px; }
 </style></head>
 <body>
-  <h1>🦶 FeetBrowser</h1>
-  <p class="sub">A web browser built from scratch — its own HTTP client,
-  HTML parser, CSS engine, and layout engine.</p>
-  <h3>Try these</h3>
-  <ul>
-    <li><a href="https://example.com">example.com</a> — the classic test page</li>
-    <li><a href="https://info.cern.ch/hypertext/WWW/TheProject.html">the first web page ever</a></li>
-    <li><a href="https://news.ycombinator.com">Hacker News</a></li>
-    <li><a href="https://en.wikipedia.org/wiki/Web_browser">Wikipedia: Web browser</a></li>
-    <li><a href="about:bookmarks">about:bookmarks</a> — your saved pages</li>
-    <li><a href="about:history">about:history</a> — back/forward timeline</li>
-    <li><a href="view-source:https://example.com">view-source:example.com</a></li>
-  </ul>
-  <h3>Your toes</h3>
-  <ul>
-    <li><a href="toe://hub">toe://hub</a> — browse and install toes</li>
-  </ul>
-  <h3>Shortcuts</h3>
-  <ul>
-    <li><b>Ctrl-L</b> focus address bar &nbsp; <b>Ctrl-T</b> new tab &nbsp;
-        <b>Ctrl-W</b> close tab &nbsp; <b>Ctrl-Tab</b> / <b>Ctrl-PgUp/Dn</b> cycle tabs</li>
-    <li><b>Ctrl-R</b> reload &nbsp; <b>Ctrl-D</b> bookmark page &nbsp;
-        <b>Ctrl-H</b> history &nbsp; <b>Alt-Left/Right</b> back / forward</li>
-    <li><b>↑ ↓ / wheel</b> scroll &nbsp; <b>PgUp/Dn</b> scroll by page &nbsp;
-        <b>Home / End</b> jump to top / bottom &nbsp; <b>Esc</b> blur</li>
-    <li><b>Middle-click</b> or <b>Ctrl-click</b> a link to open it in a new tab</li>
-  </ul>
-  <p class="sub">Forms are wired up, you can focus a text field to type, press
-  Enter to submit, and toggle checkboxes. Images, floats, flexbox, CSS grid,
-  and tables also render. JavaScript is a work in progress: scripts might execute on
-  load, could rewrite the page via the DOM, and occasionally handle clicks.</p>
-  <p class="sub">Type a URL or a search term in the address bar to begin.</p>
+  <div class="stage">
+    <div class="shell">
+      <h1>FeetBrowser</h1>
+      <p class="tagline">A browser built from scratch — its own HTTP client,
+      HTML parser, CSS engine, and layout engine.</p>
+      <h3>Try these</h3>
+      <ul>
+        <li><a href="https://example.com">example.com</a> — the classic test page</li>
+        <li><a href="https://info.cern.ch/hypertext/WWW/TheProject.html">the first web page ever</a></li>
+        <li><a href="https://news.ycombinator.com">Hacker News</a></li>
+        <li><a href="https://en.wikipedia.org/wiki/Web_browser">Wikipedia: Web browser</a></li>
+        <li><a href="about:bookmarks">about:bookmarks</a> — your saved pages</li>
+        <li><a href="about:history">about:history</a> — back/forward timeline</li>
+        <li><a href="view-source:https://example.com">view-source:example.com</a></li>
+      </ul>
+      <h3>Your toes</h3>
+      <ul>
+        <li><a href="toe://hub">toe://hub</a> — browse and install toes</li>
+      </ul>
+      <h3>Shortcuts</h3>
+      <ul>
+        <li><b>Ctrl-L</b> focus address bar &nbsp; <b>Ctrl-T</b> new tab &nbsp;
+            <b>Ctrl-W</b> close tab &nbsp; <b>Ctrl-Tab</b> / <b>Ctrl-PgUp/Dn</b> cycle tabs</li>
+        <li><b>Ctrl-R</b> reload &nbsp; <b>Ctrl-D</b> bookmark page &nbsp;
+            <b>Ctrl-H</b> history &nbsp; <b>Alt-Left/Right</b> back / forward</li>
+        <li><b>↑ ↓ / wheel</b> scroll &nbsp; <b>PgUp/Dn</b> scroll by page &nbsp;
+            <b>Home / End</b> jump to top / bottom &nbsp; <b>Esc</b> blur</li>
+      </ul>
+      <p class="tagline">Type a URL or a search term in the address bar to begin.</p>
+    </div>
+  </div>
 </body></html>
 """
 

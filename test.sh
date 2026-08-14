@@ -10,6 +10,7 @@ run() {
   python3 tests/test_js.py
   python3 tests/test_nav.py
   python3 tests/test_toes.py
+  python3 tests/test_gh_scroll.py
   python3 tests/smoke.py
 }
 

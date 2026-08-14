@@ -166,6 +166,183 @@ class RootSelector:
         return isinstance(node, Element) and node.parent is None
 
 
+class AttrSelector:
+    """Attribute selector: [attr], [attr=value], [attr~=v], [attr|=v],
+    [attr^=v], [attr$=v], [attr*=v]. `op` is None for mere presence."""
+
+    def __init__(self, attr, op=None, value=None):
+        self.attr = attr
+        self.op = op
+        self.value = value
+        self.priority = (0, 1, 0)
+
+    def matches(self, node):
+        if not isinstance(node, Element):
+            return False
+        val = node.attributes.get(self.attr)
+        if val is None:
+            return False
+        if self.op is None:
+            return True
+        val = str(val)
+        if self.op == "=":
+            return val == self.value
+        if self.op == "~=":
+            return self.value in val.split()
+        if self.op == "|=":
+            return val == self.value or val.startswith(self.value + "-")
+        if self.op == "^=":
+            return val.startswith(self.value)
+        if self.op == "$=":
+            return val.endswith(self.value)
+        if self.op == "*=":
+            return self.value in val
+        return False
+
+
+# Pseudo-classes whose state the engine cannot track (interaction, browsing
+# history, etc.). Their rule's base selector still applies (as if the
+# pseudo-class were stripped) so styling is not silently lost.
+_DYNAMIC_PSEUDOS = frozenset({
+    "hover", "active", "focus", "focus-within", "focus-visible", "visited",
+    "target", "any-link", "current", "past", "future", "playing", "paused",
+    "autofill", "default", "defined", "fullscreen", "indeterminate", "open",
+    "optional", "read-only", "read-write", "user-invalid", "valid", "invalid",
+    "in-range", "out-of-range", "placeholder-shown", "scope", "blank",
+    "popover-open", "lang",
+})
+
+_FORM_TAGS = frozenset({
+    "input", "button", "select", "textarea", "option", "fieldset",
+})
+
+
+def _match_nth(expr, index):
+    """Evaluate an :nth-child() expression against a 1-based element index."""
+    if expr is None:
+        return False
+    expr = expr.strip().lower()
+    if expr == "odd":
+        return index % 2 == 1
+    if expr == "even":
+        return index % 2 == 0
+    if "n" in expr:
+        m = re.match(r"^([+-]?\d*)n\s*(?:([+-])\s*(\d+))?$", expr)
+        if not m:
+            return False
+        a_str = m.group(1)
+        a = int(a_str) if a_str not in ("", "+", "-") \
+            else (1 if a_str in ("", "+") else -1)
+        if m.group(2) is None:
+            b = 0
+        else:
+            b = int(m.group(3)) * (1 if m.group(2) == "+" else -1)
+        diff = index - b
+        if diff % a != 0:
+            return False
+        k = diff // a
+        return k >= 1 and index >= 1
+    try:
+        return index == int(expr)
+    except ValueError:
+        return False
+
+
+class PseudoSelector:
+    """A pseudo-class on an element, e.g. :first-child, :not(.x), :nth-of-type.
+    `arg` holds the matched argument text, or (for :not/:is/:where/:has) a
+    list of parsed sub-selectors."""
+
+    def __init__(self, name, arg=None):
+        self.name = name
+        self.arg = arg
+        self.priority = self._priority()
+
+    def _priority(self):
+        if self.name == "where":
+            return (0, 0, 0)
+        if self.name in ("not", "is", "has") and self.arg:
+            return max(s.priority for s in self.arg)
+        return (0, 1, 0)
+
+    def matches(self, node):
+        name = self.name
+        if name in ("not", "is", "where"):
+            if name == "not":
+                return not any(s.matches(node) for s in self.arg or ())
+            return any(s.matches(node) for s in self.arg or ())
+        if name == "has":
+            return _has_match(node, self.arg or ())
+        if name in ("first-child", "last-child", "only-child", "nth-child",
+                    "nth-last-child", "first-of-type", "last-of-type",
+                    "only-of-type", "nth-of-type", "nth-last-of-type"):
+            return self._structural(node)
+        if name == "empty":
+            return isinstance(node, Element) and not node.children
+        if name == "link":
+            return isinstance(node, Element) and node.tag == "a" \
+                and "href" in node.attributes
+        if name == "checked":
+            return isinstance(node, Element) and node.tag in ("input", "option") \
+                and "checked" in node.attributes
+        if name in ("disabled", "enabled", "required"):
+            if not isinstance(node, Element) or node.tag not in _FORM_TAGS:
+                return False
+            if name == "disabled":
+                return "disabled" in node.attributes
+            if name == "enabled":
+                return "disabled" not in node.attributes
+            return "required" in node.attributes
+        return False
+
+    def _structural(self, node):
+        if not isinstance(node, Element) or node.parent is None:
+            return False
+        sibs = [c for c in node.parent.children if isinstance(c, Element)]
+        try:
+            idx = sibs.index(node)
+        except ValueError:
+            return False
+        count = len(sibs)
+        name = self.name
+        if "of-type" in name:
+            tsibs = [c for c in sibs if c.tag == node.tag]
+            tidx = tsibs.index(node)
+            tcount = len(tsibs)
+            if name == "first-of-type":
+                return tidx == 0
+            if name == "last-of-type":
+                return tidx == tcount - 1
+            if name == "only-of-type":
+                return tcount == 1
+            if name == "nth-of-type":
+                return _match_nth(self.arg, tidx + 1)
+            return _match_nth(self.arg, tcount - tidx)
+        if name == "first-child":
+            return idx == 0
+        if name == "last-child":
+            return idx == count - 1
+        if name == "only-child":
+            return count == 1
+        if name == "nth-child":
+            return _match_nth(self.arg, idx + 1)
+        return _match_nth(self.arg, count - idx)
+
+
+def _has_match(node, selectors):
+    """:has(sel) — true when any descendant matches `sel`. Child (>) and
+    sibling (+/~) combinators inside the argument are treated as the
+    descendant approximation already used elsewhere in the parser."""
+    if not isinstance(node, Element):
+        return False
+    for child in node.children:
+        if any(s.matches(child) for s in selectors):
+            return True
+        if isinstance(child, Element) and _has_match(child, selectors):
+            return True
+    return False
+
+
 def _ancestor_possible(selector, node):
     """Cheap necessary condition for `selector` to match some ancestor of
     `node`, using the ancestor-feature sets primed by style(). Only used as a
@@ -188,9 +365,6 @@ def _ancestor_possible(selector, node):
     return True
 
 
-_IDENT_RE = re.compile(r"^[A-Za-z*][-_A-Za-z0-9]*$")
-
-
 _PSEUDO_ELEMENTS = {
     "before", "after", "first-line", "first-letter", "selection",
     "placeholder", "marker", "backdrop", "file-selector-button", "cue",
@@ -199,49 +373,13 @@ _PSEUDO_ELEMENTS = {
 
 _VENDOR_PREFIXES = ("-webkit-", "-moz-", "-ms-", "-o-", "-khtml-")
 
+# Sentinel: a dynamic pseudo-class (:hover, ...) was parsed; the base selector
+# still applies, so simple_selector() emits nothing for this token.
+_SKIP_PSEUDO = object()
 
-def _strip_pseudo(text):
-    """Strip pseudo-classes (:hover, :not(.x), ...); `:root` becomes a marker.
-
-    Pseudo-elements (::before, :after, ::first-line, ...) create a box the
-    engine does not render, so a rule that targets one must be dropped
-    entirely -- otherwise its declarations would leak onto the parent element
-    (e.g. `.x::after { height: 1px }` would shrink `.x` itself)."""
-    out = []
-    i = 0
-    n = len(text)
-    while i < n:
-        if text[i] != ":":
-            out.append(text[i])
-            i += 1
-            continue
-        start = i
-        while i < n and text[i] not in " \t\r\n>+~":
-            if text[i] == "(":
-                depth = 1
-                i += 1
-                while i < n and depth:
-                    if text[i] == "(":
-                        depth += 1
-                    elif text[i] == ")":
-                        depth -= 1
-                    i += 1
-                continue
-            i += 1
-        token = text[start:i]
-        if token in (":root", "::root"):
-            out.append(":root")
-            continue
-        if token.startswith("::"):
-            return ""
-        name = token[1:]
-        for pref in _VENDOR_PREFIXES:
-            if name.startswith(pref):
-                name = name[len(pref):]
-                break
-        if name in _PSEUDO_ELEMENTS:
-            return ""
-    return "".join(out)
+_ATTR_SEL_RE = re.compile(
+    r"\[\s*([-_A-Za-z0-9]+)\s*"
+    r"(?:([~|^$*]?=)\s*(?:\"([^\"]*)\"|'([^']*)'|([^\]\s]+))\s*)?\]")
 
 
 class CSSParser:
@@ -314,37 +452,143 @@ class CSSParser:
         return pairs
 
     def simple_selector(self, text):
-        # e.g. div.note#id  or  .cls  or  #id  or  *  or  :root
-        text = _strip_pseudo(text).strip()
+        # e.g. div.note#id, .cls, #id, *, :root,
+        #      [data-x="1"].cls:first-child, a[href^="https"]:not(.no-link)
+        text = text.strip()
         if not text:
             return None
         if text == ":root":
             return RootSelector()
-        parts = [p for p in re.split(r"(?=[.#])", text) if p]
-
-        simples = []
-        for part in parts:
-            if part.startswith(("#", ".")):
-                ident = part[1:]
-                if not ident or not _IDENT_RE.match(ident):
+        parts = []
+        i = 0
+        n = len(text)
+        while i < n:
+            c = text[i]
+            if c == ".":
+                m = re.match(r"\.[-_A-Za-z0-9]+", text[i:])
+                if not m:
                     return None
-                simples.append(IdSelector(ident) if part[0] == "#"
-                               else ClassSelector(ident))
+                parts.append(ClassSelector(m.group(0)[1:]))
+                i += m.end()
+            elif c == "#":
+                m = re.match(r"#[-_A-Za-z0-9]+", text[i:])
+                if not m:
+                    return None
+                parts.append(IdSelector(m.group(0)[1:]))
+                i += m.end()
+            elif c == "[":
+                m = _ATTR_SEL_RE.match(text, i)
+                if not m:
+                    return None
+                value = m.group(3)
+                if value is None:
+                    value = m.group(4)
+                if value is None:
+                    value = m.group(5)
+                parts.append(AttrSelector(m.group(1).lower(), m.group(2),
+                                          value))
+                i = m.end()
+            elif c == ":":
+                sel, end = self._pseudo_selector(text, i)
+                if sel is None:
+                    return None
+                if sel is not _SKIP_PSEUDO:
+                    parts.append(sel)
+                i = end
+            elif c == "*":
+                parts.append(TagSelector("*"))
+                i += 1
+            elif re.match(r"[A-Za-z]", c):
+                m = re.match(r"[-_A-Za-z0-9]+", text[i:])
+                parts.append(TagSelector(m.group(0).lower()))
+                i += m.end()
             else:
-                # Attribute selectors (input[type=x]) etc. are not supported;
-                # skip the rule rather than match nothing forever.
-                if not _IDENT_RE.match(part):
-                    return None
-                simples.append(TagSelector(part.lower()))
-        if len(simples) == 1:
-            return simples[0]
-        return CompoundSelector(simples)
+                return None
+        if not parts:
+            return None
+        if len(parts) == 1:
+            return parts[0]
+        return CompoundSelector(parts)
+
+    def _pseudo_selector(self, text, i):
+        """Parse a `:name(arg)` token starting at `i`. Returns `(selector,
+        end_index)`; the selector is a real selector, the `_SKIP_PSEUDO`
+        sentinel (dynamic pseudo-class: apply the base selector, emit nothing)
+        or None (pseudo-element / bad syntax: drop the whole rule)."""
+        n = len(text)
+        j = i + 1
+        if j < n and text[j] == ":":
+            return None, j  # pseudo-element (::before, ...): drop the rule
+        while j < n and re.match(r"[A-Za-z0-9_-]", text[j]):
+            j += 1
+        name = text[i + 1:j].lower()
+        for pref in _VENDOR_PREFIXES:
+            if name.startswith(pref):
+                name = name[len(pref):]
+                break
+        if name in _PSEUDO_ELEMENTS:
+            return None, j
+        arg = None
+        if j < n and text[j] == "(":
+            depth = 1
+            j += 1
+            start = j
+            while j < n and depth:
+                if text[j] == "(":
+                    depth += 1
+                elif text[j] == ")":
+                    depth -= 1
+                j += 1
+            if depth != 0:
+                return None, j
+            arg = text[start:j - 1]
+        if name == "root":
+            sel = RootSelector()
+        elif name in ("not", "is", "where", "has"):
+            arg_sels = self._pseudo_arg(arg)
+            if arg_sels is None:
+                return None, j
+            sel = PseudoSelector(name, arg_sels)
+        elif name in _DYNAMIC_PSEUDOS:
+            sel = _SKIP_PSEUDO
+        else:
+            sel = PseudoSelector(name, arg)
+        return sel, j
+
+    def _pseudo_arg(self, arg):
+        """Parse the selector argument of :not/:is/:where/:has."""
+        if arg is None or not arg.strip():
+            return None
+        sels = []
+        for part in arg.split(","):
+            sel = self.selector(part.strip())
+            if sel is None:
+                return None
+            sels.append(sel)
+        return sels
 
     def selector(self, text):
-        # Handle descendant combinators (whitespace between simple selectors).
-        # >, + and ~ are approximated as descendant relationships; unsupported
-        # tokens are dropped rather than left to crash the rule.
-        tokens = text.split()
+        # Split on whitespace outside parentheses (so `:has(> img)` keeps its
+        # internal space), treating >, + and ~ as descendant relationships;
+        # unsupported tokens are dropped rather than left to crash the rule.
+        tokens = []
+        buf = []
+        depth = 0
+        for ch in text:
+            if ch == "(":
+                depth += 1
+                buf.append(ch)
+            elif ch == ")":
+                depth = max(0, depth - 1)
+                buf.append(ch)
+            elif ch in " \t\r\n\f" and depth == 0:
+                if buf:
+                    tokens.append("".join(buf))
+                    buf = []
+            else:
+                buf.append(ch)
+        if buf:
+            tokens.append("".join(buf))
         tokens = [t for t in tokens if t not in (">", "+", "~")]
         if not tokens:
             return None
@@ -466,7 +710,13 @@ def _selector_hint(selector):
     if isinstance(selector, RootSelector):
         return ("root", None)
     if isinstance(selector, CompoundSelector):
-        return _selector_hint(selector.parts[-1])
+        # Walk parts from the end so a trailing :nth-child/[attr] pseudo
+        # doesn't hide a bucketing tag/class/id that precedes it.
+        for part in reversed(selector.parts):
+            hint = _selector_hint(part)
+            if hint[0] != "any":
+                return hint
+        return ("any", None)
     if isinstance(selector, DescendantSelector):
         return _selector_hint(selector.descendant)
     return ("any", None)

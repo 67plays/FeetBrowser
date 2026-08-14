@@ -62,8 +62,11 @@ def display_text(tab):
 
 
 def test_no_toes_by_default():
-    toe_list = toes.discover_toes()
-    assert toe_list == [], f"expected bare framework, found {toe_list}"
+    # A fresh checkout ships barefoot: discover_toes on an empty dir must
+    # find nothing (the local toes/ may hold user-installed toes).
+    with tempfile.TemporaryDirectory() as tmp:
+        toe_list = toes.discover_toes(tmp)
+        assert toe_list == [], f"expected bare framework, found {toe_list}"
 
 
 def test_unknown_scheme_parses():
@@ -81,7 +84,7 @@ def test_unknown_scheme_empty_host_parses():
 
 
 def test_hub_renders_with_zero_toes():
-    stub = StubBrowser()
+    stub = StubBrowser([])
     tab = Tab(700, stub)
     stub.active_tab = tab
     tab.load("toe://hub")
@@ -90,12 +93,18 @@ def test_hub_renders_with_zero_toes():
 
 
 def test_gallery_empty():
-    stub = StubBrowser()
-    tab = Tab(700, stub)
-    stub.active_tab = tab
-    tab.load("toe://gallery")
-    assert "GALLERY" in display_text(tab)
-    assert "No toes installed" in display_text(tab)
+    with tempfile.TemporaryDirectory() as tmp:
+        orig_root = toes.repo_root
+        toes.repo_root = lambda: tmp
+        try:
+            stub = StubBrowser([])
+            tab = Tab(700, stub)
+            stub.active_tab = tab
+            tab.load("toe://gallery")
+            assert "GALLERY" in display_text(tab)
+            assert "No toes installed" in display_text(tab)
+        finally:
+            toes.repo_root = orig_root
 
 
 def test_hello_placeholder():

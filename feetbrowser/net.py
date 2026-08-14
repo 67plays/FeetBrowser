@@ -7,7 +7,6 @@ Nothing here wraps an existing HTTP client engine beyond Python's socket/ssl.
 
 import base64
 import codecs
-import gzip
 import os
 import socket
 import ssl
@@ -32,6 +31,61 @@ _DNS_CACHE = {}
 _DNS_CACHE_MAX = 512
 _DNS_TTL = 300.0  # seconds
 _DNS_LOCK = threading.Lock()
+
+# Bounded pool of idle keep-alive connections, keyed by (scheme, host, port).
+# HTTP/1.1 lets one connection serve several requests to the same origin, which
+# skips the fresh TCP + TLS handshake each resource used to pay — the most
+# expensive part of a fetch. Sockets are parked after a fully-framed response
+# and reclaimed by the next request to that origin; a parked socket whose peer
+# already closed it is detected and retried once on a fresh connection. A lock
+# guards access because image fetches run on background threads, and the TTL
+# bounds how long we hold a socket that a page may not use again.
+_CONN_POOL = {}
+_CONN_POOL_MAX_PER_ORIGIN = 4
+_CONN_POOL_MAX_TOTAL = 64
+_CONN_POOL_TTL = 30.0  # seconds idle before a parked socket is closed
+_CONN_LOCK = threading.Lock()
+
+
+def _close_socket(s):
+    try:
+        s.close()
+    except OSError:
+        pass
+
+
+def _pool_take(key):
+    """Pop the most recently parked idle socket for `key`, or None. Stale
+    (TTL-expired) parked sockets are closed rather than reused."""
+    with _CONN_LOCK:
+        lst = _CONN_POOL.get(key)
+        if not lst:
+            _CONN_POOL.pop(key, None)
+            return None
+        now = time.time()
+        while lst:
+            s, parked = lst.pop()
+            if now - parked > _CONN_POOL_TTL:
+                _close_socket(s)
+                continue
+            if not lst:
+                del _CONN_POOL[key]
+            return s
+        _CONN_POOL.pop(key, None)
+        return None
+
+
+def _pool_park(key, s):
+    """Return a healthy socket to the idle pool, evicting the oldest socket
+    for the same origin (and a random origin) when the pool is full."""
+    with _CONN_LOCK:
+        if len(_CONN_POOL) >= _CONN_POOL_MAX_TOTAL and key not in _CONN_POOL:
+            _close_socket(s)
+            return
+        lst = _CONN_POOL.setdefault(key, [])
+        if len(lst) >= _CONN_POOL_MAX_PER_ORIGIN:
+            _close_socket(lst.pop(0)[0])
+        lst.append((s, time.time()))
 
 
 def _connect(host, port):
@@ -88,6 +142,12 @@ DEFAULT_HEADERS = {
 }
 
 MAX_REDIRECTS = 10
+
+#: Hard cap on any single response (headers + body) read from the network or
+#: from a local file, and on the decompressed size of a gzip/deflate payload.
+#: Keeps a hostile peer from exhausting memory with an unbounded stream or a
+#: decompression bomb.
+_MAX_BODY_BYTES = 64 * 1024 * 1024
 
 # Schemes the URL parser understands (used to distinguish a bare host from a
 # scheme-less string like "example.com:8080").
@@ -274,7 +334,7 @@ class URL:
     def _request_file(self, raw=False):
         try:
             with open(self.path, "rb") as f:
-                payload = f.read()
+                payload = f.read(_MAX_BODY_BYTES + 1)
         except (FileNotFoundError, IsADirectoryError, PermissionError) as e:
             if os.path.isdir(self.path):
                 items = sorted(os.listdir(self.path))
@@ -284,6 +344,10 @@ class URL:
                 body = f"<h1>Index of {self.path}</h1><ul>{links}</ul>"
             else:
                 body = f"<h1>Cannot open file</h1><p>{e}</p>"
+            return {}, body.encode("utf8", "replace") if raw else body, \
+                "text/html"
+        if len(payload) > _MAX_BODY_BYTES:
+            body = f"<h1>File too large to open</h1><p>{self.path}</p>"
             return {}, body.encode("utf8", "replace") if raw else body, \
                 "text/html"
         ext = os.path.splitext(self.path)[1].lower()
@@ -304,6 +368,16 @@ class URL:
             body = decoded.encode("utf8", "replace") if raw else decoded
         return {}, body, ctype
 
+    def _new_connection(self):
+        s = _connect(self.host, self.port)
+        if self.scheme == "https":
+            ctx = ssl.create_default_context()
+            s = ctx.wrap_socket(s, server_hostname=self.host)
+        # Guard against a server that streams forever / stalls: bound each
+        # recv() call so a dead or hostile peer can't hang the UI.
+        s.settimeout(30)
+        return s
+
     def _request_http(self, redirects_left, payload, raw=False, refresh=False):
         # Two documents that differ only by fragment are the same resource.
         cache_key = str(self).split("#", 1)[0]
@@ -314,18 +388,10 @@ class URL:
             else:
                 del _CACHE[cache_key]
 
-        s = _connect(self.host, self.port)
-        if self.scheme == "https":
-            ctx = ssl.create_default_context()
-            s = ctx.wrap_socket(s, server_hostname=self.host)
-        # Guard against a server that streams forever / stalls: bound each
-        # recv() call so a dead or hostile peer can't hang the UI.
-        s.settimeout(30)
-
         method = "POST" if payload is not None else "GET"
         headers = dict(DEFAULT_HEADERS)
         headers["Host"] = self.netloc()  # brackets IPv6, includes the port
-        headers["Connection"] = "close"
+        headers["Connection"] = "keep-alive"
         if refresh:
             # Ask intermediaries to revalidate too.
             headers["Cache-Control"] = "no-cache"
@@ -337,11 +403,41 @@ class URL:
 
         lines = "\r\n".join(f"{k}: {v}" for k, v in headers.items())
         req = f"{method} {self.path} HTTP/1.1\r\n{lines}\r\n\r\n"
+
+        def attempt(s):
+            try:
+                s.sendall(req.encode("utf8") + body_bytes)
+            except OSError:
+                _close_socket(s)
+                raise
+            return self._read_response(s)
+
+        origin = (self.scheme, self.host, self.port)
+        s = _pool_take(origin)
+        pooled = s is not None
         try:
-            s.sendall(req.encode("utf8") + body_bytes)
-            status, resp_headers, body = self._read_response(s)
-        finally:
-            s.close()
+            if s is None:
+                s = self._new_connection()
+            try:
+                status, resp_headers, body, reusable = attempt(s)
+            except (OSError, RuntimeError):
+                _close_socket(s)
+                if not pooled:
+                    raise
+                # The parked connection went stale (the peer closed it, e.g.
+                # an HTTP/1.0 server or a keep-alive timeout): retry once on
+                # a fresh connection rather than failing the request.
+                s = self._new_connection()
+                status, resp_headers, body, reusable = attempt(s)
+            if reusable:
+                _pool_park(origin, s)
+            else:
+                # Body was read to EOF (no framing), so the connection cannot
+                # be reused — it is already closed by the peer.
+                _close_socket(s)
+        except BaseException:
+            _close_socket(s)
+            raise
 
         # Redirects.
         if status in (301, 302, 303, 307, 308) and "location" in resp_headers:
@@ -360,6 +456,12 @@ class URL:
                 self._adopt(new_url)
                 return self._request_http(redirects_left - 1, follow_payload,
                                           raw=raw, refresh=refresh)
+            if new_url.scheme == "file":
+                # Never let a remote server redirect into the local
+                # filesystem: that would be an arbitrary local-file read with
+                # no user interaction.
+                raise RuntimeError(
+                    f"Blocked redirect to local file: {new_url}")
             return new_url.request(redirects_left - 1, follow_payload, raw=raw,
                                    refresh=refresh)
 
@@ -405,10 +507,19 @@ class URL:
         framing so a keep-alive peer that does not close the socket doesn't
         make us wait for EOF (which could stall for the socket timeout).
 
-        Returns (status, headers, body_bytes)."""
+        Returns (status, headers, body_bytes, reusable), where `reusable` is
+        True only when the body was read to a clean frame boundary, so the
+        caller may park the socket for another request. A read-to-EOF body
+        (no framing hints) means the peer closed the connection, so it cannot
+        be reused."""
         buf = bytearray()
 
         def read_more(n=65536):
+            if len(buf) >= _MAX_BODY_BYTES:
+                return b""
+            n = min(n, _MAX_BODY_BYTES - len(buf))
+            if n <= 0:
+                return b""
             chunk = s.recv(n)
             if chunk:
                 buf.extend(chunk)
@@ -417,23 +528,30 @@ class URL:
         # Read the header block (terminated by an empty line).
         while b"\r\n\r\n" not in buf and read_more():
             pass
+        if b"\r\n\r\n" not in buf:
+            raise RuntimeError("HTTP response headers too large")
         head, _, body = bytes(buf).partition(b"\r\n\r\n")
         headers = URL._parse_headers(head)
 
+        reusable = False
         if headers.get("transfer-encoding", "").lower() == "chunked":
             # Read until the terminating zero-length chunk.
             while b"\r\n0\r\n\r\n" not in buf and read_more():
                 pass
+            reusable = b"\r\n0\r\n\r\n" in buf
         elif "content-length" in headers:
             try:
                 remaining = int(headers["content-length"]) - len(body)
             except ValueError:
                 remaining = -1
+            if remaining > _MAX_BODY_BYTES:
+                raise RuntimeError("HTTP response body too large")
             while remaining > 0:
                 chunk = read_more(min(65536, remaining))
                 if not chunk:
                     break
                 remaining -= len(chunk)
+            reusable = remaining <= 0
         else:
             # No framing hints: read until EOF (socket timeout guards stalls).
             while read_more():
@@ -445,7 +563,7 @@ class URL:
         parts = status_line.split(" ", 2)
         if len(parts) < 2 or not parts[1].isdigit():
             raise RuntimeError(f"Malformed status line: {status_line!r}")
-        return int(parts[1]), headers, body
+        return int(parts[1]), headers, body, reusable
 
     @staticmethod
     def _parse_headers(head):
@@ -458,20 +576,40 @@ class URL:
         return headers
 
     @staticmethod
+    def _decompress_gzip_bounded(data):
+        """Decompress a gzip payload, refusing output beyond the body cap.
+
+        Uses a streaming zlib object with a max_length limit rather than
+        gzip.decompress so a decompression bomb cannot allocate unbounded
+        memory; returns None when the output would exceed the cap or the
+        stream is malformed."""
+        try:
+            d = zlib.decompressobj(16 + zlib.MAX_WBITS)
+            out = d.decompress(data, _MAX_BODY_BYTES)
+            if d.unconsumed_tail or d.unused_data:
+                return None
+            return out
+        except zlib.error:
+            return None
+
+    @staticmethod
     def _decode_body(body, headers):
         if headers.get("transfer-encoding", "").lower() == "chunked":
             body = URL._dechunk(body)
         enc = headers.get("content-encoding", "").lower()
         if enc == "gzip":
-            try:
-                body = gzip.decompress(body)
-            except (OSError, EOFError):
-                pass
+            decompressed = URL._decompress_gzip_bounded(body)
+            if decompressed is not None:
+                body = decompressed
         elif enc == "deflate":
             try:
-                body = zlib.decompress(body)
+                body = zlib.decompress(body, zlib.MAX_WBITS, _MAX_BODY_BYTES)
             except zlib.error:
-                body = zlib.decompress(body, -zlib.MAX_WBITS)
+                try:
+                    body = zlib.decompress(body, -zlib.MAX_WBITS,
+                                           _MAX_BODY_BYTES)
+                except (OSError, ValueError, zlib.error):
+                    pass
         return body
 
     @staticmethod

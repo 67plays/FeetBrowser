@@ -9,7 +9,8 @@ from feetbrowser.cssparser import CSSParser, style
 from feetbrowser.layout import DrawText, get_font, _measure
 from feetbrowser.browser import (
     Tab, Browser, _AboutURL, _BookmarksURL, _HistoryURL,
-    bookmarks_html, history_html, tree_to_list, find_base_href, FormAction
+    bookmarks_html, history_html,
+    tree_to_list, find_base_href, FormAction
 )
 
 
@@ -348,12 +349,36 @@ def test_combinators_do_not_crash_and_match():
     eq(li.style["color"], "green", "ul > li matches (child treated as descendant)")
 
 
-def test_unsupported_selector_tokens_skipped():
+def test_attribute_selector_matches():
     rules = CSSParser("div a[href] { color: blue }").parse()
-    eq(rules, [], "unsupported attribute selector silently skipped")
+    eq(len(rules), 1, "attribute selector parses")
+    dom = HTMLParser('<div><a href="/x">hi</a><a>no</a></div>').parse()
+    style(dom, rules)
+    links = [n for n in tree_to_list(dom, [])
+             if isinstance(n, Element) and n.tag == "a"]
+    eq(links[0].style["color"], "blue", "a[href] matches an anchor with href")
+    eq(links[1].style["color"], "black", "anchor without href is not styled")
     rules = CSSParser("a[href] { color: blue } p { color: red }").parse()
-    eq(len(rules), 1, "well-formed rule after unsupported one still parses")
-    eq(rules[0][0].tag, "p", "surviving rule is the plain <p>")
+    eq(len(rules), 2, "rule after attribute selector still parses")
+
+
+def test_pseudo_class_structural_and_not():
+    rules = CSSParser(
+        "li:first-child { color: red } li:nth-child(2n) { color: green } "
+        "li:not(.skip) { font-weight: bold }"
+    ).parse()
+    eq(len(rules), 3, "structural pseudo-classes parse")
+    dom = HTMLParser(
+        '<ul><li>a</li><li class="skip">b</li><li>c</li><li>d</li></ul>'
+    ).parse()
+    style(dom, rules)
+    lis = [n for n in tree_to_list(dom, [])
+           if isinstance(n, Element) and n.tag == "li"]
+    eq(lis[0].style["color"], "red", ":first-child matches the first item")
+    eq(lis[1].style["color"], "green", ":nth-child(2n) matches even items")
+    eq(lis[3].style["color"], "green", ":nth-child(2n) matches the fourth item")
+    eq(lis[1].style["font-weight"], "normal", ":not(.skip) excludes .skip")
+    eq(lis[2].style["font-weight"], "bold", ":not(.skip) matches others")
 
 
 def test_data_uri_background_parsed():
@@ -738,6 +763,179 @@ def test_flex_column_stacks_vertically():
     # All column items span the full container width (stretch).
     for b in items:
         assert b.width == 604, f"column item width {b.width}"
+
+
+def test_flex_wrap_rows_onto_new_line():
+    from feetbrowser.layout import DocumentLayout
+    from feetbrowser.cssparser import CSSParser, style as apply_style
+    css = (".f { display: flex; flex-wrap: wrap; gap: 4px; }"
+           ".a { width: 100px; }")
+    html = ("<style>css</style><div class=f>"
+            "<div class=a>A</div><div class=a>B</div><div class=a>C</div>"
+            "<div class=a>D</div></div>")
+    dom = HTMLParser(html).parse()
+    apply_style(dom, CSSParser(css).parse())
+    body = next(n for n in tree_to_list(dom, []) if getattr(n, "tag", "") == "body")
+    doc = DocumentLayout(body, 260)  # 244px container -> 2 items per line
+    doc.layout()
+    items = [b for b in tree_to_list(doc, []) if b.node.tag == "div"
+             and b.node.attributes.get("class") not in (None, "f")]
+    line1, line2 = items[0:2], items[2:4]
+    assert all(b.y == line1[0].y for b in line1), "first two items share line one"
+    assert all(b.y == line2[0].y for b in line2), "last two items share line two"
+    assert line2[0].y > line1[0].y, "second line sits below the first"
+    assert line2[0].x == line1[0].x, "each line starts at the container edge"
+
+
+def test_flex_wrap_with_gap():
+    from feetbrowser.layout import DocumentLayout
+    from feetbrowser.cssparser import CSSParser, style as apply_style
+    css = (".f { display: flex; flex-wrap: wrap; row-gap: 10px; column-gap: 20px; }"
+           ".a { width: 90px; }")
+    html = ("<style>css</style><div class=f>"
+            "<div class=a>A</div><div class=a>B</div><div class=a>C</div>"
+            "<div class=a>D</div></div>")
+    dom = HTMLParser(html).parse()
+    apply_style(dom, CSSParser(css).parse())
+    body = next(n for n in tree_to_list(dom, []) if getattr(n, "tag", "") == "body")
+    doc = DocumentLayout(body, 260)  # 244px container -> 2 items per line
+    doc.layout()
+    items = [b for b in tree_to_list(doc, []) if b.node.tag == "div"
+             and b.node.attributes.get("class") not in (None, "f")]
+    a, b, c, d = items
+    assert b.x >= a.x + a.width + 20 - 1, "column-gap separates line-one items"
+    assert d.x >= c.x + 90 + 20 - 1, "line two items also honor column-gap"
+    assert c.y >= a.y + a.height + 10 - 1, "row-gap separates the two lines"
+    assert d.y == c.y, "line-two items share a row"
+
+
+def test_flex_wrap_justify_per_line():
+    from feetbrowser.layout import DocumentLayout
+    from feetbrowser.cssparser import CSSParser, style as apply_style
+    css = (".f { display: flex; flex-wrap: wrap; justify-content: space-between; }"
+           ".a { width: 90px; }")
+    html = ("<style>css</style><div class=f>"
+            "<div class=a>A</div><div class=a>B</div><div class=a>C</div>"
+            "<div class=a>D</div></div>")
+    dom = HTMLParser(html).parse()
+    apply_style(dom, CSSParser(css).parse())
+    body = next(n for n in tree_to_list(dom, []) if getattr(n, "tag", "") == "body")
+    doc = DocumentLayout(body, 260)  # 244px container -> 2 items per line
+    doc.layout()
+    container = next(b for b in tree_to_list(doc, [])
+                     if b.node.attributes.get("class") == "f")
+    items = [b for b in tree_to_list(doc, []) if b.node.tag == "div"
+             and b.node.attributes.get("class") not in (None, "f")]
+    a, b, c, d = items
+    # space-between runs independently per line: line one pins its first item
+    # at the container's left edge and pushes its second to the right edge...
+    assert a.x == container.x, "line-one first item at container start"
+    assert b.x > a.x + a.width, "space-between pushed the second item right"
+    # ...while line two starts over from the container's left edge again.
+    assert c.x == container.x, "line-two first item at container start"
+    assert d.x > c.x + c.width, "line-two items also spaced apart"
+    assert c.y > a.y, "line two is below line one"
+
+
+def test_flex_wrap_align_content_center():
+    from feetbrowser.layout import DocumentLayout
+    from feetbrowser.cssparser import CSSParser, style as apply_style
+    css = (".f { display: flex; flex-wrap: wrap; align-content: center; "
+           "height: 300px; row-gap: 10px; }"
+           ".a { width: 90px; }")
+    html = ("<style>css</style><div class=f>"
+            "<div class=a>A</div><div class=a>B</div><div class=a>C</div>"
+            "<div class=a>D</div><div class=a>E</div></div>")
+    dom = HTMLParser(html).parse()
+    apply_style(dom, CSSParser(css).parse())
+    body = next(n for n in tree_to_list(dom, []) if getattr(n, "tag", "") == "body")
+    doc = DocumentLayout(body, 260)  # 244px container -> 2 items per line
+    doc.layout()
+    container = next(b for b in tree_to_list(doc, [])
+                     if b.node.attributes.get("class") == "f")
+    items = [b for b in tree_to_list(doc, []) if b.node.tag == "div"
+             and b.node.attributes.get("class") not in (None, "f")]
+    top_item = min(items, key=lambda b: b.y)
+    bottom_item = max(items, key=lambda b: b.y + b.height)
+    top_gap = top_item.y - container.y
+    bottom_gap = (container.y + container.height
+                  - (bottom_item.y + bottom_item.height))
+    assert top_gap > 0, "wrapped lines pushed down from the container top"
+    assert abs(top_gap - bottom_gap) < 1, "line block centered vertically"
+
+
+def test_flex_wrap_align_items_per_line():
+    from feetbrowser.layout import DocumentLayout
+    from feetbrowser.cssparser import CSSParser, style as apply_style
+    css = (".f { display: flex; flex-wrap: wrap; align-items: flex-end; }"
+           ".a { width: 90px; }"
+           ".b { width: 90px; height: 60px; }")
+    html = ("<style>css</style><div class=f>"
+            "<div class=a>A</div><div class=b>B</div>"
+            "<div class=a>C</div><div class=a>D</div></div>")
+    dom = HTMLParser(html).parse()
+    apply_style(dom, CSSParser(css).parse())
+    body = next(n for n in tree_to_list(dom, []) if getattr(n, "tag", "") == "body")
+    doc = DocumentLayout(body, 260)  # 244px container -> 2 items per line
+    doc.layout()
+    items = [b for b in tree_to_list(doc, []) if b.node.tag == "div"
+             and b.node.attributes.get("class") not in (None, "f")]
+    a, b, c, d = items
+    # flex-end hangs each item from its line's bottom, so all bottoms on a
+    # line line up even though the 60px item rules the line's height.
+    assert abs((a.y + a.height) - (b.y + b.height)) < 1, \
+        "flex-end aligns items to the bottom of their line"
+    assert abs((c.y + c.height) - (d.y + d.height)) < 1, \
+        "line two also bottom-aligned"
+    assert c.y > a.y, "second line sits below the first"
+
+
+def test_flex_column_wrap_columns_side_by_side():
+    from feetbrowser.layout import DocumentLayout
+    from feetbrowser.cssparser import CSSParser, style as apply_style
+    css = (".f { display: flex; flex-direction: column; flex-wrap: wrap; "
+           "height: 200px; column-gap: 10px; }"
+           ".a { width: 80px; height: 60px; }")
+    html = ("<style>css</style><div class=f>"
+            "<div class=a>A</div><div class=a>B</div><div class=a>C</div>"
+            "<div class=a>D</div><div class=a>E</div></div>")
+    dom = HTMLParser(html).parse()
+    apply_style(dom, CSSParser(css).parse())
+    body = next(n for n in tree_to_list(dom, []) if getattr(n, "tag", "") == "body")
+    doc = DocumentLayout(body, 260)
+    doc.layout()
+    items = [b for b in tree_to_list(doc, []) if b.node.tag == "div"
+             and b.node.attributes.get("class") not in (None, "f")]
+    a, b, c, d, e = items
+    assert b.y > a.y and c.y > b.y, "first column stacks its items vertically"
+    assert c.x == a.x, "third item stays in the first column"
+    assert d.x > a.x, "fourth item flowed into a second column to the right"
+    assert d.x == e.x, "second-column items share an x"
+    assert abs(d.x - (a.x + a.width + 10)) < 1, "column-gap separates columns"
+    assert e.y > d.y, "second column stacks its items"
+    assert d.y == a.y, "both columns top out at the container top"
+
+
+def test_flex_wrap_reverse_orders_lines_bottom_up():
+    from feetbrowser.layout import DocumentLayout
+    from feetbrowser.cssparser import CSSParser, style as apply_style
+    css = (".f { display: flex; flex-wrap: wrap-reverse; row-gap: 8px; }"
+           ".a { width: 100px; }")
+    html = ("<style>css</style><div class=f>"
+            "<div class=a>A</div><div class=a>B</div><div class=a>C</div>"
+            "<div class=a>D</div></div>")
+    dom = HTMLParser(html).parse()
+    apply_style(dom, CSSParser(css).parse())
+    body = next(n for n in tree_to_list(dom, []) if getattr(n, "tag", "") == "body")
+    doc = DocumentLayout(body, 260)  # 244px container -> 2 items per line
+    doc.layout()
+    items = [b for b in tree_to_list(doc, []) if b.node.tag == "div"
+             and b.node.attributes.get("class") not in (None, "f")]
+    a, b, c, d = items
+    assert a.y == b.y, "first line items share a row"
+    assert c.y == d.y, "second line items share a row"
+    assert a.y > c.y, "wrap-reverse puts the first line below the second"
+    assert a.x == c.x, "lines still start at the container edge"
 
 
 def test_data_image_pipeline_renders_drawimage():
