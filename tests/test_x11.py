@@ -19,7 +19,8 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from feetbrowser import x11
-from feetbrowser.window import STATE_ALT, STATE_CONTROL, STATE_SHIFT
+from feetbrowser.window import (QUIET, STATE_ALT, STATE_CONTROL,
+                                STATE_SHIFT)
 
 # The two formats every ordinary server hands out: a little-endian machine
 # stores 0x00RRGGBB as B,G,R,pad, and a big-endian one stores it as pad,R,G,B.
@@ -270,6 +271,9 @@ if LIVE:
 
     _string_to_keysym = _extra("XStringToKeysym", x11.KeySym,
                                [ctypes.c_char_p])
+    _get_input_focus = _extra("XGetInputFocus", x11.Status,
+                              [x11.Display, ctypes.POINTER(x11.XID),
+                               ctypes.POINTER(ctypes.c_int)])
     _keysym_to_keycode = _extra("XKeysymToKeycode", ctypes.c_ubyte,
                                 [x11.Display, x11.KeySym])
     _get_image = _extra("XGetImage", ctypes.POINTER(x11.XImage),
@@ -517,6 +521,26 @@ def live_window_opens_at_the_size_asked_for():
     with _Session(640, 480) as win:
         eq(geometry(win), (640, 480), "the server disagrees")
         assert win.winfo_exists()
+
+
+def live_a_quiet_window_does_not_take_the_keyboard():
+    """The suite opens dozens of windows in a few seconds. Under QUIET each
+    one must map without the window manager placing it, raising it or handing
+    it the keyboard, while staying a real mapped window the live half can
+    read pixels back from. Without this the fix regresses silently, and the
+    only symptom is a machine nobody can type on while the tests run."""
+    if not QUIET:
+        print("  ..  quiet-window check needs FEETBROWSER_QUIET=1")
+        return
+    with _Session(640, 480) as win:
+        focus, revert = x11.XID(), ctypes.c_int()
+        _get_input_focus(win._display, ctypes.byref(focus),
+                         ctypes.byref(revert))
+        assert int(focus.value) != int(win._window), \
+            "a quiet window took the keyboard"
+        # Still real, mapped and the size asked for, or the quiet is
+        # worthless: the live tests below read pixels off this window.
+        eq(geometry(win), (640, 480), "the server disagrees")
 
 
 def live_present_puts_the_right_colours_on_the_server():

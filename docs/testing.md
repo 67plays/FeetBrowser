@@ -84,6 +84,36 @@ attribute in the mouse path once swallowed every click with the browser
 underneath looking healthy. Each skips itself with a message where its
 platform is not there, so the suite is green on all three either way.
 
+Real windows have real manners, and a suite that opens dozens of them in a
+few seconds inherits all of them: each one centres itself on the display,
+raises above everything and takes the keyboard, so for as long as the run
+lasts the machine belongs to the tests. `FEETBROWSER_QUIET` drops exactly
+those three habits and nothing else — a quiet window is still created,
+mapped, sized, drawn into and sent real events, so every assertion in those
+suites is testing what it tested before. `test.sh` and `test.cmd` set it, so
+the ordinary way of running the tests already leaves you your machine; set
+`FEETBROWSER_QUIET=0` when you want to watch the windows work.
+
+The mechanism differs per platform because the manners do: macOS runs the app
+under the accessory activation policy (no Dock icon, never becomes the active
+app) and orders each window in at the back instead of making it key; X11 maps
+the window override-redirect, which is the one portable way to tell a window
+manager not to place, decorate, raise or focus something — every other route
+is a hint it may ignore; Windows shows the window with `SW_SHOWNOACTIVATE`
+and skips `SetForegroundWindow`. Each backend's suite asserts the promise
+rather than the mechanism: open a quiet window, then check the keyboard did
+not move to it and that the window is nonetheless real and the size asked
+for. That last half matters — quiet is only worth having if the window it
+leaves behind is still the one the other tests are reading pixels off.
+
+One thing quiet does not do is make the windows invisible. On macOS they sit
+behind whatever you are working in; under X11 they map where the server puts
+them. Not ordering the window in at all was tried and does not work — AppKit
+gives an unordered window no usable backing store, and seventeen tests fail.
+If you want silence rather than good manners, the window suites skip cleanly
+when their platform is absent: quit XQuartz and `test_x11.py`'s live half
+steps aside on its own.
+
 `test_x11.py` splits in half. The arithmetic and the lookup tables — scanline
 padding, the byte layout a visual's channel masks imply, keysym names, wheel
 buttons — are plain functions over plain values, and those tests run

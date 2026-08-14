@@ -18,6 +18,16 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
+# Those window suites open dozens of real windows in a few seconds, and a
+# window's default manners -- centre itself, raise above everything, take the
+# keyboard -- make the machine unusable for as long as the run lasts. QUIET
+# drops exactly those three things and nothing else: the windows are still
+# created, mapped, drawn into and sent real events, so the suites still prove
+# what they proved before. Export it rather than assign it, so it reaches the
+# suites, and honour an existing value so `FEETBROWSER_QUIET=0 ./test.sh`
+# still gets you the windows when you want to watch them.
+export FEETBROWSER_QUIET="${FEETBROWSER_QUIET:-1}"
+
 if [ ! -x .venv/bin/python ]; then
   # Same venv run.sh builds, and for the same reason it is not sealed. That
   # reason used to be the image decoders and is not any more -- we decode our
