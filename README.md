@@ -39,7 +39,9 @@ directly.
 There is a second JavaScript engine, written from scratch in Zig and loaded
 with `ctypes` rather than built into a venv. `FEETBROWSER_JS=zig ./run.sh`
 selects it; `rust` is the default. Both pass the same test suite, and the
-design of the Zig one is in [docs/jszig.md](docs/jszig.md).
+design of the Zig one is in [docs/jszig.md](docs/jszig.md). That variable and
+every other one the browser reads are documented in
+[docs/usage.md](docs/usage.md#environment-variables).
 
 The window itself is ours too. macOS gets one through AppKit and Linux gets
 one through Xlib — both by ctypes, so there is nothing to install for either,

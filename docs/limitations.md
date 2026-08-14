@@ -20,8 +20,9 @@ are natural next milestones — the architecture has clean seams for each.
 
 There are two, and `FEETBROWSER_JS` picks between them: `rust` (the default)
 and `zig`. They share the same Python-facing API and the same test suite.
-What follows is what the Zig engine leaves out; its design is written up in
-`docs/jszig.md`.
+That variable and the rest of the environment are documented in
+[usage](usage.md#environment-variables). What follows is what the Zig engine
+leaves out; its design is written up in `docs/jszig.md`.
 
 **Syntax it will not parse.** ES modules — `import`/`export` are reported as
 "ES modules are not supported" rather than as a mystery syntax error, so a
