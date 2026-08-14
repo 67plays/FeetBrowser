@@ -168,6 +168,11 @@ jobs:
           type "%RUNNER_TEMP%\said.txt"
           findstr /c:"Desktop development with C++" "%RUNNER_TEMP%\said.txt" >nul || exit /b 1
           findstr /c:"rustup.rs" "%RUNNER_TEMP%\said.txt" >nul || exit /b 1
+          rem The GNU toolchain is the other answer people are given, and it
+          rem fails at dlltool rather than at link.exe. Someone sent down that
+          rem road by the paragraph above needs the rest of the story in the
+          rem same message, so assert it is still in there.
+          findstr /c:"dlltool.exe" "%RUNNER_TEMP%\said.txt" >nul || exit /b 1
 
   # The job above proves the browser needs no display. This one proves it can
   # use one: a real X server, a real window, real events, and a photograph of

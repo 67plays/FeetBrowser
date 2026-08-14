@@ -58,6 +58,34 @@ command prompt afterwards so the linker is on `PATH`, then run `run.cmd`
 again. `run.cmd` and `test.cmd` both say all of this themselves if the build
 fails, so nobody has to find this page first.
 
+There is a second route, and it is worth knowing what it does and does not
+save you. rustup's GNU toolchain links with MinGW rather than MSVC:
+
+```bat
+rustup toolchain install stable-x86_64-pc-windows-gnu
+rustup default stable-x86_64-pc-windows-gnu
+```
+
+That does build a working engine — the extension imports and the whole suite
+passes on it — but it is a swap, not a saving, because it has a prerequisite
+of its own that rustup does not install. Without MinGW-w64's binutils on
+`PATH` the build gets *past* the linker, spends a while compiling, and then
+stops at
+
+```
+error: error calling dlltool 'dlltool.exe': program not found
+error: could not compile `pyo3-ffi` (lib) due to 1 previous error
+```
+
+Install MinGW-w64 — [MSYS2](https://www.msys2.org) is one way — and put its
+`bin` directory on `PATH`. The `dlltool.exe` that rustup installs next to the
+toolchain is not a substitute: it is there, but it shells out to an assembler
+that ships in the same MinGW package, and without that it fails with
+`dlltool.exe: CreateProcess` instead. Of the two routes, Visual Studio is the
+one CI builds against, so it is the better-trodden one; the GNU route was
+verified by experiment on a Windows runner rather than by a job in this
+repository.
+
 If `python` isn't on your `PATH` — a fresh install from the Microsoft Store
 often leaves only the launcher — use `py -3` in place of `python` in the two
 commands `run.cmd` runs.

@@ -93,8 +93,8 @@ echo.
 echo FeetBrowser: the JavaScript engine did not build.
 echo.
 echo The compiler's own output is above and says what went wrong. If it
-echo mentions link.exe, or a missing linker, that is the system side of a Rust
-echo install rather than anything about this repository.
+echo mentions link.exe or dlltool.exe, or a missing linker, that is the system
+echo side of a Rust install rather than anything about this repository.
 echo.
 
 :say_linker
@@ -111,4 +111,24 @@ echo is word for word the one you get having never installed them.
 echo.
 echo Open a new command prompt afterwards so the linker is on your PATH, then
 echo run this script again.
+echo.
+echo There is a second route, if a multi-gigabyte Visual Studio download is
+echo not what you want. rustup's GNU toolchain links with MinGW instead:
+echo.
+echo   rustup toolchain install stable-x86_64-pc-windows-gnu
+echo   rustup default stable-x86_64-pc-windows-gnu
+echo.
+echo That one has a prerequisite rustup does not install either, so it trades
+echo one download for another rather than avoiding one. If the build gets
+echo further and then stops at
+echo.
+echo   error calling dlltool 'dlltool.exe': program not found
+echo.
+echo it is MinGW-w64's binutils that are missing. Install MinGW-w64 -- MSYS2,
+echo at https://www.msys2.org, is one way -- and put its bin directory on your
+echo PATH. The dlltool.exe that rustup installs alongside the toolchain does
+echo not stand in for them: it needs the assembler from that same package
+echo sitting next to it, and fails differently without it.
+echo.
+echo Of the two routes, Visual Studio is the one this project builds against.
 goto :eof

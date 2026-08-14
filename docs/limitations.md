@@ -26,10 +26,20 @@ other two platforms do not: rustup selects the MSVC toolchain but does not
 provide the linker it calls, and Windows ships no linker of its own, so the
 first `run.cmd` stops at `error: linker \`link.exe\` not found` until the
 Visual Studio build tools are installed. See [usage.md](usage.md) for the
-exact download and the one workload to tick. Whether the GNU toolchain can
-stand in for it here is untested and not claimed: official CPython is built
-with MSVC, and MinGW does not read the import-library format that produces,
-so MSVC is the only toolchain this has been built with.
+exact download and the one workload to tick.
+
+The GNU toolchain is a real alternative rather than a dead end, which is worth
+saying because the opposite is usually assumed: official CPython is built with
+MSVC, but `pyo3-ffi` does not read MSVC's import libraries, it generates its
+own with `dlltool`, so a `stable-x86_64-pc-windows-gnu` build produces an
+extension that imports and passes the whole suite. It is not the cheaper road,
+though. It needs MinGW-w64's binutils on `PATH`; without them the build gets
+past the linker and stops at `error calling dlltool 'dlltool.exe': program not
+found` instead. The `dlltool.exe` rustup itself installs beside the toolchain
+does not stand in for them — it shells out to an assembler that ships in the
+same package and fails without it. So the GNU route swaps one download for
+another rather than removing one, and MSVC is what this project builds against
+in CI. The GNU path was checked by experiment on a Windows runner, not here.
 
 **Windows, specifically:** the process asks for per-monitor-v2 DPI awareness,
 so Windows hands over the real pixels rather than scaling a 96-DPI frame up.

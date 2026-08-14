@@ -113,8 +113,8 @@ goto :say_linker
 :say_nolinker
 echo.
 echo The JavaScript engine did not build. The compiler's own output is above.
-echo If it mentions link.exe, or a missing linker, that is the system side of
-echo a Rust install rather than anything about this repository.
+echo If it mentions link.exe or dlltool.exe, or a missing linker, that is the
+echo system side of a Rust install rather than anything about this repository.
 echo.
 
 :say_linker
@@ -125,4 +125,11 @@ echo development with C++" workload in its installer. Ticking it is the part
 echo that gets missed: the Build Tools without that workload leave you with no
 echo link.exe at all, and the error is identical to never having installed
 echo them. Open a new command prompt afterwards, then run this script again.
+echo.
+echo rustup's GNU toolchain (rustup default stable-x86_64-pc-windows-gnu) is a
+echo second route, but it trades one install for another rather than avoiding
+echo one: it wants MinGW-w64's binutils on PATH, and without them stops at
+echo "error calling dlltool 'dlltool.exe': program not found". MSYS2, at
+echo https://www.msys2.org, is one way to get them. Visual Studio is the route
+echo this project builds against.
 goto :eof
