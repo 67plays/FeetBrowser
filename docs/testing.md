@@ -24,7 +24,8 @@ tests/
   test_x11.py       the X11 window, driven by real X events (needs a server)
   x11_shot.py       photographs a real X11 window with XGetImage (CI artifact)
   test_units.py     offline unit tests (URL, HTML, CSS, layout, internal pages)
-  test_js.py        offline tests for the JS engine + DOM bridge
+  test_js.py        offline tests for the JS engine + DOM bridge (run twice,
+                    once per engine, via FEETBROWSER_JS)
   test_shoes.py     the Shoes theme manager
   test_nav.py       click-to-navigate, history, view-source (needs network)
   test_toes.py      toe engine + ToeHub tests (install/uninstall/toggle)

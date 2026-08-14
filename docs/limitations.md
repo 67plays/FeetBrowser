@@ -18,8 +18,8 @@ are natural next milestones — the architecture has clean seams for each.
 
 ## The JavaScript engine
 
-There are two, and `FEETBROWSER_JS` picks between them: `zig` (the default)
-and `rust`. They share the same Python-facing API and the same test suite.
+There are two, and `FEETBROWSER_JS` picks between them: `rust` (the default)
+and `zig`. They share the same Python-facing API and the same test suite.
 What follows is what the Zig engine leaves out; its design is written up in
 `docs/jszig.md`.
 
@@ -42,19 +42,25 @@ tagged-template raw strings are cooked-only.
 `getUTCHours()` agree and `getTimezoneOffset()` is always 0. Regular
 expressions are a backtracking matcher over bytes: case-insensitive matching
 folds ASCII only, and there are no lookbehind, named groups, or unicode
-property escapes. `Number.prototype.toFixed` rounds the double it is given
+property escapes. `toUpperCase` and `toLowerCase` map per character across
+ASCII, Latin-1, Latin Extended-A, Greek and Cyrillic, and leave other scripts
+alone; the mappings that change a string's length (`ß` to `SS`) and the ones
+that depend on position (Greek final sigma) are not done.
+`Number.prototype.toFixed` rounds the double it is given
 rather than the decimal a reader imagines, which is what most engines do but
 not all of them. Sorting is stable.
 
 **The DOM is smaller than the language.** The bridge exposes elements,
 attributes, `classList`, inline styles, `querySelector`/`querySelectorAll`
-(tag, class and id selectors only — no combinators), `getElementsBy*`,
-`innerHTML`, `textContent`, node insertion and removal, events, timers,
-`fetch`, `XMLHttpRequest`, `location`, and `localStorage`. Text nodes have no
-wrapper, so `childNodes` and `firstChild` see elements only; there is no
-`getComputedStyle`, no `Element`/`Node` constructor objects to hang polyfills
-on, and no CSSOM. jQuery 1.8 loads and runs against this; Modernizr and
-anything that measures a laid-out box do not.
+(tag, class and id selectors only — no combinators), `matches`, `closest`,
+`getElementsBy*`, `innerHTML`, `outerHTML`, `textContent`, document
+fragments, node insertion and removal, events, timers, `fetch`,
+`XMLHttpRequest`, `location`, `getComputedStyle`, and `localStorage`.
+`createTextNode` returns a text-node wrapper, but the tree walks
+(`childNodes`, `firstChild`) still see elements only; there are no
+`Element`/`Node` constructor objects to hang polyfills on, and no CSSOM.
+jQuery 1.8 loads and runs against this; Modernizr and anything that measures
+a laid-out box do not.
 
 **Cycles across the boundary are not collected.** The engine's collector is a
 precise mark-and-sweep over its own heap, and Python's is a reference count

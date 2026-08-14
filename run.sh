@@ -1,19 +1,18 @@
 #!/usr/bin/env bash
 # Launch FeetBrowser. No GUI toolkit needed -- rendering is our own, and the
 # only outside requirement is a system font; every platform we support ships
-# one.
+# one. The JavaScript engine is the Rust extension `feetbrowser_engine`,
+# which maturin builds into a local venv the first time you run this -- so
+# the first start compiles Rust and says so, and no later one does.
 #
-# The JavaScript engine is ours too, written in Zig and built as a plain
-# dynamic library the browser loads with ctypes. That means the system
-# python3 can run the whole browser: no venv, no extension module, nothing
-# tied to a Python version. Set FEETBROWSER_JS=rust to run the Rust engine
-# instead, which is a CPython extension `feetbrowser_engine` that maturin
-# builds into a local venv the first time you ask for it -- so that first
-# start compiles Rust and says so, and no later one does.
+# There is a second engine, written in Zig and built as a plain dynamic
+# library the browser loads with ctypes. FEETBROWSER_JS=zig selects it, and
+# then the system python3 can run the whole browser: no venv, no extension
+# module, nothing tied to a Python version.
 set -euo pipefail
 cd "$(dirname "$0")"
 
-if [ "${FEETBROWSER_JS:-zig}" = "rust" ]; then
+if [ "${FEETBROWSER_JS:-rust}" != "zig" ]; then
   if python3 -c "import feetbrowser_engine" 2>/dev/null; then
     exec python3 -m feetbrowser "$@"
   fi
@@ -53,7 +52,7 @@ directory:
 
 Other ways to install it, including your distribution's packages, are at
 https://rustup.rs. Open a new shell afterwards so cargo is on your PATH, then
-run this script again. Or leave FEETBROWSER_JS unset and run the Zig engine,
+run this script again. Or set FEETBROWSER_JS=zig and run the other engine,
 which needs only a Zig compiler.
 NORUST
       exit 1

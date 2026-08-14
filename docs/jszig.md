@@ -392,6 +392,12 @@ a property read on `document.body` is a call out of Zig, into Python, and
 back. The boundary is five function pointers — get, set, call, construct,
 release — and one 24-byte wire struct.
 
+`FEETBROWSER_JS=zig` selects it. The default is `rust`, the older engine:
+this one has passed the same test suite but has not spent nearly as long in
+front of real pages, and an engine should earn the default rather than be
+handed it. `feetbrowser/jsengine.py` and `feetbrowser/jsdom.py` are where the
+choice is made, once, on first use.
+
 ## Scope
 
 Implemented: closures, `var`/`let`/`const` with a temporal dead zone, objects,

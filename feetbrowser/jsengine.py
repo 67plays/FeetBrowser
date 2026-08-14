@@ -3,13 +3,15 @@
 The browser talks to `Interpreter`, `JSException` and `UNDEFINED` and does
 not care which engine is behind them. There are two:
 
-    zig     our own engine, a dynamic library loaded with ctypes (the default)
-    rust    the `feetbrowser_engine` extension module
+    rust    the `feetbrowser_engine` extension module (the default)
+    zig     our own engine, a dynamic library loaded with ctypes
 
 Selection is by the ``FEETBROWSER_JS`` environment variable. Both are real
 choices, not a primary and a fallback: they run the same test suite, and
 having two implementations of the same contract is how a bug in either one
-gets found.
+gets found. The Rust one is the default because it is the one that has been
+in front of real pages the longest, and a new engine should have to earn
+that position rather than be handed it.
 
 Resolution is deferred to first use, the way `gui.py` defers picking a
 rendering backend, so that merely importing this module never builds or
@@ -18,7 +20,7 @@ loads anything.
 
 import os
 
-ENGINE = os.environ.get("FEETBROWSER_JS", "zig").strip().lower()
+ENGINE = os.environ.get("FEETBROWSER_JS", "rust").strip().lower()
 
 def _use_zig():
     from . import jszig
@@ -49,10 +51,10 @@ def _resolve():
     global _impl, ENGINE
     if _impl is not None:
         return _impl
-    if ENGINE == "rust":
-        _impl = _use_rust()
-    else:
+    if ENGINE == "zig":
         _impl = _use_zig()
+    else:
+        _impl = _use_rust()
     ENGINE = _impl["name"]
     return _impl
 

@@ -28,8 +28,9 @@ jobs:
         with:
           version: 0.14.0
 
-      # The default engine. A dynamic library the browser loads with ctypes,
-      # so nothing here is tied to the Python version above.
+      # The opt-in engine, selected by FEETBROWSER_JS=zig. A dynamic library
+      # the browser loads with ctypes, so nothing here is tied to the Python
+      # version above.
       - name: Build the Zig JS engine
         run: |
           cd zig

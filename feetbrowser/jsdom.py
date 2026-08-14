@@ -25,10 +25,10 @@ def _resolve():
     global _impl
     if _impl is not None:
         return _impl
-    if jsengine.engine() == "rust":
-        from . import jsdom_rust as impl
-    else:
+    if jsengine.engine() == "zig":
         from . import jsdom_py as impl
+    else:
+        from . import jsdom_rust as impl
     _impl = impl
     return impl
 
