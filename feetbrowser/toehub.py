@@ -268,24 +268,27 @@ def _handle_hub(url, browser):
 
 def _config_page(url, name, browser):
     """Render the config page for a toe, or apply a set action."""
-    ctx = _find_context(browser, name)
-    if ctx is None:
-        return {}, _msg(f"<b>{name}</b> is not installed."), "text/html"
-    # toehub://config/<name>/set/<key>/<value>
+    # toehub://config/<name>[/set/<key>/<value>]
     parts = [urllib.parse.unquote(p) for p in (url.path or "").split("/")
              if p]
-    if len(parts) >= 3 and parts[0] == name and parts[1] == "set":
+    if not parts:
+        return {}, _msg("Missing toe name."), "text/html"
+    toe_name = parts[0]
+    ctx = _find_context(browser, toe_name)
+    if ctx is None:
+        return {}, _msg(f"<b>{toe_name}</b> is not installed."), "text/html"
+    if len(parts) >= 4 and parts[1] == "set":
         key, value = parts[2], "/".join(parts[3:])
         ctx.set_config(key, value)
     options = ctx.config_options()
     if not options:
-        return {}, _config_page_html(name, "<div class='box'>This toe has "
-            "no configurable options.</div>"), "text/html"
+        return {}, _config_page_html(toe_name, "<div class='box'>This toe "
+            "has no configurable options.</div>"), "text/html"
     rows = []
     for key, opt in options:
         value = ctx.config_value(key)
-        rows.append(_config_option_html(name, key, opt, value))
-    return {}, _config_page_html(name, "\n".join(rows)), "text/html"
+        rows.append(_config_option_html(toe_name, key, opt, value))
+    return {}, _config_page_html(toe_name, "\n".join(rows)), "text/html"
 
 
 def _config_page_html(name, body):
