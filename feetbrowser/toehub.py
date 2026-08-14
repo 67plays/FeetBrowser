@@ -337,7 +337,7 @@ def _config_option_html(name, key, opt, value):
     help_html = f'<div class="dim">{_esc(opt.help)}</div>' if opt.help else ""
     return (f'<div class="box"><b>{_esc(opt.label)}</b> '
             f'<span class="v">= {value_html}</span><br>{control}'
-            f'{help_html}</div>')
+            f'<br>{help_html}</div>')
 
 
 def _find_context(browser, name):
