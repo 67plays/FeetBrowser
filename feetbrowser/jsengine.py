@@ -84,11 +84,19 @@ class _ExecutionBudget(BaseException):
 
 
 class _Break(BaseException):
-    __slots__ = ()
+    """`break`, optionally aimed at a named enclosing statement."""
+    __slots__ = ("label",)
+
+    def __init__(self, label=None):
+        self.label = label
 
 
 class _Continue(BaseException):
-    __slots__ = ()
+    """`continue`, optionally aimed at a named enclosing loop."""
+    __slots__ = ("label",)
+
+    def __init__(self, label=None):
+        self.label = label
 
 
 class _Suspend:
@@ -311,6 +319,16 @@ class Update:
 
 
 @dataclass
+class Sequence:
+    """`a, b, c` -- evaluate each in turn, and the value is the last one.
+
+    Minifiers love this: it is how `return f(x), y` and `for (i = 0, n = 5;;)`
+    get written once every statement boundary has been squeezed out.
+    """
+    items: list
+
+
+@dataclass
 class Binary:
     op: str
     left: object
@@ -529,12 +547,21 @@ class Return:
 
 @dataclass
 class Break:
-    pass
+    label: object = None
 
 
 @dataclass
 class Continue:
-    pass
+    label: object = None
+
+
+@dataclass
+class Labelled:
+    """`name: statement`. Only two things ever look at the name: a `break`
+    or `continue` that spells it out, and a minifier's `a: { ... break a }`
+    standing in for the early exit an `if` would have cost more bytes."""
+    name: str
+    body: object
 
 
 @dataclass
@@ -2116,8 +2143,38 @@ class _Parser:
         """Parse a standalone expression (used for template substitutions)."""
         return self._expression()
 
+    def _optional_label(self):
+        """The name after `break`/`continue`, when there is one on the line.
+
+        A newline ends the statement instead (automatic semicolon insertion),
+        so `break\nfoo()` breaks and then calls -- it does not break to a
+        label named foo.
+        """
+        kind, value, offset = self._peek()
+        if kind != "ident":
+            return None
+        prev_end = self.tokens[self.pos - 1][2] if self.pos else 0
+        if "\n" in self.source[prev_end:offset]:
+            return None
+        self.pos += 1
+        return value
+
     def _statement(self):
         kind, value, _ = self._peek()
+        if kind == "ident" and self._peek2()[:2] == ("punct", ":"):
+            self.pos += 2
+            body = self._statement()
+            # A loop needs its own name to hand back to `continue name`;
+            # everything else only ever sees a `break`, which the Labelled
+            # node catches for itself.
+            if isinstance(body, (For, ForIn, ForOf, While, DoWhile)):
+                body.label = value
+            return Labelled(value, body)
+        if kind == "punct" and value == ";":
+            # The empty statement. `if (a) ; else b()` is real code, and
+            # `for (;;) ;` is how you spell a body-less loop.
+            self.pos += 1
+            return Block([])
         if kind == "punct" and value == "{":
             return Block(self._parse_stmts_until("}"))
         if kind == "kw" and value in self._STMT:
@@ -2130,7 +2187,7 @@ class _Parser:
             name = self._expect_ident()
             params, defaults, rest, body = self._function_rest(True)
             return FunctionDecl(name, params, body, True, defaults, rest)
-        return ExprStmt(self._expression())
+        return ExprStmt(self._sequence())
 
     def _parse_stmts_until(self, closing):
         if closing is not None:
@@ -2334,11 +2391,15 @@ class _Parser:
     def _return_statement(self):
         kind, value, _ = self._peek()
         if kind is not None and not (kind == "punct" and value in (";", "}")):
-            return Return(self._expression())
+            return Return(self._sequence())
         return Return(None)
 
     def _if_statement(self):
         cond, then = self._cond_body()
+        # The semicolon belongs to the statement it ends, and only the
+        # statement list bothers to eat one. Left here it hides the `else`
+        # in `if (a) b(); else c();` -- which is every minified if/else.
+        self._match_punct(";")
         else_stmt = self._statement() if self._match_kw("else") else None
         return If(cond, then, else_stmt)
 
@@ -2351,14 +2412,14 @@ class _Parser:
         self._match_punct(";")  # ASI: `do stmt; while(...)`
         self._match_kw("while")
         self._expect_punct("(")
-        cond = self._expression()
+        cond = self._sequence()
         self._expect_punct(")")
         self._match_punct(";")
         return DoWhile(body, cond)
 
     def _switch_statement(self):
         self._expect_punct("(")
-        expr = self._expression()
+        expr = self._sequence()
         self._expect_punct(")")
         self._expect_punct("{")
         cases = []
@@ -2397,7 +2458,7 @@ class _Parser:
     def _cond_body(self):
         """Parse `(expression)` then a statement body."""
         self._expect_punct("(")
-        cond = self._expression()
+        cond = self._sequence()
         self._expect_punct(")")
         return cond, self._statement()
 
@@ -2413,7 +2474,7 @@ class _Parser:
                 k2, v2, _ = self._peek()
                 if k2 == "kw" and v2 in ("in", "of"):
                     self.pos += 1
-                    iterable = self._expression()
+                    iterable = self._sequence()
                     self._expect_punct(")")
                     body = self._statement()
                     if v2 == "in":
@@ -2427,7 +2488,7 @@ class _Parser:
                 k2, v2, _ = self._peek()
                 if k2 == "kw" and v2 in ("in", "of"):
                     self.pos += 1
-                    iterable = self._expression()
+                    iterable = self._sequence()
                     self._expect_punct(")")
                     body = self._statement()
                     if v2 == "in":
@@ -2441,23 +2502,23 @@ class _Parser:
                 self.pos += 1
                 init = VarDecl(value, self._declaration_list())
             else:
-                init = ExprStmt(self._expression())
+                init = ExprStmt(self._sequence())
         self._expect_punct(";")
         cond = None
         kind, value, _ = self._peek()
         if not (kind == "punct" and value == ";"):
-            cond = self._expression()
+            cond = self._sequence()
         self._expect_punct(";")
         update = None
         kind, value, _ = self._peek()
         if not (kind == "punct" and value == ")"):
-            update = self._expression()
+            update = self._sequence()
         self._expect_punct(")")
         body = self._statement()
         return For(init, cond, update, body)
 
     def _throw_statement(self):
-        return Throw(self._expression())
+        return Throw(self._sequence())
 
     def _try_statement(self):
         try_block = self._block()
@@ -2474,7 +2535,23 @@ class _Parser:
     # -- expressions --------------------------------------------------------
 
     def _expression(self):
+        """One expression, stopping at a comma.
+
+        This is the form that goes in an argument list, an array element or
+        an object value -- everywhere a comma separates things rather than
+        joining them. `_sequence` is the other one.
+        """
         return self._assign()
+
+    def _sequence(self):
+        """An expression where a comma joins rather than separates."""
+        node = self._assign()
+        if self._peek()[:2] != ("punct", ","):
+            return node
+        items = [node]
+        while self._match_punct(","):
+            items.append(self._assign())
+        return Sequence(items)
 
     def _assign(self):
         left = self._conditional()
@@ -2692,10 +2769,10 @@ class _Parser:
                     params, defaults, rest = self._param_list()
                     return self._arrow_rest(params, defaults, rest, False)
                 self.pos += 1
-                node = self._expression()
                 # Comma expressions inside parens: (0, fn)(...), (a, b).
-                while self._match_punct(","):
-                    node = self._expression()
+                # The earlier operands are not spare -- `(a = 1, a)` is only
+                # worth writing because the assignment happens.
+                node = self._sequence()
                 self._expect_punct(")")
                 return node
             if value == "[":
@@ -2808,8 +2885,8 @@ _Parser._STMT = {
     "do": lambda s: s._do_while_statement(),
     "switch": lambda s: s._switch_statement(),
     "for": lambda s: s._for_statement(),
-    "break": lambda s: Break(),
-    "continue": lambda s: Continue(),
+    "break": lambda s: Break(s._optional_label()),
+    "continue": lambda s: Continue(s._optional_label()),
     "throw": lambda s: s._throw_statement(),
     "try": lambda s: s._try_statement(),
 }
@@ -3839,6 +3916,11 @@ class Interpreter:
             return (yield from self._eval_unary(node, env))
         if isinstance(node, Update):
             return (yield from self._eval_update(node, env))
+        if isinstance(node, Sequence):
+            value = UNDEFINED
+            for item in node.items:
+                value = yield from self._eval(item, env)
+            return value
         if isinstance(node, Binary):
             left = yield from self._eval(node.left, env)
             right = yield from self._eval(node.right, env)
@@ -4209,20 +4291,33 @@ class Interpreter:
             while self._truthy((yield from self._eval(node.cond, env))):
                 try:
                     yield from self._exec(node.body, env)
-                except _Break:
+                except _Break as b:
+                    if not self._mine(b, node):
+                        raise
                     break
-                except _Continue:
+                except _Continue as c:
+                    if not self._mine(c, node):
+                        raise
                     continue
         elif isinstance(node, DoWhile):
             while True:
                 try:
                     yield from self._exec(node.body, env)
-                except _Break:
+                except _Break as b:
+                    if not self._mine(b, node):
+                        raise
                     break
-                except _Continue:
-                    pass
+                except _Continue as c:
+                    if not self._mine(c, node):
+                        raise
                 if not self._truthy((yield from self._eval(node.cond, env))):
                     break
+        elif isinstance(node, Labelled):
+            try:
+                yield from self._exec(node.body, env)
+            except _Break as b:
+                if b.label != node.name:
+                    raise
         elif isinstance(node, Switch):
             yield from self._exec_switch(node, env)
         elif isinstance(node, For):
@@ -4236,15 +4331,19 @@ class Interpreter:
                 else (yield from self._eval(node.value, env))
             raise _Return(value)
         elif isinstance(node, Break):
-            raise _Break()
+            raise _Break(node.label)
         elif isinstance(node, Continue):
-            raise _Continue()
+            raise _Continue(node.label)
         elif isinstance(node, Throw):
             raise _JSThrow((yield from self._eval(node.expr, env)))
         elif isinstance(node, TryCatch):
             yield from self._exec_try(node, env)
         else:
             raise JSException(f"Unknown statement {type(node).__name__}.")
+
+    def _mine(self, signal, node):
+        """Whether a break/continue aimed at a label belongs to this loop."""
+        return signal.label is None or signal.label == getattr(node, "label", None)
 
     def _exec_for(self, node, env):
         child = Environment(env)
@@ -4254,10 +4353,13 @@ class Interpreter:
                 self._truthy((yield from self._eval(node.cond, child))):
             try:
                 yield from self._exec(node.body, child)
-            except _Break:
+            except _Break as b:
+                if not self._mine(b, node):
+                    raise
                 break
-            except _Continue:
-                pass
+            except _Continue as c:
+                if not self._mine(c, node):
+                    raise
             if node.update is not None:
                 yield from self._eval(node.update, child)
 
@@ -4280,7 +4382,9 @@ class Interpreter:
             try:
                 for stmt in stmts:
                     yield from self._exec(stmt, env)
-            except _Break:
+            except _Break as b:
+                if b.label is not None:
+                    raise
                 break
             except _Continue:
                 raise
@@ -4375,9 +4479,13 @@ class Interpreter:
             self._bind_loop_var(child, node.var_kind, node.name, key)
             try:
                 yield from self._exec(node.body, child)
-            except _Break:
+            except _Break as b:
+                if not self._mine(b, node):
+                    raise
                 break
-            except _Continue:
+            except _Continue as c:
+                if not self._mine(c, node):
+                    raise
                 continue
 
     def _exec_for_of(self, node, env):
@@ -4393,9 +4501,13 @@ class Interpreter:
             self._bind_loop_var(child, node.var_kind, node.name, item)
             try:
                 yield from self._exec(node.body, child)
-            except _Break:
+            except _Break as b:
+                if not self._mine(b, node):
+                    raise
                 break
-            except _Continue:
+            except _Continue as c:
+                if not self._mine(c, node):
+                    raise
                 continue
 
     def _exec_try(self, node, env):
