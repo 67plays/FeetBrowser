@@ -443,6 +443,57 @@ def test_a_frame_is_presented_after_interaction():
             "nothing was presented after a tab opened"
 
 
+def _tall_page(br):
+    """Load a page far taller than the window and return its tab."""
+    br.new_tab("data:text/html," + "".join("<p>line %d</p>" % i
+                                           for i in range(300)))
+    br.draw()
+    tab = br.active_tab
+    assert tab.content_height() > br.tab_height(), "the page is not tall"
+    return tab
+
+
+def test_dragging_the_scrollbar_scrolls_the_page():
+    """AppKit's own three events -- mouseDown, mouseDragged, mouseUp -- are
+    what the scrollbar is dragged with, and mouseDragged is the one nothing
+    used to be listening for on the bar."""
+    with _Browser() as br:
+        tab = _tall_page(br)
+        # An unscrolled page puts the thumb at the very top of the track.
+        thumb_top = br.chrome_height()
+        x = br.canvas.winfo_width() - 7
+        send_mouse(br.window, cocoa._LEFT_DOWN, x, thumb_top + 5)
+        assert tab.scroll == 0, "pressing the thumb jumped the page"
+        send_mouse(br.window, cocoa._LEFT_DRAGGED, x, thumb_top + 105)
+        assert tab.scroll > 0, "mouseDragged on the thumb did not scroll"
+        send_mouse(br.window, cocoa._LEFT_UP, x, thumb_top + 105)
+        settled = tab.scroll
+        send_mouse(br.window, cocoa._LEFT_DRAGGED, x, thumb_top + 300)
+        assert tab.scroll == settled, "the drag survived mouseUp"
+
+
+def test_a_drag_that_leaves_the_window_still_scrolls():
+    """AppKit keeps sending the drag to the window the press went to, so the
+    coordinates run off the top and bottom of the window -- and dragging the
+    bar past the end of the document has to stop where the wheel stops."""
+    with _Browser() as br:
+        tab = _tall_page(br)
+        tab.scroll_by(10 ** 9)
+        bottom = tab.scroll
+        tab.set_scroll(0)
+        br.draw()
+        thumb_top = br.chrome_height()
+        x = br.canvas.winfo_width() - 7
+        send_mouse(br.window, cocoa._LEFT_DOWN, x, thumb_top + 5)
+        send_mouse(br.window, cocoa._LEFT_DRAGGED, x, br.window.height + 4000)
+        assert tab.scroll == bottom, \
+            "dragged off the bottom to %r, the wheel stops at %r" % (tab.scroll,
+                                                                    bottom)
+        send_mouse(br.window, cocoa._LEFT_DRAGGED, x, -4000)
+        assert tab.scroll == 0, "dragged off the top to %r" % tab.scroll
+        send_mouse(br.window, cocoa._LEFT_UP, x, -4000)
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

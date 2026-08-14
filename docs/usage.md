@@ -212,6 +212,12 @@ ways the browser ends up headless.
 | `↑` / `↓` / wheel | scroll | `Esc` | blur address / input |
 | middle / `Ctrl`-click | open link in new tab | `Ctrl-PgUp/Dn` | cycle tabs |
 
+The scrollbar down the right-hand edge works with the mouse as well: drag the
+thumb and the page follows it, keeping whatever part of the thumb you grabbed
+under the pointer, and press the empty track above or below the thumb to jump
+there and carry straight on dragging. Both stop at the same top and bottom of
+the document the wheel does.
+
 Type a URL in the address bar and press Enter, or type words to search
 (DuckDuckGo HTML). Bare hosts without a scheme (`example.com:8080`,
 `localhost:8000`) are assumed to be `https://`.

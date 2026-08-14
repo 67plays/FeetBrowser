@@ -1332,6 +1332,167 @@ def test_settle_waits_for_images_a_finished_document_asked_for():
         shutil.rmtree(work, ignore_errors=True)
 
 
+# -- the scrollbar, dragged ------------------------------------------------
+#
+# The bar is painted onto the same canvas as everything else and is not a
+# widget, so nothing in the platform layers knows it exists: whether a press
+# on it scrolls is decided in browser.py, and both backends deliver the
+# press, the drag and the release through exactly the bindings used here.
+# That is why these live with the rest of the drawn chrome rather than in
+# either platform suite -- and why the platform suites each drive the same
+# gesture through their own event translation as well.
+
+def _scrollable_browser(lines=300):
+    """A browser showing a page far taller than its window."""
+    from feetbrowser.browser import Browser
+
+    browser = Browser()
+    browser.new_tab("data:text/html," + "".join("<p>line %d</p>" % i
+                                                for i in range(lines)))
+    browser.draw()
+    tab = browser.tabs[0]
+    assert tab.content_height() > browser.tab_height(), \
+        "the fixture page is not tall enough to scroll"
+    assert _thumb(browser)[0] is not None, "no scrollbar is drawn"
+    return browser, tab
+
+
+def _mouse(browser, sequence, y, x=None):
+    """Press, drag or release on the scrollbar, the way a backend would."""
+    if x is None:
+        x = browser.canvas.winfo_width() - 7  # the middle of the thumb
+    browser.window.dispatch(sequence, Event(x=x, y=y, num=1, type=sequence))
+
+
+def _thumb(browser):
+    """(top, height) of the thumb, read off the painted pixels.
+
+    Off the pixels rather than out of the browser's own arithmetic, so these
+    tests say where the reader can see the thumb and not merely where the
+    code that draws it thinks it is.
+    """
+    rgb = tuple(canvasmod.color(browser.c("scroll_thumb"))[:3])
+    x = browser.canvas.winfo_width() - 7
+    surface = browser.canvas.render()
+    rows = [y for y in range(surface.height) if _pixel(surface, x, y) == rgb]
+    if not rows:
+        return None, None
+    return min(rows), max(rows) - min(rows) + 1
+
+
+def _track(browser):
+    """(top, height) of the whole track the thumb travels in."""
+    return browser.chrome_height(), browser.tab_height()
+
+
+def _span(tab):
+    """The scroll offset the bottom of the track stands for."""
+    return tab.content_height() - tab.tab_height
+
+
+def test_dragging_the_scrollbar_scrolls_the_page():
+    """The bug: the bar was painted and nothing hit-tested it, so a press on
+    it started a text selection and the page never moved."""
+    browser, tab = _scrollable_browser()
+    top, _height = _thumb(browser)
+    _mouse(browser, "<Button-1>", top + 5)
+    assert tab.scroll == 0, "merely grabbing the thumb moved the page"
+    assert tab.selection is None, "the press started a text selection"
+    _mouse(browser, "<B1-Motion>", top + 105)
+    assert tab.scroll > 0, "dragging the scrollbar did not scroll the page"
+    # 100px of a track that is (track height - thumb height) long, in
+    # document terms: the thumb covers the viewport, the rest is the scroll.
+    _track_top, track_h = _track(browser)
+    expected = 100 / (track_h - _thumb(browser)[1]) * _span(tab)
+    assert abs(tab.scroll - expected) < 10, \
+        "scrolled %r, expected about %r" % (tab.scroll, expected)
+
+
+def test_the_grabbed_point_stays_under_the_pointer():
+    """Whatever part of the thumb was grabbed is the part that follows the
+    pointer -- otherwise the page jumps on the first pixel of movement."""
+    browser, _tab = _scrollable_browser()
+    top, height = _thumb(browser)
+    grab = top + height - 3  # grabbed near the bottom edge of the thumb
+    _mouse(browser, "<Button-1>", grab)
+    assert _thumb(browser)[0] == top, "the thumb moved when it was grabbed"
+    for step in (40, 90, 61):
+        _mouse(browser, "<B1-Motion>", grab + step)
+        moved = _thumb(browser)[0] - top
+        assert abs(moved - step) <= 1, \
+            "pointer moved %d, thumb moved %r" % (step, moved)
+
+
+def test_dragging_the_scrollbar_stops_where_the_wheel_stops():
+    """Past either end of the track the page stops at the same offsets the
+    wheel stops at, rather than at limits of the scrollbar's own."""
+    browser, tab = _scrollable_browser()
+    tab.scroll_by(10 ** 9)
+    bottom = tab.scroll  # where the wheel gives up
+    tab.set_scroll(0)
+    browser.draw()
+    top, _height = _thumb(browser)
+    _mouse(browser, "<Button-1>", top + 5)
+    _mouse(browser, "<B1-Motion>", 10 ** 6)  # far below the window
+    assert tab.scroll == bottom, \
+        "dragging off the bottom gave %r, the wheel gives %r" % (tab.scroll,
+                                                                 bottom)
+    _mouse(browser, "<B1-Motion>", -10 ** 6)  # and far above it
+    assert tab.scroll == 0, "dragging off the top gave %r" % tab.scroll
+
+
+def test_releasing_outside_the_window_ends_the_drag():
+    """A release lands wherever the pointer got to, which is routinely
+    outside the window. Missing it would leave the bar stuck to the mouse."""
+    browser, tab = _scrollable_browser()
+    top, _height = _thumb(browser)
+    _mouse(browser, "<Button-1>", top + 5)
+    _mouse(browser, "<B1-Motion>", top + 205)
+    scrolled = tab.scroll
+    assert scrolled > 0, "the drag never got going"
+    # Off the bottom of the window and off its left edge, which is where a
+    # pointer ends up when someone flings the bar and lets go.
+    _mouse(browser, "<ButtonRelease-1>", 10 ** 6, x=-400)
+    _mouse(browser, "<B1-Motion>", top + 400)
+    assert tab.scroll == scrolled, \
+        "the page kept following the pointer after the button came up"
+
+
+def test_pressing_the_empty_track_centres_the_thumb_and_drags_on():
+    """The track is jump-to-here, and the jump hands straight over to a drag
+    so one gesture can start anywhere on the bar."""
+    browser, tab = _scrollable_browser()
+    track_top, track_h = _track(browser)
+    target = track_top + track_h - 40  # well below the thumb, on the track
+    _mouse(browser, "<Button-1>", target)
+    top, height = _thumb(browser)
+    assert abs((top + height / 2) - target) <= 1, \
+        "the thumb centred on %r, not on the press at %r" % (top + height / 2,
+                                                             target)
+    jumped = tab.scroll
+    _mouse(browser, "<B1-Motion>", target - 50)
+    assert tab.scroll < jumped, "the press did not hand over to a drag"
+    assert abs(_thumb(browser)[0] - (top - 50)) <= 1, \
+        "the drag did not continue from where the thumb landed"
+
+
+def test_a_page_that_fits_has_no_scrollbar_to_drag():
+    """Nothing to scroll, so a press in the gutter is the page's, and a drag
+    across it must not move anything or raise."""
+    from feetbrowser.browser import Browser
+
+    browser = Browser()
+    browser.new_tab("data:text/html,<p>short</p>")
+    browser.draw()
+    tab = browser.tabs[0]
+    assert tab.content_height() <= browser.tab_height(), "fixture too tall"
+    assert _thumb(browser)[0] is None, "a bar was drawn anyway"
+    _mouse(browser, "<Button-1>", browser.chrome_height() + 200)
+    _mouse(browser, "<B1-Motion>", browser.chrome_height() + 300)
+    _mouse(browser, "<ButtonRelease-1>", browser.chrome_height() + 300)
+    assert tab.scroll == 0, "a page that fits scrolled to %r" % tab.scroll
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

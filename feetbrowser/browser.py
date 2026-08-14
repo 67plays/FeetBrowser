@@ -46,6 +46,13 @@ TAB_WIDTH = 158  # each tab's drawn width
 TAB_GAP = 160  # stride between tab left edges (TAB_WIDTH + 2px gutter)
 TAB_CLOSE_W = 20  # hit width of the per-tab "×" close box
 NEW_TAB_W = 34  # hit width of the "+" new-tab button
+SCROLLBAR_RIGHT = 10  # the thumb's left edge, measured back from the right
+SCROLLBAR_W = 6  # the thumb's drawn width
+SCROLLBAR_MIN_THUMB = 30  # a thumb shorter than this is too small to grab
+# The thumb is 6px wide and a pointer is not that accurate, so the region
+# that answers to a press is the whole gutter: a little to the left of the
+# thumb, and everything to the right of it out to the window edge.
+SCROLLBAR_GRAB_PAD = 4
 BOOKMARKS_FILE = os.path.expanduser("~/.feetbrowser_bookmarks.json")
 MAX_CACHED_IMAGES = 300
 # Cap the number of concurrent image fetches across the whole browser.
@@ -2100,6 +2107,9 @@ class Browser:
         self.address_sel = None  # (start, end) while selecting, else None
         self.address_view = 0  # horizontal scroll offset in px
         self._drag_moved = False  # a press+move (vs. a plain click) happened
+        # Scrollbar drag: how far below the top of the thumb the pointer went
+        # down, so the grabbed point stays under it. None when not dragging.
+        self._scroll_grab = None
         self._resize_after = None
         self._last_size = (WIDTH, HEIGHT)
         # Chrome-style loading spinner: current arc start angle (degrees).
@@ -2403,10 +2413,19 @@ class Browser:
         was_address = self.focus == "address"
         self.focus = None
         self._drag_moved = False
+        # A press ends any scrollbar drag still on the books -- normally the
+        # release did, but a release delivered somewhere else (the pointer
+        # left the window at the wrong moment) must not leave the bar stuck
+        # to the pointer for the rest of the session.
+        self._scroll_grab = None
         if e.y < self.chrome_height():
             self._chrome_click(e.x, e.y, was_address)
             return
         if not self.active_tab:
+            return
+        if self._scrollbar_press(e.x, e.y):
+            if was_address:
+                self._draw_chrome()  # drop the address bar's focus ring
             return
         ctrl = bool(getattr(e, "state", 0) & 0x4)
         dest = self.active_tab.click(e.x, e.y - self.chrome_height())
@@ -2471,6 +2490,12 @@ class Browser:
             self.new_tab(str(dest))
 
     def _on_release(self, e):
+        if self._scroll_grab is not None:
+            # Letting go anywhere -- inside the window or well outside it --
+            # ends the drag and leaves the page where the bar put it.
+            self._scroll_grab = None
+            self._drag_moved = False
+            return
         if self.focus == "address":
             return
         tab = self.active_tab
@@ -2488,6 +2513,13 @@ class Browser:
             tab._draw_selection(c, self.chrome_height())
 
     def _on_drag(self, e):
+        if self._scroll_grab is not None:
+            # Dragging the scrollbar, wherever the pointer has got to by now:
+            # both backends keep sending the drag to the window the press
+            # went to, so e.y may be above the track or below the window.
+            self._drag_moved = True
+            self._scrollbar_drag_to(e.y)
+            return
         if self.focus == "address" and e.x >= self._address_bar_x() - 10:
             self._drag_moved = True
             if self.address_sel is None:
@@ -3623,25 +3655,95 @@ class Browser:
                       font=get_font(11, "normal", "roman", "Helvetica"),
                       fill=self.c("status_text"), tags=("statusbar",))
 
-    def _draw_scrollbar(self):
+    def _scrollbar_metrics(self):
+        """Where the scrollbar is right now, or None when there is not one.
+
+        One description of the geometry, used both to draw the thumb and to
+        decide what a press on it means -- drawing and hit-testing that each
+        work it out for themselves drift apart, and a bar you cannot grab
+        where you can see it is the bug this is here to avoid.
+
+        Returns (track_x, track_top, track_h, thumb_top, thumb_h, span),
+        where `span` is the scroll offset the bottom of the track stands for.
+        """
         tab = self.active_tab
         if not tab:
-            return
+            return None
         view = self.tab_height()
         total = tab.content_height()
-        c = self.canvas
-        c.delete("scrollbar")
         if total <= view:
-            return
-        track_x = c.winfo_width() - 10
+            return None  # the page fits: nothing to scroll and no bar drawn
+        track_x = self.canvas.winfo_width() - SCROLLBAR_RIGHT
         track_top = self.chrome_height()
         track_h = view
-        frac = view / total
-        thumb_h = max(30, track_h * frac)
-        thumb_top = track_top + (track_h - thumb_h) * (tab.scroll / (total - view))
-        c.create_rectangle(track_x, thumb_top, track_x + 6, thumb_top + thumb_h,
+        thumb_h = max(SCROLLBAR_MIN_THUMB, track_h * (view / total))
+        thumb_h = min(thumb_h, track_h)
+        span = total - view
+        thumb_top = track_top + (track_h - thumb_h) * (tab.scroll / span)
+        return track_x, track_top, track_h, thumb_top, thumb_h, span
+
+    def _draw_scrollbar(self):
+        c = self.canvas
+        c.delete("scrollbar")
+        metrics = self._scrollbar_metrics()
+        if metrics is None:
+            return
+        track_x, _track_top, _track_h, thumb_top, thumb_h, _span = metrics
+        c.create_rectangle(track_x, thumb_top, track_x + SCROLLBAR_W,
+                           thumb_top + thumb_h,
                            fill=self.c("scroll_thumb"), width=0,
                            tags=("scrollbar",))
+
+    # -- scrollbar dragging ----------------------------------------------
+
+    def _scrollbar_press(self, x, y):
+        """Handle a left press at (x, y) if it landed on the scrollbar.
+
+        True means the press was the bar's and the page must not also treat
+        it as a click. Pressing the thumb starts a drag that keeps the
+        grabbed point under the pointer; pressing the empty track jumps the
+        thumb to centre on the press and then drags from there, so one
+        gesture can start anywhere on the bar.
+        """
+        metrics = self._scrollbar_metrics()
+        if metrics is None:
+            return False
+        track_x, track_top, track_h, thumb_top, thumb_h, _span = metrics
+        if x < track_x - SCROLLBAR_GRAB_PAD:
+            return False
+        if not track_top <= y < track_top + track_h:
+            return False
+        if thumb_top <= y < thumb_top + thumb_h:
+            self._scroll_grab = y - thumb_top
+        else:
+            self._scroll_grab = thumb_h / 2
+            self._scrollbar_drag_to(y)
+        return True
+
+    def _scrollbar_drag_to(self, y):
+        """Put the thumb where a pointer at `y` says it should be."""
+        if self._scroll_grab is None:
+            return
+        metrics = self._scrollbar_metrics()
+        if metrics is None:
+            # The page shrank under the drag (an image failed, a script
+            # rewrote it) and there is nothing left to scroll.
+            self._scroll_grab = None
+            return
+        _track_x, track_top, track_h, _thumb_top, thumb_h, span = metrics
+        travel = track_h - thumb_h
+        if travel <= 0:
+            return  # a thumb that fills the track has nowhere to go
+        # Dragging past either end of the track is ordinary -- the pointer
+        # leaves the window all the time -- and set_scroll() clamps to the
+        # same limits the wheel gets.
+        offset = (y - self._scroll_grab - track_top) / travel * span
+        self._dismiss_select_popup()
+        self.active_tab.set_scroll(offset)
+        # Same repaint the wheel does: the page layer, then the chrome over
+        # it -- which is where the thumb itself is drawn, so it follows.
+        self._draw_page()
+        self._draw_chrome()
 
     def run(self):
         self.window.update_idletasks()
