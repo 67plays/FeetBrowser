@@ -4,24 +4,52 @@ on:
   push:
     branches: [ main, 'feat/**' ]
   pull_request:
+  # The one job that leaves the machine runs on a timer instead of on every
+  # push; see `live-web` at the bottom.
+  schedule:
+    - cron: '23 5 * * 1'
+
+# Pushing three times in a minute should leave one run, not three. Except on
+# main, where every commit's run is the record of whether that commit was
+# good, and cancelling it erases the answer.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+# .venv/bin on unix, .venv/Scripts on Windows -- bash exists on all three
+# runners, so $PY works everywhere and a step never has to know which.
+defaults:
+  run:
+    shell: bash
 
 jobs:
+  # The whole offline suite, on every interpreter the engine claims to
+  # support (rust/pyproject.toml says >=3.9) and on both platforms that have
+  # a window backend. macOS is here for one specific reason: cocoa.py is a
+  # 22-test window backend that Linux can only ever prove skips cleanly.
   test:
-    runs-on: ubuntu-latest
+    name: ${{ matrix.os }} py${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, python: '3.9' }
+          - { os: ubuntu-latest, python: '3.10' }
+          - { os: ubuntu-latest, python: '3.11' }
+          - { os: ubuntu-latest, python: '3.12' }
+          - { os: ubuntu-latest, python: '3.13' }
+          - { os: ubuntu-latest, python: '3.14' }
+          - { os: macos-latest, python: '3.12' }
+          - { os: macos-latest, python: '3.14' }
+          # A Windows entry goes here when win32.py lands: the composite
+          # action already resolves .venv/Scripts and every step below is
+          # written against $PY.
     steps:
       - uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: ./.github/actions/build
         with:
-          python-version: '3.12'
-
-      # No Tk and no Xvfb: rendering is our own and runs with no display.
-      # The only outside requirement is a system font.
-      - name: Install fonts
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y fonts-dejavu-core fonts-liberation
+          python-version: ${{ matrix.python }}
 
       - name: Set up Zig
         uses: mlugg/setup-zig@v1
@@ -29,70 +57,70 @@ jobs:
           version: 0.14.0
 
       # The opt-in engine, selected by FEETBROWSER_JS=zig. A dynamic library
-      # the browser loads with ctypes, so nothing here is tied to the Python
-      # version above.
+      # the browser loads with ctypes, so this one build serves every
+      # interpreter in the matrix: nothing about it is tied to a Python
+      # version the way the Rust extension is. Its own Zig-side tests are a
+      # separate job, for the same reason the Rust ones are.
       - name: Build the Zig JS engine
-        run: |
-          cd zig
-          zig build
-          zig build test
-
-      - name: Build the Rust JS engine
-        run: |
-          python -m venv .venv
-          .venv/bin/pip install maturin pyflakes
-          .venv/bin/maturin develop --release --manifest-path rust/Cargo.toml
+        run: cd zig && zig build
 
       - name: Lint (pyflakes)
-        run: .venv/bin/python -m pyflakes feetbrowser tests
+        run: $PY -m pyflakes feetbrowser tests
 
-      # Warnings are kept at zero deliberately. Denying them here is the only
-      # thing that keeps it true; 84 of them accumulated the other way.
-      - name: Rust warnings
-        env:
-          RUSTFLAGS: -D warnings
-        run: cargo check --manifest-path rust/Cargo.toml --all-targets
+      # The list of suites below is typed out twice, here and in test.sh, so
+      # that a red job names the suite that went red. This is what stops the
+      # two copies drifting: it fails if a file in tests/ is in neither.
+      - name: Every suite is run by something
+        run: $PY tests/test_suites.py
 
       - name: Renderer tests
-        run: .venv/bin/python tests/test_render.py
+        run: $PY tests/test_render.py
 
-      # Both skip themselves off their own platform; here to prove the skips
-      # stay clean, and test_x11 still runs its whole offline half.
+      # test_cocoa opens real NSWindows on the macOS runners and skips on
+      # Linux; test_x11 runs its whole offline half everywhere.
       - name: Platform window tests
         run: |
-          .venv/bin/python tests/test_cocoa.py
-          .venv/bin/python tests/test_x11.py
+          $PY tests/test_cocoa.py
+          $PY tests/test_x11.py
 
       - name: Unit tests
-        run: .venv/bin/python tests/test_units.py
+        run: $PY tests/test_units.py
 
       # Both engines answer to the same contract, so both take the same suite.
       - name: JS engine tests (zig)
-        run: FEETBROWSER_JS=zig .venv/bin/python tests/test_js.py
+        run: FEETBROWSER_JS=zig $PY tests/test_js.py
 
       - name: JS engine tests (rust)
-        run: FEETBROWSER_JS=rust .venv/bin/python tests/test_js.py
+        run: FEETBROWSER_JS=rust $PY tests/test_js.py
 
       - name: Shoes tests
-        run: .venv/bin/python tests/test_shoes.py
+        run: $PY tests/test_shoes.py
 
       - name: Toe engine tests
-        run: .venv/bin/python tests/test_toes.py
+        run: $PY tests/test_toes.py
 
       # Linux/x86-64 assembles and runs the real kernels here; everywhere
       # else the module's pure-Python fallback is what gets checked.
       - name: Assembly span kernels
-        run: .venv/bin/python tests/test_asmblend.py
+        run: $PY tests/test_asmblend.py
 
-      - name: Screenshot a page end to end
+      # The check this whole file was rebuilt for. A page with text, a PNG,
+      # a GIF, a background and a border is fetched from a local server and
+      # rendered, and then the pixels are counted: an image that stops
+      # drawing takes a colour off the screen and this says which one.
+      - name: End-to-end pixels
+        run: $PY tests/test_e2e.py
+
+      # Both of these have always needed the network, so CI never ran them
+      # and the click-to-navigate path went unexercised. They point at an
+      # offline mirror of the same two pages instead, over a real socket.
+      - name: Navigation and history against the fixtures
+        run: $PY tests/fixture_server.py tests/test_nav.py '{base}example.com/'
+
+      - name: Whole-pipeline smoke against the fixtures
         run: |
-          .venv/bin/python -m feetbrowser --screenshot about:blank /tmp/blank.png
-          .venv/bin/python - <<'EOF'
-          import os
-          size = os.path.getsize("/tmp/blank.png")
-          assert size > 2000, f"screenshot suspiciously small: {size} bytes"
-          print(f"rendered /tmp/blank.png ({size} bytes)")
-          EOF
+          $PY tests/fixture_server.py tests/smoke.py \
+            '{base}example.com/' '{base}iana.org/domains/example.html'
 
   # The job above proves the browser needs no display. This one proves it can
   # use one: a real X server, a real window, real events, and a photograph of
@@ -101,41 +129,32 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: ./.github/actions/build
         with:
           python-version: '3.12'
-
-      - name: Install fonts and an X server
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y fonts-dejavu-core fonts-liberation xvfb
-
-      - name: Build the Rust JS engine
-        run: |
-          python -m venv .venv
-          .venv/bin/pip install maturin
-          .venv/bin/maturin develop --release --manifest-path rust/Cargo.toml
+          xvfb: 'true'
 
       # 24-bit TrueColor: what every desktop actually runs, and the format
       # the backend converts to with no per-pixel work.
       - name: X11 tests at depth 24
         run: |
           xvfb-run -a --server-args="-screen 0 1600x1200x24" \
-            .venv/bin/python tests/test_x11.py
+            $PY tests/test_x11.py
 
       # 16-bit 5-6-5, which no byte layout can describe, so this is the only
       # thing that ever runs the slow per-channel path against a real server.
       - name: X11 tests at depth 16
         run: |
           xvfb-run -a --server-args="-screen 0 1600x1200x16" \
-            .venv/bin/python tests/test_x11.py
+            $PY tests/test_x11.py
 
+      # x11_shot.py now checks what came back off the server -- the three
+      # colour swatches, present and in order -- rather than only that the
+      # file is not empty. The upload is for a human, not for the build.
       - name: Photograph a real X11 window
         run: |
           xvfb-run -a --server-args="-screen 0 1600x1200x24" \
-            .venv/bin/python tests/x11_shot.py artifacts/x11-window.png
+            $PY tests/x11_shot.py artifacts/x11-window.png
 
       - name: Upload the window
         uses: actions/upload-artifact@v4
@@ -144,3 +163,112 @@ jobs:
           path: artifacts/x11-window.png
           if-no-files-found: error
 
+  # Warnings are kept at zero deliberately. Denying them here is the only
+  # thing that keeps it true; 84 of them accumulated the other way. Its own
+  # job because it depends on nothing Python and holds up nothing else.
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache the Rust build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: cargo-check-${{ hashFiles('rust/Cargo.lock') }}
+          restore-keys: cargo-check-
+
+      - name: Rust warnings
+        env:
+          RUSTFLAGS: -D warnings
+        run: cargo check --manifest-path rust/Cargo.toml --all-targets
+
+  # The Zig engine's own tests: the VM, the parser and the regex engine, none
+  # of which ever cross into Python. The matrix above builds the library and
+  # runs the Python-side JS suite against it on every interpreter, but these
+  # cases would be the same eight times over, so like the Rust job they run
+  # once and hold up nothing else.
+  zig:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v1
+        with:
+          version: 0.14.0
+
+      - name: Zig engine tests
+        run: |
+          cd zig
+          zig build
+          zig build test
+
+  # The Go port of the transport layer arrived with 421 lines of its own
+  # tests and nothing that ran them: no job, no line in test.sh, no mention
+  # in the docs. It is not wired into the browser yet -- every other job here
+  # runs the Python net.py and never looks at net/ -- so this is the only
+  # thing standing between that package and rot.
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache-dependency-path: go.mod
+
+      - name: Build and vet
+        run: |
+          go build ./...
+          go vet ./...
+
+      - name: Go tests
+        run: go test ./...
+
+  # Pillow and cairosvg are optional and stay optional: the browser decodes
+  # PNG, GIF and PNM itself and only reaches for them for JPEG, WebP and SVG.
+  # Every job above runs with neither installed, which is what proves the
+  # browser still works without them. This one installs both so the branches
+  # behind them are executed at least once.
+  optional-image-libraries:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/build
+        with:
+          python-version: '3.12'
+          extras: Pillow cairosvg
+
+      - name: Unit tests with Pillow and cairosvg present
+        run: $PY tests/test_units.py
+
+      - name: Renderer tests with Pillow and cairosvg present
+        run: $PY tests/test_render.py
+
+      - name: End-to-end pixels with Pillow and cairosvg present
+        run: $PY tests/test_e2e.py
+
+  # The only job that leaves the machine. Its two suites run against fixtures
+  # on every push, which is what catches a broken click or a broken form;
+  # this runs the same code against the real web, where DNS, TLS, chunked
+  # bodies and gzip are somebody else's and change without telling us.
+  # Weekly and on main, because a third party's bad afternoon is not a reason
+  # to fail a contributor's pull request.
+  live-web:
+    if: github.event_name == 'schedule' || github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/build
+        with:
+          python-version: '3.12'
+
+      - name: Navigation and history against the real web
+        run: $PY tests/test_nav.py
+
+      - name: Whole-pipeline smoke against the real web
+        run: $PY tests/smoke.py

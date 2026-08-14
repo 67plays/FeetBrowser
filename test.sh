@@ -10,7 +10,9 @@
 #
 # Three suites step outside all that: test_cocoa.py and test_x11.py open real
 # windows wherever their platform has one and skip everywhere else, and
-# test_nav.py and smoke.py reach the network.
+# test_nav.py and smoke.py reach the network. The last of those is why CI
+# runs both of them against the offline mirror in tests/fixtures instead --
+# see tests/fixture_server.py.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -51,6 +53,7 @@ if ! .venv/bin/python -c "import pyflakes" 2>/dev/null; then
 fi
 
 .venv/bin/python -m pyflakes feetbrowser tests
+.venv/bin/python tests/test_suites.py  # every file below, and nothing missing
 .venv/bin/python tests/test_render.py
 .venv/bin/python tests/test_cocoa.py   # opens real windows on macOS, skips elsewhere
 .venv/bin/python tests/test_x11.py     # opens real windows under X11, skips elsewhere
@@ -58,7 +61,18 @@ fi
 FEETBROWSER_JS=zig .venv/bin/python tests/test_js.py
 FEETBROWSER_JS=rust .venv/bin/python tests/test_js.py
 .venv/bin/python tests/test_shoes.py
+.venv/bin/python tests/test_e2e.py     # a fixture page in, its pixels back out
 .venv/bin/python tests/test_nav.py
 .venv/bin/python tests/test_toes.py
 .venv/bin/python tests/test_asmblend.py  # raw assembly on Linux/x86-64, Python elsewhere
 .venv/bin/python tests/smoke.py
+
+# The Go port of the transport layer (net/) is a separate toolchain, so it is
+# run where one is installed and skipped where there is not, the same way the
+# window suites treat their platforms.
+if command -v go >/dev/null 2>&1; then
+  go vet ./...
+  go test ./...
+else
+  echo "skipping the Go net tests: no go toolchain on PATH"
+fi
