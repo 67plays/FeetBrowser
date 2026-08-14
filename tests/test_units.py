@@ -1699,6 +1699,23 @@ def test_a_closed_details_shows_only_its_summary():
     assert {"Caches", "Open", "Ghostarchive"} <= words, words
 
 
+def test_an_inline_block_keeps_its_blocks_to_itself():
+    """A byline is one line with a dropdown in the middle of it. The dropdown
+    is an inline-block full of blocks, and letting those blocks reach out
+    turns the whole byline into a word per line."""
+    from feetbrowser.layout import DrawText
+    html = ('<div>via <a href="#">seb</a> | '
+            '<span class=drop><div>one</div><div>two</div></span>'
+            ' | <a href="#">19 comments</a></div>')
+    cmds = [c for c in _paint_all(html, ".drop { display: inline-block }",
+                                 ua=True) if isinstance(c, DrawText)]
+    tops = {c.text: c.top for c in cmds}
+    eq(tops["via"], tops["seb"], "the byline is one line")
+    eq(tops["via"], tops["comments"], "still one line past the dropdown")
+    assert tops["one"] < tops["two"], "and the blocks inside it stack"
+    assert tops["one"] < tops["via"], "sitting on the line, not below it"
+
+
 def test_hidden_attribute_hides_the_element():
     from feetbrowser.layout import DrawText
     cmds = _paint_all('<p>shown</p><p hidden>gone</p>', ua=True)

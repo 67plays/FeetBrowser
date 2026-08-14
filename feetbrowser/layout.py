@@ -652,6 +652,17 @@ def _is_inline_level(node):
     return display in ("inline", "inline-block")
 
 
+def _is_atomic_inline(node):
+    """Whether this box sits on the line as a single unbreakable thing.
+
+    An inline-block takes part in the line like a word does, but inside it
+    lays out as a block -- so nothing within it can break the line it sits
+    on, and nothing outside it needs to know what is in there.
+    """
+    return isinstance(node, Element) \
+        and node.style.get("display") == "inline-block"
+
+
 def _wraps_block_content(node):
     """True when an inline element contains block-level content.
 
@@ -660,6 +671,11 @@ def _wraps_block_content(node):
     the thumbnail and the title together on a single line, so the enclosing
     box has to lay out as a block. Only inline descendants are walked
     through: once a block turns up, the answer is settled.
+
+    An inline-block is where the walk stops. It is one atom on the line and
+    the blocks inside it are its own business -- that is the entire reason
+    the value exists. Descending into one is how a byline with a <details>
+    dropdown in the middle of it comes apart into a line per word.
     """
     stack = list(node.children)
     while stack:
@@ -667,6 +683,8 @@ def _wraps_block_content(node):
         if isinstance(child, Text):
             continue
         if child.style.get("display") == "none":
+            continue
+        if _is_atomic_inline(child):
             continue
         if _is_inline_level(child):
             stack.extend(child.children)
@@ -1023,7 +1041,7 @@ class _LineItem:
 
     def __init__(self, kind, x, text, font, color, node, w, h, photo=None,
                  bg=None, pl=0, pr=0, pt=0, pb=0):
-        self.kind = kind  # "text", "img" or "pill"
+        self.kind = kind  # "text", "img", "pill" or "block"
         self.x = x
         self.text = text
         self.font = font
@@ -1042,12 +1060,18 @@ class _LineItem:
     def ascent(self):
         if self.kind == "img":
             return int(self.h * 0.82)
+        if self.kind == "block":
+            # An inline-block sits on the baseline rather than straddling it,
+            # so the whole of it counts as height above the line.
+            return self.h
         return _metrics(self.font, "ascent")
 
     @property
     def descent(self):
         if self.kind == "img":
             return int(self.h * 0.18)
+        if self.kind == "block":
+            return 0.0
         return _metrics(self.font, "descent")
 
 
@@ -1165,7 +1189,8 @@ class BlockLayout(LayoutBox):
                 # ...</div></a> is the card link on every listing page. CSS
                 # splits the inline box around the block, so the box holding
                 # it is a block box no matter what its own display says.
-                if _wraps_block_content(child):
+                # An inline-block is exempt -- it keeps its blocks to itself.
+                if not _is_atomic_inline(child) and _wraps_block_content(child):
                     return "block"
                 continue
             return "block"
@@ -1533,6 +1558,11 @@ class BlockLayout(LayoutBox):
                     total += w + _measure(font, " ")
                     longest = max(longest, w)
             elif isinstance(n, Element):
+                if n is not el and n.style.get("display") == "none":
+                    # What is not drawn takes up no room. A closed dropdown
+                    # holding a whole menu would otherwise demand width for
+                    # every item in it.
+                    continue
                 if n.tag == "img":
                     # Size against the real pixels when the image has been
                     # decoded, not the "[img]" placeholder, or the column is
@@ -2381,6 +2411,11 @@ class BlockLayout(LayoutBox):
                 pt, pr, pb, pl = _padding_box(style)
                 self._inline_pill(node, bg, pl, pr, pt, pb)
                 return
+            if _wraps_block_content(node):
+                # Blocks inside it, so its insides cannot simply be poured
+                # into this line: it gets a box of its own and joins the line
+                # as one atom, the way an image does.
+                return self._inline_block(node)
         for child in node.children:
             self.recurse(child)
 
@@ -2464,6 +2499,15 @@ class BlockLayout(LayoutBox):
                     item.x + offset, y,
                     item.x + offset + item.w, y + item.h, "#aaaaaa"))
                 xoff, ty, color = 4, y + 2, "#888888"
+            elif item.kind == "block":
+                # Now that the baseline is settled there is a place to put it.
+                box = BlockLayout(item.node, self, None)
+                box._float_pos = (item.x + offset, baseline - item.ascent,
+                                  item.w)
+                box.layout()
+                self.children.append(box)
+                self._underline_run = None
+                continue
             elif item.kind == "pill":
                 y = baseline - item.h
                 if item.bg:
@@ -2593,6 +2637,30 @@ class BlockLayout(LayoutBox):
         self.line.append(_LineItem("img", self.cursor_x, label, font, None,
                                    node, w, h, photo))
         self.cursor_x += w + (_measure(font, " ") if photo is None else w * 0.25)
+
+    def _inline_block(self, node):
+        """Place an inline-block that holds blocks: measure it in a box of its
+        own, then reserve that much room on the line.
+
+        The box itself is built again in flush(), once the baseline is known
+        and there is somewhere to put it. Laying it out twice is the price of
+        an inline-level thing whose height decides how tall the line is.
+        """
+        avail = max(1.0, self.width - (self.cursor_x - self.x))
+        mi, ma = self._measure_width(node)
+        w = max(1.0, min(max(avail, mi), max(mi, ma)))
+        css_w = node.style.get("width", "")
+        if css_w.strip().lower() not in ("", "auto", "fit-content",
+                                         "min-content", "max-content"):
+            w = max(1.0, _resolve_len(css_w, self.width, avail))
+        w = self._fit_control(w, min_w=min(w, 20.0))
+        probe = BlockLayout(node, self, None)
+        probe._float_pos = (self.x, self.y, w)
+        probe.layout()
+        self.line.append(_LineItem("block", self.cursor_x, "",
+                                   _node_font(node), None, node, w,
+                                   probe.height))
+        self.cursor_x += w + _measure(_node_font(node), " ")
 
     def _image_cache(self):
         """Walk up the layout tree to find the tab's image cache (a dict of
