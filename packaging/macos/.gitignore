@@ -1,0 +1,6 @@
+# Everything build.sh makes. The CPython installer in cache/ is 60 MB and
+# the built bundle is another 60; neither belongs in the history, and both
+# are reproducible from what is checked in beside this file.
+build/
+cache/
+dist/
