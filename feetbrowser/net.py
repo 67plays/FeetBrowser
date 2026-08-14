@@ -32,6 +32,24 @@ _DNS_CACHE_MAX = 512
 _DNS_TTL = 300.0  # seconds
 _DNS_LOCK = threading.Lock()
 
+# How long a name lookup may block before we give up on it. getaddrinfo is a
+# blocking call into the platform resolver: socket.settimeout does not apply
+# to it, and there is no portable way to interrupt one in flight -- the usual
+# escape hatch, SIGALRM, does not exist on Windows at all. A resolver that
+# never answers (a VPN, a captive portal, an unreachable corporate DNS
+# server) would otherwise stop the browser dead with nothing printed and no
+# way out but killing it. Resolving on a worker thread and giving up on the
+# join puts a ceiling on it, at the cost of leaving that thread behind: it is
+# a daemon, so a wedged lookup cannot keep the process alive.
+_DNS_TIMEOUT = 20.0  # seconds
+
+# Lookups currently in flight, keyed like _DNS_CACHE. Callers that want a host
+# somebody else is already resolving wait on that one worker instead of
+# starting another, so a slow resolver costs one thread per host rather than
+# one per request -- a page with thirty images on a stalled origin would
+# otherwise start thirty identical lookups.
+_DNS_INFLIGHT = {}
+
 # Bounded pool of idle keep-alive connections, keyed by (scheme, host, port).
 # HTTP/1.1 lets one connection serve several requests to the same origin, which
 # skips the fresh TCP + TLS handshake each resource used to pay — the most
@@ -48,6 +66,13 @@ _CONN_LOCK = threading.Lock()
 
 
 def _close_socket(s):
+    # None is allowed: the cleanup paths in _request_http run from `except`
+    # blocks that can be reached before a socket was ever opened -- a failed
+    # lookup or a refused connect leaves `s` unset. Closing it there used to
+    # raise AttributeError, which is not an OSError and so escaped the guard
+    # below, replacing the real network error with a confusing one.
+    if s is None:
+        return
     try:
         s.close()
     except OSError:
@@ -88,10 +113,76 @@ def _pool_park(key, s):
         lst.append((s, time.time()))
 
 
+def _resolve(host, port, timeout=None):
+    """socket.getaddrinfo with a ceiling on how long it may block.
+
+    Raises socket.timeout if the resolver has not answered within `timeout`
+    seconds. The lookup itself cannot be cancelled, so the worker is left to
+    finish (or not) on its own; what is bounded is how long *we* wait.
+    """
+    if timeout is None:
+        timeout = _DNS_TIMEOUT
+    key = (host, port)
+    with _DNS_LOCK:
+        cell = _DNS_INFLIGHT.get(key)
+        mine = cell is None
+        if mine:
+            cell = {"done": threading.Event()}
+            _DNS_INFLIGHT[key] = cell
+
+    if mine:
+        def work():
+            try:
+                cell["infos"] = socket.getaddrinfo(
+                    host, port, 0, socket.SOCK_STREAM)
+            except BaseException as exc:  # re-raised on the waiting thread
+                cell["error"] = exc
+            finally:
+                with _DNS_LOCK:
+                    if _DNS_INFLIGHT.get(key) is cell:
+                        del _DNS_INFLIGHT[key]
+                cell["done"].set()
+
+        threading.Thread(target=work, name=f"dns-{host}", daemon=True).start()
+
+    if not cell["done"].wait(timeout):
+        raise socket.timeout(
+            f"DNS lookup for {host} took longer than {timeout:g}s")
+    if "error" in cell:
+        raise cell["error"]
+    infos = cell.get("infos")
+    if not infos:
+        raise socket.gaierror(socket.EAI_NONAME, "Name or service not known")
+    return infos
+
+
+def _connect_any(host, port):
+    """What socket.create_connection does -- try every address the host
+    reports, keep the first that answers -- with the name lookup bounded the
+    same way the cached path's is. create_connection resolves internally, so
+    calling it here would reintroduce the unbounded getaddrinfo this avoids.
+    """
+    last = None
+    for family, socktype, proto, _canon, sockaddr in _resolve(host, port):
+        s = None
+        try:
+            s = socket.socket(family, socktype, proto)
+            s.settimeout(20)
+            s.connect(sockaddr)
+            return s
+        except OSError as exc:
+            if s is not None:
+                _close_socket(s)
+            last = exc
+    if last is not None:
+        raise last
+    raise socket.gaierror(socket.EAI_NONAME, "Name or service not known")
+
+
 def _connect(host, port):
     """Open a TCP socket to (host, port), reusing a cached address when one
-    is available and falling back to socket.create_connection (which retries
-    across all resolved addresses) otherwise."""
+    is available and falling back to the full resolver (which retries across
+    all resolved addresses) otherwise."""
     key = (host, port)
     now = time.time()
     with _DNS_LOCK:
@@ -99,14 +190,17 @@ def _connect(host, port):
         if entry is not None and now - entry[0] > _DNS_TTL:
             _DNS_CACHE.pop(key, None)
             entry = None
-        if entry is None:
-            infos = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
-            if not infos:
-                raise socket.gaierror(socket.EAI_NONAME, "Name or service not known")
-            info = infos[0][:3] + (infos[0][4],)
+    if entry is None:
+        # Deliberately outside the lock. The lock is here to keep concurrent
+        # image fetches from corrupting the dict, not to serialise them
+        # against the network: holding it across a lookup would make one slow
+        # resolver stall every other thread that wanted any host at all.
+        infos = _resolve(host, port)
+        info = infos[0][:3] + (infos[0][4],)
+        entry = (now, info)
+        with _DNS_LOCK:
             if len(_DNS_CACHE) < _DNS_CACHE_MAX:
-                _DNS_CACHE[key] = (now, info)
-            entry = (now, info)
+                _DNS_CACHE[key] = entry
     info = entry[1]
     s = None
     try:
@@ -122,7 +216,7 @@ def _connect(host, port):
         with _DNS_LOCK:
             if _DNS_CACHE.get(key) == entry:
                 _DNS_CACHE.pop(key, None)
-        s = socket.create_connection((host, port), timeout=20)
+        s = _connect_any(host, port)
         # Cache the address the fallback actually connected to, so a repeat
         # request skips the failed attempt.
         try:

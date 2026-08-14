@@ -1,5 +1,8 @@
 """Fast, offline unit tests for URL parsing, HTML, CSS, and internal pages."""
 import http.server
+import socket
+import threading
+import time
 import urllib.parse
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -7,6 +10,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from feetbrowser.canvas import CanvasError, PhotoImage
 from feetbrowser.window import Tk
 
+from feetbrowser import net as net_mod
 from feetbrowser.net import URL
 from feetbrowser.htmlparser import HTMLParser, Element, Text
 from feetbrowser.cssparser import CSSParser, style
@@ -22,6 +26,15 @@ from feetbrowser.browser import (
 
 def eq(a, b, msg=""):
     assert a == b, f"{msg}: {a!r} != {b!r}"
+
+
+def _swallow(fn, *args, **kwargs):
+    """Run fn on a helper thread without letting its exception escape into a
+    thread nobody is watching. Returns the result, or the exception."""
+    try:
+        return fn(*args, **kwargs)
+    except Exception as exc:
+        return exc
 
 
 def test_url_parsing():
@@ -3169,6 +3182,205 @@ def test_an_untouched_select_submits_its_fallback_choice():
     act = tab.click(cx, cy)
     fields = urllib.parse.parse_qsl(act.payload, keep_blank_values=True)
     eq(fields, [("size", "M")], "the first choosable option, not the disabled one")
+
+
+class _FakeResolver:
+    """Stands in for socket.getaddrinfo. Hosts named in `stall` block until
+    released; everything else answers at once. Records what it was asked."""
+
+    def __init__(self, stall=()):
+        self.stall = set(stall)
+        self.asked = []
+        self.release = threading.Event()
+        self.lock = threading.Lock()
+
+    def __call__(self, host, port, *args, **kwargs):
+        with self.lock:
+            self.asked.append(host)
+        if host in self.stall:
+            # Bounded so a failing test cannot wedge the suite.
+            self.release.wait(30)
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "",
+                 ("127.0.0.1", port))]
+
+
+def _with_resolver(resolver):
+    """Install `resolver` as socket.getaddrinfo; returns a restore callable."""
+    real = socket.getaddrinfo
+    socket.getaddrinfo = resolver
+
+    def restore():
+        resolver.release.set()
+        socket.getaddrinfo = real
+        with net_mod._DNS_LOCK:
+            net_mod._DNS_INFLIGHT.clear()
+            net_mod._DNS_CACHE.clear()
+    return restore
+
+
+def test_a_dns_lookup_that_never_answers_gives_up():
+    """getaddrinfo cannot be interrupted and settimeout does not reach it, so
+    an unreachable resolver used to hang the browser with nothing printed.
+    The wait is bounded now; the lookup itself still cannot be cancelled."""
+    resolver = _FakeResolver(stall=["stalled.invalid"])
+    restore = _with_resolver(resolver)
+    try:
+        started = time.time()
+        try:
+            net_mod._resolve("stalled.invalid", 80, timeout=0.25)
+            assert False, "a resolver that never answers should not return"
+        except socket.timeout:
+            pass
+        waited = time.time() - started
+        assert waited < 5, f"waited {waited:.1f}s, so the ceiling did not hold"
+    finally:
+        restore()
+
+
+def test_one_stalled_host_does_not_block_lookups_of_another():
+    """The regression this guards: the lookup used to happen while holding
+    _DNS_LOCK, so a single unreachable host stalled every other thread that
+    wanted any host at all -- background image fetches included."""
+    resolver = _FakeResolver(stall=["stalled.invalid"])
+    restore = _with_resolver(resolver)
+    try:
+        stuck = threading.Thread(
+            target=lambda: _swallow(net_mod._resolve, "stalled.invalid", 80),
+            daemon=True)
+        stuck.start()
+        # Wait until the stalled lookup is genuinely in flight.
+        deadline = time.time() + 5
+        while "stalled.invalid" not in resolver.asked and time.time() < deadline:
+            time.sleep(0.01)
+        assert "stalled.invalid" in resolver.asked, "the stall never started"
+
+        started = time.time()
+        infos = net_mod._resolve("fine.invalid", 80, timeout=5)
+        waited = time.time() - started
+        assert infos, "the second host should still resolve"
+        assert waited < 2, f"second host waited {waited:.1f}s behind the first"
+    finally:
+        restore()
+
+
+def test_a_stalled_host_does_not_stall_connections_to_another():
+    """The same regression seen from where it actually bit: _connect, not the
+    resolver underneath it. Written against _connect on purpose -- it is the
+    entry point that existed when the lock was held across the lookup, so it
+    is the one that can tell the two behaviours apart. The connection itself
+    is expected to fail (nothing is listening); only the time taken matters.
+    """
+    resolver = _FakeResolver(stall=["stalled.invalid"])
+    restore = _with_resolver(resolver)
+    try:
+        threading.Thread(
+            target=lambda: _swallow(net_mod._connect, "stalled.invalid", 80),
+            daemon=True).start()
+        deadline = time.time() + 5
+        while "stalled.invalid" not in resolver.asked and time.time() < deadline:
+            time.sleep(0.01)
+        assert "stalled.invalid" in resolver.asked, "the stall never started"
+
+        started = time.time()
+        _swallow(net_mod._connect, "fine.invalid", 80)
+        waited = time.time() - started
+        assert waited < 2, (
+            f"connecting to a second host waited {waited:.1f}s behind an "
+            "unrelated stalled lookup")
+    finally:
+        restore()
+
+
+def test_callers_wanting_the_same_host_share_one_lookup():
+    """A page with thirty images on one origin should cost one lookup, not
+    thirty -- and on a slow resolver, one waiting thread rather than thirty."""
+    resolver = _FakeResolver(stall=["slow.invalid"])
+    restore = _with_resolver(resolver)
+    try:
+        done = []
+        threads = [threading.Thread(
+            target=lambda: done.append(
+                _swallow(net_mod._resolve, "slow.invalid", 80, timeout=10)),
+            daemon=True) for _ in range(5)]
+        for t in threads:
+            t.start()
+        # Wait for the first caller to reach the resolver, then give the rest
+        # a moment to arrive and coalesce onto it.
+        deadline = time.time() + 5
+        while "slow.invalid" not in resolver.asked and time.time() < deadline:
+            time.sleep(0.01)
+        time.sleep(0.3)
+        # Counted per host, not as a total: a stalled lookup from an earlier
+        # test is still parked on its own thread, and when it is released it
+        # lands in whichever fake resolver is installed by then.
+        eq(resolver.asked.count("slow.invalid"), 1,
+           "five callers should share one lookup")
+        resolver.release.set()
+        for t in threads:
+            t.join(10)
+        eq(len(done), 5, "every caller should receive the answer")
+    finally:
+        restore()
+
+
+def test_a_resolver_failure_reaches_the_caller():
+    """A name that does not exist must still raise, not time out: the worker
+    re-raises the resolver's own error on the waiting thread."""
+    def broken(host, port, *args, **kwargs):
+        raise socket.gaierror(socket.EAI_NONAME, "Name or service not known")
+    real = socket.getaddrinfo
+    socket.getaddrinfo = broken
+    try:
+        try:
+            net_mod._resolve("nosuch.invalid", 80, timeout=5)
+            assert False, "a name that does not resolve should raise"
+        except socket.gaierror:
+            pass
+    finally:
+        socket.getaddrinfo = real
+        with net_mod._DNS_LOCK:
+            net_mod._DNS_INFLIGHT.clear()
+            net_mod._DNS_CACHE.clear()
+
+
+def test_a_failed_request_reports_the_network_error_not_a_cleanup_error():
+    """_request_http cleans up from `except` blocks that can be reached
+    before any socket exists -- a lookup that fails leaves it unset. Closing
+    None raised AttributeError, which is not an OSError and so slipped past
+    the guard, and the caller saw that instead of the real failure."""
+    resolver = _FakeResolver(stall=["stalled.invalid"])
+    restore = _with_resolver(resolver)
+    real_timeout = net_mod._DNS_TIMEOUT
+    net_mod._DNS_TIMEOUT = 0.25
+    try:
+        try:
+            URL("http://stalled.invalid/").request()
+            assert False, "a request to an unresolvable host should raise"
+        except AttributeError as exc:
+            assert False, f"cleanup error masked the real one: {exc}"
+        except OSError:
+            pass  # socket.timeout, which is what the caller should see
+    finally:
+        net_mod._DNS_TIMEOUT = real_timeout
+        restore()
+
+
+def test_closing_a_socket_that_was_never_opened_is_harmless():
+    """The narrow version of the same thing, so the intent is recorded even
+    if _request_http's cleanup is restructured later."""
+    net_mod._close_socket(None)
+
+
+def test_a_finished_lookup_leaves_nothing_in_flight():
+    """The in-flight entry has to be cleared however the lookup ended, or the
+    next caller for that host waits on a worker that is already gone."""
+    resolver = _FakeResolver()
+    restore = _with_resolver(resolver)
+    try:
+        net_mod._resolve("quick.invalid", 80, timeout=5)
+        eq(net_mod._DNS_INFLIGHT, {}, "in-flight entry outlived its lookup")
+    finally:
+        restore()
 
 
 def _fixture(name):
