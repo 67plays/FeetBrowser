@@ -54,7 +54,7 @@ _image_fetch_sem = threading.Semaphore(MAX_CONCURRENT_IMAGE_FETCHES)
 sys.setrecursionlimit(20000)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-with open(os.path.join(HERE, "ua.css")) as f:
+with open(os.path.join(HERE, "ua.css"), encoding="utf8") as f:
     DEFAULT_STYLE_SHEET = CSSParser(f.read()).parse()
 
 
@@ -637,9 +637,12 @@ class Tab:
             base = self.base_url
             if base is None or base.scheme != "file":
                 return False
+            # URL space, not os.path: a file: URL's path is slash-separated
+            # whatever the platform, and os.path.dirname would hand back a
+            # backslash-separated prefix on Windows that never matches.
             base_path = base.path
             base_dir = base_path if base_path.endswith("/") \
-                else os.path.dirname(base_path) + "/"
+                else base_path.rpartition("/")[0] + "/"
             return target.path.startswith(base_dir)
         return False
 
