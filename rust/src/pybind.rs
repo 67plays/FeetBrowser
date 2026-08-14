@@ -196,7 +196,16 @@ impl JsGlobals {
 
 // -- a JS value handed across the boundary ---------------------------------
 
-#[pyclass(module = "feetbrowser_engine", name = "JSValue", unsendable)]
+// `from_py_object` is asked for rather than inherited: pyo3 derives it for a
+// Clone pyclass today but is making that opt-in, and py_to_js does extract
+// one of these -- it is how a JS value that went out to Python and came back
+// is recognised as itself instead of being rebuilt from its repr.
+#[pyclass(
+    module = "feetbrowser_engine",
+    name = "JSValue",
+    unsendable,
+    from_py_object
+)]
 #[derive(Clone)]
 pub struct PyJsValue {
     pub inner: Rc<Interpreter>,

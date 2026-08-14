@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, 'feat/**' ]
   pull_request:
 
 jobs:
@@ -31,6 +31,13 @@ jobs:
 
       - name: Lint (pyflakes)
         run: .venv/bin/python -m pyflakes feetbrowser tests
+
+      # Warnings are kept at zero deliberately. Denying them here is the only
+      # thing that keeps it true; 84 of them accumulated the other way.
+      - name: Rust warnings
+        env:
+          RUSTFLAGS: -D warnings
+        run: cargo check --manifest-path rust/Cargo.toml --all-targets
 
       - name: Renderer tests
         run: .venv/bin/python tests/test_render.py

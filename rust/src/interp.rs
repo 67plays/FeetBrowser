@@ -162,7 +162,7 @@ impl Interpreter {
 
 // -- public API ------------------------------------------------------------
 
-pub fn drive_sync(this: &Rc<Interpreter>, fut: EvResult) -> Result<JsValue, JsError> {
+pub fn drive_sync(_this: &Rc<Interpreter>, fut: EvResult) -> Result<JsValue, JsError> {
     let mut fut = fut;
     let waker = Waker::noop();
     let mut cx = Context::from_waker(&waker);
@@ -172,7 +172,7 @@ pub fn drive_sync(this: &Rc<Interpreter>, fut: EvResult) -> Result<JsValue, JsEr
     }
 }
 
-pub fn drive_sync_unit(this: &Rc<Interpreter>, fut: StResult) -> Result<(), JsError> {
+pub fn drive_sync_unit(_this: &Rc<Interpreter>, fut: StResult) -> Result<(), JsError> {
     let mut fut = fut;
     let waker = Waker::noop();
     let mut cx = Context::from_waker(&waker);
@@ -387,10 +387,6 @@ pub fn js_error_message(this: &Interpreter, e: &JsError) -> String {
     }
 }
 
-pub fn repr_js(this: &Interpreter, v: &JsValue) -> String {
-    this.repr(v)
-}
-
 // -- host bridge -----------------------------------------------------------
 
 pub fn py_to_js(this: &Interpreter, py: Python<'_>, obj: &Bound<'_, PyAny>) -> JsValue {
@@ -551,7 +547,7 @@ pub fn index_name(this: &Interpreter, value: &JsValue) -> String {
     }
 }
 
-pub fn own_keys(this: &Interpreter, value: &JsValue) -> Vec<String> {
+pub fn own_keys(_this: &Interpreter, value: &JsValue) -> Vec<String> {
     match value {
         JsValue::Object(m) => m.borrow().keys().cloned().collect(),
         JsValue::Array(a) => (0..a.borrow().len()).map(|i| i.to_string()).collect(),
@@ -664,7 +660,7 @@ pub fn string_split(
 }
 
 pub fn string_match(
-    this: &Interpreter,
+    _this: &Interpreter,
     text: &str,
     regex: &JsValue,
 ) -> Result<JsValue, JsError> {
@@ -995,7 +991,7 @@ fn make_host_method(h: Py<PyAny>, name: &str) -> JsValue {
             _ => {
                 let this_arg = args.first().cloned().unwrap_or(JsValue::Undefined);
                 let pre = args.into_iter().skip(1).collect::<Vec<_>>();
-                let i3 = interp.clone();
+                let _i3 = interp.clone();
                 let h3 = Python::attach(|py| h.clone_ref(py));
                 let pre2 = pre.clone();
                 let t = this_arg.clone();
@@ -1238,7 +1234,7 @@ pub fn list_get(
                     } as usize;
                     let items = args.into_iter().skip(2).collect::<Vec<_>>();
                     let removed: Vec<JsValue> = arr.drain(s..s + dc).collect();
-                    let mut tail = arr.split_off(s);
+                    let tail = arr.split_off(s);
                     arr.extend(items);
                     arr.extend(tail);
                     Ok(JsValue::array(removed))
@@ -1303,7 +1299,7 @@ pub fn list_get(
             let i0 = this.clone();
             return JsValue::Callback(Rc::new(move |i: &Rc<Interpreter>, args: Vec<JsValue>| -> EvResult {
                 let i2 = i.clone();
-                let i3 = i0.clone();
+                let _i3 = i0.clone();
                 let a2 = a.clone();
                 let op2 = op.clone();
                 Box::pin(async move {
@@ -1379,7 +1375,7 @@ pub fn list_get(
             let i0 = this.clone();
             return JsValue::Callback(Rc::new(move |i: &Rc<Interpreter>, args: Vec<JsValue>| -> EvResult {
                 let i2 = i.clone();
-                let i3 = i0.clone();
+                let _i3 = i0.clone();
                 let a2 = a.clone();
                 let op2 = op.clone();
                 Box::pin(async move {
@@ -1489,7 +1485,7 @@ pub fn string_get(this: &Rc<Interpreter>, text: &Rc<str>, name: &str) -> JsValue
         return JsValue::Number(char_count(text) as f64);
     }
     let t = text.clone();
-    let i0 = this.clone();
+    let _i0 = this.clone();
     match name {
         "charAt" => {
             return JsValue::Callback(Rc::new(move |_i: &Rc<Interpreter>, args: Vec<JsValue>| -> EvResult {
@@ -1701,7 +1697,7 @@ pub fn string_get(this: &Rc<Interpreter>, text: &Rc<str>, name: &str) -> JsValue
         "concat" => {
             let i0 = this.clone();
             return JsValue::Callback(Rc::new(move |i: &Rc<Interpreter>, args: Vec<JsValue>| -> EvResult {
-                let i2 = i.clone();
+                let _i2 = i.clone();
                 let i3 = i0.clone();
                 let t2 = t.clone();
                 Box::pin(async move {
@@ -1728,7 +1724,7 @@ pub fn string_get(this: &Rc<Interpreter>, text: &Rc<str>, name: &str) -> JsValue
         "padStart" | "padEnd" => {
             let op = name.to_string();
             return JsValue::Callback(Rc::new(move |i: &Rc<Interpreter>, args: Vec<JsValue>| -> EvResult {
-                let i2 = i.clone();
+                let _i2 = i.clone();
                 let t2 = t.clone();
                 let op2 = op.clone();
                 Box::pin(async move {
@@ -1745,7 +1741,7 @@ pub fn string_get(this: &Rc<Interpreter>, text: &Rc<str>, name: &str) -> JsValue
         "split" => {
             let i0 = this.clone();
             return JsValue::Callback(Rc::new(move |i: &Rc<Interpreter>, args: Vec<JsValue>| -> EvResult {
-                let i2 = i.clone();
+                let _i2 = i.clone();
                 let i3 = i0.clone();
                 let t2 = t.clone();
                 Box::pin(async move {
@@ -1758,7 +1754,7 @@ pub fn string_get(this: &Rc<Interpreter>, text: &Rc<str>, name: &str) -> JsValue
         "match" | "matchAll" => {
             let i0 = this.clone();
             return JsValue::Callback(Rc::new(move |i: &Rc<Interpreter>, args: Vec<JsValue>| -> EvResult {
-                let i2 = i.clone();
+                let _i2 = i.clone();
                 let i3 = i0.clone();
                 let t2 = t.clone();
                 Box::pin(async move {
@@ -1831,7 +1827,7 @@ pub fn number_get(this: &Rc<Interpreter>, num: f64, name: &str) -> JsValue {
         "toString" => {
             let i0 = this.clone();
             return JsValue::Callback(Rc::new(move |i: &Rc<Interpreter>, args: Vec<JsValue>| -> EvResult {
-                let i2 = i.clone();
+                let _i2 = i.clone();
                 let i3 = i0.clone();
                 Box::pin(async move {
                     let radix = args.first().cloned().unwrap_or(JsValue::Undefined);
@@ -1842,7 +1838,7 @@ pub fn number_get(this: &Rc<Interpreter>, num: f64, name: &str) -> JsValue {
         "toLocaleString" => {
             let i0 = this.clone();
             return JsValue::Callback(Rc::new(move |i: &Rc<Interpreter>, args: Vec<JsValue>| -> EvResult {
-                let i2 = i.clone();
+                let _i2 = i.clone();
                 let i3 = i0.clone();
                 Box::pin(async move {
                     let radix = args.first().cloned().unwrap_or(JsValue::Undefined);
@@ -1916,7 +1912,7 @@ pub fn map_get(this: &Rc<Interpreter>, m: &Rc<RefCell<JsMap>>, name: &str) -> Js
             let m3 = m.clone();
             return JsValue::Callback(Rc::new(move |i: &Rc<Interpreter>, args: Vec<JsValue>| -> EvResult {
                 let i2 = i.clone();
-                let i3 = i0.clone();
+                let _i3 = i0.clone();
                 let m2 = m3.clone();
                 Box::pin(async move {
                     let fn_ = args.first().cloned().unwrap_or(JsValue::Undefined);
@@ -1979,7 +1975,7 @@ pub fn set_get(this: &Rc<Interpreter>, s: &Rc<RefCell<JsSet>>, name: &str) -> Js
             return JsValue::Number(s.borrow().store.borrow().len() as f64);
         }
         "forEach" => {
-            let i0 = this.clone();
+            let _i0 = this.clone();
             let s3 = s.clone();
             return JsValue::Callback(Rc::new(move |i: &Rc<Interpreter>, args: Vec<JsValue>| -> EvResult {
                 let i2 = i.clone();
@@ -2027,10 +2023,10 @@ fn month_name(m: u32) -> &'static str {
     const N: [&str; 12] = [
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
     ];
-    N[((m as usize + 11) % 12)]
+    N[(m as usize + 11) % 12]
 }
 
-pub fn date_get(this: &Rc<Interpreter>, d: &Rc<RefCell<JsDate>>, name: &str) -> JsValue {
+pub fn date_get(_this: &Rc<Interpreter>, d: &Rc<RefCell<JsDate>>, name: &str) -> JsValue {
     let d2 = d.clone();
     let make = move |f: fn(&JsDate) -> Option<f64>| -> JsValue {
         let d2 = d2.clone();
@@ -2124,7 +2120,7 @@ pub fn date_get(this: &Rc<Interpreter>, d: &Rc<RefCell<JsDate>>, name: &str) -> 
 
 // -- regex/error -----------------------------------------------------------
 
-pub fn regex_get(this: &Rc<Interpreter>, r: &Rc<RefCell<JsRegex>>, name: &str) -> JsValue {
+pub fn regex_get(_this: &Rc<Interpreter>, r: &Rc<RefCell<JsRegex>>, name: &str) -> JsValue {
     let r2 = r.clone();
     match name {
         "source" => {
@@ -2151,7 +2147,7 @@ pub fn regex_get(this: &Rc<Interpreter>, r: &Rc<RefCell<JsRegex>>, name: &str) -
                 let r2 = r2.clone();
                 Box::pin(async move {
                     let text = i2.repr(&args.first().cloned().unwrap_or(JsValue::Undefined));
-                    let mut r = r2.borrow_mut();
+                    let r = r2.borrow_mut();
                     let start = if r.global_ {
                         r.last_index.get() as usize
                     } else {
@@ -2182,7 +2178,7 @@ pub fn regex_get(this: &Rc<Interpreter>, r: &Rc<RefCell<JsRegex>>, name: &str) -
                 let r2 = r2.clone();
                 Box::pin(async move {
                     let text = i2.repr(&args.first().cloned().unwrap_or(JsValue::Undefined));
-                    let mut r = r2.borrow_mut();
+                    let r = r2.borrow_mut();
                     let start = if r.global_ {
                         r.last_index.get() as usize
                     } else {
@@ -2269,16 +2265,6 @@ pub fn class_get(this: &Rc<Interpreter>, c: &Rc<RefCell<JsClass>>, name: &str) -
     Ok(JsValue::Undefined)
 }
 
-pub fn class_set(c: &Rc<RefCell<JsClass>>, name: &str, value: &JsValue) -> Result<(), JsError> {
-    let is_proto_member = c.borrow().prototype.borrow().contains_key(name);
-    if is_proto_member {
-        c.borrow().prototype.borrow_mut().insert(name.to_string(), value.clone());
-    } else {
-        c.borrow().statics.borrow_mut().insert(name.to_string(), value.clone());
-    }
-    Ok(())
-}
-
 pub fn instance_get(inst: &Rc<RefCell<JsClassInstance>>, name: &str) -> JsValue {
     let inst = inst.borrow();
     if let Some(v) = inst.props.borrow().get(name) {
@@ -2301,7 +2287,7 @@ pub fn instance_get(inst: &Rc<RefCell<JsClassInstance>>, name: &str) -> JsValue 
 // -- function_get ----------------------------------------------------------
 
 pub fn function_get(
-    this: &Rc<Interpreter>,
+    _this: &Rc<Interpreter>,
     f: &Rc<JSFunction>,
     name: &str,
 ) -> Result<JsValue, JsError> {
@@ -2367,7 +2353,7 @@ fn make_bound(f: Rc<JSFunction>, this_arg: JsValue, pre: Vec<JsValue>) -> JsValu
 // -- promise_get -----------------------------------------------------------
 
 pub fn promise_get(
-    this: &Rc<Interpreter>,
+    _this: &Rc<Interpreter>,
     p: &Rc<RefCell<JsPromise>>,
     name: &str,
 ) -> Result<JsValue, JsError> {
@@ -2458,7 +2444,7 @@ fn settle(this: &Rc<Interpreter>, p: &Rc<RefCell<JsPromise>>, ok: bool, value: J
         let this2 = this.clone();
         for cb in observers {
             let v = value.clone();
-            let this3 = this2.clone();
+            let _this3 = this2.clone();
             this2.enqueue(Rc::new(move || cb(v.clone(), !ok)));
         }
         if !ok {
@@ -2483,7 +2469,7 @@ pub fn promise_on_settle(
     if pending {
         p.borrow_mut().observers.borrow_mut().push(cb);
     } else {
-        let this2 = this.clone();
+        let _this2 = this.clone();
         this.enqueue(Rc::new(move || {
             cb(state_value.clone(), rejected);
         }));
@@ -3119,7 +3105,7 @@ async fn await_promise(
             PromiseState::Rejected(v) => Poll::Ready(Err(JsError::Thrown(v.clone()))),
             PromiseState::Pending => {
                 let waker = cx.waker().clone();
-                let p2 = promise.clone();
+                let _p2 = promise.clone();
                 p.observers.borrow_mut().push(Rc::new(move |_v, _r| {
                     waker.wake_by_ref();
                 }));
@@ -3937,7 +3923,7 @@ fn bind_pattern(
                         m.insert(key.clone(), js_get(&this, &value, key)?);
                     }
                 }
-                if let Some(rest) = &pattern.rest {
+                if let Some(_rest) = &pattern.rest {
                     for key in own_keys(&this, &value) {
                         m.entry(key.clone())
                             .or_insert_with(|| js_get(&this, &value, &key).unwrap_or(JsValue::Undefined));
