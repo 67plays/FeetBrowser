@@ -1,7 +1,8 @@
 """Offline tests for the JS interpreter (jsengine) and its browser
 integration (script execution, console, click handlers).
 """
-import sys, os, tkinter
+import http.server
+import sys, os, threading, time, tkinter
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from feetbrowser.net import URL
@@ -213,6 +214,181 @@ def test_js_array_growth_and_length_truncate():
     assert g["hole"] is None or str(g["hole"]) == "undefined", \
         "holes read as undefined"
     eq(g["len2"], 2, "setting length truncates the array")
+
+
+def test_js_promise_then_all():
+    interp = Interpreter()
+    interp.run("""
+        var out = 0;
+        Promise.resolve(42).then(function(v){ out = v; });
+        var all;
+        Promise.all([Promise.resolve(1), Promise.resolve(2)]).then(
+            function(v){ all = v; });
+        var chained;
+        Promise.resolve(2).then(function(v){ return v * 3; }).then(
+            function(v){ chained = v; });
+        console.log("ok");
+    """)
+    eq(interp.globals["out"], 0, "then is async before drain")
+    interp.drain()
+    eq(interp.globals["out"], 42, "then runs on drain")
+    eq(interp.globals["all"], [1, 2], "Promise.all resolves in order")
+    eq(interp.globals["chained"], 6, "chained then carries values")
+
+
+def test_js_promise_reject_and_new():
+    interp = Interpreter()
+    interp.run("""
+        var caught;
+        Promise.reject("boom").catch(function(e){ caught = e; });
+        var fromExecutor;
+        new Promise(function(resolve, reject){ resolve(7); }).then(
+            function(v){ fromExecutor = v; });
+        console.log("ok");
+    """)
+    interp.drain()
+    eq(interp.globals["caught"], "boom", "reject() + catch()")
+    eq(interp.globals["fromExecutor"], 7, "new Promise(executor)")
+
+
+def test_js_async_await():
+    interp = Interpreter()
+    interp.run("""
+        var out;
+        (async function () {
+            var x = await Promise.resolve(6);
+            var y = await Promise.resolve(7);
+            out = x * y;
+        })();
+    """)
+    interp.drain()
+    eq(interp.globals["out"], 42, "await resolves values")
+
+
+def test_js_async_await_rejection():
+    interp = Interpreter()
+    interp.run("""
+        var out;
+        (async function () {
+            try { await Promise.reject("nope"); }
+            catch (e) { out = "caught:" + e; }
+        })();
+    """)
+    interp.drain()
+    eq(interp.globals["out"], "caught:nope", "await rejection is catchable")
+
+
+def test_js_timers():
+    interp = Interpreter()
+    interp.run("""
+        var out = 0;
+        setTimeout(function(){ out = 1; }, 50);
+        setTimeout(function(){ out = 2; }, 10);
+    """)
+    interp.advance(20); interp.drain()
+    eq(interp.globals["out"], 2, "earlier timeout fires first")
+    interp.advance(100); interp.drain()
+    eq(interp.globals["out"], 1, "later timeout fires after advance")
+
+
+def test_js_queue_microtask():
+    interp = Interpreter()
+    interp.run("""
+        var out = 0;
+        queueMicrotask(function(){ out = 5; });
+    """)
+    eq(interp.globals["out"], 0, "microtask deferred")
+    interp.drain()
+    eq(interp.globals["out"], 5, "microtask runs on drain")
+
+
+def test_js_try_catch_throw():
+    interp = Interpreter()
+    interp.run("""
+        var out;
+        try { throw "err"; } catch (e) { out = e; }
+        var fin;
+        function f(){ try { return 1; } finally { fin = "done"; } }
+        var r = f();
+        var emsg;
+        try { throw new Error("x"); } catch (e) { emsg = e.message; }
+        console.log("ok");
+    """)
+    eq(interp.globals["out"], "err", "throw + catch binds the value")
+    eq(interp.globals["r"], 1, "return value survives finally")
+    eq(interp.globals["fin"], "done", "finally runs on return")
+    eq(interp.globals["emsg"], "x", "new Error().message")
+
+
+def test_js_fetch_updates_page():
+    served = {"body": "fetched"}
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = served["body"].encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        port = srv.server_address[1]
+        tab = _make_tab(
+            f'<p id="x">old</p><script>'
+            f'fetch("http://127.0.0.1:{port}/data").then(function(r)'
+            f'{{ return r.text(); }}).then(function(t)'
+            f'{{ document.getElementById("x").textContent = t; }});'
+            f'</script>')
+        deadline = time.time() + 5
+        texts = _texts(tab)
+        while "fetched" not in texts and time.time() < deadline:
+            tab._drain_js()
+            time.sleep(0.02)
+            texts = _texts(tab)
+        assert "fetched" in texts, f"fetch result not rendered: {texts}"
+    finally:
+        srv.shutdown()
+
+
+def test_js_xhr_basic_get():
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = b"xhr-body"
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        port = srv.server_address[1]
+        tab = _make_tab(
+            f'<p id="x">old</p><script>'
+            f'var x = new XMLHttpRequest();'
+            f'x.onload = function()'
+            f'{{ document.getElementById("x").textContent = x.responseText; }};'
+            f'x.open("GET", "http://127.0.0.1:{port}/x");'
+            f'x.send();'
+            f'</script>')
+        deadline = time.time() + 5
+        texts = _texts(tab)
+        while "xhr-body" not in texts and time.time() < deadline:
+            tab._drain_js()
+            time.sleep(0.02)
+            texts = _texts(tab)
+        assert "xhr-body" in texts, f"XHR result not rendered: {texts}"
+    finally:
+        srv.shutdown()
 
 
 def _make_tab(body, url="https://example.com/page"):
