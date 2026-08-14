@@ -36,6 +36,15 @@ importable, so a first run needs the Rust toolchain (the script installs
 for the interpreter you're invoking, `python3 -m feetbrowser <url>` works
 directly.
 
+If you would rather not install a Rust toolchain at all, don't: the
+[Wheels](.github/workflows/wheels.yml) workflow builds the extension for
+macOS (Intel and Apple Silicon in one universal wheel), manylinux x86-64 and
+Windows x86-64, on CPython 3.9 through 3.14. They are attached to every
+tagged release, and every run of that workflow keeps the same files as
+downloadable artifacts. Install one into the interpreter you run the browser
+with — `pip install feetbrowser_engine-*.whl` — and `run.sh` finds the
+engine already importable and skips the build.
+
 There is a second JavaScript engine, written from scratch in Zig and loaded
 with `ctypes` rather than built into a venv. `FEETBROWSER_JS=zig ./run.sh`
 selects it; `rust` is the default. Both pass the same test suite, and the

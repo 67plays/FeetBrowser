@@ -1,0 +1,289 @@
+name: Wheels
+
+# The engine is not optional. raster.py, fontengine.py, imagecodec.py,
+# cssparser.py, jsengine.py and jsdom.py all `import feetbrowser_engine` at
+# module top level, with no try/except and no Python fallback, so a machine
+# without a Rust toolchain cannot start the browser at all -- it stops on the
+# first import. run.sh papers over that by compiling the extension into a
+# .venv on first run, which works only if cargo is already installed.
+#
+# This workflow removes the toolchain from the equation for everyone who is
+# not developing the engine: it builds the extension on every platform the
+# browser has a window backend for, keeps the wheels as artifacts of every
+# run, and attaches them to a release when a tag is pushed. `pip install`
+# then replaces `cargo build`.
+#
+# ci.yml stays the judge of whether the code is correct; nothing here runs a
+# test suite. What it does check is the one thing a wheel can get wrong
+# silently: that the archive really contains a compiled extension and that
+# the interpreter it claims to be for can import it.
+#
+# Every job below builds the same six interpreters, because
+# rust/pyproject.toml says requires-python >= 3.9 and ci.yml tests through
+# 3.14. One wheel per interpreter is the cost of not using pyo3's abi3
+# feature, and that is not a choice this file gets to make:
+# rust/src/raster.rs implements __getbuffer__/__releasebuffer__ so that
+# Surface can hand its framebuffer out as a zero-copy memoryview, and
+# rust/src/pyutil.rs reads bytes-like arguments through
+# pyo3::buffer::PyBuffer. pyo3 gates both on
+# `any(not(Py_LIMITED_API), Py_3_11)`, because Py_buffer only entered the
+# limited API in CPython 3.11. `cargo check` with abi3-py39 fails with
+# `cannot find type Py_buffer in module ffi` and five more like it; the same
+# check with abi3-py311 passes. abi3 is available only at the price of
+# dropping 3.9 and 3.10, which the project supports and tests, so this pays
+# in wheels instead.
+#
+# Nothing here is cached. The crate download is seconds next to a release
+# build with LTO on, and a wheel that gets handed to a stranger should be
+# linked out of objects this run produced rather than ones a cache key
+# happened to match.
+
+on:
+  # Wheels are slow and platform-specific, so they run when something that
+  # can change them changes: the Rust sources, the build metadata, or this
+  # file. Everything else is ci.yml's business.
+  pull_request:
+    paths:
+      - 'rust/**'
+      - '.github/workflows/wheels.yml'
+  # No paths filter on tags: a release publishes wheels whether or not that
+  # particular commit touched rust/.
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # x86-64 Linux, built inside the manylinux image rather than on the runner.
+  # A wheel linked against ubuntu-latest's glibc would be tagged for a glibc
+  # newer than most distributions ship and would refuse to install nearly
+  # everywhere; manylinux_2_28 is the oldest base that still runs the Node
+  # the actions themselves need. The container is driven with `docker run`
+  # instead of `container:` so that checkout and upload stay on the runner
+  # and only the compiler goes inside.
+  linux:
+    name: manylinux_2_28 x86_64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and check the wheels
+        run: |
+          docker run --rm -i -v "$PWD:/io" -w /io \
+            quay.io/pypa/manylinux_2_28_x86_64 bash -s <<'BUILD'
+          set -euo pipefail
+
+          # The manylinux images carry every CPython but no Rust.
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain stable
+          export PATH="$HOME/.cargo/bin:/opt/python/cp312-cp312/bin:$PATH"
+
+          # Missing interpreters would quietly cost us wheels, so they are an
+          # error rather than a shorter matrix.
+          args=()
+          for v in 3.9 3.10 3.11 3.12 3.13 3.14; do
+            tag="cp${v/./}"
+            py="/opt/python/$tag-$tag/bin/python"
+            if [ ! -x "$py" ]; then
+              echo "no interpreter for $v at $py" >&2
+              exit 1
+            fi
+            args+=(-i "$py")
+          done
+
+          pip install --quiet maturin
+          maturin build --release --manifest-path rust/Cargo.toml \
+            --out dist "${args[@]}"
+
+          # A wheel that builds but ships no compiled module is the failure
+          # this catches: every interpreter installs the wheel pip picks for
+          # it, imports the module, and looks for the .so it came out of.
+          for v in 3.9 3.10 3.11 3.12 3.13 3.14; do
+            tag="cp${v/./}"
+            py="/opt/python/$tag-$tag/bin/python"
+            "$py" -m pip install --quiet --no-index --find-links dist \
+              feetbrowser-engine
+            "$py" - <<'CHECK'
+          import pathlib
+          import feetbrowser_engine as e
+          so = sorted(pathlib.Path(e.__file__).parent.glob("*.so"))
+          assert so, e.__file__
+          print(so[0])
+          CHECK
+          done
+          BUILD
+          sudo chown -R "$(id -u):$(id -g)" dist rust/target
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-manylinux-x86_64
+          path: dist/*.whl
+          if-no-files-found: error
+
+  # One wheel per interpreter covering both Macs. `--target
+  # universal2-apple-darwin` builds the crate twice and lipos the halves
+  # together, which is half as many artifacts as an arm64 job plus an x86_64
+  # job and, unlike them, cannot end up with only one of the two published.
+  macos:
+    name: macOS universal2 py${{ matrix.python }}
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.9', '3.10', '3.11', '3.12', '3.13', '3.14']
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      # The runner is Apple Silicon, so the Intel half is a cross-build. It
+      # needs no Python of its own: a macOS extension module leaves the
+      # interpreter's symbols to be resolved at load time rather than
+      # linking against a libpython.
+      - name: Add both Mac targets
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: Build the wheel
+        run: |
+          python -m pip install --quiet maturin
+          maturin build --release --manifest-path rust/Cargo.toml \
+            --target universal2-apple-darwin --out dist
+
+      - name: Check it carries both architectures and imports
+        run: |
+          whl=$(echo dist/*.whl)
+          unzip -o -q "$whl" -d unpacked
+          dylib=$(find unpacked -name '*.so' | head -1)
+          test -n "$dylib" || { echo "no extension in $whl" >&2; exit 1; }
+          file "$dylib"
+          archs=$(lipo -archs "$dylib")
+          echo "architectures: $archs"
+          grep -q x86_64 <<<"$archs"
+          grep -q arm64 <<<"$archs"
+          python -m pip install --quiet --no-index --find-links dist \
+            feetbrowser-engine
+          python -c "import feetbrowser_engine as e; print(e.__file__)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-macos-universal2-py${{ matrix.python }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  # x86-64 Windows. arm64 Windows would need a cross-build with no runner to
+  # test it on, and the browser has no window backend there yet, so it is
+  # left out rather than shipped unverified.
+  windows:
+    name: Windows x86_64 py${{ matrix.python }}
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.9', '3.10', '3.11', '3.12', '3.13', '3.14']
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          architecture: x64
+
+      - name: Build the wheel
+        run: |
+          python -m pip install --quiet maturin
+          maturin build --release --manifest-path rust/Cargo.toml --out dist
+
+      - name: Check it carries a .pyd and imports
+        run: |
+          whl=$(echo dist/*.whl)
+          python -c "
+          import sys, zipfile
+          names = zipfile.ZipFile(sys.argv[1]).namelist()
+          pyds = [n for n in names if n.endswith('.pyd')]
+          assert pyds, names
+          print(pyds)
+          " "$whl"
+          python -m pip install --quiet --no-index --find-links dist \
+            feetbrowser-engine
+          python -c "import feetbrowser_engine as e; print(e.__file__)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-windows-x86_64-py${{ matrix.python }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  # The source distribution, for anyone on a platform no wheel above covers
+  # -- they still need cargo, which is exactly the situation everybody was in
+  # before this file existed.
+  sdist:
+    name: sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Build the sdist
+        run: |
+          python -m pip install --quiet maturin
+          maturin sdist --manifest-path rust/Cargo.toml --out dist
+
+      # An sdist missing src/ still installs on a machine with a warm cargo
+      # cache and fails on a cold one, so its contents get checked here.
+      - name: Check it carries the Rust sources
+        run: |
+          sd=$(echo dist/*.tar.gz)
+          listing=$(tar tzf "$sd")
+          printf '%s\n' "$listing"
+          grep -q 'src/lib\.rs$' <<<"$listing"
+          grep -q 'Cargo\.lock$' <<<"$listing"
+          grep -q 'pyproject\.toml$' <<<"$listing"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  # Tags only. Everything above is downloadable from its own run whether or
+  # not a release exists; this puts the same files somewhere a user can find
+  # without knowing what GitHub Actions is.
+  release:
+    name: Attach to the release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [linux, macos, windows, sdist]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          ls -l dist
+          gh release view "$TAG" >/dev/null 2>&1 \
+            || gh release create "$TAG" --title "$TAG" --generate-notes
+          gh release upload "$TAG" dist/* --clobber
