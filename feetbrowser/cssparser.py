@@ -183,6 +183,52 @@ class DescendantSelector:
         return False
 
 
+class ChildSelector:
+    """`a > b`: b's own parent must be an a, not merely some ancestor.
+
+    Treating this as a descendant relationship is how one `.menu > li` rule
+    reaches every list item on the page, submenus included.
+    """
+
+    def __init__(self, parent, child):
+        self.parent = parent
+        self.child = child
+        self.priority = tuple(
+            a + b for a, b in zip(parent.priority, child.priority))
+
+    def matches(self, node):
+        return self.child.matches(node) and node.parent is not None \
+            and isinstance(node.parent, Element) \
+            and self.parent.matches(node.parent)
+
+
+class SiblingSelector:
+    """`a + b` (adjacent) and `a ~ b` (any earlier sibling)."""
+
+    def __init__(self, before, after, adjacent):
+        self.before = before
+        self.after = after
+        self.adjacent = adjacent
+        self.priority = tuple(
+            a + b for a, b in zip(before.priority, after.priority))
+
+    def matches(self, node):
+        if not self.after.matches(node):
+            return False
+        parent = node.parent
+        if not isinstance(parent, Element):
+            return False
+        earlier = []
+        for child in parent.children:
+            if child is node:
+                break
+            if isinstance(child, Element):
+                earlier.append(child)
+        if self.adjacent:
+            return bool(earlier) and self.before.matches(earlier[-1])
+        return any(self.before.matches(sib) for sib in earlier)
+
+
 class RootSelector:
     """Matches the document root element (`:root`), i.e. the node with no
     parent. Typical target for custom-property (`--x`) declarations."""
@@ -596,38 +642,61 @@ class CSSParser:
         return sels
 
     def selector(self, text):
-        # Split on whitespace outside parentheses (so `:has(> img)` keeps its
-        # internal space), treating >, + and ~ as descendant relationships;
-        # unsupported tokens are dropped rather than left to crash the rule.
+        # Split into compounds and the combinators between them. Whitespace
+        # inside parentheses is left alone, so `:has(> img)` survives; a
+        # combinator needs no space around it, because minified CSS writes
+        # `.menu>li+li` and that is three compounds, not one.
         tokens = []
         buf = []
         depth = 0
         for ch in text:
-            if ch == "(":
+            if ch in "([":
                 depth += 1
                 buf.append(ch)
-            elif ch == ")":
+            elif ch in ")]":
                 depth = max(0, depth - 1)
                 buf.append(ch)
-            elif ch in " \t\r\n\f" and depth == 0:
+            elif depth == 0 and (ch in " \t\r\n\f" or ch in ">+~"):
                 if buf:
                     tokens.append("".join(buf))
                     buf = []
+                if ch in ">+~":
+                    # A combinator replaces any descendant space beside it.
+                    if tokens and tokens[-1] in (">", "+", "~"):
+                        tokens[-1] = ch
+                    else:
+                        tokens.append(ch)
             else:
                 buf.append(ch)
         if buf:
             tokens.append("".join(buf))
-        tokens = [t for t in tokens if t not in (">", "+", "~")]
+        while tokens and tokens[0] in (">", "+", "~"):
+            # A leading combinator means a relative selector, and the only
+            # place we accept one is inside `:has()` -- `:has(> img)`. What it
+            # is relative to is the element being tested, which _has_match
+            # already supplies by walking descendants, so the combinator has
+            # nothing left to say here.
+            tokens.pop(0)
         if not tokens:
             return None
         result = self.simple_selector(tokens[0])
         if result is None:
             return None
+        combinator = " "
         for tok in tokens[1:]:
+            if tok in (">", "+", "~"):
+                combinator = tok
+                continue
             simple = self.simple_selector(tok)
             if simple is None:
                 return None
-            result = DescendantSelector(result, simple)
+            if combinator == ">":
+                result = ChildSelector(result, simple)
+            elif combinator in ("+", "~"):
+                result = SiblingSelector(result, simple, combinator == "+")
+            else:
+                result = DescendantSelector(result, simple)
+            combinator = " "
         return result
 
     def parse(self):

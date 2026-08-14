@@ -62,3 +62,11 @@ title, head, style, script, meta, link { display: none; }
 
 nav      { display: block; }
 header   { display: block; }
+
+/* A closed <details> shows its <summary> and nothing else. Pages use it for
+   dropdowns and "read more" panels, so without this rule every one of them
+   spills its contents onto the page with no way to tell them apart from the
+   real text around them. */
+details  { display: block; }
+summary  { display: block; font-weight: bold; }
+details:not([open]) > *:not(summary) { display: none; }

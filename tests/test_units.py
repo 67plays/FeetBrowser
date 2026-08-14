@@ -1640,6 +1640,65 @@ def test_the_older_clip_property_hides_it_too():
     assert "skip" not in words, words
 
 
+def _painted(html, css="", ua=False):
+    """Every word the page actually draws."""
+    from feetbrowser.layout import DrawText
+    return {c.text for c in _paint_all(html, css, ua=ua)
+            if isinstance(c, DrawText)}
+
+
+def _reds(html, css):
+    """Which elements a `color: red` rule reached, by id."""
+    dom = HTMLParser(html).parse()
+    style(dom, CSSParser(css).parse())
+    found, stack = [], [dom]
+    while stack:
+        node = stack.pop()
+        if hasattr(node, "tag"):
+            # By id, because colour inherits and the children of a matched
+            # element are red too without the rule ever naming them.
+            if node.style.get("color") == "red" and node.attributes.get("id"):
+                found.append(node.attributes["id"])
+            stack.extend(reversed(node.children))
+    return sorted(found)
+
+
+def test_child_combinator_stops_at_the_first_generation():
+    """`>` is not a fancier space. A menu that styles `.menu > li` means the
+    top level only; reading it as a descendant reaches every submenu too."""
+    html = '<div><p id=own>a</p><section><p id=deep>b</p></section></div>'
+    eq(_reds(html, "div > p { color: red }"), ["own"], "spaced")
+    eq(_reds(html, "div>p { color: red }"), ["own"], "minified, no spaces")
+    eq(_reds(html, "div p { color: red }"), ["deep", "own"], "descendant")
+
+
+def test_sibling_combinators_look_backwards():
+    html = ('<div><h1 id=h>t</h1><p id=a>a</p><span id=s>s</span>'
+            '<p id=b>b</p></div>')
+    eq(_reds(html, "h1 + p { color: red }"), ["a"], "adjacent only")
+    eq(_reds(html, "h1 ~ p { color: red }"), ["a", "b"], "any later sibling")
+    eq(_reds(html, "ul > li + li { color: red }"),
+       [], "no list here to match")
+    eq(_reds('<ul><li id=x>1</li><li id=y>2</li><li id=z>3</li></ul>',
+             "ul>li+li{color:red}"), ["y", "z"], "all but the first")
+
+
+def test_has_still_takes_a_relative_selector():
+    """`:has(> img)` leads with a combinator, which is legal only in there."""
+    eq(_reds('<p id=with><img></p><p id=without>x</p>',
+             "p:has(> img) { color: red }"), ["with"])
+
+
+def test_a_closed_details_shows_only_its_summary():
+    """Dropdowns and "read more" panels are <details>; without the rule that
+    hides a closed one, every page spills them into the text."""
+    html = ('<details><summary>Caches</summary><a>Archive.org</a></details>'
+            '<details open><summary>Open</summary><a>Ghostarchive</a></details>')
+    words = _painted(html, ua=True)
+    assert "Archive.org" not in words, words
+    assert {"Caches", "Open", "Ghostarchive"} <= words, words
+
+
 def test_hidden_attribute_hides_the_element():
     from feetbrowser.layout import DrawText
     cmds = _paint_all('<p>shown</p><p hidden>gone</p>', ua=True)
