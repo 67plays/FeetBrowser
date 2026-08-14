@@ -11,6 +11,7 @@ backend (see gui.py) and are cached.
 
 import copy
 import re
+from collections import namedtuple
 from . import gui
 from . import cssparser
 
@@ -21,7 +22,7 @@ INLINE_ELEMENTS = {
     "a", "b", "i", "em", "strong", "span", "small", "big", "sub", "sup",
     "code", "tt", "kbd", "samp", "u", "abbr", "cite", "q", "s", "strike",
     "font", "label", "br", "img", "input", "button", "mark", "time", "var",
-    "select", "textarea", "option",
+    "select", "textarea", "option", "optgroup",
 }
 
 _FONT_CACHE = {}
@@ -1185,6 +1186,179 @@ def field_checked(node):
     return "checked" in node.attributes
 
 
+# -- <select> ---------------------------------------------------------------
+#
+# The painter here and the drop-down list in browser.py have to agree on what
+# a <select> currently holds, so the reading of it lives in one place. The
+# `selected` attribute on an <option> is the single source of truth; the
+# select's own `value` attribute is a mirror the Tab keeps in step, because
+# that attribute is what JavaScript sees when it reads `.value`.
+
+
+def select_options(node):
+    """The <option>s of a <select>, in document order, each paired with the
+    label of the <optgroup> it came out of (None when it was not in one).
+
+    Groups are flattened rather than nested because nothing about choosing an
+    option cares about the nesting -- only the drawing of the list does, and
+    the group label is all it needs.
+    """
+    out = []
+    for child in node.children:
+        if not isinstance(child, Element):
+            continue
+        if child.tag == "option":
+            out.append((child, None))
+        elif child.tag == "optgroup":
+            label = child.attributes.get("label", "")
+            for inner in child.children:
+                if isinstance(inner, Element) and inner.tag == "option":
+                    out.append((inner, label))
+    return out
+
+
+def option_label(option):
+    """The text an <option> shows. HTML lets the label be given either as the
+    element's text or, when there is none, as its `label` attribute."""
+    text = "".join(c.text for c in option.children
+                   if isinstance(c, Text)).strip()
+    return text or option.attributes.get("label", "")
+
+
+def option_value(option):
+    """What an <option> submits: its `value` attribute, or its label when it
+    has no `value` at all."""
+    if "value" in option.attributes:
+        return option.attributes["value"]
+    return option_label(option)
+
+
+def selected_options(node):
+    """The chosen <option>s of a <select>.
+
+    A single-choice select always has one even when the markup marks none:
+    browsers fall back to the first option the user could have picked, and
+    forms submit that, so the painter must show it too.
+    """
+    options = [opt for opt, _group in select_options(node)]
+    chosen = [opt for opt in options if "selected" in opt.attributes]
+    multiple = "multiple" in node.attributes
+    if chosen:
+        return chosen if multiple else chosen[-1:]
+    if multiple:
+        return []
+    for opt in options:
+        if "disabled" not in opt.attributes:
+            return [opt]
+    return []
+
+
+# One line of a <select>'s list. A row with no `option` is an <optgroup>
+# heading: it is drawn, but it can never be highlighted or chosen.
+SelectRow = namedtuple("SelectRow", "option label enabled heading")
+
+
+def select_rows(node):
+    """Flatten a <select> into the lines its list shows.
+
+    The drop-down and the expanded listbox show exactly the same lines, so
+    they read them from here rather than each flattening the tree its own
+    way and drifting apart.
+    """
+    rows = []
+    group = None
+    for option, group_label in select_options(node):
+        if group_label is not None and group_label != group:
+            rows.append(SelectRow(None, group_label, False, True))
+        group = group_label
+        rows.append(SelectRow(option, option_label(option),
+                              "disabled" not in option.attributes, False))
+    return rows
+
+
+# Geometry of an expanded <select>. Hit-testing a click on one happens in
+# browser.py against these same numbers, so they live next to the painter
+# that draws them rather than being written down twice.
+LISTBOX_ROW_H = 20
+LISTBOX_PAD = 3
+LISTBOX_PAD_X = 7
+LISTBOX_INDENT = 12
+LISTBOX_DEFAULT_ROWS = 4
+
+
+def listbox_rows(node):
+    """How many option rows an expanded <select> shows, or 0 when it is an
+    ordinary drop-down.
+
+    `size` asks for the expanded form outright. `multiple` implies it: a
+    control offering more than one choice at a time has to show more than
+    one row, or there is nothing to choose between, and browsers settle on
+    about four when the markup does not say.
+    """
+    size = None
+    raw = node.attributes.get("size")
+    if raw is not None:
+        try:
+            size = int(str(raw).strip())
+        except ValueError:
+            size = None
+    if size is not None and size > 1:
+        return size
+    if "multiple" in node.attributes:
+        return size if size is not None and size > 0 else LISTBOX_DEFAULT_ROWS
+    return 0
+
+
+def listbox_scroll(node, nrows=None):
+    """Index of the first row an expanded <select> is showing.
+
+    Clamped on the way out, because the offset lives on the node and the
+    list under it can shrink -- a script removing options must not leave
+    the box scrolled past its own end.
+    """
+    visible = listbox_rows(node)
+    if nrows is None:
+        nrows = len(select_rows(node))
+    raw = node.attributes.get("data-scroll")
+    if raw is None:
+        # Nobody has scrolled it yet. Opening at the top would be wrong for a
+        # short box whose chosen option is a long way down it -- the reader
+        # would be looking at rows their own choice is not among -- so the
+        # resting position is wherever the choice is.
+        i = listbox_active(node)
+        top = 0 if i < visible else i - visible + 1
+    else:
+        try:
+            top = int(raw)
+        except (TypeError, ValueError):
+            top = 0
+    return max(0, min(top, max(0, nrows - visible)))
+
+
+def listbox_active(node, rows=None):
+    """Index of the row an expanded <select>'s keyboard cursor is on.
+
+    Before any arrow has been pressed there is no explicit one, and the
+    answer is the chosen option: that is where the reader is looking, so it
+    is where the first arrow press should move from.
+    """
+    if rows is None:
+        rows = select_rows(node)
+    raw = node.attributes.get("data-active")
+    if raw is not None:
+        try:
+            i = int(raw)
+        except (TypeError, ValueError):
+            i = -1
+        if 0 <= i < len(rows) and rows[i].enabled:
+            return i
+    chosen = {id(opt) for opt in selected_options(node)}
+    for i, row in enumerate(rows):
+        if row.option is not None and id(row.option) in chosen:
+            return i
+    return next((i for i, row in enumerate(rows) if row.enabled), -1)
+
+
 class LayoutBox:
     """Base class carrying geometry."""
 
@@ -1214,7 +1388,7 @@ class _LineItem:
 
     def __init__(self, kind, x, text, font, color, node, w, h, photo=None,
                  bg=None, pl=0, pr=0, pt=0, pb=0):
-        self.kind = kind  # "text", "img", "pill" or "block"
+        self.kind = kind  # "text", "img", "pill", "block" or "listbox"
         self.x = x
         self.text = text
         self.font = font
@@ -1233,9 +1407,12 @@ class _LineItem:
     def ascent(self):
         if self.kind == "img":
             return int(self.h * 0.82)
-        if self.kind == "block":
+        if self.kind in ("block", "listbox"):
             # An inline-block sits on the baseline rather than straddling it,
-            # so the whole of it counts as height above the line.
+            # so the whole of it counts as height above the line. An expanded
+            # <select> is the same shape of thing, and this is what makes the
+            # line grow to hold it instead of the text below running through
+            # it.
             return self.h
         return _metrics(self.font, "ascent")
 
@@ -1243,7 +1420,7 @@ class _LineItem:
     def descent(self):
         if self.kind == "img":
             return int(self.h * 0.18)
-        if self.kind == "block":
+        if self.kind in ("block", "listbox"):
             return 0.0
         return _metrics(self.font, "descent")
 
@@ -2718,6 +2895,11 @@ class BlockLayout(LayoutBox):
                 self.children.append(box)
                 self._underline_run = None
                 continue
+            elif item.kind == "listbox":
+                self._paint_listbox(item.x + offset, baseline - item.ascent,
+                                    item)
+                self._underline_run = None
+                continue
             elif item.kind == "pill":
                 y = baseline - item.h
                 if item.bg:
@@ -2909,7 +3091,8 @@ class BlockLayout(LayoutBox):
         self.cursor_x = x + w + _measure(font, " ")
 
     def _paint_control(self, node, label, wpad, hpad, rect, outline,
-                       dx, dy, tcolor, dropdown=False):
+                       dx, dy, tcolor, dropdown=False, thickness=1,
+                       glyph="#555555"):
         """Paint a button/select-shaped control from a resolved label."""
         font = get_font(13, "normal", "roman")
         w = self._fit_control(_measure(font, label) + wpad)
@@ -2917,9 +3100,10 @@ class BlockLayout(LayoutBox):
         y = self.cursor_y
         texts = [(self.cursor_x + dx, y + dy, label, font, tcolor)]
         if dropdown:
-            texts.append((self.cursor_x + w - 14, y + 4, "▾", font, "#555555"))
+            texts.append((self.cursor_x + w - 14, y + 4, "▾", font, glyph))
         self._box_control(self.cursor_x, y, w, h, font, node,
-                          rect=rect, outline=outline, texts=texts)
+                          rect=rect, outline=outline, thickness=thickness,
+                          texts=texts)
 
     def _inline_input(self, node):
         itype = node.attributes.get("type", "text").lower()
@@ -3024,16 +3208,110 @@ class BlockLayout(LayoutBox):
         self.cursor_x += total_w + _measure(font, " ")
 
     def _inline_select(self, node):
-        opts = [c for c in node.children
-                if isinstance(c, Element) and c.tag == "option"]
-        chosen = [o for o in opts if "selected" in o.attributes] or opts[:1]
-        label = chosen[0].attributes.get("value", "") if chosen else ""
-        if not label and chosen:
-            label = "".join(c.text for c in chosen[0].children
-                            if isinstance(c, Text))
-        self._paint_control(node, label or "▾", 20, 8,
-                            "#f2f2f2", "#999999", 4, 4, "#111111",
-                            dropdown=True)
+        # `size` and `multiple` ask for the options to be on the page rather
+        # than behind a drop-down, which is a different shape of box: tall,
+        # and taking up room the rest of the line has to make way for.
+        if listbox_rows(node):
+            return self._inline_listbox(node)
+        # The closed control shows the *labels* of the chosen options, not
+        # their values: the value is what the form submits, the label is what
+        # the page told the reader to look for.
+        label = ", ".join(option_label(opt) for opt in selected_options(node))
+        disabled = "disabled" in node.attributes
+        open_ = "data-focused" in node.attributes
+        # A select with nothing to show still needs a box wide enough for the
+        # arrow, so pad the empty label out rather than collapsing to a sliver.
+        self._paint_control(node, label or "    ", 24, 8,
+                            "#e9e9e9" if disabled else "#f2f2f2",
+                            "#c8c8c8" if disabled else
+                            ("#3b82f6" if open_ else "#999999"),
+                            6, 4,
+                            "#8a8a8a" if disabled else "#111111",
+                            dropdown=True, thickness=2 if open_ else 1,
+                            glyph="#bbbbbb" if disabled else "#555555")
+
+    def _inline_listbox(self, node):
+        """Reserve room on the line for an expanded <select>.
+
+        Unlike the drop-down, this is page content and not an overlay: it is
+        as tall as the rows it shows, and the line it sits on has to grow to
+        hold it or the text after it would be drawn straight through it. So
+        it joins the pending line as one atom, the way an inline-block does,
+        and is painted in flush() once the baseline is settled and there is
+        somewhere to put it.
+        """
+        rows = select_rows(node)
+        font = get_font(13, "normal", "roman")
+        indent = LISTBOX_INDENT if any(row.heading for row in rows) else 0
+        w = 80.0
+        for row in rows:
+            w = max(w, _measure(font, row.label) + 2 * LISTBOX_PAD_X
+                    + (0 if row.heading else indent))
+        w = self._fit_control(w, min_w=40)
+        h = listbox_rows(node) * LISTBOX_ROW_H + 2 * LISTBOX_PAD
+        self.line.append(_LineItem("listbox", self.cursor_x, "", font, None,
+                                   node, w, h))
+        self.cursor_x += w + _measure(font, " ")
+
+    def _paint_listbox(self, x, y, item):
+        """Draw an expanded <select> and record it as one hit box.
+
+        The rows are not separate controls -- which row a click landed on is
+        arithmetic on this box, done where the click arrives -- so the whole
+        listbox goes into input_boxes once, exactly as the closed control
+        does.
+        """
+        node, font, w, h = item.node, item.font, item.w, item.h
+        rows = select_rows(node)
+        disabled = "disabled" in node.attributes
+        focused = "data-focused" in node.attributes and not disabled
+        shown = listbox_rows(node)
+        top = listbox_scroll(node, len(rows))
+        active = listbox_active(node, rows)
+        chosen = {id(opt) for opt in selected_options(node)}
+        indent = LISTBOX_INDENT if any(row.heading for row in rows) else 0
+        self.display_list.append(DrawRect(
+            x, y, x + w, y + h, "#e9e9e9" if disabled else "#ffffff"))
+        self.display_list.append(DrawOutline(
+            x, y, x + w, y + h,
+            "#c8c8c8" if disabled else ("#3b82f6" if focused else "#999999"),
+            2 if focused else 1))
+        # Row text sits in the middle of its row rather than at the top, so a
+        # row reads as a band the reader can aim at.
+        inset = max(0.0, (LISTBOX_ROW_H - _linespace(font)) / 2)
+        ry = y + LISTBOX_PAD
+        for i in range(top, min(len(rows), top + shown)):
+            row = rows[i]
+            if row.heading:
+                self.display_list.append(DrawText(
+                    x + LISTBOX_PAD_X, ry + inset, row.label,
+                    get_font(12, "bold", "roman"), "#8a8a8a", node))
+                ry += LISTBOX_ROW_H
+                continue
+            picked = id(row.option) in chosen
+            if picked:
+                self.display_list.append(DrawRect(
+                    x + 1, ry, x + w - 1, ry + LISTBOX_ROW_H,
+                    "#c9d7ef" if disabled else "#3b82f6"))
+            elif focused and i == active:
+                # The keyboard is here but this row is not taken. A wash and a
+                # ring, both paler than the solid fill a taken row gets, are
+                # the only thing saying where the next Space would land.
+                self.display_list.append(DrawRect(
+                    x + 1, ry, x + w - 1, ry + LISTBOX_ROW_H, "#e5edfc"))
+                self.display_list.append(DrawOutline(
+                    x + 1, ry, x + w - 1, ry + LISTBOX_ROW_H, "#5b8def", 1))
+            if disabled or not row.enabled:
+                color = "#8a8a8a"
+            elif picked:
+                color = "#ffffff"
+            else:
+                color = "#111111"
+            self.display_list.append(DrawText(
+                x + LISTBOX_PAD_X + indent, ry + inset, row.label, font,
+                color, node))
+            ry += LISTBOX_ROW_H
+        self.input_boxes.append((x, y, x + w, y + h, node))
 
     # -- painting --------------------------------------------------------
 
