@@ -323,6 +323,39 @@ def test_config_set_via_handle_route():
             toes.repo_root = orig_root
 
 
+def test_config_set_via_query_param():
+    """The form submit (str/int inputs) must apply through the query param
+    route: toehub://config/<name>/set/<key>?value=<v>."""
+    from feetbrowser import toehub
+    with tempfile.TemporaryDirectory() as tmp:
+        demo = os.path.join(tmp, "toes", "demo")
+        os.makedirs(demo)
+        with open(os.path.join(demo, "toe.json"), "w") as f:
+            f.write('{"name": "demo", "entry": "toe.py"}')
+        with open(os.path.join(demo, "toe.py"), "w") as f:
+            f.write('from feetbrowser import toes\n'
+                    'def activate(ctx):\n'
+                    '    ctx.define_config(toes.ConfigOption'
+                    '("size", "Size", "int", default=16))\n')
+        orig_root = toes.repo_root
+        toes.repo_root = lambda: tmp
+        try:
+            browser = StubBrowser()
+            toe = toes.Toe("demo", "0", "", demo, demo_mod())
+            browser.toe_contexts = [toes.Context(browser, toe.module)]
+            browser.toes = [toe]
+            tab = Tab(700, browser)
+            browser.active_tab = tab
+
+            resp = toehub.handle(
+                URL("toehub://config/demo/set/size?value=32"), tab)
+            assert resp is not None
+            ctx = browser.toe_contexts[0]
+            assert ctx.config_value("size") == 32, ctx.config_value("size")
+        finally:
+            toes.repo_root = orig_root
+
+
 def demo_mod():
     import types
     m = types.ModuleType("toe_demo")
