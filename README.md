@@ -24,17 +24,33 @@ Code in this repo is evaluated on six principles:
 ## Run it
 
 ```bash
-./run.sh                 # opens the welcome page
+./run.sh                 # macOS, Linux: opens the welcome page
 ./run.sh https://example.com
 ```
 
+```bat
+run.cmd                  :: Windows: the same script for cmd.exe
+run.cmd https://example.com
+```
+
 No GUI toolkit to install — just Python 3 and a system font. The one thing
-that does get built is the engine: `run.sh` compiles the Rust
+that does get built is the engine: `run.sh` and `run.cmd` compile the Rust
 extension (`feetbrowser_engine`) into a local `.venv` when it isn't
 importable, so a first run needs the Rust toolchain (the script installs
-`maturin` into the venv for you). Once the extension is built and installed
+`maturin` into the venv for you). On Windows it needs a C++ linker as well,
+which rustup does not bring with it — [usage.md](docs/usage.md) has the one
+download and the one checkbox. Once the extension is built and installed
 for the interpreter you're invoking, `python3 -m feetbrowser <url>` works
 directly.
+
+If you would rather not install a Rust toolchain at all, don't: the
+[Wheels](.github/workflows/wheels.yml) workflow builds the extension for
+macOS (Intel and Apple Silicon in one universal wheel), manylinux x86-64 and
+Windows x86-64, on CPython 3.9 through 3.14. They are attached to every
+tagged release, and every run of that workflow keeps the same files as
+downloadable artifacts. Install one into the interpreter you run the browser
+with — `pip install feetbrowser_engine-*.whl` — and `run.sh` finds the
+engine already importable and skips the build.
 
 There is a second JavaScript engine, written from scratch in Zig and loaded
 with `ctypes` rather than built into a venv. `FEETBROWSER_JS=zig ./run.sh`
@@ -43,11 +59,12 @@ design of the Zig one is in [docs/jszig.md](docs/jszig.md). That variable and
 every other one the browser reads are documented in
 [docs/usage.md](docs/usage.md#environment-variables).
 
-The window itself is ours too. macOS gets one through AppKit and Linux gets
-one through Xlib — both by ctypes, so there is nothing to install for either,
-and X11 covers Wayland desktops through XWayland. Anywhere else, and anywhere
-with no display, the browser still renders: `--screenshot` writes the page to
-a PNG without opening anything.
+The window itself is ours too. macOS gets one through AppKit, Linux one
+through Xlib, and Windows one through user32/gdi32 — all by ctypes, so there
+is nothing to install for any of them, and X11 covers Wayland desktops
+through XWayland. Anywhere else, and anywhere with no display, the browser
+still renders: `--screenshot` writes the page to a PNG without opening
+anything.
 
 To render a page to a PNG without opening a window:
 

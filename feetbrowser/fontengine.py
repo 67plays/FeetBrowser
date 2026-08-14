@@ -35,18 +35,45 @@ from feetbrowser_engine import Font, FontError, flatten
 FONT_DIRS = {
     "darwin": ["~/Library/Fonts", "/Library/Fonts", "/System/Library/Fonts",
                "/System/Library/Fonts/Supplemental"],
-    "win32": ["~/AppData/Local/Microsoft/Windows/Fonts", "C:/Windows/Fonts"],
+    # Per-user fonts (installed from the Settings app) first, then the
+    # machine-wide store. %WINDIR% rather than a hardcoded C: -- Windows is
+    # not always on C:, and a machine that moved it has no fonts at all
+    # otherwise. See _dirs() for how the environment variable is filled in.
+    "win32": ["~/AppData/Local/Microsoft/Windows/Fonts",
+              "${WINDIR}/Fonts", "C:/Windows/Fonts"],
 }
 FONT_DIRS_DEFAULT = ["~/.fonts", "~/.local/share/fonts",
                      "/usr/share/fonts", "/usr/local/share/fonts"]
+
+# Python under Cygwin and MSYS2 reports its own sys.platform but is looking
+# at a Windows filesystem, so it wants the Windows font directories.
+FONT_DIR_ALIASES = {"cygwin": "win32", "msys": "win32"}
 
 __all__ = ["FONT_DIRS", "FONT_DIRS_DEFAULT", "Font", "FontError", "flatten",
            "find", "index", "load"]
 
 
 def _dirs():
-    raw = FONT_DIRS.get(sys.platform, FONT_DIRS_DEFAULT)
-    return [os.path.expanduser(d) for d in raw]
+    """The font directories to scan, expanded and de-duplicated.
+
+    Both ``~`` and ``${VAR}`` are expanded, because the Windows font store
+    lives wherever %WINDIR% points -- and if the variable is unset,
+    expandvars leaves the placeholder behind, which is not a directory and so
+    drops out on its own.
+    """
+    platform = FONT_DIR_ALIASES.get(sys.platform, sys.platform)
+    raw = FONT_DIRS.get(platform, FONT_DIRS_DEFAULT)
+    dirs, seen = [], set()
+    for entry in raw:
+        path = os.path.normpath(
+            os.path.expanduser(os.path.expandvars(entry)))
+        # normcase, because %WINDIR%/Fonts and C:/Windows/Fonts are the same
+        # directory spelled two ways and scanning it twice is pure waste.
+        key = os.path.normcase(path)
+        if key not in seen:
+            seen.add(key)
+            dirs.append(path)
+    return dirs
 
 
 # -- system font discovery -----------------------------------------------
@@ -73,7 +100,10 @@ def _scan():
                     count = 1
                     if head == b"ttcf":
                         count = struct.unpack(">I", data[8:12])[0]
-                    for i in range(min(count, 24)):
+                    # A cap, because the count comes off disk and a corrupt
+                    # one would have us parsing the same file forever. 64 is
+                    # well clear of the real collections Windows ships.
+                    for i in range(min(count, 64)):
                         font = Font(data, i)
                         if font.cff:
                             continue  # metrics only; cannot rasterise

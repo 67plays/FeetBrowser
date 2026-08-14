@@ -19,3 +19,7 @@ toes/*
 
 # per-toe persisted settings
 toes/*/settings.json
+
+# screenshots written by the CI end-to-end check
+blank.png
+shot.png

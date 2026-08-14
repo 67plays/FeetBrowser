@@ -8,17 +8,25 @@
 ./run.sh view-source:https://example.com
 ```
 
-`run.sh` builds the Rust JS engine (`feetbrowser_engine`) into a local `.venv`
-with maturin if it isn't importable yet, then runs the browser from that venv
-(so a first run needs the Rust toolchain; maturin is installed into the venv
-automatically). Once the extension is built and installed for your
+On Windows, `run.cmd` is the same script for `cmd.exe`:
+
+```bat
+run.cmd
+run.cmd https://example.com
+```
+
+Either script builds the Rust JS engine (`feetbrowser_engine`) into a local
+`.venv` with maturin if it isn't importable yet, then runs the browser from
+that venv (so a first run needs the Rust toolchain; maturin is installed into
+the venv automatically). Once the extension is built and installed for your
 interpreter, `python3 -m feetbrowser <url>` works directly.
 
 There is nothing else to install. The renderer is ours (see [the rendering
-engine](rendering.md)), so no GUI toolkit is needed — only Python 3 and at
-least one system font. The window is ours as well: AppKit on macOS, Xlib on
-Linux and on Wayland desktops through XWayland, both reached by ctypes with
-no bindings package in between.
+engine](rendering.md)), so no GUI toolkit is needed — only Python 3, a Rust
+toolchain for that one extension, and at least one system font. The window is
+ours as well: AppKit on macOS, Xlib on Linux and on Wayland desktops through
+XWayland, and user32/gdi32 on Windows, all reached by ctypes with no bindings
+package in between.
 
 `FEETBROWSER_DISPLAY` decides which one, and normally wants leaving alone; it
 and the rest of the environment are described under [environment
@@ -27,6 +35,60 @@ variables](#environment-variables) below.
 With no display at all — no `$DISPLAY`, no server answering, or a platform
 with no backend — the browser says which of those it was and carries on
 headless, where `--screenshot` still works.
+
+On Windows, "a Rust toolchain" is two installs rather than one, and the
+second is the one that catches people out. rustup selects the MSVC toolchain
+by default (`stable-x86_64-pc-windows-msvc`), but selecting it is not the
+same as having it: `rustc` compiles the code and then hands it to a C++
+linker, and Windows does not ship one. Without it the first `run.cmd` gets a
+long way — venv made, maturin installed, crates downloaded — and then stops
+with
+
+```
+error: linker `link.exe` not found
+```
+
+Install **Build Tools for Visual Studio** from
+<https://visualstudio.microsoft.com/downloads/> and tick the **Desktop
+development with C++** workload in its installer. Ticking that workload is
+the step that gets missed, and the Build Tools installed without it give the
+identical error, so it is worth checking rather than assuming. A full Visual
+Studio installation with the same workload does just as well. Open a new
+command prompt afterwards so the linker is on `PATH`, then run `run.cmd`
+again. `run.cmd` and `test.cmd` both say all of this themselves if the build
+fails, so nobody has to find this page first.
+
+There is a second route, and it is worth knowing what it does and does not
+save you. rustup's GNU toolchain links with MinGW rather than MSVC:
+
+```bat
+rustup toolchain install stable-x86_64-pc-windows-gnu
+rustup default stable-x86_64-pc-windows-gnu
+```
+
+That does build a working engine — the extension imports and the whole suite
+passes on it — but it is a swap, not a saving, because it has a prerequisite
+of its own that rustup does not install. Without MinGW-w64's binutils on
+`PATH` the build gets *past* the linker, spends a while compiling, and then
+stops at
+
+```
+error: error calling dlltool 'dlltool.exe': program not found
+error: could not compile `pyo3-ffi` (lib) due to 1 previous error
+```
+
+Install MinGW-w64 — [MSYS2](https://www.msys2.org) is one way — and put its
+`bin` directory on `PATH`. The `dlltool.exe` that rustup installs next to the
+toolchain is not a substitute: it is there, but it shells out to an assembler
+that ships in the same MinGW package, and without that it fails with
+`dlltool.exe: CreateProcess` instead. Of the two routes, Visual Studio is the
+one CI builds against, so it is the better-trodden one; the GNU route was
+verified by experiment on a Windows runner rather than by a job in this
+repository.
+
+If `python` isn't on your `PATH` — a fresh install from the Microsoft Store
+often leaves only the launcher — use `py -3` in place of `python` in the two
+commands `run.cmd` runs.
 
 To render a page without opening a window:
 
@@ -64,10 +126,17 @@ either way, and the same again when there is no window at all.
 
 | value | effect |
 | --- | --- |
-| unset or empty | try Cocoa, then X11, and take the first that works (the default) |
+| unset or empty | try Cocoa, then Win32, then X11, and take the first that works (the default) |
 | `cocoa`, `macos`, `darwin` | demand the macOS window; fail loudly if there is none |
+| `win32`, `windows` | demand the Windows window; fail loudly if there is none |
 | `x11`, `linux`, `xorg` | demand the X11 window; fail loudly if there is none |
 | `none` | stay headless even where a window is possible |
+
+The order of the first row costs nothing to get right and would be confusing
+to get wrong: no machine offers Win32 alongside either of the others, so its
+position only matters on paper. Cocoa is ahead of X11 for a real reason,
+which is that macOS with XQuartz installed has both and the Mac window is the
+one you meant.
 
 Naming a backend that cannot run here is an error rather than a quiet
 fallback, and it is reported as a sentence rather than a traceback. Silently
@@ -101,6 +170,12 @@ at import, so importing the browser neither builds nor loads an engine.
 build: the default path builds the Rust extension into a local `.venv` and
 runs the browser from there, while `FEETBROWSER_JS=zig` runs `zig build` and
 then the system `python3`, needing no venv and no extension module.
+
+`run.cmd` does not read it. It builds the Rust extension and starts the
+browser from the venv, which is the default either way. Nothing here has
+ever built the Zig engine on Windows — CI builds it on the Linux jobs only —
+so rather than have the Windows script offer a path nobody has walked, it
+offers the one that is tested.
 
 ### `FEETBROWSER_JS_LIB`
 

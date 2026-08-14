@@ -1,0 +1,3 @@
+# Batch files are run by cmd.exe, which wants CRLF, and they are only
+# ever used on Windows. Everything else keeps LF whatever the checkout.
+*.cmd text eol=crlf
