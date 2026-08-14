@@ -32,6 +32,8 @@ Need Tk? On Debian/Ubuntu: `sudo apt install python3-tk` (other distros:
 - Open tabs, back/forward, reload, bookmarks, history, and page source
 - Fill in forms, follow links, search from the address bar
 - Add extensions ("toes") — open **`toe://hub`** in the browser
+- Restyle the browser with **Shoes** themes — open **`about:shoes`**
+  (`Ctrl+Shift+S`)
 - Keyboard shortcuts: `Ctrl-T` new tab, `Ctrl-L` focus address bar,
   `Ctrl-W` close tab, and more
 
