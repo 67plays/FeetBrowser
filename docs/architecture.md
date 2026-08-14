@@ -95,6 +95,7 @@ says why that is the right trade and not a regression waiting to be fixed.
 ```
 feetbrowser/
   net.py         URL parsing + HTTP/HTTPS/data/file transport + connection pool
+  downloads.py   streaming a response to disk: names, progress, cancellation
   htmlparser.py  HTML tokenizer + DOM tree builder
   cssparser.py   CSS parser, selectors and specificity; the cascade is Rust
   jsengine.py    thin shim over the Rust `feetbrowser_engine` extension
@@ -138,6 +139,7 @@ tests/
   test_units.py  offline unit tests (URL, HTML, CSS, layout, internal pages)
   test_js.py     offline tests for the JS engine + DOM bridge
   test_nav.py    click-to-navigate, history, view-source
+  download_cases.py  downloads against a local server (run from test_nav.py)
   test_shoes.py  Shoes theme manager tests
   test_toes.py   toe engine + ToeHub tests (install/uninstall/toggle)
   smoke.py       end-to-end pipeline on real pages

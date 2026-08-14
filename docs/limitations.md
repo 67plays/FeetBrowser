@@ -7,8 +7,9 @@ run JavaScript (scripts on load, DOM reads/writes, click handlers, `Promise`
 with microtasks, `async`/`await`, timers, `fetch`/`XMLHttpRequest`, and
 `throw`/`try`/`catch`, with `console.log` surfaced in the page's log buffer),
 manage extensions ("toes") from the built-in ToeHub — install, uninstall,
-enable, and disable them without a restart — and restyle the whole browser
-with **Shoes** color themes (`about:shoes`, or `Ctrl+Shift+S`).
+enable, and disable them without a restart — restyle the whole browser
+with **Shoes** color themes (`about:shoes`, or `Ctrl+Shift+S`), and download
+files to disk with a manager that shows progress and can cancel (`Ctrl-J`).
 
 **Runs on:** macOS, Linux and Windows, with a real window of its own on each
 (`cocoa.py`, `x11.py` and `win32.py`, all ctypes and no toolkit), and
@@ -52,6 +53,14 @@ headless and 96 DPI. There is no IME support for composed input, no
 drag-and-drop, no printing, and no jump list or taskbar integration. `cargo`
 builds under a deep checkout can run into the 260-character path limit; keep
 the repo somewhere short, or turn long paths on.
+
+**Downloads, specifically:** files go to the platform's download directory
+under the name the server suggests, made safe first; there is no save-as
+dialog to put one somewhere else, because there is no file picker in a browser
+that draws its own widgets. A transfer can be cancelled but not paused by
+hand, though one the network interrupts is resumed with a `Range` request
+where the server allows it. Nothing is opened after it is saved, and there is
+no history of past downloads across runs: the list is what this session did.
 
 **Doesn't (yet):** flexbox wrapping, `<textarea>`/`<select>` selection (beyond
 read-only), or the full ECMAScript feature set (see below). Shoes themes are

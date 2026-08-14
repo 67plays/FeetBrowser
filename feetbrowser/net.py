@@ -806,3 +806,275 @@ class URL:
             except LookupError:
                 pass
         return "utf8"
+
+
+# -- Streaming responses -------------------------------------------------
+#
+# Everything above reads a whole response into memory before the caller sees
+# a byte of it. That is the right shape for a document -- the parser needs
+# all of it anyway -- and exactly the wrong one for a file: _MAX_BODY_BYTES
+# would reject a 2 GB download, and if it did not, the memory would still
+# not be there. What follows hands back the status line and the headers as
+# soon as they arrive and leaves the body on the socket, so a download can
+# write it to disk a piece at a time (feetbrowser/downloads.py) and a
+# navigation can decide from the headers alone whether what is coming back
+# is a page at all. It is deliberately separate from _request_http: no
+# cache, no connection pool, and no decompressing a body nobody has read.
+
+#: Cap on the header block of a streamed response. The body is unbounded by
+#: design here; the headers are not.
+_MAX_HEAD_BYTES = 256 * 1024
+
+
+class IncompleteRead(OSError):
+    """The peer stopped sending before the framing said the body ended.
+
+    An OSError, so a caller that already handles "the network broke" handles
+    a truncated body the same way -- which is what it is. It carries how
+    much arrived, so a download can decide whether resuming is worth a try.
+    """
+
+    def __init__(self, message, received=0, expected=None):
+        super().__init__(message)
+        self.received = received
+        self.expected = expected
+
+
+class HTTPStream:
+    """A response whose headers have arrived and whose body has not.
+
+    Iterate `chunks()` to pull the body off the socket a piece at a time,
+    already stripped of chunked transfer-encoding. `length` is the body size
+    when the server stated one and None when it did not, which is a fact the
+    caller has to carry rather than paper over: there is no honest
+    percentage for a response of unknown length.
+    """
+
+    def __init__(self, url, sock, status, headers, leftover=b""):
+        self.url = url
+        self.status = status
+        self.headers = headers
+        self._sock = sock
+        self._buf = bytearray(leftover)
+        self._eof = False
+        self._closed = False
+        self.received = 0
+        te = headers.get("transfer-encoding", "").lower()
+        self.chunked = "chunked" in te
+        self.length = None
+        if not self.chunked:
+            try:
+                self.length = int(headers["content-length"])
+            except (KeyError, ValueError):
+                self.length = None
+
+    # -- introspection ---------------------------------------------------
+
+    @property
+    def content_type(self):
+        return self.headers.get(
+            "content-type", "").split(";")[0].strip().lower()
+
+    def charset(self):
+        return URL._charset(self.headers)
+
+    # -- reading ---------------------------------------------------------
+
+    def _fill(self, n=65536):
+        """Pull more bytes off the socket. False once the peer is done."""
+        if self._eof:
+            return False
+        data = self._sock.recv(max(1, min(n, 65536)))
+        if not data:
+            self._eof = True
+            return False
+        self._buf.extend(data)
+        return True
+
+    def _take(self, n):
+        piece = bytes(self._buf[:n])
+        del self._buf[:n]
+        self.received += len(piece)
+        return piece
+
+    def chunks(self, size=65536):
+        """Yield the body a piece at a time, transfer-encoding removed."""
+        if self.chunked:
+            return self._chunked(size)
+        if self.length is not None:
+            return self._counted(size)
+        return self._until_eof(size)
+
+    def _counted(self, size):
+        remaining = self.length
+        while remaining > 0:
+            if not self._buf and not self._fill(min(size, remaining)):
+                raise IncompleteRead(
+                    "connection closed with %d of %d bytes received"
+                    % (self.received, self.length),
+                    received=self.received, expected=self.length)
+            take = min(len(self._buf), remaining)
+            remaining -= take
+            yield self._take(take)
+
+    def _until_eof(self, size):
+        # No framing at all: EOF is the end of the body, and nothing here
+        # can tell a complete response from a truncated one.
+        while True:
+            if self._buf:
+                yield self._take(len(self._buf))
+            elif not self._fill(size):
+                return
+
+    def _chunked(self, size):
+        while True:
+            while b"\r\n" not in self._buf:
+                if not self._fill(size):
+                    raise IncompleteRead("truncated chunked body",
+                                         received=self.received)
+            line, _, _rest = bytes(self._buf).partition(b"\r\n")
+            del self._buf[:len(line) + 2]
+            try:
+                count = int(line.strip().split(b";")[0], 16)
+            except ValueError:
+                raise IncompleteRead("malformed chunk header: %r" % line[:40],
+                                     received=self.received)
+            if count == 0:
+                return  # trailers, then the blank line; nothing reads them
+            got = 0
+            while got < count:
+                if not self._buf and not self._fill(min(size, count - got)):
+                    raise IncompleteRead("truncated chunk",
+                                         received=self.received)
+                take = min(len(self._buf), count - got)
+                got += take
+                yield self._take(take)
+            while len(self._buf) < 2:
+                if not self._fill(size):
+                    raise IncompleteRead("chunk missing its terminator",
+                                         received=self.received)
+            del self._buf[:2]
+
+    def read_all(self, limit=_MAX_BODY_BYTES, decode=True):
+        """Read the whole body into memory, bounded by `limit`.
+
+        For the caller that turned out to want a document after all: the
+        same cap and the same content-encoding handling as request(), so a
+        page fetched through a stream is the same string a page fetched
+        through _request_http would have been.
+        """
+        out = bytearray()
+        for piece in self.chunks():
+            out.extend(piece)
+            if len(out) > limit:
+                raise RuntimeError("HTTP response body too large")
+        body = bytes(out)
+        if decode:
+            enc = self.headers.get("content-encoding", "").lower()
+            if enc == "gzip":
+                decompressed = URL._decompress_gzip_bounded(body)
+                if decompressed is not None:
+                    body = decompressed
+            elif enc == "deflate":
+                for wbits in (zlib.MAX_WBITS, -zlib.MAX_WBITS):
+                    try:
+                        body = zlib.decompress(body, wbits, limit)
+                        break
+                    except (OSError, ValueError, zlib.error):
+                        continue
+        return body
+
+    # -- teardown --------------------------------------------------------
+
+    def shutdown(self):
+        """Unblock a read in progress from another thread.
+
+        A cancelled download has to stop a worker that may be parked in
+        recv() until the socket timeout. Shutting the socket down makes that
+        recv return at once without closing the descriptor underneath the
+        thread that owns it -- close() from a second thread frees a number
+        the kernel is free to hand to the next file opened anywhere in the
+        process.
+        """
+        try:
+            self._sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+
+    def close(self):
+        if not self._closed:
+            self._closed = True
+            _close_socket(self._sock)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        self.close()
+        return False
+
+
+def _read_head(sock):
+    """Read just the header block. Returns (status, headers, leftover)."""
+    buf = bytearray()
+    while b"\r\n\r\n" not in buf:
+        if len(buf) > _MAX_HEAD_BYTES:
+            raise RuntimeError("HTTP response headers too large")
+        data = sock.recv(65536)
+        if not data:
+            raise IncompleteRead("connection closed before the headers ended")
+        buf.extend(data)
+    head, _, rest = bytes(buf).partition(b"\r\n\r\n")
+    status_line = head.split(b"\r\n")[0].decode("latin1")
+    parts = status_line.split(" ", 2)
+    if len(parts) < 2 or not parts[1].isdigit():
+        raise RuntimeError(f"Malformed status line: {status_line!r}")
+    return int(parts[1]), URL._parse_headers(head), rest
+
+
+def open_stream(url, extra_headers=None, timeout=30,
+                redirects_left=MAX_REDIRECTS, accept_encoding="identity"):
+    """Send a GET and return an HTTPStream positioned at the body.
+
+    Redirects are followed here, so the caller only ever sees the response
+    it is going to read, and a redirect out of http/https is refused for the
+    same reason _request_http refuses one: a remote server must not be able
+    to point us at the local filesystem. `accept_encoding` defaults to
+    identity because a download wants the bytes of the file, and a
+    Content-Length describing something else is worse than none at all.
+    """
+    if isinstance(url, str):
+        url = URL(url)
+    while True:
+        if url.scheme not in ("http", "https"):
+            raise ValueError(f"cannot stream a {url.scheme or '?'}: URL")
+        headers = dict(DEFAULT_HEADERS)
+        headers["Host"] = url.netloc()
+        headers["Accept-Encoding"] = accept_encoding
+        headers["Connection"] = "close"
+        if extra_headers:
+            headers.update(extra_headers)
+        sock = _connect(url.host, url.port)
+        try:
+            if url.scheme == "https":
+                sock = ssl.create_default_context().wrap_socket(
+                    sock, server_hostname=url.host)
+            sock.settimeout(timeout)
+            lines = "\r\n".join(f"{k}: {v}" for k, v in headers.items())
+            sock.sendall(
+                f"GET {url.path} HTTP/1.1\r\n{lines}\r\n\r\n".encode("utf8"))
+            status, resp_headers, leftover = _read_head(sock)
+        except BaseException:
+            _close_socket(sock)
+            raise
+        if status in (301, 302, 303, 307, 308) and "location" in resp_headers:
+            _close_socket(sock)
+            if redirects_left <= 0:
+                raise RuntimeError("Too many redirects")
+            redirects_left -= 1
+            target = url.resolve(resp_headers["location"])
+            if target.scheme not in ("http", "https"):
+                raise RuntimeError(f"Blocked redirect to {target}")
+            url = target
+            continue
+        return HTTPStream(url, sock, status, resp_headers, leftover)
