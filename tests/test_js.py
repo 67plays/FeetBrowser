@@ -10,7 +10,7 @@ from feetbrowser import gui
 from feetbrowser.net import URL
 from feetbrowser.browser import Tab
 from feetbrowser.layout import DrawText
-from feetbrowser.jsengine import Interpreter, UNDEFINED
+from feetbrowser.jsengine import Interpreter, JSException, UNDEFINED
 
 
 def eq(a, b, msg=""):
@@ -844,6 +844,52 @@ def test_js_labelled_break_and_continue():
     eq(g["stopped"], [0, 1, 2], "break leaves both loops at once")
     eq(g["block"], [1, 3], "a labelled block is breakable too")
     eq(g["plain"], [0, 2], "an unlabelled continue is unaffected")
+
+
+def test_js_source_is_read_as_utf8_not_bytes():
+    # The lexer used to read one byte and call it a character, which is a
+    # Latin-1 misreading of UTF-8: a `×` scanned as `Ã` plus a control
+    # character. That mangled every non-ASCII literal, and because `Ã` is
+    # alphabetic the identifier scanner accepted it, stopped one byte in, and
+    # sliced through the middle of the character -- a Rust panic, which
+    # crosses the FFI boundary and kills the whole page load. python.org
+    # ships a `×` in an inline script and rendered nothing at all.
+    interp = Interpreter()
+    interp.run("""
+        var mul = "×";
+        var mullen = mul.length;
+        var jp = "日本語";
+        var jplen = jp.length;
+        var third = jp[2];
+        var café = 5;
+        var ident = café + 1;
+        var escaped = "\\u00d7";
+        var same = (escaped === mul);
+        var hit = /é+/.test("xée");
+        var up = "héllo".toUpperCase();
+        /* × in a comment */
+        var after = 1 + 1;
+    """)
+    g = interp.globals
+    eq(g["mul"], "×", "a multi-byte literal survives intact")
+    eq(g["mullen"], 1, "and counts as one character, not two bytes")
+    eq(g["jp"], "日本語", "three-byte characters too")
+    eq(g["jplen"], 3, "counted by character")
+    eq(g["third"], "語", "and indexable by character")
+    eq(g["ident"], 6, "a non-ASCII identifier is one name")
+    assert g["same"] is True, "\\u00d7 and a literal x are the same string"
+    assert g["hit"] is True, "a regex literal keeps its non-ASCII class"
+    eq(g["up"], "HÉLLO", "case mapping is per character")
+    eq(g["after"], 2, "and the scan carries on past a non-ASCII comment")
+
+    # A stray non-ASCII character is a syntax error, and reports itself as the
+    # character it is rather than the first byte of one.
+    try:
+        Interpreter().run("1 +× 2")
+    except JSException as e:
+        assert "'×'" in str(e), f"names the character it choked on: {e}"
+    else:
+        raise AssertionError("a stray character should not tokenize")
 
 
 def _walk_all(node):
