@@ -119,6 +119,28 @@ jobs:
         shell: cmd
         run: run.cmd --version
 
+      # The other half of run.cmd: what it says when the toolchain is not
+      # there. That is the first thing a new contributor on Windows meets --
+      # rustup does not install the linker and Windows does not ship one, so
+      # the build stops -- and nothing else here goes near the branch, because
+      # this runner has both a linker and a built engine already. Copying the
+      # script somewhere with no .venv and hiding cargo from PATH takes it on
+      # purpose. It is also the only thing that checks the batch parses: an
+      # unmatched label or a stray parenthesis in a block cmd.exe never
+      # reaches would otherwise ship unnoticed.
+      - name: The toolchain message says what to install
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: |
+          mkdir "%RUNNER_TEMP%\notoolchain"
+          copy /y run.cmd "%RUNNER_TEMP%\notoolchain\" >nul
+          set "PATH=%pythonLocation%;%SystemRoot%\System32"
+          call "%RUNNER_TEMP%\notoolchain\run.cmd" > "%RUNNER_TEMP%\said.txt" 2>&1
+          if not errorlevel 1 exit /b 1
+          type "%RUNNER_TEMP%\said.txt"
+          findstr /c:"Desktop development with C++" "%RUNNER_TEMP%\said.txt" >nul || exit /b 1
+          findstr /c:"rustup.rs" "%RUNNER_TEMP%\said.txt" >nul || exit /b 1
+
   # The job above proves the browser needs no display. This one proves it can
   # use one: a real X server, a real window, real events, and a photograph of
   # the result taken with XGetImage.
