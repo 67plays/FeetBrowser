@@ -1,0 +1,307 @@
+name: Package (Windows)
+
+# Builds the double-clickable Windows application and then proves it works on
+# a machine that has none of the things it was built with.
+#
+# The proving is the point. A packaging job that ends at "the zip was
+# produced" tests nothing a user cares about: every interesting way for a
+# bundle to be broken -- a missing DLL, an extension module built for the
+# wrong interpreter, a sys.path that silently reaches back into the build
+# machine's Python -- produces a perfectly good-looking zip. So the second job
+# below downloads the artifact onto a fresh runner, takes that runner's own
+# Python away, and drives the .exe: --version, --help, a page fetched over a
+# socket and counted pixel by pixel, an https fetch, and a real window.
+#
+# Nothing here is a freezer. There is no PyInstaller, no cx_Freeze, no
+# Nuitka, and no bytecode scanner guessing at imports. The bundle is
+# python.org's own Windows embeddable package -- redistributable CPython, no
+# installer -- with feetbrowser/ and feetbrowser_engine.pyd dropped in beside
+# it and a `._pth` file saying what sys.path is. packaging/windows/README.md
+# is the long version.
+
+on:
+  # The normal way to get a build: pick a branch, press the button.
+  workflow_dispatch:
+  # A tagged version should have an application to download, not just wheels.
+  push:
+    tags:
+      - 'v*'
+  # And any change to the packaging itself has to prove itself before it
+  # lands. Everything else is ci.yml's business -- this workflow never runs
+  # the test suite.
+  pull_request:
+    paths:
+      - 'packaging/windows/**'
+      - '.github/workflows/package-windows.yml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+permissions:
+  contents: read
+
+env:
+  # The bundle carries this CPython, so the engine has to be compiled for it.
+  # pyo3 here is not abi3 (wheels.yml explains why), which makes the minor
+  # version a hard match rather than a preference. build.ps1 refuses a wheel
+  # with the wrong tag, so the two cannot drift apart silently -- but they are
+  # both derived from this one line.
+  PYTHON_MINOR: '3.13'
+  BUNDLE_ARTIFACT: FeetBrowser-windows-x64
+
+jobs:
+  build:
+    name: Build the bundle
+    runs-on: windows-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_MINOR }}
+          architecture: x64
+
+      # The engine is built here rather than pulled out of wheels.yml's
+      # artifacts on purpose. wheels.yml runs on `rust/**` pull requests and
+      # on tags, so on a pull request that only touches packaging/ there is no
+      # wheel from this commit to fetch -- reaching for one would mean reaching
+      # across workflow runs for the newest green build of some *other*
+      # commit, and the bundle would then contain an engine that was never
+      # tested against the code beside it. One interpreter's worth of maturin
+      # is about ninety seconds; that is a cheap price for the artifact being
+      # built out of exactly one commit.
+      - name: Build the engine for CPython ${{ env.PYTHON_MINOR }}
+        run: |
+          python -m pip install --disable-pip-version-check --quiet maturin
+          maturin build --release --manifest-path rust/Cargo.toml --out dist
+          Get-ChildItem dist
+
+      - name: Assemble
+        run: ./packaging/windows/build.ps1 -OutDir build/windows
+
+      # `strings` on the thing that actually ships. A version resource is easy
+      # to fill in wrongly, and a Rust binary will happily carry the build
+      # machine's directory layout around in its panic messages -- which on
+      # somebody's laptop means their home directory, and their name, inside a
+      # file the whole internet downloads. --remap-path-prefix in build.ps1 is
+      # the fix; this is the proof that it took.
+      - name: The binary gives nothing away
+        run: |
+          $exe = 'build/windows/FeetBrowser/FeetBrowser.exe'
+          $bytes = [IO.File]::ReadAllBytes($exe)
+          # Both encodings: Rust literals are UTF-8, Windows resources UTF-16.
+          $ascii = [Text.Encoding]::ASCII.GetString($bytes)
+          $utf16 = [Text.Encoding]::Unicode.GetString($bytes)
+          $haystack = $ascii + "`n" + $utf16
+
+          $forbidden = @('C:\\Users\\', '/Users/', '/home/', '\.cargo\\registry',
+                         'Documents and Settings')
+          $hits = @()
+          foreach ($pattern in $forbidden) {
+            foreach ($m in [regex]::Matches($haystack, $pattern + '[^\x00]{0,60}')) {
+              $hits += $m.Value
+            }
+          }
+          if ($hits) {
+            $hits | Select-Object -Unique | ForEach-Object { Write-Host "  $_" }
+            throw "the launcher has build-machine paths baked into it"
+          }
+          Write-Host "no build-machine paths in FeetBrowser.exe."
+
+          $info = (Get-Item $exe).VersionInfo
+          Write-Host "  CompanyName     $($info.CompanyName)"
+          Write-Host "  ProductName     $($info.ProductName)"
+          Write-Host "  FileDescription $($info.FileDescription)"
+          Write-Host "  ProductVersion  $($info.ProductVersion)"
+          Write-Host "  LegalCopyright  $($info.LegalCopyright)"
+          # The version block is the one place a real name could reach a user
+          # without anybody noticing, so it is pinned rather than eyeballed.
+          if ($info.CompanyName -ne 'FeetBrowser') { throw "unexpected CompanyName '$($info.CompanyName)'" }
+          if ($info.ProductName -ne 'FeetBrowser') { throw "unexpected ProductName '$($info.ProductName)'" }
+
+      - name: Size
+        run: |
+          $zip = Get-Item build/windows/FeetBrowser-windows-x64.zip
+          $dir = Get-ChildItem -Recurse -File build/windows/FeetBrowser |
+                 Measure-Object -Property Length -Sum
+          $lines = @(
+            "| | |",
+            "|-|-|",
+            ("| zip | {0:N1} MB |" -f ($zip.Length / 1MB)),
+            ("| unpacked | {0:N1} MB in {1} files |" -f ($dir.Sum / 1MB), $dir.Count),
+            ("| CPython | {0} |" -f (Get-ChildItem build/windows/FeetBrowser -Filter 'python3??.dll')[0].Name),
+            ("| engine | {0} |" -f (Get-ChildItem build/windows/FeetBrowser -Filter 'feetbrowser_engine*.pyd')[0].Name)
+          )
+          $lines | Tee-Object -FilePath $env:GITHUB_STEP_SUMMARY -Append
+
+      - name: Upload the bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BUNDLE_ARTIFACT }}
+          path: build/windows/FeetBrowser-windows-x64.zip
+          if-no-files-found: error
+
+      # Uploaded separately so that the job below can have the verification
+      # script without checking the repository out. That is not tidiness: a
+      # checkout is the one thing that would put the project's own sources on
+      # the machine that is supposed to prove it does not need them.
+      - name: Upload the verification script
+        uses: actions/upload-artifact@v4
+        with:
+          name: verify-script
+          path: packaging/windows/verify-bundle.ps1
+          if-no-files-found: error
+
+  verify:
+    name: Run it on a clean machine
+    needs: build
+    runs-on: windows-latest
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      # No actions/checkout. This job never sees feetbrowser/, rust/, or
+      # anything else from the repository; the only two things that arrive are
+      # the zip and one .ps1 file.
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.BUNDLE_ARTIFACT }}
+          path: artifact
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: verify-script
+          path: scripts
+
+      # windows-latest ships Python in the hosted tool cache and puts it on
+      # PATH. Leaving it there would make every check below meaningless: a
+      # bundle missing its interpreter entirely would still "work", because
+      # something would answer. So it gets moved out of the way, and every
+      # step that touches the bundle runs with PATH cut back to the system
+      # directories -- see the `env: PATH:` on each one.
+      - name: Take the runner's Python away
+        run: |
+          foreach ($dir in @('C:\hostedtoolcache\windows\Python',
+                             'C:\hostedtoolcache\windows\PyPy',
+                             'C:\Miniconda')) {
+            if (Test-Path $dir) {
+              Rename-Item -Path $dir -NewName ((Split-Path -Leaf $dir) + '-hidden-from-the-bundle-test')
+              Write-Host "moved $dir out of the way"
+            }
+          }
+
+      - name: There is no Python on this machine any more
+        env:
+          PATH: C:\Windows\system32;C:\Windows;C:\Windows\System32\Wbem;C:\Windows\System32\WindowsPowerShell\v1.0;C:\Program Files\PowerShell\7
+        run: |
+          Write-Host "PATH = $env:PATH"
+          $found = @()
+          foreach ($name in @('python', 'python3', 'pythonw', 'py', 'pip', 'conda')) {
+            $cmd = Get-Command $name -ErrorAction SilentlyContinue
+            if ($cmd) { $found += "$name -> $($cmd.Source)" }
+          }
+          if ($found) {
+            $found | ForEach-Object { Write-Host $_ }
+            throw "the runner still has a Python on PATH; nothing below would prove anything"
+          }
+          Write-Host "no python, python3, pythonw, py, pip or conda is reachable."
+          # Belt and braces for the other half of the claim: these are set to
+          # a directory that does not exist, so an interpreter that honoured
+          # them would fail to start rather than quietly find something.
+          Write-Host "PYTHONHOME and PYTHONPATH are set to a bogus path by verify-bundle.ps1 itself."
+
+      # C:\Program Files: a space in the path, and a directory that ordinary
+      # user code cannot write to -- which is where the browser's own habit of
+      # keeping toes/ next to the package would show up if it were a problem.
+      - name: Install it under C:\Program Files and run it
+        env:
+          PATH: C:\Windows\system32;C:\Windows;C:\Windows\System32\Wbem;C:\Windows\System32\WindowsPowerShell\v1.0;C:\Program Files\PowerShell\7
+        run: |
+          $dest = 'C:\Program Files\FeetBrowser'
+          Expand-Archive -Path artifact\FeetBrowser-windows-x64.zip -DestinationPath 'C:\Program Files' -Force
+          if (-not (Test-Path "$dest\FeetBrowser.exe")) { throw "nothing at $dest" }
+          # A child pwsh, not a dot-source: the script sets PYTHONHOME and
+          # PYTHONPATH to a bogus path on purpose and that must not survive
+          # into the next step, and its exit code has to be its own.
+          pwsh -NoProfile -File scripts\verify-bundle.ps1 -Root $dest `
+               -Evidence "$env:RUNNER_TEMP\evidence\program-files"
+          if ($LASTEXITCODE -ne 0) { throw "verification failed under C:\Program Files" }
+
+      # The same bundle again, this time somewhere with an accent as well as a
+      # space. Both parts matter: Windows paths are UTF-16 and the launcher
+      # hands them to CPython as wchar_t, so anything that narrowed a string
+      # on the way through would surface here and nowhere else.
+      - name: Unzip it somewhere with a space and an accent in the name and run it
+        env:
+          PATH: C:\Windows\system32;C:\Windows;C:\Windows\System32\Wbem;C:\Windows\System32\WindowsPowerShell\v1.0;C:\Program Files\PowerShell\7
+        run: |
+          # Built from code points so the folder name does not depend on how
+          # this YAML file was encoded on its way to the runner.
+          $name = 'Caf' + [char]0xE9 + ' ' + [char]0xDC + 'ber Test'
+          $parent = Join-Path $env:RUNNER_TEMP $name
+          New-Item -ItemType Directory -Force -Path $parent | Out-Null
+          Expand-Archive -Path artifact\FeetBrowser-windows-x64.zip -DestinationPath $parent -Force
+          $dest = Join-Path $parent 'FeetBrowser'
+          Write-Host "running from $dest"
+          # -SkipNetwork: the run above already proved https end to end, and
+          # asking example.com twice per build doubles the chance of a red
+          # tick that says nothing about this change.
+          pwsh -NoProfile -File scripts\verify-bundle.ps1 -Root $dest `
+               -Evidence "$env:RUNNER_TEMP\evidence\accented" -SkipNetwork
+          if ($LASTEXITCODE -ne 0) { throw "verification failed under an accented path" }
+
+      # There is no setup.exe (packaging/windows/README.md says why), but
+      # install.ps1 is still the thing most people will run, so it gets the
+      # same treatment: install, check the three things it claims to create,
+      # uninstall, check they are gone.
+      - name: install.ps1 and uninstall.ps1 round-trip
+        env:
+          PATH: C:\Windows\system32;C:\Windows;C:\Windows\System32\Wbem;C:\Windows\System32\WindowsPowerShell\v1.0;C:\Program Files\PowerShell\7
+        run: |
+          $src = 'C:\Program Files\FeetBrowser'
+          pwsh -NoProfile -File "$src\install.ps1"
+          if ($LASTEXITCODE -ne 0) { throw "install.ps1 exited $LASTEXITCODE" }
+
+          $installed = Join-Path $env:LOCALAPPDATA 'Programs\FeetBrowser'
+          $link = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\FeetBrowser.lnk'
+          $key = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\FeetBrowser'
+          foreach ($thing in @($installed, $link, $key)) {
+            if (-not (Test-Path $thing)) { throw "install.ps1 did not create $thing" }
+          }
+          $entry = Get-ItemProperty $key
+          Write-Host "  DisplayName     $($entry.DisplayName)"
+          Write-Host "  DisplayVersion  $($entry.DisplayVersion)"
+          Write-Host "  Publisher       $($entry.Publisher)"
+          Write-Host "  InstallLocation $($entry.InstallLocation)"
+          if ($entry.Publisher -ne '67plays') { throw "unexpected Publisher '$($entry.Publisher)'" }
+
+          # The installed copy has to work too, not just the one it came from.
+          $r = Start-Process -FilePath (Join-Path $installed 'FeetBrowser.exe') `
+                             -ArgumentList '"--version"' -Wait -PassThru `
+                             -RedirectStandardOutput "$env:RUNNER_TEMP\installed-version.txt"
+          if ($r.ExitCode -ne 0) { throw "the installed copy exited $($r.ExitCode)" }
+          Get-Content "$env:RUNNER_TEMP\installed-version.txt"
+
+          pwsh -NoProfile -File "$installed\uninstall.ps1" -Quiet
+          if ($LASTEXITCODE -ne 0) { throw "uninstall.ps1 exited $LASTEXITCODE" }
+          foreach ($thing in @($installed, $link, $key)) {
+            if (Test-Path $thing) { throw "uninstall.ps1 left $thing behind" }
+          }
+          Write-Host "installed, verified and removed cleanly."
+
+      # The renders, for a human to look at. The pixel counting already
+      # happened inside verify-bundle.ps1 and a bad render is a failed job by
+      # this point -- these are the photographs, not the assertion.
+      - name: Upload the evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-render-evidence
+          path: ${{ runner.temp }}/evidence
+          if-no-files-found: warn

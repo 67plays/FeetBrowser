@@ -1,0 +1,12 @@
+# Everything build.ps1 makes or fetches. Scoped to this directory rather than
+# added to the root .gitignore, so that packaging stays self-contained.
+
+# the downloaded python.org embeddable package
+.cache/
+
+# the launcher's build output
+launcher/target/
+
+# assembled bundles, if build.ps1 was pointed here instead of build/windows
+FeetBrowser/
+*.zip
