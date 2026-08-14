@@ -441,7 +441,9 @@ func (u *URL) requestData(raw bool) (*Response, error) {
 		}
 		decoded = b
 	} else {
-		unescaped, err := url.QueryUnescape(data)
+		// PathUnescape (not QueryUnescape) matches Python's urllib.parse.unquote:
+		// a literal "+" stays a "+" rather than becoming a space.
+		unescaped, err := url.PathUnescape(data)
 		if err != nil {
 			unescaped = data // best effort, matching the tolerant Python behavior
 		}
@@ -562,7 +564,7 @@ func (u *URL) requestHTTP(opts Options) (*Response, error) {
 	// Redirects.
 	if isRedirect(status) {
 		if location, ok := respHeaders["location"]; ok {
-			if opts.redirectsLeft <= 1 {
+			if opts.redirectsLeft <= 0 {
 				return nil, ErrTooManyRedirects
 			}
 			next, err := u.Resolve(location)
