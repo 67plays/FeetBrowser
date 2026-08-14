@@ -17,8 +17,31 @@ class ImageError(Exception):
     """Raised for malformed or unsupported image data."""
 
 
-def decode(data):
-    """Decode any supported image. Returns ``(width, height, rgba)``."""
+# These bytes come off the network, and a header is a claim rather than a
+# fact: nothing stops a page declaring 40000x40000 pixels, or shipping a few
+# hundred bytes that inflate to gigabytes. The pixel cap matches the one the
+# optional Pillow path already applies.
+MAX_PIXELS = 20_000_000
+MAX_INFLATED = 256 << 20
+
+
+def _check_size(width, height):
+    if width <= 0 or height <= 0:
+        raise ImageError("image has no area")
+    if width * height > MAX_PIXELS:
+        raise ImageError("image too large: %dx%d pixels" % (width, height))
+
+
+def _inflate(data):
+    """zlib, with a ceiling on what comes out the other end."""
+    obj = zlib.decompressobj()
+    out = obj.decompress(data, MAX_INFLATED)
+    if obj.unconsumed_tail:
+        raise ImageError("compressed image data expands too far")
+    return out
+
+
+def _decode(data):
     if data[:8] == b"\x89PNG\r\n\x1a\n":
         return decode_png(data)
     if data[:6] in (b"GIF87a", b"GIF89a"):
@@ -26,6 +49,23 @@ def decode(data):
     if data[:2] in (b"P1", b"P2", b"P3", b"P4", b"P5", b"P6"):
         return decode_pnm(data)
     raise ImageError("unrecognised image format")
+
+
+def decode(data):
+    """Decode any supported image. Returns ``(width, height, rgba)``.
+
+    Truncated files are the normal case, not the exceptional one -- a
+    connection drops mid-image on any page -- so every way a decoder can come
+    apart on short or malformed input arrives as ImageError, which is what
+    callers are watching for.
+    """
+    try:
+        return _decode(data)
+    except ImageError:
+        raise
+    except (IndexError, ValueError, KeyError, TypeError, struct.error,
+            zlib.error, MemoryError, OverflowError) as exc:
+        raise ImageError("malformed image data: %s" % exc) from exc
 
 
 def sniff(data):
@@ -77,7 +117,8 @@ def decode_png(data):
     if depth not in (1, 2, 4, 8, 16):
         raise ImageError("unsupported PNG bit depth %d" % depth)
 
-    raw = zlib.decompress(b"".join(idat))
+    _check_size(width, height)
+    raw = _inflate(b"".join(idat))
     channels = _CHANNELS[color]
 
     if interlace == 1:
@@ -266,6 +307,7 @@ def decode_gif(data):
         elif block == 0x2C:  # image descriptor
             left, top, w, h, iflags = struct.unpack("<HHHHB",
                                                     data[pos + 1:pos + 10])
+            _check_size(max(screen_w, left + w), max(screen_h, top + h))
             pos += 10
             table = global_table
             if iflags & 0x80:
@@ -382,8 +424,7 @@ def decode_pnm(data):
         raise ImageError("truncated Netpbm header")
     width, height = values[0], values[1]
     maxval = values[2] if fields == 3 else 1
-    if not width or not height:
-        raise ImageError("empty Netpbm image")
+    _check_size(width, height)
     pos += 1  # single whitespace byte after the header
 
     n = width * height
@@ -412,8 +453,12 @@ def decode_pnm(data):
             d = i * 4
             for c in range(step):
                 o = s + c * (2 if wide else 1)
-                v = data[o] if not wide else data[o]
-                rgba[d + c] = int(v * (1.0 if wide else scale))
+                # A wide sample is two bytes, most significant first, and it
+                # scales against maxval like a narrow one does -- reading
+                # only the high byte is right for maxval 65535 and nothing
+                # else.
+                v = (data[o] << 8) | data[o + 1] if wide else data[o]
+                rgba[d + c] = min(255, int(v * scale))
             if step == 1:
                 rgba[d + 1] = rgba[d + 2] = rgba[d]
             rgba[d + 3] = 255

@@ -606,6 +606,43 @@ def test_url_redirect_adopt():
     eq(str(v), "https://example.com/a")
 
 
+def test_a_bad_image_is_an_image_error():
+    """Image bytes come off the network, so every way a decoder can come
+    apart has to arrive as the one exception callers watch for."""
+    import struct
+    from feetbrowser import imagecodec
+    cases = {
+        "truncated png": b"\x89PNG\r\n\x1a\n" + b"\x00" * 9,
+        "truncated gif": b"GIF89a" + b"\x00" * 8,
+        "truncated pnm": b"P5 4 4 255 \x00",
+        "not an image": b"<html>",
+        # A header is a claim, not a fact: 1.6 billion pixels is 6GB of RGBA.
+        "absurd png": b"\x89PNG\r\n\x1a\n" + struct.pack(">I", 13) + b"IHDR"
+                      + struct.pack(">IIBBBBB", 40000, 40000, 8, 2, 0, 0, 0)
+                      + b"\x00\x00\x00\x00",
+    }
+    for name, data in cases.items():
+        try:
+            imagecodec.decode(data)
+        except imagecodec.ImageError:
+            continue
+        except Exception as exc:  # noqa: BLE001 - that is the point
+            raise AssertionError("%s raised %r, not ImageError" % (name, exc))
+        # A truncated file that still decodes to something is fine.
+
+
+def test_wide_netpbm_samples_scale_to_maxval():
+    """A 16-bit sample is two bytes and still scales against maxval; reading
+    only the high byte is right for maxval 65535 and nothing else."""
+    import struct
+    from feetbrowser import imagecodec
+    w, h, rgba = imagecodec.decode(b"P5 1 1 1023 " + struct.pack(">H", 512))
+    eq((w, h), (1, 1))
+    eq(rgba[0], 127, "roughly half brightness")
+    _w, _h, full = imagecodec.decode(b"P5 1 1 1023 " + struct.pack(">H", 1023))
+    eq(full[0], 255, "maxval is white")
+
+
 def test_webp_image_decode():
     """WebP (used heavily by Google) must decode to a PhotoImage when Pillow
     is available, instead of staying a placeholder."""
