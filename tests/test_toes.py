@@ -668,7 +668,12 @@ def test_toe_after_timer_fires():
     window = gui.Tk()
     ticks = []
     window.after(0, lambda: ticks.append(1))
-    window.update_idletasks()
+    # update(), not update_idletasks(): our window treats them alike, but real
+    # Tk flushes only idle callbacks from the latter, and an after() timer is
+    # not one -- so the idletasks spelling passes here and fails under
+    # FEETBROWSER_BACKEND=tk, which is the one thing this test exists to
+    # rule out.
+    window.update()
     assert ticks == [1], ticks
 
 
