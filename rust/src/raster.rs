@@ -14,7 +14,7 @@
 //! range-checked once per row rather than trusted.
 
 use crate::font::{flatten_contours, Font};
-use crate::pyutil::{bytes_arg, rgb, to_int};
+use crate::pyutil::{bytes_arg, for_each_char, rgb, to_int};
 use pyo3::exceptions::{PyMemoryError, PyValueError};
 use pyo3::ffi;
 use pyo3::prelude::*;
@@ -738,7 +738,7 @@ pub fn draw_text(
     surface: &Bound<'_, Surface>,
     font: &Bound<'_, Font>,
     size: f64,
-    text: &str,
+    text: &Bound<'_, PyAny>,
     x: f64,
     baseline: f64,
     color: &Bound<'_, PyAny>,
@@ -746,49 +746,84 @@ pub fn draw_text(
     let c = rgb(color)?;
     let scale = font.borrow().scale_of(size);
     let mut pen = x;
-    for ch in text.chars() {
-        let gid = font.borrow_mut().glyph_of(ch);
+    let mut failed: Option<PyErr> = None;
+    for_each_char(text, |code| {
+        if failed.is_some() {
+            return;
+        }
+        let gid = font.borrow_mut().glyph_of(code);
         let adv = font.borrow().advance_of(gid as i64) as f64 * scale;
-        if ch != ' ' && ch != '\t' {
-            let bitmap = glyph_bitmap(py, font, size, gid)?;
-            let bitmap = bitmap.bind(py);
-            let w: i64 = bitmap.get_item(1)?.extract()?;
-            if w != 0 {
-                // Borrowed out of the cached tuple rather than extracted: a
-                // page of text is tens of thousands of these, and copying each
-                // bitmap on its way to the blitter would undo the cache.
-                let cov = bitmap.get_item(0)?;
-                let cov = cov.cast::<PyBytes>()?;
-                let h: i64 = bitmap.get_item(2)?.extract()?;
-                let left: i64 = bitmap.get_item(3)?.extract()?;
-                let top: i64 = bitmap.get_item(4)?.extract()?;
-                surface.borrow_mut().blit_cov(
-                    cov.as_bytes(),
-                    w,
-                    h,
-                    trunc_i64(pen) + left,
-                    trunc_i64(baseline) + top,
-                    c,
-                );
+        // Space and tab advance the pen without a trip through the glyph
+        // cache; they are most of the characters on a page.
+        if code != 0x20 && code != 0x09 {
+            if let Err(e) = blit_glyph(py, surface, font, size, gid, pen,
+                                       baseline, c) {
+                failed = Some(e);
+                return;
             }
         }
         pen += adv;
+    })?;
+    match failed {
+        Some(e) => Err(e),
+        None => Ok(pen - x),
     }
-    Ok(pen - x)
+}
+
+fn blit_glyph(
+    py: Python<'_>,
+    surface: &Bound<'_, Surface>,
+    font: &Bound<'_, Font>,
+    size: f64,
+    gid: u32,
+    pen: f64,
+    baseline: f64,
+    c: [u8; 3],
+) -> PyResult<()> {
+    let bitmap = glyph_bitmap(py, font, size, gid)?;
+    let bitmap = bitmap.bind(py);
+    let w: i64 = bitmap.get_item(1)?.extract()?;
+    if w == 0 {
+        return Ok(());
+    }
+    // Borrowed out of the cached tuple rather than extracted: a page of text
+    // is tens of thousands of these, and copying each bitmap on its way to
+    // the blitter would undo the cache.
+    let cov = bitmap.get_item(0)?;
+    let cov = cov.cast::<PyBytes>()?;
+    let h: i64 = bitmap.get_item(2)?.extract()?;
+    let left: i64 = bitmap.get_item(3)?.extract()?;
+    let top: i64 = bitmap.get_item(4)?.extract()?;
+    surface.borrow_mut().blit_cov(
+        cov.as_bytes(),
+        w,
+        h,
+        trunc_i64(pen) + left,
+        trunc_i64(baseline) + top,
+        c,
+    );
+    Ok(())
 }
 
 /// Advance width of a string in pixels.
 #[pyfunction]
-pub fn measure_text(font: &Bound<'_, Font>, size: f64, text: &str) -> f64 {
+pub fn measure_text(
+    font: &Bound<'_, Font>,
+    size: f64,
+    text: &Bound<'_, PyAny>,
+) -> PyResult<f64> {
     let mut total: i64 = 0;
     {
         let mut f = font.borrow_mut();
-        for ch in text.chars() {
-            let gid = f.glyph_of(ch);
+        for_each_char(text, |code| {
+            let gid = f.glyph_of(code);
             total += f.advance_of(gid as i64);
-        }
+        })?;
     }
-    total as f64 * font.borrow().scale_of(size)
+    // Summed in font units and scaled once, so the width of a string is
+    // exactly the sum of its characters' widths -- which is what the layout
+    // engine's per-character width cache assumes.
+    Ok(total as f64 * font.borrow().scale_of(size))
 }
 
 /// Add one subsample row's coverage for the span [x0, x1).

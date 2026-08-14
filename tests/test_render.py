@@ -157,6 +157,205 @@ def test_missing_glyph_falls_back_to_another_face():
     assert font.measure(ch) >= 0
 
 
+# -- malformed fonts -------------------------------------------------------
+#
+# Fonts come off the local disk rather than off the network, so the threat is
+# not a hostile author but a truncated download, a partially written file, or
+# a face doing something the spec allows and nobody expects. The rule is the
+# same either way: a file that is not a font raises FontError, and a font that
+# is merely strange gives up on the glyph it cannot read and keeps going. It
+# may never crash the parser, which since the parser is Rust would mean
+# taking the process with it.
+
+def _sfnt(tables):
+    """Assemble an sfnt file from ``{tag: payload}``."""
+    tags = sorted(tables)
+    out = struct.pack(">IHHHH", 0x00010000, len(tags), 0, 0, 0)
+    offset = 12 + 16 * len(tags)
+    body = b""
+    for tag in tags:
+        payload = tables[tag]
+        out += tag.encode("ascii").ljust(4)[:4]
+        out += struct.pack(">III", 0, offset + len(body), len(payload))
+        body += payload + b"\x00" * (-len(payload) % 4)
+    return out + body
+
+
+def _minimal(glyf=None, loca=None, cmap=None, n_glyphs=2, n_metrics=2,
+             index_to_loc=0):
+    head = bytearray(54)
+    struct.pack_into(">H", head, 18, 1000)          # unitsPerEm
+    struct.pack_into(">h", head, 50, index_to_loc)  # indexToLocFormat
+    hhea = bytearray(36)
+    struct.pack_into(">hhh", hhea, 4, 800, -200, 0)
+    struct.pack_into(">H", hhea, 34, n_metrics)
+    maxp = bytearray(6)
+    struct.pack_into(">H", maxp, 4, n_glyphs)
+    hmtx = struct.pack(">HhHh", 500, 0, 300, 0)
+    if glyf is None:
+        # One square contour, points given as 16-bit deltas.
+        glyf = (struct.pack(">hhhhh", 1, 0, 0, 100, 100)
+                + struct.pack(">HH", 3, 0) + bytes([1, 1, 1, 1])
+                + struct.pack(">hhhh", 0, 100, 0, -100)
+                + struct.pack(">hhhh", 0, 0, 100, 0))
+    if loca is None:
+        loca = struct.pack(">HHH", 0, 0, len(glyf) // 2)
+    if cmap is None:
+        # Format 6, mapping 'A' to glyph 1.
+        sub = struct.pack(">HHHHHH", 6, 12, 0, ord("A"), 1, 1)
+        cmap = struct.pack(">HHHHI", 0, 1, 3, 1, 12) + sub
+    return _sfnt({"head": bytes(head), "hhea": bytes(hhea),
+                  "maxp": bytes(maxp), "hmtx": hmtx, "glyf": glyf,
+                  "loca": loca, "cmap": cmap})
+
+
+def _raises_fonterror(data, why):
+    try:
+        fontengine.Font(data)
+    except fontengine.FontError:
+        return
+    raise AssertionError(why)
+
+
+def test_minimal_font_parses():
+    """The scaffolding above has to make a font, or the tests below prove
+    nothing about the cases they break."""
+    font = fontengine.Font(_minimal())
+    assert (font.units_per_em, font.ascent, font.descent) == (1000, 800, -200)
+    assert font.glyph_id("A") == 1 and font.glyph_id("B") == 0
+    assert len(font.glyph_contours(1)) == 1
+    assert font.advance(0) == 500 and font.advance(1) == 300
+
+
+def test_font_rejects_files_that_are_not_fonts():
+    _raises_fonterror(b"", "an empty file is not a font")
+    _raises_fonterror(b"<html>not a font at all</html>", "HTML is not a font")
+    _raises_fonterror(b"\x00\x01\x00\x00", "a bare sfnt tag is not a font")
+    _raises_fonterror(_sfnt({"cmap": b"\x00" * 8}),
+                      "a font without head cannot be measured")
+
+
+def test_font_rejects_a_collection_index_it_does_not_have():
+    _raises_fonterror(b"ttcf" + struct.pack(">IIII", 0x00010000, 1, 200, 0),
+                      "a one-font collection has no second face")
+
+
+def test_font_treats_tables_pointing_past_the_end_as_absent():
+    """A truncated font leaves directory entries pointing into nothing. Those
+    read as missing tables, which is how a partly written file still gives up
+    politely instead of indexing off the end of the buffer."""
+    data = bytearray(_minimal())
+    # The directory is sorted by tag, so cmap is the first entry: aim its
+    # offset a megabyte past the end of the file.
+    struct.pack_into(">I", data, 12 + 8, 1 << 20)
+    font = fontengine.Font(bytes(data))
+    assert font.glyph_id("A") == 0, "a missing cmap maps nothing"
+    assert font.names() == {}
+
+
+def test_font_ignores_a_truncated_glyph():
+    good = _minimal()
+    for cut in (10, 12, 14, 16, 20, 24):
+        glyf = (struct.pack(">hhhhh", 1, 0, 0, 100, 100)
+                + struct.pack(">HH", 3, 0) + bytes([1, 1, 1, 1])
+                + struct.pack(">hhhh", 0, 100, 0, -100)
+                + struct.pack(">hhhh", 0, 0, 100, 0))[:cut]
+        font = fontengine.Font(_minimal(glyf=glyf,
+                                        loca=struct.pack(">HHH", 0, 0,
+                                                         len(glyf) // 2)))
+        assert font.glyph_contours(1) == [], f"cut at {cut} produced an outline"
+    assert fontengine.Font(good).glyph_contours(1), "the whole glyph is fine"
+
+
+def test_font_ignores_loca_entries_past_glyf():
+    font = fontengine.Font(_minimal(loca=struct.pack(">HHH", 0, 0, 30000)))
+    assert font.glyph_contours(1) == []
+    assert font.glyph_contours(9999) == [], "a glyph id past loca is blank"
+
+
+def test_font_stops_on_a_composite_that_refers_to_itself():
+    """A composite pointing at itself would recurse for ever. The parser gives
+    up after a few levels and returns nothing, which is the only answer that
+    terminates."""
+    glyf = (struct.pack(">hhhhh", -1, 0, 0, 100, 100)
+            + struct.pack(">HH", 0x0002, 1) + bytes([0, 0]))
+    font = fontengine.Font(_minimal(glyf=glyf,
+                                    loca=struct.pack(">HHH", 0, 0,
+                                                     len(glyf) // 2)))
+    assert font.glyph_contours(1) == []
+
+
+def test_font_cmap_ignores_impossible_ranges():
+    """A format 12 group spanning the whole 32-bit space is a corrupt record,
+    not four billion characters to enumerate."""
+    groups = (struct.pack(">III", ord("A"), ord("A"), 1)
+              + struct.pack(">III", 0, 0xFFFFFFFF, 1))
+    sub = struct.pack(">HHIII", 12, 0, 16 + len(groups), 0, 2) + groups
+    cmap = struct.pack(">HHHHI", 0, 1, 3, 10, 12) + sub
+    font = fontengine.Font(_minimal(cmap=cmap))
+    assert font.glyph_id("A") == 1
+    assert font.glyph_id("B") == 0, "the impossible group should be skipped"
+
+
+def test_font_advance_falls_back_to_the_last_metric():
+    """hmtx stops after numberOfHMetrics entries and every glyph after that
+    shares the last advance -- that is how the format spells a monospaced
+    tail, not a reason to index past the table."""
+    font = fontengine.Font(_minimal())
+    assert font.advance(1) == 300
+    assert font.advance(50000) == 300
+    assert font.advance(-1) == 300
+
+
+def test_font_survives_arbitrary_corruption():
+    """Flip bytes through a real font and a hand-built one and insist the
+    parser always either works or raises FontError. A font is read once and
+    then asked for outlines all day, so a stray offset must be survivable at
+    every one of those calls, not just at parse time."""
+    import random
+
+    seeds = [_minimal()]
+    for faces in fontengine.index().values():
+        path, _face = next(iter(faces.values()))
+        with open(path, "rb") as f:
+            seeds.append(f.read(200000))
+        break
+    rng = random.Random(20260814)
+    for _ in range(1500):
+        data = bytearray(rng.choice(seeds))
+        for _flip in range(rng.randint(1, 8)):
+            data[rng.randrange(len(data))] = rng.randrange(256)
+        if rng.random() < 0.3:
+            del data[rng.randrange(len(data)):]
+        try:
+            font = fontengine.Font(bytes(data))
+            font.names()
+            for ch in ("A", "g", "☃"):
+                font.glyph_id(ch)
+            for gid in (0, 1, 7, 4000):
+                fontengine.flatten(font.glyph_contours(gid), font.scale(16))
+                font.advance(gid)
+        except fontengine.FontError:
+            pass
+        except Exception as exc:                 # noqa: BLE001
+            raise AssertionError(
+                f"{type(exc).__name__} escaped the font parser: {exc}")
+
+
+def test_text_survives_lone_surrogates():
+    """``&#xD800;`` puts a lone surrogate in a page's text. It is not a
+    character any font maps, but measuring and drawing it must come back
+    quietly rather than raise on the way into the renderer."""
+    font = _sans()
+    face = font.face
+    assert face.glyph_id("\ud800") == 0
+    assert face.has_char("\ud800") is False
+    text = "a\ud800b"
+    assert raster.measure_text(face, 16, text) >= 0
+    s = raster.Surface(40, 20, (255, 255, 255))
+    raster.draw_text(s, face, 16, text, 2, 15, (0, 0, 0))
+
+
 # -- rasteriser ------------------------------------------------------------
 
 def test_surface_starts_filled_with_background():

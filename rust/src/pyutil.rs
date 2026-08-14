@@ -2,8 +2,9 @@
 
 use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::{PyTypeError, PyValueError};
+use pyo3::ffi;
 use pyo3::prelude::*;
-use pyo3::types::{PyByteArray, PyBytes, PyFloat};
+use pyo3::types::{PyByteArray, PyBytes, PyFloat, PyString};
 use std::borrow::Cow;
 
 /// Read a Python bytes-like argument without copying when we can help it.
@@ -54,6 +55,63 @@ pub fn to_int(obj: &Bound<'_, PyAny>) -> PyResult<i64> {
         Ok(v) => Ok(v.trunc().clamp(i64::MIN as f64, i64::MAX as f64) as i64),
         Err(_) => Err(PyTypeError::new_err(
             "expected a number for a drawing coordinate",
+        )),
+    }
+}
+
+/// Visit each code point of a Python string.
+///
+/// Not `&str`: a Python string can hold a lone surrogate, and a page puts one
+/// there with a numeric character reference like `&#xD800;`. Rust's `str`
+/// cannot represent that, so extracting one would raise UnicodeEncodeError
+/// and take the whole page load down over a character the Python renderer
+/// measured as zero-width and drew as nothing. The common case still goes
+/// through UTF-8; only a string that is not valid UTF-8 pays for the
+/// character-at-a-time read.
+pub fn for_each_char<F>(obj: &Bound<'_, PyAny>, mut visit: F) -> PyResult<()>
+where
+    F: FnMut(u32),
+{
+    let s = obj
+        .cast::<PyString>()
+        .map_err(|_| PyTypeError::new_err("expected a string"))?;
+    if let Ok(text) = s.to_str() {
+        for c in text.chars() {
+            visit(c as u32);
+        }
+        return Ok(());
+    }
+    let py = obj.py();
+    let n = unsafe { ffi::PyUnicode_GetLength(s.as_ptr()) };
+    if n < 0 {
+        return Err(PyErr::take(py).unwrap_or_else(|| PyTypeError::new_err("bad string")));
+    }
+    for i in 0..n {
+        let c = unsafe { ffi::PyUnicode_ReadChar(s.as_ptr(), i) };
+        if c == u32::MAX {
+            if let Some(e) = PyErr::take(py) {
+                return Err(e);
+            }
+        }
+        visit(c);
+    }
+    Ok(())
+}
+
+/// The single code point of a one-character string, as `ord()` gave it.
+pub fn one_char(obj: &Bound<'_, PyAny>) -> PyResult<u32> {
+    let mut found: Option<u32> = None;
+    let mut count = 0usize;
+    for_each_char(obj, |c| {
+        count += 1;
+        if found.is_none() {
+            found = Some(c);
+        }
+    })?;
+    match found {
+        Some(c) if count == 1 => Ok(c),
+        _ => Err(PyTypeError::new_err(
+            "ord() expected a character, but string of length != 1 found",
         )),
     }
 }
