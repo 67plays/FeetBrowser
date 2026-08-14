@@ -1765,6 +1765,130 @@ def test_js_custom_iterable_and_not_iterable():
     assert g["threw"] is True, "for...of over a non-iterable throws"
 
 
+def test_js_symbol_registry_keys_are_namespaced():
+    # A symbol addresses a property slot by its key string, and `Symbol.for`'s
+    # argument is an arbitrary string a script chooses -- so if the two were
+    # the same string, `Symbol.for("length")` would name the slot `o.length`
+    # already lives in and writing through it would silently destroy the real
+    # property. `Symbol.for("@@iterator")` would be worse still: it would land
+    # on the well-known iterator slot and make an object iterable by accident.
+    # Registry symbols therefore get a namespace of their own.
+    interp = Interpreter()
+    interp.run("""
+        var o = { length: 7, name: "n" };
+        o[Symbol.for("length")] = 99;
+        o[Symbol.for("name")] = "other";
+        var plainLength = o.length;
+        var plainName = o.name;
+        var throughSymbol = o[Symbol.for("length")];
+        var hijack = {};
+        hijack[Symbol.for("@@iterator")] = function () {};
+        var stillNotIterable = typeof hijack[Symbol.iterator];
+        var s1 = Symbol.for("k");
+        var same = Symbol.for("k") === s1;
+        var roundTrip = Symbol.keyFor(s1);
+        var described = s1.description;
+        var unregistered = Symbol.keyFor(Symbol("k"));
+    """)
+    g = interp.globals
+    eq(g["plainLength"], 7, "a registry symbol does not overwrite a string key")
+    eq(g["plainName"], "n", "whatever the string happens to be called")
+    eq(g["throughSymbol"], 99, "and the symbol still addresses its own slot")
+    eq(g["stillNotIterable"], "undefined",
+       "nor can a registry symbol reach a well-known symbol's slot")
+    assert g["same"] is True, "Symbol.for still hands out one symbol per key"
+    eq(g["roundTrip"], "k", "Symbol.keyFor still round-trips the key it was made from")
+    eq(g["described"], "k", "and the description is still the key")
+    assert g["unregistered"] is UNDEFINED, \
+        "while an unregistered symbol has no key to give back"
+
+
+def test_js_symbol_key_derivation_is_one_rule():
+    # Symbols are stored in property maps under a key string, which is what
+    # lets `obj[Symbol.iterator]` and the `"@@iterator"` slot `iterate()` reads
+    # be one mechanism rather than two. That only holds while every site that
+    # turns a value into a property key uses the same derivation. Any site that
+    # spells its own rule -- printing the symbol instead of naming its slot --
+    # fails silently: the property lands somewhere nothing else looks, and the
+    # class goes quietly un-iterable. So: four shapes that write a symbol key,
+    # each read back by the three consumers that ought to agree about it.
+    interp = Interpreter()
+    interp.run("""
+        function twice() {
+            var n = 0;
+            return { next: function () {
+                n += 1;
+                return n <= 2 ? { value: n, done: false } : { value: undefined, done: true };
+            } };
+        }
+        // 1. a computed class member
+        class Member { [Symbol.iterator]() { return twice(); } }
+        // 2. an instance field
+        class Field { [Symbol.iterator] = twice; }
+        // 3. a static field, read off the class itself
+        class Static { static [Symbol.iterator] = twice; }
+        // 4. a computed object literal key
+        var lit = { [Symbol.iterator]: twice };
+
+        function consumers(x) {
+            var out = "";
+            for (var v of x) { out += v; }
+            return [...x].join(",") + "|" + Array.from(x).join(",") + "|" + out;
+        }
+        var member = consumers(new Member());
+        var field = consumers(new Field());
+        var stat = consumers(Static);
+        var literal = consumers(lit);
+
+        // And `in` has to answer about the slot a read would reach, whichever
+        // way round the key was written.
+        var writtenAsSymbol = {};
+        writtenAsSymbol[Symbol.iterator] = twice;
+        var writtenAsString = {};
+        writtenAsString["@@iterator"] = twice;
+        var symbolFindsString = Symbol.iterator in writtenAsString;
+        var symbolFindsSymbol = Symbol.iterator in writtenAsSymbol;
+        var stringFindsSymbol = "@@iterator" in writtenAsSymbol;
+        var absent = Symbol.iterator in {};
+        var fresh = Symbol("f");
+        var freshHolder = {};
+        freshHolder[fresh] = 1;
+        var freshFound = fresh in freshHolder;
+        var freshMissed = Symbol("f") in freshHolder;
+        class Inst { [Symbol.iterator] = twice; }
+        var onInstance = Symbol.iterator in new Inst();
+
+        // The same rule again, on the object machinery that takes a key as an
+        // argument rather than in brackets.
+        var owned = writtenAsSymbol.hasOwnProperty(Symbol.iterator);
+        var hasOwn = Object.hasOwn(writtenAsSymbol, Symbol.iterator);
+        var defined = {};
+        Object.defineProperty(defined, Symbol.iterator, { value: twice });
+        var definedReads = typeof defined[Symbol.iterator];
+        var descriptor = Object.getOwnPropertyDescriptor(writtenAsSymbol, Symbol.iterator) !== undefined;
+        var entries = Object.fromEntries([[Symbol.iterator, twice]]);
+        var fromEntriesReads = typeof entries[Symbol.iterator];
+    """)
+    g = interp.globals
+    agree = "1,2|1,2|12"
+    eq(g["member"], agree, "spread, Array.from and for...of agree on a computed method")
+    eq(g["field"], agree, "and on an instance field")
+    eq(g["stat"], agree, "and on a static field")
+    eq(g["literal"], agree, "and on a computed object-literal key")
+    assert g["symbolFindsString"] is True, "'in' finds a slot the string spelling wrote"
+    assert g["symbolFindsSymbol"] is True, "and one the symbol wrote"
+    assert g["stringFindsSymbol"] is True, "which is the same slot from either side"
+    assert g["absent"] is False, "'in' still says no when nothing is there"
+    assert g["freshFound"] is True, "a fresh symbol finds its own slot"
+    assert g["freshMissed"] is False, "and never another symbol's"
+    assert g["onInstance"] is True, "'in' reaches a symbol-keyed field on an instance"
+    assert g["owned"] is True, "hasOwnProperty names the slot rather than printing the symbol"
+    assert g["hasOwn"] is True, "and so does Object.hasOwn"
+    eq(g["definedReads"], "function", "Object.defineProperty writes the slot a read finds")
+    assert g["descriptor"] is True, "Object.getOwnPropertyDescriptor finds it too"
+    eq(g["fromEntriesReads"], "function", "and Object.fromEntries writes it")
+
+
 def test_js_destructuring_assignment_onto_properties():
     # vimeo.com, fb6eed97: `({comparer: f.moduleSpecifierComparer} = eaL(_, u))`
     # -- a destructuring assignment whose targets are properties, not names.

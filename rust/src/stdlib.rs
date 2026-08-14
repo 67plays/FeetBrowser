@@ -948,7 +948,7 @@ fn obj_define_property(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue
     Box::pin(async move {
         if args.len() >= 3 {
             if let JsValue::Object(map) = &args[0] {
-                define_one(map, this.repr(&args[1]), &args[2]);
+                define_one(map, index_name(&this, &args[1]), &args[2]);
             }
         }
         Ok(args.into_iter().next().unwrap_or(JsValue::Undefined))
@@ -988,7 +988,7 @@ fn obj_get_own_descriptor(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsVa
     Box::pin(async move {
         if args.len() >= 2 {
             if let JsValue::Object(map) = &args[0] {
-                let key = this.repr(&args[1]);
+                let key = index_name(&this, &args[1]);
                 let slot = map.borrow().get(&key).cloned();
                 if let Some(slot) = slot {
                     return Ok(descriptor_for(&slot));
@@ -1053,7 +1053,7 @@ fn obj_has_own(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> Ev
     Box::pin(async move {
         if args.len() >= 2 {
             if let JsValue::Object(m) = &args[0] {
-                let key = this.repr(&args[1]);
+                let key = index_name(&this, &args[1]);
                 return Ok(JsValue::Bool(m.borrow().contains_key(&key)));
             }
         }
@@ -1089,7 +1089,7 @@ fn obj_from_entries(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) 
             for pair in items.borrow().iter() {
                 if let JsValue::Array(entry) = pair {
                     let e = entry.borrow();
-                    let key = this.repr(e.first().unwrap_or(&JsValue::Undefined));
+                    let key = index_name(&this, e.first().unwrap_or(&JsValue::Undefined));
                     let val = e.get(1).cloned().unwrap_or(JsValue::Undefined);
                     out.insert(key, val);
                 }
@@ -1104,7 +1104,7 @@ fn object_proto_has_own(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValu
     Box::pin(async move {
         if args.len() >= 2 {
             if let JsValue::Object(m) = &args[0] {
-                let key = this.repr(&args[1]);
+                let key = index_name(&this, &args[1]);
                 return Ok(JsValue::Bool(m.borrow().contains_key(&key)));
             }
         }
@@ -1787,8 +1787,13 @@ fn date_get(_this: &Rc<Interpreter>, _obj: &JsValue, name: &str) -> Result<JsVal
 // symbol ever collides with a string key.
 static SYMBOL_SEQ: AtomicUsize = AtomicUsize::new(0);
 
+/// The namespace `Symbol.for`'s property keys live in. See `symbol_for`.
+const SYMBOL_FOR_PREFIX: &str = "@@for:";
+
 thread_local! {
-    /// `Symbol.for`'s registry: one symbol per key, shared across the page.
+    /// `Symbol.for`'s registry, keyed by the symbol's property key rather than
+    /// by the string the script passed, so `Symbol.keyFor` can recognise one
+    /// of its own symbols by looking its `key` straight up.
     static SYMBOL_REGISTRY: RefCell<BTreeMap<String, Rc<JsSymbol>>> = RefCell::new(BTreeMap::new());
     /// The well-known symbols, cached so `Symbol.iterator === Symbol.iterator`.
     static WELL_KNOWN: RefCell<BTreeMap<String, Rc<JsSymbol>>> = RefCell::new(BTreeMap::new());
@@ -1833,19 +1838,29 @@ fn symbol_call(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> Ev
 }
 
 /// `Symbol.for` shares one symbol per key across the whole page.
+///
+/// The registry key a script passes is an arbitrary string, so it cannot be
+/// the property-map key as well: `Symbol.for("length")` would then address the
+/// very slot `o.length` lives in, and `o[Symbol.for("length")] = 99` would
+/// quietly overwrite it. Worse, `Symbol.for("@@iterator")` would land on the
+/// well-known iterator slot and make an object iterable by accident. The
+/// prefix keeps registry symbols in their own space, where they can collide
+/// neither with a string key a script wrote nor with a well-known symbol,
+/// while `desc` keeps the original string for `Symbol.keyFor` to hand back.
 fn symbol_for(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
     let this = this.clone();
     Box::pin(async move {
-        let key = match args.first() {
+        let name = match args.first() {
             Some(v) if !nullish(v) => this.repr(v),
             _ => String::new(),
         };
+        let key = format!("{SYMBOL_FOR_PREFIX}{name}");
         if let Some(s) = SYMBOL_REGISTRY.with(|r| r.borrow().get(&key).cloned()) {
             return Ok(JsValue::Symbol(s));
         }
         let sym = Rc::new(JsSymbol {
             key: key.clone(),
-            desc: key.clone(),
+            desc: name,
         });
         SYMBOL_REGISTRY.with(|r| r.borrow_mut().insert(key, sym.clone()));
         Ok(JsValue::Symbol(sym))

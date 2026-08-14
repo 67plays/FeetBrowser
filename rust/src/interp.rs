@@ -1177,7 +1177,7 @@ fn object_proto_method(name: &str) -> Option<JsValue> {
         "hasOwnProperty" | "propertyIsEnumerable" => Some(JsValue::Callback(Rc::new(
             move |i: &Rc<Interpreter>, args: Vec<JsValue>| -> EvResult {
                 let r = args.first().cloned().unwrap_or(JsValue::Undefined);
-                let key = i.repr(&args.get(1).cloned().unwrap_or(JsValue::Undefined));
+                let key = index_name(i, &args.get(1).cloned().unwrap_or(JsValue::Undefined));
                 Box::pin(async move { Ok(JsValue::Bool(has_own(&r, &key))) })
             },
         ))),
@@ -4709,8 +4709,11 @@ async fn eval_class(
         if !f.is_static {
             continue;
         }
+        // A computed field name goes through the same derivation a computed
+        // method name does, so `static [Symbol.iterator] = f` lands on the
+        // slot the iteration protocol reads rather than on `"Symbol(...)"`.
         let key = match &f.key {
-            Some(k) => this.repr(&eval(this, k, env.clone()).await?),
+            Some(k) => index_name(this, &eval(this, k, env.clone()).await?),
             None => f.name.clone(),
         };
         let v = match &f.value {
@@ -4725,7 +4728,7 @@ async fn eval_class(
             continue;
         }
         let key = match &f.key {
-            Some(k) => this.repr(&eval(this, k, env.clone()).await?),
+            Some(k) => index_name(this, &eval(this, k, env.clone()).await?),
             None => f.name.clone(),
         };
         inst_fields.push((key, f.value.clone()));
@@ -4986,10 +4989,12 @@ fn ordered(left: &JsValue, right: &JsValue) -> bool {
 }
 
 fn eval_in(this: &Interpreter, key: &JsValue, obj: &JsValue) -> Result<bool, JsError> {
-    let name = match key {
-        JsValue::Str(s) => s.to_string(),
-        _ => this.repr(key),
-    };
+    // The same derivation a property read uses, and for the same reason: `in`
+    // has to answer about the slot `obj[key]` would reach. Spelling the rule
+    // out again here is how `Symbol.iterator in obj` came to disagree with
+    // `obj[Symbol.iterator]` -- a symbol fell through to `repr`, which prints
+    // it rather than naming its slot.
+    let name = index_name(this, key);
     match obj {
         JsValue::Object(map) => Ok(map.borrow().contains_key(&name)),
         JsValue::Instance(inst) => {
