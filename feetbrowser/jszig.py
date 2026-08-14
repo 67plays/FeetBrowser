@@ -207,6 +207,12 @@ class JSValue:
     def js_call(self, *args):
         return self._interp._call(self._handle, UNDEFINED, args)
 
+    # A JavaScript function handed to a Python host object arrives here, and
+    # host code should not have to know which engine produced it. The Rust
+    # engine hands over something Python can call, so this one does too:
+    # `callback(a, b)` in the DOM bridge means the same thing either way.
+    __call__ = js_call
+
     def js_new(self, *args):
         return self._interp._construct(self._handle, args)
 

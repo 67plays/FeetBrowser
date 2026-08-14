@@ -24,11 +24,13 @@ from .net import URL
 from .htmlparser import HTMLParser, Text, Element
 from .cssparser import CSSParser, style, parse_inline, set_viewport, \
     media_matches, get_viewport
-from .layout import DocumentLayout, paint_tree, get_font, DrawText, _measure
+from .layout import DocumentLayout, paint_tree, get_font, DrawText, _measure, \
+    field_value, field_checked
 from . import shoes as shoes
-from .jsdom import JSDocument, JSLocation
+from .jsdom import JSDocument, JSLocation, _JSStaticProps, _JSComputedStyle
 from .jsengine import Interpreter, JSException, UNDEFINED
 from . import toes as toes
+from . import __version__
 
 WIDTH, HEIGHT = 1000, 720
 SCROLL_STEP = 80
@@ -66,6 +68,15 @@ def tree_to_list(tree, out):
         for child in reversed(node.children):
             stack.append(child)
     return out
+
+
+def _option_value(option):
+    """What an <option> submits: its `value` attribute, or -- when it has
+    none, which is the common shorthand -- the text it shows."""
+    if "value" in option.attributes:
+        return option.attributes["value"]
+    return "".join(c.text for c in option.children
+                   if isinstance(c, Text)).strip()
 
 
 def find_links(node, out):
@@ -565,7 +576,8 @@ class Tab:
         self._js_interp = Interpreter()
         location = JSLocation(base_url=self.base_url, navigate=self._js_navigate)
         doc = JSDocument(self.nodes, base_url=self.base_url,
-                         mark_dirty=self._js_mutated, location=location)
+                         mark_dirty=self._js_mutated, interp=self._js_interp,
+                         location=location)
         self._js_doc = doc
         self._js_interp.globals["document"] = doc
         # Location/navigation: the window, its aliases, and the document all
@@ -578,6 +590,34 @@ class Tab:
         # Browser-provided host APIs (network + nothing Tk).
         self._js_interp.globals["fetch"] = self._js_fetch
         self._js_interp.globals["XMLHttpRequest"] = self._js_xhr_ctor()
+        # Rendering/event APIs. rAF rides the existing virtual-clock timer
+        # machinery (setTimeout), which the GUI advances every 60ms.
+        self._js_interp.globals["getComputedStyle"] = self._js_get_computed_style
+        self._js_interp.globals["requestAnimationFrame"] = self._js_request_frame
+        self._js_interp.globals["cancelAnimationFrame"] = self._js_cancel_frame
+        self._js_interp.globals["addEventListener"] = self._js_add_listener
+        self._js_interp.globals["removeEventListener"] = self._js_remove_listener
+        self._js_interp.globals["matchMedia"] = self._js_match_media
+        # Read-only window-ish globals scripts love to sniff.
+        self._js_interp.globals["devicePixelRatio"] = 1
+        self._js_interp.globals["innerWidth"] = WIDTH
+        self._js_interp.globals["innerHeight"] = HEIGHT
+        self._js_interp.globals["screen"] = _JSStaticProps({
+            "width": WIDTH, "height": HEIGHT,
+            "availWidth": WIDTH, "availHeight": HEIGHT,
+        })
+        self._js_interp.globals["navigator"] = _JSStaticProps({
+            "userAgent": (
+                f"Mozilla/5.0 FeetBrowser/{__version__} "
+                "(X11; Linux) AppleWebKit/537.36 (KHTML, like Gecko)"),
+            "platform": "Linux",
+            "language": "en-US",
+            "languages": ["en-US", "en"],
+            "vendor": "",
+            "onLine": True,
+            "hardwareConcurrency": 4,
+            "productSub": "20030107",
+        })
         for el in scripts:
             try:
                 code = None
@@ -588,6 +628,12 @@ class Tab:
                         sheet_url = self.base_url.resolve(src) \
                             if self.base_url else URL(src)
                         _h, code, _c = sheet_url.request()
+                        if not _is_js_script_type(_c):
+                            # `file://` and error pages return an HTML body
+                            # instead of raising; never execute it as JS.
+                            self._add_error(
+                                f"JS {sheet_url} (not a script: {_c})")
+                            code = None
                     except Exception as e:  # noqa: BLE001 - skip bad/unreachable src
                         self._add_error(
                             f"JS {sheet_url or src} ({type(e).__name__})")
@@ -767,6 +813,46 @@ class Tab:
 
     def _js_xhr_ctor(self):
         return _JSXHRCtor(self)
+
+    def _js_get_computed_style(self, el, *rest):
+        """Host `getComputedStyle(el)`: wraps the node so property reads and
+        `getPropertyValue()` resolve against the cascaded `.style` dict."""
+        if hasattr(el, "js_unwrap"):
+            el = el.js_unwrap()
+        if el is UNDEFINED or el is None or not hasattr(el, "node"):
+            return _JSComputedStyle(None)
+        return _JSComputedStyle(el.node)
+
+    def _js_request_frame(self, cb, *rest):
+        """rAF rides the virtual-clock timer machinery so GUI polling (which
+        calls interp.advance every 60ms) fires the callback on schedule."""
+        try:
+            return self._js_interp.call(
+                self._js_interp.globals["setTimeout"], cb, 16)
+        except Exception:  # noqa: BLE001 - no timer infra in headless mode
+            return 0
+
+    def _js_cancel_frame(self, handle, *rest):
+        try:
+            return self._js_interp.call(
+                self._js_interp.globals["clearTimeout"], handle)
+        except Exception:  # noqa: BLE001 - no timer infra in headless mode
+            return None
+
+    def _js_add_listener(self, *args):
+        return None
+
+    def _js_remove_listener(self, *args):
+        return None
+
+    def _js_match_media(self, query):
+        return _JSStaticProps({
+            "matches": False,
+            "media": str(query),
+            "addListener": lambda *a: None,
+            "removeListener": lambda *a: None,
+            "addEventListener": lambda *a: None,
+        })
 
     def _drain_js(self):
         """UI thread: settle JS network results and run pending microtasks /
@@ -1196,24 +1282,28 @@ class Tab:
         return None
 
     def _activate_control(self, control):
-        if control.tag == "input" and control.attributes.get("type", "").lower() \
-                in ("checkbox", "radio"):
-            current = control.attributes.get("value", "on")
-            control.attributes["value"] = "off" if current == "on" else "on"
+        itype = control.attributes.get("type", "").lower() \
+            if control.tag == "input" else ""
+        if itype in ("checkbox", "radio"):
+            checked = field_checked(control)
+            if itype == "radio" and not checked:
+                # A radio group is one field: ticking a button unticks the
+                # rest of its name group, or the submission carries every
+                # button the user has ever clicked.
+                self._clear_radio_group(control)
+            control.attributes["data-checked"] = "off" if checked else "on"
             self.render()
             return None
-        if control.tag == "input" and control.attributes.get("type", "").lower() == "reset":
+        if itype == "reset":
             form = self._enclosing_form(control)
             if form:
                 self.reset_form(form)
             return None
-        is_submit = (control.tag == "button"
-                     or control.attributes.get("type", "").lower()
-                     in ("submit", "image"))
+        is_submit = (control.tag == "button" or itype in ("submit", "image"))
         if is_submit:
             form = self._enclosing_form(control)
             if form:
-                return self._submit_form(form)
+                return self._submit_form(form, control)
             return None
         # Focusable field.
         if self.focused_input is not None:
@@ -1223,6 +1313,19 @@ class Tab:
         self.render()
         return None
 
+    def _clear_radio_group(self, radio):
+        """Untick every other radio sharing this one's name within its form."""
+        name = radio.attributes.get("name")
+        if not name:
+            return
+        scope = self._enclosing_form(radio) or self.nodes
+        for node in tree_to_list(scope, []):
+            if isinstance(node, Element) and node is not radio \
+                    and node.tag == "input" \
+                    and node.attributes.get("type", "").lower() == "radio" \
+                    and node.attributes.get("name") == name:
+                node.attributes["data-checked"] = "off"
+
     def reset_form(self, form):
         for node in tree_to_list(form, []):
             if not isinstance(node, Element):
@@ -1230,13 +1333,14 @@ class Tab:
             if node.tag == "input":
                 itype = node.attributes.get("type", "text").lower()
                 if itype in ("checkbox", "radio"):
-                    node.attributes["value"] = "off"
-                    if "checked" in node.attributes:
-                        node.attributes["value"] = "on"
+                    # Drop the recorded state so the markup's own `checked`
+                    # attribute is what decides again.
+                    node.attributes.pop("data-checked", None)
                 elif itype not in ("submit", "button", "reset", "image"):
                     node.attributes["value"] = ""
             elif node.tag == "textarea":
-                node.attributes["value"] = ""
+                # Dropping `value` restores the markup's own content.
+                node.attributes.pop("value", None)
         self.render()
 
     def blur_input(self):
@@ -1246,17 +1350,25 @@ class Tab:
             self.render()
 
     def type_char(self, ch):
+        return self.insert_text(ch)
+
+    def insert_text(self, text):
+        """Append `text` to the focused field. Returns True if it landed
+        somewhere, so the caller knows whether a repaint is due."""
         inp = self.focused_input
-        if inp is None:
+        if inp is None or not text:
             return False
-        value = inp.attributes.get("value", "")
-        if inp.tag == "textarea":
-            inp.attributes["value"] = value + ch
-        else:
-            itype = inp.attributes.get("type", "text").lower()
-            if itype in ("checkbox", "radio"):
+        if inp.tag not in ("input", "textarea"):
+            return False
+        if inp.tag == "input":
+            if inp.attributes.get("type", "text").lower() in ("checkbox",
+                                                              "radio"):
                 return False
-            inp.attributes["value"] = value + ch
+            # A single-line field has nowhere to put a line break, so a
+            # pasted multi-line block folds onto one line rather than
+            # silently losing everything after the first newline.
+            text = " ".join(text.splitlines())
+        inp.attributes["value"] = field_value(inp) + text
         self.render()
         return True
 
@@ -1264,8 +1376,7 @@ class Tab:
         inp = self.focused_input
         if inp is None:
             return False
-        value = inp.attributes.get("value", "")
-        inp.attributes["value"] = value[:-1]
+        inp.attributes["value"] = field_value(inp)[:-1]
         self.render()
         return True
 
@@ -1278,7 +1389,7 @@ class Tab:
             return self._submit_form(form)
         return None
 
-    def _submit_form(self, form):
+    def _submit_form(self, form, submitter=None):
         method = form.attributes.get("method", "get").lower()
         action = form.attributes.get("action", "")
         base = (self.base_url if self.base_url else self.url)
@@ -1292,24 +1403,32 @@ class Tab:
             if not isinstance(node, Element):
                 continue
             name = node.attributes.get("name")
-            if not name:
+            if not name or "disabled" in node.attributes:
                 continue
             if node.tag == "input":
                 itype = node.attributes.get("type", "text").lower()
                 if itype in ("submit", "button", "reset", "image"):
+                    # Only the control that was actually pressed speaks for
+                    # the form; the other buttons stay silent, which is how a
+                    # form with several submit buttons says which one ran.
+                    if node is submitter:
+                        params.append((name, field_value(node)))
                     continue
-                if itype in ("checkbox", "radio") and \
-                        node.attributes.get("value") != "on":
+                if itype in ("checkbox", "radio"):
+                    if field_checked(node):
+                        params.append((name, field_value(node) or "on"))
                     continue
-                params.append((name, node.attributes.get("value", "")))
+                params.append((name, field_value(node)))
             elif node.tag == "textarea":
-                params.append((name, node.attributes.get("value", "")))
+                params.append((name, field_value(node)))
+            elif node.tag == "button":
+                if node is submitter:
+                    params.append((name, node.attributes.get("value", "")))
             elif node.tag == "select":
                 opts = [c for c in node.children
                         if isinstance(c, Element) and c.tag == "option"]
                 chosen = [o for o in opts if "selected" in o.attributes] or opts[:1]
-                value = chosen[0].attributes.get("value", "") if chosen else ""
-                params.append((name, value))
+                params.append((name, _option_value(chosen[0]) if chosen else ""))
 
         query = urllib.parse.urlencode(params)
         if method == "post":
@@ -2103,8 +2222,17 @@ class Browser:
             self._address_key(e)
             return
         ctrl = bool(getattr(e, "state", 0) & 0x4)
-        if ctrl and getattr(e, "keysym", "").lower() == "c":
+        key = getattr(e, "keysym", "").lower()
+        if ctrl and key == "c":
             self._copy_selection()
+            return
+        if ctrl and key == "v" and self.active_tab \
+                and self.active_tab.focused_input is not None:
+            # Paste reaches a page field the same way it reaches the address
+            # bar: the modified keypress carries no printable char, so it has
+            # to be recognised here or nothing at all happens.
+            if self.active_tab.insert_text(self._clipboard_text()):
+                self._draw_page()
             return
         # Toes get first crack at keys when no address bar has focus, but
         # only consume the key when a toe explicitly returns True (a False
@@ -2278,11 +2406,17 @@ class Browser:
         self._address_copy()
         self._address_delete_selection()
 
-    def _address_paste(self):
+    def _clipboard_text(self):
+        """The clipboard's text, or "" when there is none to be had. Reading
+        raises for an empty clipboard and for one whose owner offers no text
+        flavour, and neither deserves a traceback in the user's face."""
         try:
-            data = self.window.clipboard_get()
+            return self.window.clipboard_get()
         except gui.TclError:
-            return
+            return ""
+
+    def _address_paste(self):
+        data = self._clipboard_text()
         if data:
             self._address_insert(data)
 
@@ -3655,10 +3789,23 @@ def main():
         screenshot(url, out)
         print("wrote %s" % out)
         return
-    if not gui.has_display():
-        print("FeetBrowser: no window available on this platform; "
-              "use --screenshot <url> [out.png] to render to a file.",
-              file=sys.stderr)
+    try:
+        usable = gui.has_display()
+    except RuntimeError as exc:
+        # FEETBROWSER_DISPLAY named a backend that cannot run here. Asking for
+        # one by name and quietly getting a headless root is how you end up
+        # with a black screenshot and no idea why, so this is an error -- but
+        # a sentence, not a traceback.
+        print("FeetBrowser: %s." % exc, file=sys.stderr)
+        return 1
+    if not usable:
+        # Say why where we can. "No window available" on a Linux box that has
+        # a perfectly good X server two lines of setup away is a dead end;
+        # "$DISPLAY is not set" is a thing the user can act on.
+        problem = gui.display_problem()
+        print("FeetBrowser: no window available on this platform%s; "
+              "use --screenshot <url> [out.png] to render to a file."
+              % (" (%s)" % problem if problem else ""), file=sys.stderr)
         return 1
     browser = Browser(gui.new_window())
     start = args[0] if args else "about:blank"

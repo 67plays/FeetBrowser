@@ -1296,14 +1296,90 @@ fn strAt(ctx: *anyopaque, callee: *Obj, this: Value, args: []const Value) anyerr
     return vm.getIndex(s, .{ .number = i });
 }
 
+// Case mapping is per character, not per byte. Mapping bytes is a Latin-1
+// reading of UTF-8: it leaves every accented letter alone and mangles nothing
+// only by luck. The tables below are the simple (one codepoint in, one out)
+// mappings for the alphabets a page is likely to shout in -- ASCII, Latin-1,
+// Latin Extended-A, Greek and Cyrillic. Characters outside them are returned
+// unchanged, which is what the full Unicode tables would do for most of them
+// anyway; the ones it gets wrong are the multi-character mappings (German ß
+// uppercasing to SS) that no single-codepoint table can express.
+fn upperCodepoint(cp: u21) u21 {
+    if (cp < 0x80) return std.ascii.toUpper(@intCast(cp));
+    return switch (cp) {
+        0xB5 => 0x39C, // micro sign -> capital mu
+        0xE0...0xF6, 0xF8...0xFE => cp - 0x20, // Latin-1, minus the divide sign
+        0xFF => 0x178, // y with diaeresis
+        0x101...0x137 => if (cp % 2 == 1) cp - 1 else cp,
+        0x13A...0x148 => if (cp % 2 == 0) cp - 1 else cp,
+        0x14B...0x177 => if (cp % 2 == 1) cp - 1 else cp,
+        0x17A...0x17E => if (cp % 2 == 0) cp - 1 else cp,
+        0x17F => 'S', // long s
+        0x3AC => 0x386,
+        0x3AD...0x3AF => cp - 0x25,
+        0x3B1...0x3C1, 0x3C3...0x3CB => cp - 0x20,
+        0x3C2 => 0x3A3, // final sigma
+        0x3CC => 0x38C,
+        0x3CD...0x3CE => cp - 0x3F,
+        0x430...0x44F => cp - 0x20,
+        0x450...0x45F => cp - 0x50,
+        else => cp,
+    };
+}
+
+fn lowerCodepoint(cp: u21) u21 {
+    if (cp < 0x80) return std.ascii.toLower(@intCast(cp));
+    return switch (cp) {
+        0xC0...0xD6, 0xD8...0xDE => cp + 0x20, // Latin-1, minus the times sign
+        0x100...0x136 => if (cp % 2 == 0) cp + 1 else cp,
+        0x139...0x147 => if (cp % 2 == 1) cp + 1 else cp,
+        0x14A...0x176 => if (cp % 2 == 0) cp + 1 else cp,
+        0x178 => 0xFF,
+        0x179...0x17D => if (cp % 2 == 1) cp + 1 else cp,
+        0x386 => 0x3AC,
+        0x388...0x38A => cp + 0x25,
+        0x38C => 0x3CC,
+        0x38E...0x38F => cp + 0x3F,
+        0x391...0x3A1, 0x3A3...0x3AB => cp + 0x20,
+        0x410...0x42F => cp + 0x20,
+        0x400...0x40F => cp + 0x50,
+        else => cp,
+    };
+}
+
+fn mapCase(vm: *Vm, bytes: []const u8, comptime up: bool) !Value {
+    var out = std.ArrayListUnmanaged(u8){};
+    defer out.deinit(vm.gpa);
+    var p: usize = 0;
+    while (p < bytes.len) {
+        const w = std.unicode.utf8ByteSequenceLength(bytes[p]) catch 1;
+        const end = @min(p + w, bytes.len);
+        const cp = std.unicode.utf8Decode(bytes[p..end]) catch {
+            // Not valid UTF-8. Nothing here can improve on it, so it is
+            // copied through untouched rather than replaced or dropped.
+            try out.appendSlice(vm.gpa, bytes[p..end]);
+            p = end;
+            continue;
+        };
+        const mapped = if (up) upperCodepoint(cp) else lowerCodepoint(cp);
+        var buf: [4]u8 = undefined;
+        const n = std.unicode.utf8Encode(mapped, &buf) catch {
+            try out.appendSlice(vm.gpa, bytes[p..end]);
+            p = end;
+            continue;
+        };
+        try out.appendSlice(vm.gpa, buf[0..n]);
+        p = end;
+    }
+    return vm.str(out.items);
+}
+
 fn strToUpper(ctx: *anyopaque, callee: *Obj, this: Value, args: []const Value) anyerror!Value {
     _ = callee;
     _ = args;
     const vm = V(ctx);
     const s = try thisString(vm, this);
-    const out = try vm.heap.alloc.dupe(u8, s.string.bytes);
-    for (out) |*c| c.* = std.ascii.toUpper(c.*);
-    return vm.adopt(out);
+    return mapCase(vm, s.string.bytes, true);
 }
 
 fn strToLower(ctx: *anyopaque, callee: *Obj, this: Value, args: []const Value) anyerror!Value {
@@ -1311,9 +1387,7 @@ fn strToLower(ctx: *anyopaque, callee: *Obj, this: Value, args: []const Value) a
     _ = args;
     const vm = V(ctx);
     const s = try thisString(vm, this);
-    const out = try vm.heap.alloc.dupe(u8, s.string.bytes);
-    for (out) |*c| c.* = std.ascii.toLower(c.*);
-    return vm.adopt(out);
+    return mapCase(vm, s.string.bytes, false);
 }
 
 const ws = " \t\n\r\x0b\x0c";

@@ -16,6 +16,10 @@ from .jsengine import UNDEFINED
 # Tags serialized as self-closing voids by the innerHTML serializer.
 VOID_TAGS = {"br", "img", "hr", "input", "meta", "link", "base"}
 
+# A DocumentFragment is a parentless element with a tag no parser can produce,
+# so nothing else in the tree can collide with it.
+FRAGMENT_TAG = "#fragment"
+
 
 def _clone(node, deep):
     """Copy an element, and its subtree when asked."""
@@ -92,6 +96,19 @@ def _parse_selector(sel):
                 return None
             tag = part.lower()
     return tag, classes, ids
+
+
+def _selector_hits(parsed, node):
+    """Does one element satisfy a parsed selector?"""
+    tag, classes, ids = parsed
+    if tag and node.tag != tag:
+        return False
+    if ids and node.attributes.get("id") not in ids:
+        return False
+    if classes and not classes.issubset(
+            set(node.attributes.get("class", "").split())):
+        return False
+    return True
 
 
 def _int_index(name):
@@ -194,6 +211,7 @@ class JSDocument:
             "getElementsByTagName": self._get_elements_by_tag_name,
             "getElementsByClassName": self._get_elements_by_class_name,
             "createElement": self._create_element,
+            "createTextNode": self._create_text_node,
             "createDocumentFragment": self._create_document_fragment,
             "addEventListener": self._add_event_listener,
             "removeEventListener": self._remove_event_listener,
@@ -269,12 +287,7 @@ class JSDocument:
         parsed = _parse_selector(sel)
         if parsed is None:
             return UNDEFINED
-        tag, classes, ids = parsed
-        return self._find(lambda n: isinstance(n, Element)
-                          and (not tag or n.tag == tag)
-                          and (not ids or n.attributes.get("id") in ids)
-                          and (not classes or classes.issubset(
-                              set(n.attributes.get("class", "").split()))))
+        return self._find(lambda n: _selector_hits(parsed, n))
 
     def _get_elements_by_tag_name(self, tag):
         tag = str(tag).lower()
@@ -339,6 +352,11 @@ class JSDocument:
     def _create_element(self, tag):
         return JSElement(Element(tag, {}, None), self._flag)
 
+    def _create_text_node(self, text):
+        if text is None or text is UNDEFINED:
+            text = ""
+        return JSText(Text(str(text), None), self._flag)
+
     def _add_event_listener(self, event_type, fn, *_options):
         # Document-level listeners hang off the root node, which is where the
         # Tab looks when it dispatches.
@@ -350,9 +368,7 @@ class JSDocument:
             event_type, fn)
 
     def _create_document_fragment(self):
-        # A fragment is a parentless container, which is what a detached
-        # element already is here.
-        return JSElement(Element("#fragment", {}, None), self._flag)
+        return JSFragment(_flag=self._flag)
 
     def _get_title(self):
         for n in _iter_elements(self.root):
@@ -380,6 +396,39 @@ class JSDocument:
             self.root.children.insert(0, title)
 
 
+class JSText:
+    """Bridge for one Text node, as `document.createTextNode` returns.
+
+    It is not a JSElement: a text node has no tag, no attributes and no
+    children, and letting one pretend otherwise puts a bogus element in the
+    tree. Only what a script can usefully read or write is here.
+    """
+
+    def __init__(self, node, _flag=None):
+        self.node = node
+        self._flag = _flag or {"dirty": False}
+
+    def js_get(self, name):
+        if name in ("textContent", "nodeValue", "data", "wholeText"):
+            return self.node.text
+        if name == "nodeType":
+            return 3
+        if name == "nodeName":
+            return "#text"
+        if name == "length":
+            return len(self.node.text)
+        if name == "parentNode":
+            parent = self.node.parent
+            return JSElement(parent, self._flag) if parent else UNDEFINED
+        return UNDEFINED
+
+    def js_set(self, name, value):
+        if name in ("textContent", "nodeValue", "data"):
+            self.node.text = "" if value is None or value is UNDEFINED \
+                else str(value)
+            self._flag["dirty"] = True
+
+
 class JSElement:
     """Bridge for one Element node."""
 
@@ -402,6 +451,9 @@ class JSElement:
             "insertBefore": self._insert_before,
             "cloneNode": self._clone_node,
             "contains": self._contains,
+            "remove": self._remove,
+            "matches": self._matches,
+            "closest": self._closest,
         }
 
     def js_get(self, name):
@@ -412,6 +464,8 @@ class JSElement:
                            if isinstance(n, Text))
         if name == "innerHTML":
             return serialize(self.node.children)
+        if name == "outerHTML":
+            return serialize_element(self.node)
         if name == "tagName":
             return self.node.tag.upper()
         if name == "tag":
@@ -435,6 +489,8 @@ class JSElement:
         if name == "children":
             return JSNodeList([JSElement(c, self._flag) for c in self.node.children
                                if isinstance(c, Element)])
+        if name == "childElementCount":
+            return len(self._element_children())
         if name == "parentNode":
             return JSElement(self.node.parent, self._flag) if self.node.parent else UNDEFINED
         if name == "classList":
@@ -480,38 +536,19 @@ class JSElement:
         parsed = _parse_selector(sel)
         if parsed is None:
             return UNDEFINED
-        tag, classes, ids = parsed
         for n in _iter_elements(self.node):
-            if n is self.node:
-                continue
-            if tag and n.tag != tag:
-                continue
-            if ids and n.attributes.get("id") not in ids:
-                continue
-            if classes and not classes.issubset(
-                    set(n.attributes.get("class", "").split())):
-                continue
-            return JSElement(n, self._flag)
+            if n is not self.node and _selector_hits(parsed, n):
+                return JSElement(n, self._flag)
         return UNDEFINED
 
     def _query_selector_all(self, sel):
         parsed = _parse_selector(sel)
         if parsed is None:
             return JSNodeList([])
-        tag, classes, ids = parsed
-        out = []
-        for n in _iter_elements(self.node):
-            if n is self.node:
-                continue
-            if tag and n.tag != tag:
-                continue
-            if ids and n.attributes.get("id") not in ids:
-                continue
-            if classes and not classes.issubset(
-                    set(n.attributes.get("class", "").split())):
-                continue
-            out.append(JSElement(n, self._flag))
-        return JSNodeList(out)
+        return JSNodeList([JSElement(n, self._flag)
+                           for n in _iter_elements(self.node)
+                           if n is not self.node
+                           and _selector_hits(parsed, n)])
 
     def _get_elements_by_class_name(self, cls):
         cls = str(cls)
@@ -537,13 +574,36 @@ class JSElement:
         return data
 
     def _append_child(self, child):
-        if not isinstance(child, JSElement):
+        if not isinstance(child, (JSElement, JSText)):
             return UNDEFINED
         raw = child.node
+        if isinstance(raw, Element) and raw.tag == FRAGMENT_TAG:
+            # A fragment is not itself inserted: appending it moves its
+            # children and leaves it empty, which is the whole point of
+            # building a subtree off to one side and grafting it on at once.
+            moved = list(raw.children)
+            raw.children = []
+            for node in moved:
+                node.parent = self.node
+                self.node.children.append(node)
+            self._flag["dirty"] = True
+            return child
         raw.parent = self.node
         self.node.children.append(raw)
         self._flag["dirty"] = True
         return child
+
+    def _remove(self):
+        parent = self.node.parent
+        if parent is None:
+            return UNDEFINED
+        try:
+            parent.children.remove(self.node)
+        except ValueError:
+            return UNDEFINED
+        self.node.parent = None
+        self._flag["dirty"] = True
+        return UNDEFINED
 
     def _element_children(self):
         return [c for c in self.node.children if isinstance(c, Element)]
@@ -570,11 +630,11 @@ class JSElement:
         return UNDEFINED
 
     def _insert_before(self, child, ref=UNDEFINED):
-        if not isinstance(child, JSElement):
+        if not isinstance(child, (JSElement, JSText)):
             return UNDEFINED
         raw = child.node
         raw.parent = self.node
-        if isinstance(ref, JSElement) and ref.node in self.node.children:
+        if isinstance(ref, (JSElement, JSText)) and ref.node in self.node.children:
             self.node.children.insert(self.node.children.index(ref.node), raw)
         else:
             self.node.children.append(raw)
@@ -589,8 +649,23 @@ class JSElement:
             return False
         return any(n is other.node for n in _walk(self.node))
 
+    def _matches(self, sel):
+        parsed = _parse_selector(sel)
+        return parsed is not None and _selector_hits(parsed, self.node)
+
+    def _closest(self, sel):
+        parsed = _parse_selector(sel)
+        if parsed is None:
+            return UNDEFINED
+        node = self.node
+        while node is not None:
+            if isinstance(node, Element) and _selector_hits(parsed, node):
+                return JSElement(node, self._flag)
+            node = node.parent
+        return UNDEFINED
+
     def _remove_child(self, child):
-        if not isinstance(child, JSElement):
+        if not isinstance(child, (JSElement, JSText)):
             return UNDEFINED
         raw = child.node
         try:
@@ -667,6 +742,17 @@ class JSNodeList:
         for i, item in enumerate(self._items):
             fn(item, i, self)
         return UNDEFINED
+
+
+class JSFragment(JSElement):
+    """DocumentFragment: a parentless element whose tag no parser can
+    produce, so it can hold children before they are grafted on and never
+    collide with a real element. `appendChild` on the destination is what
+    moves them across.
+    """
+
+    def __init__(self, node=None, _flag=None):
+        super().__init__(Element(FRAGMENT_TAG, {}, None), _flag)
 
 
 class JSClassList:

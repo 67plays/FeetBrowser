@@ -281,6 +281,34 @@ pub const Lexer = struct {
         return error.LexFailed;
     }
 
+    /// Report a character the lexer cannot use, naming the whole character
+    /// rather than its first byte. "unexpected character 'Ã'" sends whoever
+    /// reads it looking for a byte that is not in their file.
+    fn lexErrChar(self: *Lexer) LexError {
+        const w = std.unicode.utf8ByteSequenceLength(self.source[self.pos]) catch 1;
+        const end = @min(self.pos + w, self.source.len);
+        const text = std.fmt.allocPrint(
+            self.arena,
+            "unexpected character '{s}'",
+            .{self.source[self.pos..end]},
+        ) catch "unexpected character";
+        return self.lexErr(text);
+    }
+
+    /// How many bytes of identifier start at `i`, or 0 if none do. `first`
+    /// asks for a name's opening character, which digits may not be.
+    fn identLen(self: *const Lexer, i: usize, first: bool) usize {
+        const c = self.source[i];
+        if (c < 0x80) {
+            const ok = if (first) isIdentStart(c) else isIdentPart(c);
+            return if (ok) 1 else 0;
+        }
+        const w = std.unicode.utf8ByteSequenceLength(c) catch return 0;
+        const end = @min(i + w, self.source.len);
+        const cp = std.unicode.utf8Decode(self.source[i..end]) catch return 0;
+        return if (isLetterCp(cp)) end - i else 0;
+    }
+
     fn adv(self: *Lexer, n: usize) void {
         self.pos += n;
         self.col += @intCast(n);
@@ -402,9 +430,15 @@ pub const Lexer = struct {
         }
         const c = self.source[self.pos];
 
-        if (isIdentStart(c)) {
+        const first = self.identLen(self.pos, true);
+        if (first != 0) {
             const s = self.pos;
-            while (self.pos < self.source.len and isIdentPart(self.source[self.pos])) self.adv(1);
+            self.adv(first);
+            while (self.pos < self.source.len) {
+                const w = self.identLen(self.pos, false);
+                if (w == 0) break;
+                self.adv(w);
+            }
             tok.type = .ident;
             tok.str = self.source[s..self.pos];
             tok.kw = keywords.get(tok.str) orelse .none;
@@ -613,7 +647,7 @@ pub const Lexer = struct {
                     n = 2;
                 } else ty = .caret;
             },
-            else => return self.lexErr("unexpected character"),
+            else => return self.lexErrChar(),
         }
 
         if (ty == .lparen) {
@@ -1011,11 +1045,35 @@ pub const Lexer = struct {
 };
 
 pub fn isIdentStart(c: u8) bool {
-    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '_' or c == '$' or c == '#' or c >= 0x80;
+    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '_' or c == '$' or c == '#';
 }
 
 pub fn isIdentPart(c: u8) bool {
     return isIdentStart(c) or (c >= '0' and c <= '9');
+}
+
+/// Is this codepoint a letter, and so allowed in an identifier?
+///
+/// Approximated by block rather than by the full Unicode tables, which are
+/// larger than the rest of the lexer put together. What matters is that the
+/// answer is per character and not per byte: taking any byte over 0x7F as a
+/// letter accepts `1 +× 2` as the name `×`, and taking one byte to be one
+/// character slices `é` in half. Blocks that are letters end to end are in;
+/// punctuation, arrows, currency, maths operators and the rest are out,
+/// which is what rejects `×` (U+00D7) while keeping `café`.
+pub fn isLetterCp(cp: u21) bool {
+    return switch (cp) {
+        0xAA, 0xB5, 0xBA => true, // ordinals and the micro sign
+        0xC0...0xD6, 0xD8...0xF6 => true, // Latin-1, minus times and divide
+        0xF8...0x2FF => true, // Latin Extended-A/B, IPA, modifier letters
+        0x370...0x1FFF => true, // Greek through Greek Extended
+        0x200C...0x200D => true, // zero-width non-joiner and joiner
+        0x2C00...0x2FEF => true, // Glagolitic through Kangxi radicals
+        0x3001...0xD7FF => true, // CJK, kana, Hangul
+        0xF900...0xFDCF, 0xFDF0...0xFFFD => true, // compatibility forms
+        0x10000...0xEFFFF => true, // everything above the BMP
+        else => false,
+    };
 }
 
 fn digitVal(c: u8) ?u32 {

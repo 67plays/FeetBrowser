@@ -10,7 +10,7 @@ from feetbrowser import gui
 from feetbrowser.net import URL
 from feetbrowser.browser import Tab
 from feetbrowser.layout import DrawText
-from feetbrowser.jsengine import Interpreter, UNDEFINED
+from feetbrowser.jsengine import Interpreter, JSException, UNDEFINED
 
 
 def eq(a, b, msg=""):
@@ -844,6 +844,160 @@ def test_js_labelled_break_and_continue():
     eq(g["stopped"], [0, 1, 2], "break leaves both loops at once")
     eq(g["block"], [1, 3], "a labelled block is breakable too")
     eq(g["plain"], [0, 2], "an unlabelled continue is unaffected")
+
+
+def test_js_source_is_read_as_utf8_not_bytes():
+    # The lexer used to read one byte and call it a character, which is a
+    # Latin-1 misreading of UTF-8: a `×` scanned as `Ã` plus a control
+    # character. That mangled every non-ASCII literal, and because `Ã` is
+    # alphabetic the identifier scanner accepted it, stopped one byte in, and
+    # sliced through the middle of the character -- a Rust panic, which
+    # crosses the FFI boundary and kills the whole page load. python.org
+    # ships a `×` in an inline script and rendered nothing at all.
+    interp = Interpreter()
+    interp.run("""
+        var mul = "×";
+        var mullen = mul.length;
+        var jp = "日本語";
+        var jplen = jp.length;
+        var third = jp[2];
+        var café = 5;
+        var ident = café + 1;
+        var escaped = "\\u00d7";
+        var same = (escaped === mul);
+        var hit = /é+/.test("xée");
+        var up = "héllo".toUpperCase();
+        /* × in a comment */
+        var after = 1 + 1;
+    """)
+    g = interp.globals
+    eq(g["mul"], "×", "a multi-byte literal survives intact")
+    eq(g["mullen"], 1, "and counts as one character, not two bytes")
+    eq(g["jp"], "日本語", "three-byte characters too")
+    eq(g["jplen"], 3, "counted by character")
+    eq(g["third"], "語", "and indexable by character")
+    eq(g["ident"], 6, "a non-ASCII identifier is one name")
+    assert g["same"] is True, "\\u00d7 and a literal x are the same string"
+    assert g["hit"] is True, "a regex literal keeps its non-ASCII class"
+    eq(g["up"], "HÉLLO", "case mapping is per character")
+    eq(g["after"], 2, "and the scan carries on past a non-ASCII comment")
+
+    # A stray non-ASCII character is a syntax error, and reports itself as the
+    # character it is rather than the first byte of one.
+    try:
+        Interpreter().run("1 +× 2")
+    except JSException as e:
+        assert "'×'" in str(e), f"names the character it choked on: {e}"
+    else:
+        raise AssertionError("a stray character should not tokenize")
+def test_js_dom_nodelist_and_traversal():
+    """NodeList length/item/index/forEach, element traversal and geometry."""
+    tab = _make_tab(
+        '<div id="a" class="x"><span class="y">hi</span>'
+        '<span class="y">there</span></div>'
+        '<script>'
+        'var a = document.getElementById("a");'
+        'var ys = document.querySelectorAll(".y");'
+        'var acc = [];'
+        'ys.forEach(function(e, i) { acc.push(e.textContent + i); });'
+        'var out = {'
+        ' len: ys.length,'
+        ' first: a.firstElementChild.tagName,'
+        ' last: a.lastElementChild.textContent,'
+        ' nxt: ys[0].nextElementSibling.textContent,'
+        ' prv: ys[1].previousElementSibling.textContent,'
+        ' item: ys.item(1).textContent,'
+        ' idx: ys[0].textContent,'
+        ' fe: acc.join("|"),'
+        ' contains: a.contains(ys[0]),'
+        ' matches: a.matches(".x"),'
+        ' closest: ys[0].closest("#a").id,'
+        ' ohtml: a.outerHTML.slice(0, 12),'
+        ' cec: a.childElementCount,'
+        ' ecount: document.getElementsByTagName("span").length,'
+        ' ctn: document.createTextNode("zz").textContent,'
+        '};'
+        'window.__out = out;'
+        '</script>')
+    eq(tab.js_logs, [], "no js errors")
+    g = tab._js_interp.globals["__out"]
+    eq(g["len"], 2, "NodeList.length")
+    eq(g["first"], "SPAN", "firstElementChild")
+    eq(g["last"], "there", "lastElementChild")
+    eq(g["nxt"], "there", "nextElementSibling")
+    eq(g["prv"], "hi", "previousElementSibling")
+    eq(g["item"], "there", "NodeList.item(1)")
+    eq(g["idx"], "hi", "NodeList[0]")
+    eq(g["fe"], "hi0|there1", "NodeList.forEach indexes")
+    eq(g["contains"], True, "element.contains")
+    eq(g["matches"], True, "element.matches")
+    eq(g["closest"], "a", "element.closest")
+    eq(g["ohtml"], '<div id="a" ', "element.outerHTML")
+    eq(g["cec"], 2, "childElementCount")
+    eq(g["ecount"], 2, "getElementsByTagName")
+    eq(g["ctn"], "zz", "createTextNode")
+
+
+def test_js_window_environment_and_mutation():
+    """getComputedStyle (live), window/navigator globals, createElement +
+    appendChild, and element.remove()."""
+    tab = _make_tab(
+        '<div id="a"><span class="y">hi</span></div>'
+        '<script>'
+        'var s = document.querySelector(".y").style;'
+        's.color = "blue";'
+        'var cs = getComputedStyle(document.querySelector(".y"));'
+        'var e = document.createElement("em");'
+        'e.textContent = "NEW";'
+        'document.getElementById("a").appendChild(e);'
+        'var span = document.querySelector(".y");'
+        'span.remove();'
+        'var out = {'
+        ' color: cs.color,'
+        ' prop: cs.getPropertyValue("font-size"),'
+        ' app: document.getElementById("a").lastElementChild.textContent,'
+        ' removed: document.querySelectorAll(".y").length,'
+        ' ua: navigator.userAgent.indexOf("FeetBrowser") >= 0,'
+        ' raf: typeof requestAnimationFrame,'
+        ' caf: typeof cancelAnimationFrame,'
+        ' me: typeof matchMedia,'
+        ' wad: typeof addEventListener,'
+        ' dpr: devicePixelRatio,'
+        ' iw: innerWidth,'
+        '};'
+        'window.__out = out;'
+        '</script>')
+    eq(tab.js_logs, [], "no js errors")
+    g = tab._js_interp.globals["__out"]
+    eq(g["color"], "blue", "getComputedStyle reflects live style")
+    eq(g["prop"], "16px", "getPropertyValue resolves font-size")
+    eq(g["app"], "NEW", "createElement + appendChild")
+    eq(g["removed"], 0, "element.remove removes from DOM")
+    eq(g["ua"], True, "navigator.userAgent")
+    eq(g["raf"], "function", "requestAnimationFrame global")
+    eq(g["caf"], "function", "cancelAnimationFrame global")
+    eq(g["me"], "function", "matchMedia global")
+    eq(g["wad"], "function", "window.addEventListener global")
+    eq(g["dpr"], 1, "devicePixelRatio")
+    eq(g["iw"], 1000, "innerWidth matches browser WIDTH")
+
+
+def test_js_document_fragment():
+    tab = _make_tab(
+        '<div id="a"></div>'
+        '<script>'
+        'var frag = document.createDocumentFragment();'
+        'var e1 = document.createElement("b"); e1.textContent = "ONE";'
+        'var e2 = document.createElement("i"); e2.textContent = "TWO";'
+        'frag.appendChild(e1);'
+        'frag.appendChild(e2);'
+        'document.getElementById("a").appendChild(frag);'
+        'window.__n = document.getElementById("a").childElementCount;'
+        'window.__t = document.getElementById("a").textContent;'
+        '</script>')
+    eq(tab.js_logs, [], "no js errors")
+    eq(tab._js_interp.globals["__n"], 2, "fragment children land in body")
+    eq(tab._js_interp.globals["__t"], "ONETWO", "fragment text lands")
 
 
 def _walk_all(node):

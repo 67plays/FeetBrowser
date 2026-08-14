@@ -104,8 +104,10 @@ class JSDocument:
         self._interp = interp
         self._location_obj = location
         # Shared mutable flag: JS mutations set it; the Tab checks it after
-        # running scripts to decide whether a restyle+rerender is needed.
-        self._flag = {"dirty": False}
+        # running scripts to decide whether a restyle+rerender is needed. It
+        # also carries the live interpreter so DOM shims (NodeList.forEach,
+        # getComputedStyle) can call back into JS.
+        self._flag = {"dirty": False, "interp": interp}
 
     def js_get(self, name):
         if name == "location" and self._location_obj is not None:
@@ -133,11 +135,47 @@ class JSElement:
 class JSNodeList:
     """Array-like view over a list of JSElements."""
 
-    def __init__(self, items):
+    def __init__(self, items, _flag=None):
         self._items = items
+        self._flag = _flag or {"dirty": False}
 
     def js_get(self, name):
         return dom_get(_NODELIST, self, name)
+
+
+class JSFragment:
+    """DocumentFragment shim: an owned child list. appendChild/append
+    accumulate children; appending the fragment to an element moves them
+    (handled in dom.rs appendChild)."""
+
+    def __init__(self, node=None, _flag=None):
+        self._flag = _flag or {"dirty": False}
+        self._items = []
+
+    def js_get(self, name):
+        if name in ("append", "appendChild"):
+            return getattr(self, "_" + name)
+        if name == "childElementCount":
+            return sum(1 for i in self._items if hasattr(i, "node"))
+        if name == "children":
+            return JSNodeList(self._items, self._flag)
+        if name == "textContent":
+            return "".join(i.textContent for i in self._items
+                           if hasattr(i, "textContent"))
+        return UNDEFINED
+
+    def js_set(self, name, value):
+        return UNDEFINED
+
+    def _appendChild(self, *children):
+        for c in children:
+            if hasattr(c, "js_unwrap"):
+                c = c.js_unwrap()
+            self._items.append(c)
+        return children[-1] if children else UNDEFINED
+
+    def _append(self, *args):
+        return self._appendChild(*args)
 
 
 class JSClassList:
