@@ -436,13 +436,9 @@ fn to_rgba(
             }
         }
         0 => {
-            let key = match trns {
-                Some(t) if t.len() >= 2 => {
-                    let raw = u16::from_be_bytes([t[0], t[1]]);
-                    Some(if depth == 16 { raw >> 8 } else { raw })
-                }
-                _ => None,
-            };
+            let key = trns
+                .and_then(|t| be16(t, 0))
+                .map(|raw| if depth == 16 { raw >> 8 } else { raw });
             for i in 0..n {
                 let s = *samples.get(i).unwrap_or(&0);
                 let v = (s as u32 * scale).min(255) as u8;
@@ -464,20 +460,15 @@ fn to_rgba(
             }
         }
         2 => {
-            let key = match trns {
-                Some(t) if t.len() >= 6 => {
-                    let mut c = [
-                        u16::from_be_bytes([t[0], t[1]]),
-                        u16::from_be_bytes([t[2], t[3]]),
-                        u16::from_be_bytes([t[4], t[5]]),
-                    ];
+            let key = trns
+                .and_then(|t| Some([be16(t, 0)?, be16(t, 2)?, be16(t, 4)?]))
+                .map(|c| {
                     if depth == 16 {
-                        c = [c[0] >> 8, c[1] >> 8, c[2] >> 8];
+                        [c[0] >> 8, c[1] >> 8, c[2] >> 8]
+                    } else {
+                        c
                     }
-                    Some(c)
-                }
-                _ => None,
-            };
+                });
             for i in 0..n {
                 let (s, d) = (i * 3, i * 4);
                 let r = *samples.get(s).unwrap_or(&0);
