@@ -1,0 +1,47 @@
+// Resources for FeetBrowser.exe.
+//
+// No #include: rc.exe runs a C preprocessor over this file, and pulling in
+// <windows.h> would mean the build needed the SDK headers on an include path
+// as well as rc.exe itself. Every constant here is therefore written as the
+// number it is:
+//
+//   1  as a resource id     VS_VERSION_INFO, and CREATEPROCESS_MANIFEST_RESOURCE_ID
+//   24 as a resource type   RT_MANIFEST
+//   0x3f  FILEFLAGSMASK     all the VS_FF_ bits
+//   0x40004  FILEOS         VOS_NT_WINDOWS32
+//   0x1   FILETYPE          VFT_APP
+//   0x409 / 1200            US English, Unicode
+
+1 ICON "FeetBrowser.ico"
+
+1 24 "FeetBrowser.manifest"
+
+1 VERSIONINFO
+FILEVERSION 0,6,0,0
+PRODUCTVERSION 0,6,0,0
+FILEFLAGSMASK 0x3fL
+FILEFLAGS 0x0L
+FILEOS 0x40004L
+FILETYPE 0x1L
+FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "CompanyName", "FeetBrowser"
+            VALUE "FileDescription", "FeetBrowser"
+            VALUE "FileVersion", "0.6.0.0"
+            VALUE "InternalName", "FeetBrowser"
+            VALUE "LegalCopyright", "MIT licensed. See LICENSE in the FeetBrowser folder."
+            VALUE "OriginalFilename", "FeetBrowser.exe"
+            VALUE "ProductName", "FeetBrowser"
+            VALUE "ProductVersion", "0.6.0.0"
+            VALUE "Comments", "A web browser built from scratch. https://github.com/JuiceyDew/FeetBrowser"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END
