@@ -2319,8 +2319,12 @@ def test_the_display_variable_picks_a_backend_by_name():
             eq(root.__name__, "CocoaTk")
         elif sys.platform == "win32":
             eq(root.__name__, "Win32Tk")
-        else:
-            eq(root, None, "no native window on this platform")
+        elif root is not None:
+            # x11.py answers here too, and whether it can is a property of
+            # the machine rather than of the platform: a desktop with a
+            # server running gets X11Tk and headless CI gets None. Both are
+            # right, so the only wrong answer is some *other* backend.
+            eq(root.__name__, "X11Tk")
 
         for name in ("win32", "windows"):
             gui.DISPLAY = name
