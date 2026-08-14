@@ -35,6 +35,7 @@ from .selection import Index as SelectionIndex, Selection, \
     contrasting_text_color
 from . import shoes as shoes
 from . import downloads as downloads
+from . import media
 from .jsdom import JSDocument, JSLocation, _JSStaticProps, _JSComputedStyle
 from .jsengine import Interpreter, JSException, UNDEFINED
 from . import toes as toes
@@ -81,6 +82,40 @@ _image_fetch_sem = threading.Semaphore(MAX_CONCURRENT_IMAGE_FETCHES)
 # It is a ceiling, not a delay: settling returns the moment the last image is
 # in, and only a page pointing at something that never answers waits it out.
 # Generous, because the alternative is a screenshot of a half-drawn page.
+# How often the frame timer runs. 40 ms is 25 ticks a second: a ceiling on
+# how often a frame can change, not a frame rate -- the scheduler shows
+# whatever the clock says is current, so a faster file drops frames here
+# rather than playing slowly. See docs/media.md.
+VIDEO_TICK_MS = 40
+
+# `<source type="...">` values we will even try. Filtering here means a page
+# offering WebM first and AVI second gets the AVI, which is the entire purpose
+# of the element.
+PLAYABLE_TYPES = ("video/x-msvideo", "video/avi", "video/msvideo",
+                  "video/vnd.avi")
+
+
+def _first_playable_source(node):
+    """Pick a `<source>` for a `<video>` that has no src of its own.
+
+    Prefers one whose `type` we know we can decode, then one whose URL ends
+    in `.avi`, and falls back to the first source with a src at all -- the
+    last case being how the element still shows a real "MP4, H.264, no
+    decoder" box instead of nothing.
+    """
+    sources = [n for n in tree_to_list(node, [])
+               if isinstance(n, Element) and n.tag == "source"
+               and n.attributes.get("src")]
+    for candidate in sources:
+        kind = candidate.attributes.get("type", "").split(";")[0].strip()
+        if kind.lower() in PLAYABLE_TYPES:
+            return candidate.attributes["src"]
+    for candidate in sources:
+        if candidate.attributes["src"].lower().split("?")[0].endswith(".avi"):
+            return candidate.attributes["src"]
+    return sources[0].attributes["src"] if sources else ""
+
+
 SETTLE_TIMEOUT = 30.0
 
 # Deeply nested documents walk DOM/layout trees recursively; give Python a
@@ -262,6 +297,15 @@ class Tab:
         # Absolute URL -> decoded PhotoImage, shared with the layout
         # so <img> elements render their actual pixels.
         self.image_cache = {}
+        # Absolute URL -> media.VideoPlayer, shared with the layout so a
+        # <video> lays out at the file's real size and paints its own frames.
+        # Separate from image_cache because a player is not a picture: it owns
+        # a decode thread and has to be closed when the page goes away.
+        self.video_players = []
+        self._video_queue = []
+        self._video_nodes = {}
+        self._video_results = deque()
+        self._video_failures = deque()
         self._image_queue = []
         self._image_results = deque()
         self._image_root = None
@@ -564,9 +608,11 @@ class Tab:
             # Headless (tests / no Browser): fetch and decode synchronously so
             # the display list shows real images instead of placeholders.
             self.load_images()
+        self.load_videos(self.browser.window if self._gui_mode() else None)
 
     def _build(self, url, body, ctype="text/html"):
         """Parse, collect stylesheets, cascade, and lay out `body`."""
+        self.stop_videos()
         # Fresh document: drop any previous form focus/values and JS state.
         self.focused_input = None
         self.form_values = {}
@@ -636,7 +682,15 @@ class Tab:
         # Resolve <img src> to absolute URLs now so the layout's cache lookup
         # keys (absolute) always match what load_images() fetches.
         for node in tree_to_list(self.nodes, []):
-            if isinstance(node, Element) and node.tag == "img" \
+            if isinstance(node, Element) and node.tag == "video" \
+                    and not node.attributes.get("src"):
+                # <video><source src=...></video>: hoist the first source we
+                # could conceivably play onto the element, so everything below
+                # only ever has to look at one attribute.
+                picked = _first_playable_source(node)
+                if picked:
+                    node.attributes["src"] = picked
+            if isinstance(node, Element) and node.tag in ("img", "video") \
                     and node.attributes.get("src"):
                 try:
                     node.attributes["src"] = str(
@@ -1145,6 +1199,151 @@ class Tab:
         if self._image_done:
             self._image_done()
 
+    # -- video ----------------------------------------------------------
+
+    def load_videos(self, root=None):
+        """Fetch every `<video src>` the page names and give each element a
+        player of its own.
+
+        Two decisions worth naming. It is a separate queue from
+        load_images(): the two produce different things (a decoded picture
+        against a live player with a decode thread behind it), fail
+        differently, and a video that never arrives must not hold up the
+        "images are in, stop drawing placeholders" signal that
+        pending_images() drives.
+
+        And the player belongs to the *element*, not to the URL. Two
+        `<video>` tags pointing at one file are two independent playheads --
+        one can be paused at 3s while the other plays, and each scales its
+        own frames to its own box. The bytes are still fetched once.
+        """
+        self._video_results = deque()
+        self._video_queue = []
+        if self.nodes is None:
+            return
+        by_src = {}
+        for node in tree_to_list(self.nodes, []):
+            if not (isinstance(node, Element) and node.tag == "video"):
+                continue
+            src = node.attributes.get("src")
+            if src:
+                by_src.setdefault(src, []).append(node)
+        if not by_src:
+            return
+        self._video_queue = list(by_src)
+        self._video_nodes = by_src
+        if root is None:
+            for key in list(by_src):
+                try:
+                    _headers, data, _ctype = URL(key).request_bytes()
+                except Exception:  # noqa: BLE001 - a bad URL shows the box
+                    data = None
+                self._finish_video(key, data)
+            return
+        for key in by_src:
+            threading.Thread(target=self._fetch_video, args=(key,),
+                             daemon=True).start()
+
+    def _fetch_video(self, key):
+        """Background thread: bytes only. Nothing here touches a player, a
+        photo or the canvas."""
+        try:
+            with _image_fetch_sem:
+                _headers, data, _ctype = URL(key).request_bytes()
+        except Exception as exc:  # noqa: BLE001 - reported on the UI thread
+            self._video_failures.append((key, str(exc)))
+            self._video_results.append((key, None))
+            return
+        self._video_results.append((key, data))
+
+    def _drain_videos(self):
+        """UI thread: build players for whatever finished downloading."""
+        while self._video_failures:
+            key, _why = self._video_failures.popleft()
+            self._add_error(f"VIDEO {key}")
+        if not self._video_results:
+            return
+        arrived = []
+        try:
+            while True:
+                arrived.append(self._video_results.popleft())
+        except IndexError:
+            pass
+        for key, data in arrived:
+            self._finish_video(key, data)
+        self.render()
+
+    def _finish_video(self, key, data):
+        """Attach a player to every element that named this URL."""
+        if key in self._video_queue:
+            self._video_queue.remove(key)
+        nodes = self._video_nodes.get(key, ())
+        if not data:
+            return
+        for node in nodes:
+            try:
+                player = media.VideoPlayer(data=data, loop=False)
+            except Exception as exc:  # noqa: BLE001 - a page must not die
+                self._add_error(f"VIDEO {key}: {exc}")
+                return
+            # Show frame zero straight away. A paused <video> displaying its
+            # own first frame is what a browser does, and it is also the
+            # cheapest proof that the file really decoded.
+            player.first_frame()
+            node.video_player = player
+            self.video_players.append(player)
+            if "autoplay" in node.attributes and player.track is not None:
+                player.play()
+                if self.browser is not None:
+                    self.browser._ensure_video_tick()
+
+    def pending_videos(self):
+        return bool(self._video_queue)
+
+    def tick_videos(self):
+        """Advance every player to the frame that is due. Returns True when
+        anything on screen changed. Called from the browser's frame timer;
+        it decodes nothing itself and never blocks."""
+        changed = False
+        for player in self.video_players:
+            if player.tick():
+                changed = True
+        return changed
+
+    def playing_videos(self):
+        return any(p.playing for p in self.video_players)
+
+    def stop_videos(self):
+        """Drop every player and its decode thread. Called when the tab
+        navigates away or closes -- a daemon thread still decoding a film
+        nobody is watching is a leak with a picture on it."""
+        for player in self.video_players:
+            player.close()
+        self.video_players = []
+        self._video_queue = []
+        self._video_nodes = {}
+
+    @staticmethod
+    def _enclosing_video(node):
+        while node is not None:
+            if isinstance(node, Element) and node.tag == "video":
+                return node
+            node = node.parent
+        return None
+
+    def _toggle_video(self, node):
+        """Play/pause the player behind a `<video>`. True if we handled it."""
+        player = getattr(node, "video_player", None)
+        if player is None or player.track is None:
+            return False
+        player.toggle()
+        if self.browser is not None:
+            self.browser._ensure_video_tick()
+        self.status = player.status()
+        if self.browser is not None:
+            self.browser._repaint_needed = True
+        return True
+
     @staticmethod
     def _decode_image(data, _ctype):
         """Decode image bytes to a PhotoImage, or None for the placeholder.
@@ -1246,6 +1445,11 @@ class Tab:
         Returns a URL to load, a FormAction (form submit), or None.
         """
         node = self._node_at(x, y)
+        video = self._enclosing_video(node)
+        if video is not None and self._toggle_video(video):
+            # Clicking the picture is the whole transport UI for now: no
+            # control bar, no scrubber. Said plainly in docs/media.md.
+            return None
         control = self._hit_control(node)
         if control is not None:
             result = self._activate_control(control, x, y + self.scroll)
@@ -2423,6 +2627,7 @@ class Browser:
         # started by whoever needs it first -- run(), or settle() in a
         # headless render -- and there must only ever be one of it.
         self._polling_images = False
+        self._video_ticking = False
 
         # Toes: one Context per loaded toe, all optional hooks.
         self.toes = toes.discover_toes()
@@ -2564,6 +2769,7 @@ class Browser:
             return
         self._dismiss_select_popup()
         idx = self.tabs.index(self.active_tab)
+        self.active_tab.stop_videos()
         self.tabs.remove(self.active_tab)
         if not self.tabs:
             self.window.destroy()
@@ -4189,6 +4395,7 @@ class Browser:
         # forever, which burned CPU for idle pages.
         self.window.after(120, self._repaint_tick)
         self._poll_images()
+        self._ensure_video_tick()
         self.window.mainloop()
 
     def _repaint_tick(self):
@@ -4197,15 +4404,48 @@ class Browser:
             self._draw_page()
         self.window.after(120, self._repaint_tick)
 
+    def _ensure_video_tick(self):
+        """Arm the frame timer once, on demand.
+
+        Not armed in __init__ because a browser with no video in it should
+        not have a 25 Hz timer in it either, and not armed twice because two
+        chains would tick every player twice a frame -- which is harmless for
+        correctness (the clock decides what is due) and pure waste.
+        """
+        if self._video_ticking:
+            return
+        self._video_ticking = True
+        self._video_tick()
+
+    def _video_tick(self):
+        """The frame timer, on its own chain because it has to run far more
+        often than the 120 ms repaint coalescer and the 60 ms image sweep.
+
+        It asks each tab for the frame that is due now and repaints only if
+        one changed, so an idle page with no video costs a dictionary walk.
+        The interval is the ceiling on frame rate, not the frame rate: what
+        gets shown is whatever the clock says is current, so a 30 fps file on
+        a 40 ms tick drops frames rather than slowing down. Raising it is a
+        one-line change once the decoders are fast enough to deserve it.
+        """
+        for tab in self.tabs:
+            if tab.tick_videos() and tab is self.active_tab:
+                self._repaint_needed = True
+        self.window.after(VIDEO_TICK_MS, self._video_tick)
+
     def busy(self):
         """True while any tab still has work that changes what is on screen.
 
-        Two different things count, and conflating them is what made
+        Three different things count, and conflating them is what made
         screenshots come out full of placeholders: a document still on the
-        wire, and images still on the wire for a document that has already
-        arrived.
+        wire, images still on the wire for a document that has already
+        arrived, and -- for the same reason -- a video file still on the
+        wire, whose element is drawing a "[video: loading]" box until it
+        lands. A video that has *arrived* never makes us busy: playing is not
+        loading, and a looping film would make settle() wait for ever.
         """
-        return any(tab.loading or tab.pending_images() for tab in self.tabs)
+        return any(tab.loading or tab.pending_images() or tab.pending_videos()
+                   for tab in self.tabs)
 
     def settle(self, timeout=SETTLE_TIMEOUT):
         """Run the timer queue until nothing is outstanding, or `timeout`.
@@ -4241,6 +4481,7 @@ class Browser:
         loading = False
         for tab in self.tabs:
             tab._drain_images()
+            tab._drain_videos()
             if tab._js_interp is not None:
                 # Advance the JS virtual clock so setTimeout/setInterval fire
                 # on schedule, then run microtasks/timers/fetch settlements.

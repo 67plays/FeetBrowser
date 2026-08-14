@@ -22,7 +22,7 @@ INLINE_ELEMENTS = {
     "a", "b", "i", "em", "strong", "span", "small", "big", "sub", "sup",
     "code", "tt", "kbd", "samp", "u", "abbr", "cite", "q", "s", "strike",
     "font", "label", "br", "img", "input", "button", "mark", "time", "var",
-    "select", "textarea", "option", "optgroup",
+    "select", "textarea", "option", "optgroup", "video",
 }
 
 _FONT_CACHE = {}
@@ -313,6 +313,60 @@ class DrawImage:
         canvas.create_image(
             self.left, self.top - scroll, anchor="nw", image=self.photo,
             tags=tags)
+
+
+class DrawVideo:
+    """The current frame of a `<video>`.
+
+    Separate from `DrawImage` for two reasons, neither cosmetic. It carries a
+    `hit()`, so a click on the picture reaches the element and can play or
+    pause it -- `DrawImage` deliberately has none, and giving it one would
+    change what clicking every image on every page does. And its `photo` is a
+    buffer the player rewrites in place rather than a decoded file, so the
+    command stays valid across frames and the retained canvas item is not
+    rebuilt sixty times a second.
+    """
+
+    def __init__(self, x1, y1, x2, y2, photo, node=None):
+        self.top, self.left, self.bottom, self.right = y1, x1, y2, x2
+        self.photo = photo
+        self.node = node
+
+    def hit(self, x, y):
+        return (self.left <= x <= self.right
+                and self.top <= y <= self.bottom)
+
+    def execute(self, scroll, canvas, tags=()):
+        canvas.create_image(
+            self.left, self.top - scroll, anchor="nw", image=self.photo,
+            tags=tags)
+
+
+def _video_attr(node, name):
+    """A `<video>` width/height attribute as a positive int, or 0.
+
+    HTML says these are bare integers, and a page that writes `width="80%"`
+    is asking for the CSS property instead. Anything we cannot read as a
+    plain number is treated as absent rather than guessed at.
+    """
+    raw = node.attributes.get(name, "")
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return 0
+    return value if 0 < value <= 10000 else 0
+
+
+def _video_label(node, player):
+    """What to write in the box when there is no picture to show. The point
+    is to say something true and specific -- the codec and the reason -- so a
+    page that does not play tells you why."""
+    if player is None:
+        src = node.attributes.get("src", "")
+        return "[video: loading]" if src else "[video: no source]"
+    if player.error:
+        return "[video: %s]" % player.error
+    return "[video]"
 
 
 # `calc()` and its relatives. A page written this decade puts arithmetic in
@@ -1381,7 +1435,7 @@ class _LineItem:
 
     def __init__(self, kind, x, text, font, color, node, w, h, photo=None,
                  bg=None, pl=0, pr=0, pt=0, pb=0):
-        self.kind = kind  # "text", "img", "pill", "block" or "listbox"
+        self.kind = kind  # "text", "img", "video", "pill", "block", "listbox"
         self.x = x
         self.text = text
         self.font = font
@@ -1398,7 +1452,7 @@ class _LineItem:
 
     @property
     def ascent(self):
-        if self.kind == "img":
+        if self.kind in ("img", "video"):
             return int(self.h * 0.82)
         if self.kind in ("block", "listbox"):
             # An inline-block sits on the baseline rather than straddling it,
@@ -1411,7 +1465,7 @@ class _LineItem:
 
     @property
     def descent(self):
-        if self.kind == "img":
+        if self.kind in ("img", "video"):
             return int(self.h * 0.18)
         if self.kind in ("block", "listbox"):
             return 0.0
@@ -2747,6 +2801,8 @@ class BlockLayout(LayoutBox):
             return self.flush(force=True)
         if node.tag == "img":
             return self._inline_img(node)
+        if node.tag == "video":
+            return self._inline_video(node)
         if node.tag in ("input", "textarea", "button"):
             return self._inline_button(node) if node.tag == "button" \
                 else self._inline_input(node)
@@ -2879,6 +2935,20 @@ class BlockLayout(LayoutBox):
                     item.x + offset, y,
                     item.x + offset + item.w, y + item.h, "#aaaaaa"))
                 xoff, ty, color = 4, y + 2, "#888888"
+            elif item.kind == "video":
+                y = baseline - item.ascent
+                if item.photo is not None:
+                    self.display_list.append(DrawVideo(
+                        item.x + offset, y,
+                        item.x + offset + item.w, y + item.h,
+                        item.photo, item.node))
+                    continue
+                # No decodable picture: a dark box with the reason in it, at
+                # the size the element would have had.
+                self.display_list.append(DrawRect(
+                    item.x + offset, y,
+                    item.x + offset + item.w, y + item.h, "#1a1a1a"))
+                xoff, ty, color = 6, y + 6, "#dddddd"
             elif item.kind == "block":
                 # Now that the baseline is settled there is a place to put it.
                 box = BlockLayout(item.node, self, None)
@@ -3023,6 +3093,53 @@ class BlockLayout(LayoutBox):
         self.line.append(_LineItem("img", self.cursor_x, label, font, None,
                                    node, w, h, photo))
         self.cursor_x += w + (_measure(font, " ") if photo is None else w * 0.25)
+
+    # HTML's default `<video>` box, used when the file says nothing useful
+    # and the page gave no width or height.
+    VIDEO_DEFAULT = (300, 150)
+
+    def _inline_video(self, node):
+        """Place a `<video>`.
+
+        Sizing follows the same order a real browser uses, and the order
+        matters most when the file is one we cannot decode: `width`/`height`
+        attributes first, then the size the *container* declared -- which we
+        know even for an MP4, because probing a container is cheap and does
+        not need a codec -- and only then the 300x150 default. So a page whose
+        video we cannot play still reserves the right hole in the layout
+        instead of collapsing, and the text around it lands where it would in
+        a browser that could play it.
+        """
+        if not isinstance(node, Element):
+            return
+        # The player lives on the element, attached by the tab once the file
+        # has been fetched: one `<video>` is one playhead, so two tags on the
+        # same URL scrub and pause independently.
+        player = getattr(node, "video_player", None)
+        info = getattr(player, "info", None)
+        w = _video_attr(node, "width")
+        h = _video_attr(node, "height")
+        if not w or not h:
+            intrinsic = (info.width, info.height) if info and info.width \
+                else self.VIDEO_DEFAULT
+            if not w and not h:
+                w, h = intrinsic
+            elif not w:
+                w = max(1, int(round(h * intrinsic[0] / intrinsic[1])))
+            else:
+                h = max(1, int(round(w * intrinsic[1] / intrinsic[0])))
+        photo = None
+        if player is not None and player.track is not None:
+            player.set_display_size(w, h)
+            photo = player.photo
+        label, font = "", None
+        if photo is None:
+            font = get_font(12, "normal", "roman")
+            label = _video_label(node, player)
+        w = self._fit_control(w, min_w=min(w, 40))
+        self.line.append(_LineItem("video", self.cursor_x, label, font, None,
+                                   node, w, h, photo))
+        self.cursor_x += w + (_measure(font, " ") if font else w * 0.25)
 
     def _inline_block(self, node):
         """Place an inline-block that holds blocks: measure it in a box of its
