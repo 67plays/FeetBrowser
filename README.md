@@ -24,17 +24,26 @@ Code in this repo is evaluated on six principles:
 ## Run it
 
 ```bash
-./run.sh                 # opens the welcome page
+./run.sh                 # macOS, Linux: opens the welcome page
 ./run.sh https://example.com
 ```
 
-No GUI toolkit to install — just Python 3 and a system font. The one thing
-that does get built is the JavaScript engine: `run.sh` compiles the Rust
-extension (`feetbrowser_engine`) into a local `.venv` when it isn't
-importable, so a first run needs the Rust toolchain (the script installs
-`maturin` into the venv for you). Once the extension is built and installed
-for the interpreter you're invoking, `python3 -m feetbrowser <url>` works
-directly.
+```bat
+run.cmd                  :: Windows: the same script for cmd.exe
+run.cmd https://example.com
+```
+
+No GUI toolkit to install — the window is ours too, straight ctypes into
+AppKit on macOS and into user32/gdi32 on Windows. What you do need is Python
+3, a system font, and a Rust toolchain, because the JavaScript engine is a
+compiled extension and there is no Python fallback for it: `run.sh` and
+`run.cmd` build `feetbrowser_engine` into a local `.venv` when it isn't
+importable (installing `maturin` into the venv for you). Once the extension
+is built and installed for the interpreter you're invoking, `python3 -m
+feetbrowser <url>` works directly.
+
+A real window opens on **macOS** and **Windows**. Elsewhere the browser runs
+headless — `--screenshot` and the tests work everywhere.
 
 To render a page to a PNG without opening a window:
 

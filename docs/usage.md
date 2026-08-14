@@ -8,15 +8,30 @@
 ./run.sh view-source:https://example.com
 ```
 
-`run.sh` builds the Rust JS engine (`feetbrowser_engine`) into a local `.venv`
-with maturin if it isn't importable yet, then runs the browser from that venv
-(so a first run needs the Rust toolchain; maturin is installed into the venv
-automatically). Once the extension is built and installed for your
+On Windows, `run.cmd` is the same script for `cmd.exe`:
+
+```bat
+run.cmd
+run.cmd https://example.com
+```
+
+Either script builds the Rust JS engine (`feetbrowser_engine`) into a local
+`.venv` with maturin if it isn't importable yet, then runs the browser from
+that venv (so a first run needs the Rust toolchain; maturin is installed into
+the venv automatically). Once the extension is built and installed for your
 interpreter, `python3 -m feetbrowser <url>` works directly.
 
 There is nothing else to install. The renderer is ours (see [the rendering
-engine](rendering.md)), so no GUI toolkit is needed — only Python 3 and at
-least one system font.
+engine](rendering.md)), so no GUI toolkit is needed — only Python 3, a Rust
+toolchain for that one extension, and at least one system font. A real window
+opens on macOS and on Windows; everywhere else the browser runs headless, so
+`--screenshot` works but nothing appears on screen.
+
+On Windows the Rust toolchain wants the MSVC build tools, which is what
+rustup installs by default (`stable-x86_64-pc-windows-msvc`). If `python`
+isn't on your `PATH` — a fresh install from the Microsoft Store often leaves
+only the launcher — use `py -3` in place of `python` in the two commands
+`run.cmd` runs.
 
 To render a page without opening a window:
 

@@ -33,6 +33,12 @@ implements its own:
   scanline rasteriser writing into a `bytearray` framebuffer, PNG/GIF/PNM
   decoders, a retained scene graph, and an event loop. See
   [docs/rendering.md](rendering.md).
+- **Platform windows** — a real window on macOS (`cocoa.py`, ctypes into
+  AppKit) and on Windows (`win32.py`, ctypes into `user32`/`gdi32`/
+  `kernel32`), each translating native events into the same Tk-shaped
+  bindings and pushing the same framebuffer to the screen. Neither needs a
+  bindings package. Everywhere else the browser runs headless, which is also
+  how `--screenshot` and the whole test suite run on every platform.
 - **Browser UI** — a hand-drawn chrome on that canvas: tabs, an address bar
   with search fallback, back / forward / reload / home buttons,
   hover + clickable links, middle-click / ctrl-click to open in a new tab,
@@ -91,6 +97,8 @@ feetbrowser/
   imagecodec.py  PNG / GIF / PNM decoders -> RGBA
   canvas.py      retained scene graph, fonts, colors, images (Tk semantics)
   window.py      windows, Tk-shaped events, after() timers, main loop
+  cocoa.py       a real macOS window: AppKit through ctypes, no PyObjC
+  win32.py       a real Windows window: user32/gdi32 through ctypes, no pywin32
   gui.py         backend facade (raster by default, tk still selectable)
   browser.py     window, chrome, tabs, history, event loop, layered repaint
   toes.py        extension hooking (Toes): discovery, dispatch, CLI
@@ -109,6 +117,8 @@ rust/
 toes/            user-installed toes (gitignored; empty on a fresh checkout)
 tests/
   test_render.py offline tests for fonts, rasteriser, image codecs, canvas
+  test_cocoa.py  the macOS window, driven by real NSEvents (macOS only)
+  test_win32.py  the Windows window, driven by real messages (Windows only)
   test_units.py  offline unit tests (URL, HTML, CSS, layout, internal pages)
   test_js.py     offline tests for the JS engine + DOM bridge
   test_nav.py    click-to-navigate, history, view-source
@@ -118,4 +128,6 @@ tests/
 ```
 
 The Rust engine is built with maturin into a local venv; `run.sh` and
-`test.sh` build it on first use (`maturin develop --release`).
+`test.sh` build it on first use (`maturin develop --release`), as do their
+Windows counterparts `run.cmd` and `test.cmd`. There is no pure-Python
+fallback for it, so a Rust toolchain is a prerequisite on every platform.
