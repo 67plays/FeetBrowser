@@ -4,10 +4,10 @@
 A web browser written **from scratch**. No Chromium, no WebKit, no borrowed
 libraries — it does its own networking, HTML parsing, CSS, layout, JavaScript,
 fonts, and pixels. No GUI toolkit either: the TrueType parser, the antialiased
-rasteriser and the image decoders are all in this repo. The JavaScript engine
-and DOM bridge are compiled to a native Rust extension; everything else
-(networking, parsing, layout, rendering, chrome) is Python, standard library
-only.
+rasteriser and the image decoders are all in this repo. The JavaScript engine,
+the DOM bridge and the renderer's inner loops are compiled to a native Rust
+extension; everything else (networking, parsing, layout, the scene graph,
+chrome) is Python, standard library only.
 
 ## STRIDE — how code is judged
 
@@ -29,7 +29,7 @@ Code in this repo is evaluated on six principles:
 ```
 
 No GUI toolkit to install — just Python 3 and a system font. The one thing
-that does get built is the JavaScript engine: `run.sh` compiles the Rust
+that does get built is the engine: `run.sh` compiles the Rust
 extension (`feetbrowser_engine`) into a local `.venv` when it isn't
 importable, so a first run needs the Rust toolchain (the script installs
 `maturin` into the venv for you). Once the extension is built and installed

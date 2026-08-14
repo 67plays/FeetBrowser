@@ -3,11 +3,27 @@
 Supports: tag / class / id / universal selectors, descendant combinators,
 grouped selectors (a, b), a property/value declaration parser, specificity,
 inheritance of inherited properties, and inline style="" attributes.
+
+The parser is here; the cascade is not. `style()` comes from the Rust
+extension, because it is the one part of this module that runs per node per
+rule -- on a big article it was half the time between asking for a page and
+seeing it. The selector classes below are the parser's output and the Rust
+matcher's input: each carries a `kind` the compiler over there reads, and the
+matching itself lives in `rust/src/css.rs`. What stays in Python is
+everything that is a table rather than a loop -- what inherits, which
+shorthands expand, how a var() resolves -- so the rules of the cascade remain
+readable in one place.
 """
 
 import re
 
+import feetbrowser_engine
+
 from .htmlparser import Element
+
+# Re-exported under this module's name, because that is where the rest of the
+# browser has always asked for it.
+style = feetbrowser_engine.style
 
 # The media-query viewport. Real browsers only apply the rules inside an
 # @media block when its query matches the current window size; the default
@@ -111,76 +127,47 @@ INHERITED_PROPERTIES = {
 
 
 class TagSelector:
+    kind = "tag"
+
     def __init__(self, tag):
         self.tag = tag
         self.priority = (0, 0, 1) if tag != "*" else (0, 0, 0)
 
-    def matches(self, node):
-        return isinstance(node, Element) and (self.tag == "*" or node.tag == self.tag)
-
 
 class ClassSelector:
+    kind = "class"
+
     def __init__(self, cls):
         self.cls = cls
         self.priority = (0, 1, 0)
 
-    def matches(self, node):
-        if not isinstance(node, Element):
-            return False
-        return self.cls in node.attributes.get("class", "").split()
-
 
 class IdSelector:
+    kind = "id"
+
     def __init__(self, id_):
         self.id = id_
         self.priority = (1, 0, 0)
-
-    def matches(self, node):
-        return isinstance(node, Element) and node.attributes.get("id") == self.id
 
 
 class CompoundSelector:
     """One or more simple selectors on the same element, e.g. div.note#x"""
 
+    kind = "compound"
+
     def __init__(self, parts):
         self.parts = parts
         self.priority = tuple(sum(p) for p in zip(*[s.priority for s in parts]))
 
-    def matches(self, node):
-        return all(p.matches(node) for p in self.parts)
-
 
 class DescendantSelector:
+    kind = "descendant"
+
     def __init__(self, ancestor, descendant):
         self.ancestor = ancestor
         self.descendant = descendant
         self.priority = tuple(
             a + b for a, b in zip(ancestor.priority, descendant.priority))
-
-    def matches(self, node):
-        if not self.descendant.matches(node):
-            return False
-        # Fast path: when the style pass has primed the node's ancestor
-        # features (it walks the tree top-down), a tag/class/id ancestor can
-        # be decided with a set membership test instead of walking up the
-        # parent chain again for every rule.
-        a = self.ancestor
-        anc_tags = getattr(node, "_anc_tags", None)
-        if anc_tags is not None:
-            if isinstance(a, TagSelector) and a.tag != "*":
-                return a.tag in anc_tags
-            if isinstance(a, ClassSelector):
-                return a.cls in getattr(node, "_anc_classes", ())
-            if isinstance(a, IdSelector):
-                return a.id in getattr(node, "_anc_ids", ())
-            if not _ancestor_possible(a, node):
-                return False
-        parent = node.parent
-        while parent:
-            if self.ancestor.matches(parent):
-                return True
-            parent = parent.parent
-        return False
 
 
 class ChildSelector:
@@ -190,20 +177,19 @@ class ChildSelector:
     reaches every list item on the page, submenus included.
     """
 
+    kind = "child"
+
     def __init__(self, parent, child):
         self.parent = parent
         self.child = child
         self.priority = tuple(
             a + b for a, b in zip(parent.priority, child.priority))
 
-    def matches(self, node):
-        return self.child.matches(node) and node.parent is not None \
-            and isinstance(node.parent, Element) \
-            and self.parent.matches(node.parent)
-
 
 class SiblingSelector:
     """`a + b` (adjacent) and `a ~ b` (any earlier sibling)."""
+
+    kind = "sibling"
 
     def __init__(self, before, after, adjacent):
         self.before = before
@@ -212,66 +198,28 @@ class SiblingSelector:
         self.priority = tuple(
             a + b for a, b in zip(before.priority, after.priority))
 
-    def matches(self, node):
-        if not self.after.matches(node):
-            return False
-        parent = node.parent
-        if not isinstance(parent, Element):
-            return False
-        earlier = []
-        for child in parent.children:
-            if child is node:
-                break
-            if isinstance(child, Element):
-                earlier.append(child)
-        if self.adjacent:
-            return bool(earlier) and self.before.matches(earlier[-1])
-        return any(self.before.matches(sib) for sib in earlier)
-
 
 class RootSelector:
     """Matches the document root element (`:root`), i.e. the node with no
     parent. Typical target for custom-property (`--x`) declarations."""
 
+    kind = "root"
+
     def __init__(self):
         self.priority = (0, 0, 1)
-
-    def matches(self, node):
-        return isinstance(node, Element) and node.parent is None
 
 
 class AttrSelector:
     """Attribute selector: [attr], [attr=value], [attr~=v], [attr|=v],
     [attr^=v], [attr$=v], [attr*=v]. `op` is None for mere presence."""
 
+    kind = "attr"
+
     def __init__(self, attr, op=None, value=None):
         self.attr = attr
         self.op = op
         self.value = value
         self.priority = (0, 1, 0)
-
-    def matches(self, node):
-        if not isinstance(node, Element):
-            return False
-        val = node.attributes.get(self.attr)
-        if val is None:
-            return False
-        if self.op is None:
-            return True
-        val = str(val)
-        if self.op == "=":
-            return val == self.value
-        if self.op == "~=":
-            return self.value in val.split()
-        if self.op == "|=":
-            return val == self.value or val.startswith(self.value + "-")
-        if self.op == "^=":
-            return val.startswith(self.value)
-        if self.op == "$=":
-            return val.endswith(self.value)
-        if self.op == "*=":
-            return self.value in val
-        return False
 
 
 # Pseudo-classes whose state the engine cannot track (interaction, browsing
@@ -286,46 +234,12 @@ _DYNAMIC_PSEUDOS = frozenset({
     "popover-open", "lang",
 })
 
-_FORM_TAGS = frozenset({
-    "input", "button", "select", "textarea", "option", "fieldset",
-})
-
-
-def _match_nth(expr, index):
-    """Evaluate an :nth-child() expression against a 1-based element index."""
-    if expr is None:
-        return False
-    expr = expr.strip().lower()
-    if expr == "odd":
-        return index % 2 == 1
-    if expr == "even":
-        return index % 2 == 0
-    if "n" in expr:
-        m = re.match(r"^([+-]?\d*)n\s*(?:([+-])\s*(\d+))?$", expr)
-        if not m:
-            return False
-        a_str = m.group(1)
-        a = int(a_str) if a_str not in ("", "+", "-") \
-            else (1 if a_str in ("", "+") else -1)
-        if m.group(2) is None:
-            b = 0
-        else:
-            b = int(m.group(3)) * (1 if m.group(2) == "+" else -1)
-        diff = index - b
-        if diff % a != 0:
-            return False
-        k = diff // a
-        return k >= 1 and index >= 1
-    try:
-        return index == int(expr)
-    except ValueError:
-        return False
-
-
 class PseudoSelector:
     """A pseudo-class on an element, e.g. :first-child, :not(.x), :nth-of-type.
     `arg` holds the matched argument text, or (for :not/:is/:where/:has) a
     list of parsed sub-selectors."""
+
+    kind = "pseudo"
 
     def __init__(self, name, arg=None):
         self.name = name
@@ -338,105 +252,6 @@ class PseudoSelector:
         if self.name in ("not", "is", "has") and self.arg:
             return max(s.priority for s in self.arg)
         return (0, 1, 0)
-
-    def matches(self, node):
-        name = self.name
-        if name in ("not", "is", "where"):
-            if name == "not":
-                return not any(s.matches(node) for s in self.arg or ())
-            return any(s.matches(node) for s in self.arg or ())
-        if name == "has":
-            return _has_match(node, self.arg or ())
-        if name in ("first-child", "last-child", "only-child", "nth-child",
-                    "nth-last-child", "first-of-type", "last-of-type",
-                    "only-of-type", "nth-of-type", "nth-last-of-type"):
-            return self._structural(node)
-        if name == "empty":
-            return isinstance(node, Element) and not node.children
-        if name == "link":
-            return isinstance(node, Element) and node.tag == "a" \
-                and "href" in node.attributes
-        if name == "checked":
-            return isinstance(node, Element) and node.tag in ("input", "option") \
-                and "checked" in node.attributes
-        if name in ("disabled", "enabled", "required"):
-            if not isinstance(node, Element) or node.tag not in _FORM_TAGS:
-                return False
-            if name == "disabled":
-                return "disabled" in node.attributes
-            if name == "enabled":
-                return "disabled" not in node.attributes
-            return "required" in node.attributes
-        return False
-
-    def _structural(self, node):
-        if not isinstance(node, Element) or node.parent is None:
-            return False
-        sibs = [c for c in node.parent.children if isinstance(c, Element)]
-        try:
-            idx = sibs.index(node)
-        except ValueError:
-            return False
-        count = len(sibs)
-        name = self.name
-        if "of-type" in name:
-            tsibs = [c for c in sibs if c.tag == node.tag]
-            tidx = tsibs.index(node)
-            tcount = len(tsibs)
-            if name == "first-of-type":
-                return tidx == 0
-            if name == "last-of-type":
-                return tidx == tcount - 1
-            if name == "only-of-type":
-                return tcount == 1
-            if name == "nth-of-type":
-                return _match_nth(self.arg, tidx + 1)
-            return _match_nth(self.arg, tcount - tidx)
-        if name == "first-child":
-            return idx == 0
-        if name == "last-child":
-            return idx == count - 1
-        if name == "only-child":
-            return count == 1
-        if name == "nth-child":
-            return _match_nth(self.arg, idx + 1)
-        return _match_nth(self.arg, count - idx)
-
-
-def _has_match(node, selectors):
-    """:has(sel) — true when any descendant matches `sel`. Child (>) and
-    sibling (+/~) combinators inside the argument are treated as the
-    descendant approximation already used elsewhere in the parser."""
-    if not isinstance(node, Element):
-        return False
-    for child in node.children:
-        if any(s.matches(child) for s in selectors):
-            return True
-        if isinstance(child, Element) and _has_match(child, selectors):
-            return True
-    return False
-
-
-def _ancestor_possible(selector, node):
-    """Cheap necessary condition for `selector` to match some ancestor of
-    `node`, using the ancestor-feature sets primed by style(). Only used as a
-    quick-reject; a True result still requires the real ancestor walk."""
-    tags = node._anc_tags
-    classes = node._anc_classes
-    ids = node._anc_ids
-    if isinstance(selector, TagSelector):
-        return selector.tag == "*" or selector.tag in tags
-    if isinstance(selector, ClassSelector):
-        return selector.cls in classes
-    if isinstance(selector, IdSelector):
-        return selector.id in ids
-    if isinstance(selector, CompoundSelector):
-        # Must hold for every part, though not necessarily the same ancestor.
-        return all(_ancestor_possible(p, node) for p in selector.parts)
-    if isinstance(selector, DescendantSelector):
-        # The chain is A (X) (descendant of) B...: B must be reachable.
-        return _ancestor_possible(selector.descendant, node)
-    return True
 
 
 _PSEUDO_ELEMENTS = {
@@ -838,64 +653,12 @@ _INLINE_CACHE = {}
 _INLINE_CACHE_MAX = 2048
 
 
-def cascade_priority(rule):
-    return rule[0].priority
-
-
-def _selector_hint(selector):
-    """Terminal-part hint used to bucket rules. Returns a tuple that must match
-    the node (tag name, class, id) for the rule to have any chance of matching,
-    so style() only walks candidates instead of every rule."""
-    if isinstance(selector, TagSelector):
-        return ("tag", selector.tag) if selector.tag != "*" else ("any", None)
-    if isinstance(selector, ClassSelector):
-        return ("class", selector.cls)
-    if isinstance(selector, IdSelector):
-        return ("id", selector.id)
-    if isinstance(selector, RootSelector):
-        return ("root", None)
-    if isinstance(selector, CompoundSelector):
-        # Walk parts from the end so a trailing :nth-child/[attr] pseudo
-        # doesn't hide a bucketing tag/class/id that precedes it.
-        for part in reversed(selector.parts):
-            hint = _selector_hint(part)
-            if hint[0] != "any":
-                return hint
-        return ("any", None)
-    if isinstance(selector, DescendantSelector):
-        return _selector_hint(selector.descendant)
-    return ("any", None)
-
-
-_RULE_KEY = lambda item: (item[0], item[1])
-
-# Rule-index cache keyed by the rules list's identity. A Tab re-cascades the
-# *same* `self._last_rules` list for every JS-driven DOM mutation, and the
-# index construction (sorting every bucket) is the most expensive part of a
-# restyle; keeping it around turns those re-cascades into a dict lookup. The
-# cache holds the list too so an id() can never be reused by a newer list.
-_RULE_INDEX_CACHE = {}
-_RULE_INDEX_CACHE_MAX = 32
-
-
-def _build_rule_index(rules):
-    key = id(rules)
-    cached = _RULE_INDEX_CACHE.get(key)
-    if cached is not None:
-        return cached[1]
-    index = {}
-    for i, (selector, body) in enumerate(rules):
-        hint = _selector_hint(selector)
-        index.setdefault(hint, []).append((selector.priority, i, selector, body))
-    for bucket in index.values():
-        bucket.sort(key=_RULE_KEY)
-    if len(_RULE_INDEX_CACHE) >= _RULE_INDEX_CACHE_MAX:
-        _RULE_INDEX_CACHE.clear()
-    _RULE_INDEX_CACHE[key] = (rules, index)
-    return index
-
-
 _LIST_STYLE_POSITIONS = ("inside", "outside")
+
+# The shorthands `_expand` has something to say about. The cascade in Rust
+# reads this to know when it has to ask, so a declaration whose property is
+# not in here is applied as it stands.
+EXPANDING_SHORTHANDS = frozenset({"list-style"})
 
 
 def _expand(prop, value):
@@ -918,81 +681,6 @@ def _expand(prop, value):
                 yield "list-style-image", token
             else:
                 yield "list-style-type", lowered
-
-
-def style(node, rules):
-    """Compute the `.style` dict for `node` and its subtree.
-
-    Rules are bucketed by selector hint so each node only considers rules that
-    could possibly match it instead of scanning the whole rule list (a
-    text-heavy page has thousands of rules but a node only ever matches a
-    handful). The tree walk is iterative so deeply nested documents cannot
-    blow the recursion limit.
-    """
-    index = _build_rule_index(rules)
-
-    stack = [(node, None)]
-    while stack:
-        node, parent = stack.pop()
-
-        node.style = {}
-
-        # Prime ancestor feature sets for descendant-selector fast paths. The
-        # child's ancestors = parent's ancestors + the parent itself.
-        if parent is None:
-            node._anc_tags = node._anc_classes = node._anc_ids = frozenset()
-        else:
-            node._anc_tags = getattr(parent, "_anc_tags", frozenset()) | (
-                {parent.tag} if isinstance(parent, Element) else frozenset())
-            node._anc_classes = getattr(parent, "_anc_classes", frozenset()) | (
-                frozenset(parent.attributes.get("class", "").split())
-                if isinstance(parent, Element) else frozenset())
-            node._anc_ids = getattr(parent, "_anc_ids", frozenset()) | (
-                {parent.attributes.get("id")}
-                if isinstance(parent, Element)
-                and parent.attributes.get("id") else frozenset())
-
-        # 1. Inherited properties from parent (or defaults at root).
-        parent_style = parent.style if parent else {}
-        node.style.update(
-            {p: parent_style.get(p, d) for p, d in INHERITED_PROPERTIES.items()})
-
-        # 2. Author + UA rules, in cascade order. Only rules whose terminal
-        #    selector could match this node's tag / classes / id are walked.
-        hints = [("any", None)]
-        if isinstance(node, Element):
-            hints.append(("tag", node.tag))
-            hints.append(("id", node.attributes.get("id")))
-            if node.parent is None:
-                hints.append(("root", None))
-            for cls in node.attributes.get("class", "").split():
-                hints.append(("class", cls))
-        candidates = [r for hint in hints for r in index.get(hint, ())]
-        candidates.sort(key=_RULE_KEY)
-        for _prio, _i, selector, body in candidates:
-            if not selector.matches(node):
-                continue
-            for prop, value in body.items():
-                for expanded, v in _expand(prop, value):
-                    node.style[expanded] = v
-
-        # 3. Inline style attribute (highest, aside from !important we ignore).
-        if isinstance(node, Element) and "style" in node.attributes:
-            for prop, value in parse_inline(node.attributes["style"]).items():
-                for expanded, v in _expand(prop, value):
-                    node.style[expanded] = v
-
-        # 3b. Resolve var(--custom, fallback) references. Custom properties
-        # inherit, so lookups walk up the parent chain.
-        for prop, value in list(node.style.items()):
-            if "var(" in value:
-                node.style[prop] = _resolve_var(value, node)
-
-        # 4. Resolve relative font sizes (percent / em) against the parent.
-        _resolve_font_size(node)
-
-        for child in reversed(node.children):
-            stack.append((child, node))
 
 
 _VAR_RE = re.compile(
@@ -1023,32 +711,3 @@ def _resolve_var(value, node):
             break
         value = resolved
     return value
-
-
-def _resolve_font_size(node):
-    if "font-size" not in node.style:
-        return
-    value = node.style["font-size"]
-    parent_size = 16.0
-    if node.parent and "font-size" in node.parent.style:
-        ps = node.parent.style["font-size"]
-        if ps.endswith("px"):
-            try:
-                parent_size = float(ps[:-2])
-            except ValueError:
-                pass
-    if value.endswith("%"):
-        def factor(v):
-            return parent_size * float(v[:-1]) / 100
-    elif value.endswith("em"):
-        def factor(v):
-            return parent_size * float(v[:-2])
-    elif value in ("smaller", "larger"):
-        def factor(v):
-            return parent_size * (0.8 if v == "smaller" else 1.2)
-    else:
-        return
-    try:
-        node.style["font-size"] = f"{factor(value):.1f}px"
-    except ValueError:
-        node.style["font-size"] = f"{parent_size}px"
