@@ -134,9 +134,12 @@ def test_install_enable_disable_uninstall():
         with open(os.path.join(demo_dir, "toe.py"), "w") as f:
             f.write('def activate(ctx):\n    ctx.on("buttons",'
                     ' lambda: [])\n')
+        with open(os.path.join(demo_dir, "manual.md"), "w") as f:
+            f.write("# demo manual\n\nThis is the demo toe's manual.\n\n"
+                    "- feature one\n- feature two\n\n```\ncode block\n```\n")
         idx = {"repo": "local", "toes": [
             {"name": "demo", "version": "0.1.0", "description": "demo",
-             "files": ["toe.json", "toe.py"]}]}
+             "files": ["toe.json", "toe.py", "manual.md"]}]}
         with open(os.path.join(catalog_dir, "index.json"), "w") as f:
             json.dump(idx, f)
 
@@ -153,6 +156,9 @@ def test_install_enable_disable_uninstall():
             msg = toehub.install_toe("demo", catalog, stub)
             assert "Installed" in _strip(msg), msg
             assert "demo" in toehub.installed_toes()
+            # manual.md was downloaded with the toe
+            assert os.path.isfile(
+                os.path.join(tmp, toes.TOES_DIR, "demo", "manual.md"))
 
             # disable
             msg = toehub.toggle_toe("demo", False, stub)
@@ -204,6 +210,51 @@ def test_buttons_hook_registered():
     toe = toes.Toe("fake", "0", "", "", FakeToe())
     stub = StubBrowser([toe])
     assert stub.toe_contexts[0].call("buttons")[0].id == "fake-btn"
+
+
+def test_manual_renders_for_installed_toe():
+    from feetbrowser import toehub
+    with tempfile.TemporaryDirectory() as tmp:
+        demo = os.path.join(tmp, "toes", "demo")
+        os.makedirs(demo)
+        with open(os.path.join(demo, "toe.json"), "w") as f:
+            f.write('{"name": "demo", "entry": "toe.py"}')
+        with open(os.path.join(demo, "toe.py"), "w") as f:
+            f.write("def activate(ctx):\n    pass\n")
+        with open(os.path.join(demo, "manual.md"), "w") as f:
+            f.write("# Demo\n\nWhat it does.\n\n- one\n- two\n")
+        orig_root = toes.repo_root
+        toes.repo_root = lambda: tmp
+        try:
+            html = toehub.manual_toe("demo")
+            stripped = _strip(html)
+            assert "demo" in stripped
+            assert "What it does" in stripped
+            assert "one" in stripped and "two" in stripped
+            assert "back to the hub" in stripped
+        finally:
+            toes.repo_root = orig_root
+
+
+def test_manual_falls_back_without_file():
+    from feetbrowser import toehub
+    with tempfile.TemporaryDirectory() as tmp:
+        demo = os.path.join(tmp, "toes", "demo")
+        os.makedirs(demo)
+        with open(os.path.join(demo, "toe.json"), "w") as f:
+            f.write('{"name": "demo", "description": "just a demo",'
+                    ' "entry": "toe.py"}')
+        with open(os.path.join(demo, "toe.py"), "w") as f:
+            f.write("def activate(ctx):\n    pass\n")
+        orig_root = toes.repo_root
+        toes.repo_root = lambda: tmp
+        try:
+            html = toehub.manual_toe("demo")
+            stripped = _strip(html)
+            assert "just a demo" in stripped
+            assert "manual" in stripped.lower()
+        finally:
+            toes.repo_root = orig_root
 
 
 def _strip(html):

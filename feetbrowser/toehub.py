@@ -12,6 +12,7 @@ Pages served (via the built-in handle hook):
     toehub://uninstall/<name>  remove an installed toe
     toehub://enable/<name>     enable a disabled toe
     toehub://disable/<name>    disable an enabled toe (kept installed)
+    toehub://manual/<name>     show an installed toe's manual page
     toehub://refresh           re-fetch the catalog
     toe://hub                  alias for toehub://
 
@@ -87,12 +88,16 @@ def install_toe(name, catalog_toes, browser=None):
     os.makedirs(folder, exist_ok=True)
     files = match.get("files") or ["toe.json", "toe.py"]
     for fname in files:
+        # manual.md is optional; a missing one must not fail the install.
+        optional = fname in ("manual.md", "README.md")
         url = URL(base + fname)
         try:
             _h, data, _c = url.request()
             with open(os.path.join(folder, fname), "w") as f:
                 f.write(data)
         except Exception as e:  # noqa: BLE001 - bad fetch leaves a note
+            if optional:
+                continue
             return _msg(f"Could not fetch <b>{fname}</b>: {e}")
     toes.set_toe_enabled(name, True)
     if browser is not None:
@@ -122,6 +127,90 @@ def toggle_toe(name, enable, browser=None):
         browser.reload_toes()
     state = "enabled" if enable else "disabled"
     return _msg(f"<b>{name}</b> is now <b>{state}</b>.")
+
+
+def manual_toe(name):
+    """Render an installed toe's manual.md as an HTML page. Returns an
+    HTML body, or an error page if the toe or manual is missing."""
+    from .toes import repo_root, TOES_DIR
+    folder = os.path.join(repo_root(), TOES_DIR, name)
+    manual = os.path.join(folder, "manual.md")
+    if not os.path.isdir(folder):
+        return _msg(f"<b>{name}</b> is not installed.")
+    if not os.path.isfile(manual):
+        # Fall back to the manifest description.
+        try:
+            with open(os.path.join(folder, "toe.json")) as f:
+                manifest = json.load(f)
+            desc = manifest.get("description", "No description.")
+        except (OSError, ValueError):
+            desc = "No description."
+        return _manual_page(name, f"{desc}\n\nThis toe ships without a "
+                                   "manual.md.")
+    try:
+        with open(manual) as f:
+            md = f.read()
+    except OSError as e:
+        return _manual_page(name, f"Could not read manual: {e}")
+    return _manual_page(name, md)
+
+
+def _manual_page(name, md):
+    """Render a markdown manual as a simple HTML page."""
+    body = _md_to_html(md)
+    return f"""<!doctype html>
+<html><head><title>{_esc(name)} manual</title><style>{HUB_STYLE}</style>
+</head>
+<body>
+<h1>{_esc(name)}</h1>
+<p class="dim">MANUAL · HOW THIS TOE WORKS</p>
+{body}
+<p class="dim"><a href="toehub://">back to the hub</a></p>
+</body></html>
+"""
+
+
+def _md_to_html(md):
+    """A tiny markdown -> HTML renderer (headings, code fences, bullets,
+    tables-as-text, paragraphs). Good enough for a manual."""
+    out = []
+    in_code = False
+    for line in md.splitlines():
+        if line.strip().startswith("```"):
+            if in_code:
+                out.append("</pre>")
+                in_code = False
+            else:
+                out.append("<pre>")
+                in_code = True
+            continue
+        if in_code:
+            out.append(_esc(line))
+            continue
+        stripped = line.strip()
+        if not stripped:
+            out.append("")
+            continue
+        if stripped.startswith("# "):
+            out.append(f"<h1>{_esc(stripped[2:])}</h1>")
+        elif stripped.startswith("## "):
+            out.append(f"<h2>{_esc(stripped[3:])}</h2>")
+        elif stripped.startswith("### "):
+            out.append(f"<h3>{_esc(stripped[4:])}</h3>")
+        elif stripped.startswith("- ") or stripped.startswith("* "):
+            out.append(f'<div class="box">• {_esc(stripped[2:])}</div>')
+        elif stripped.startswith("|"):
+            out.append(f"<p>{_esc(stripped)}</p>")
+        else:
+            out.append(f"<p>{_esc(stripped)}</p>")
+    if in_code:
+        out.append("</pre>")
+    return "\n".join(out)
+
+
+def _esc(s):
+    return (str(s).replace("&", "&amp;").replace("<", "&lt;")
+            .replace(">", "&gt;"))
 
 
 def _msg(body):
@@ -165,6 +254,8 @@ def _handle_hub(url, browser):
         return {}, toggle_toe(name, True, browser), "text/html"
     if action == "disable" and name:
         return {}, toggle_toe(name, False, browser), "text/html"
+    if action == "manual" and name:
+        return {}, manual_toe(name), "text/html"
     if action == "refresh" or action in ("hub", ""):
         return {}, _hub_page(), "text/html"
     return {}, _hub_page(), "text/html"
@@ -184,11 +275,13 @@ def _hub_page():
         if name in installed:
             if name in disabled:
                 action = (f'<a href="toehub://enable/{name}">enable</a> '
+                          f'<a href="toehub://manual/{name}">manual</a> '
                           f'<a href="toehub://uninstall/{name}">uninstall</a> '
                           f'<span class="dim">disabled</span>')
                 cls = "disabled"
             else:
                 action = (f'<a href="toehub://disable/{name}">disable</a> '
+                          f'<a href="toehub://manual/{name}">manual</a> '
                           f'<a href="toehub://uninstall/{name}">uninstall</a> '
                           f'<span class="dim">enabled</span>')
                 cls = "installed"
@@ -210,6 +303,7 @@ def _hub_page():
             + (f' — <a href="toehub://enable/{n}">enable</a>'
                if n in disabled else
                f' — <a href="toehub://disable/{n}">disable</a>')
+            + f' · <a href="toehub://manual/{n}">manual</a>'
             + f' · <a href="toehub://uninstall/{n}">uninstall</a></div>'
             for n in sorted(installed))
     return f"""<!doctype html>
@@ -241,6 +335,7 @@ def _gallery_page():
             + (f' — <a href="toehub://enable/{n}">enable</a>'
                if n in disabled else
                f' — <a href="toehub://disable/{n}">disable</a>')
+            + f' · <a href="toehub://manual/{n}">manual</a>'
             + f' · <a href="toehub://uninstall/{n}">uninstall</a></div>'
             for n in sorted(installed))
     return f"""<!doctype html>
