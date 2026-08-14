@@ -1968,16 +1968,26 @@ class BlockLayout(LayoutBox):
                     self.flush(force=True)
                 self._place_word(line, font, color, node, measure=False, nowrap=True)
             return
-        nowrap = white_space == "nowrap"
+        if white_space == "nowrap":
+            # white-space:nowrap collapses spaces but forbids wrapping inside
+            # the element: the whole run is one unbreakable token. It still
+            # moves to the next line as a unit when the current one runs out
+            # of room (e.g. Wikipedia's language cloud of <a> links), instead
+            # of one-word-per-line forever overflowing the viewport.
+            words = content.split()
+            if words:
+                self._place_word(" ".join(words), font, color, node,
+                                 nowrap=True)
+            return
         for word in content.split():
-            self._place_word(word, font, color, node, nowrap=nowrap)
+            self._place_word(word, font, color, node)
 
     def _place_word(self, word, font, color, node, measure=True, nowrap=False):
         if not word:
             return
         w = _measure(font, word)
         x0, x1 = self._line_bounds()
-        if not nowrap and x0 >= x1:
+        if x0 >= x1:
             # A float covers the whole line (e.g. a full-width floated table):
             # don't draw the word on top of the float, drop below it first.
             # Flush any words already queued so their baseline isn't dragged
@@ -1992,7 +2002,11 @@ class BlockLayout(LayoutBox):
                 self.cursor_y = bottom
             self.cursor_x = self._line_bounds()[0]
             x0, x1 = self._line_bounds()
-        if not nowrap and self.cursor_x + w > x1:
+        if self.cursor_x + w > x1 and self.cursor_x > x0:
+            # The token doesn't fit on the remaining space: break before it.
+            # A nowrap token breaks here as a whole unit (never inside); a
+            # pre line (measure=False) starts a fresh line and simply
+            # overflows when wider than the line.
             if self.line:
                 self.flush()
             self.cursor_x = self._line_bounds()[0]

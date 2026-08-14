@@ -24,9 +24,10 @@ from .cssparser import CSSParser, style, parse_inline, set_viewport, \
     media_matches, get_viewport
 from .layout import DocumentLayout, paint_tree, get_font, DrawText, _measure
 from . import shoes as shoes
-from .jsdom import JSDocument, JSLocation
+from .jsdom import JSDocument, JSLocation, _JSStaticProps, _JSComputedStyle
 from .jsengine import Interpreter, JSException, UNDEFINED
 from . import toes as toes
+from . import __version__
 
 WIDTH, HEIGHT = 1000, 720
 SCROLL_STEP = 80
@@ -563,7 +564,8 @@ class Tab:
         self._js_interp = Interpreter()
         location = JSLocation(base_url=self.base_url, navigate=self._js_navigate)
         doc = JSDocument(self.nodes, base_url=self.base_url,
-                         mark_dirty=self._js_mutated, location=location)
+                         mark_dirty=self._js_mutated, interp=self._js_interp,
+                         location=location)
         self._js_doc = doc
         self._js_interp.globals["document"] = doc
         # Location/navigation: the window, its aliases, and the document all
@@ -576,6 +578,34 @@ class Tab:
         # Browser-provided host APIs (network + nothing Tk).
         self._js_interp.globals["fetch"] = self._js_fetch
         self._js_interp.globals["XMLHttpRequest"] = self._js_xhr_ctor()
+        # Rendering/event APIs. rAF rides the existing virtual-clock timer
+        # machinery (setTimeout), which the GUI advances every 60ms.
+        self._js_interp.globals["getComputedStyle"] = self._js_get_computed_style
+        self._js_interp.globals["requestAnimationFrame"] = self._js_request_frame
+        self._js_interp.globals["cancelAnimationFrame"] = self._js_cancel_frame
+        self._js_interp.globals["addEventListener"] = self._js_add_listener
+        self._js_interp.globals["removeEventListener"] = self._js_remove_listener
+        self._js_interp.globals["matchMedia"] = self._js_match_media
+        # Read-only window-ish globals scripts love to sniff.
+        self._js_interp.globals["devicePixelRatio"] = 1
+        self._js_interp.globals["innerWidth"] = WIDTH
+        self._js_interp.globals["innerHeight"] = HEIGHT
+        self._js_interp.globals["screen"] = _JSStaticProps({
+            "width": WIDTH, "height": HEIGHT,
+            "availWidth": WIDTH, "availHeight": HEIGHT,
+        })
+        self._js_interp.globals["navigator"] = _JSStaticProps({
+            "userAgent": (
+                f"Mozilla/5.0 FeetBrowser/{__version__} "
+                "(X11; Linux) AppleWebKit/537.36 (KHTML, like Gecko)"),
+            "platform": "Linux",
+            "language": "en-US",
+            "languages": ["en-US", "en"],
+            "vendor": "",
+            "onLine": True,
+            "hardwareConcurrency": 4,
+            "productSub": "20030107",
+        })
         for el in scripts:
             try:
                 code = None
@@ -586,6 +616,12 @@ class Tab:
                         sheet_url = self.base_url.resolve(src) \
                             if self.base_url else URL(src)
                         _h, code, _c = sheet_url.request()
+                        if not _is_js_script_type(_c):
+                            # `file://` and error pages return an HTML body
+                            # instead of raising; never execute it as JS.
+                            self._add_error(
+                                f"JS {sheet_url} (not a script: {_c})")
+                            code = None
                     except Exception as e:  # noqa: BLE001 - skip bad/unreachable src
                         self._add_error(
                             f"JS {sheet_url or src} ({type(e).__name__})")
@@ -765,6 +801,46 @@ class Tab:
 
     def _js_xhr_ctor(self):
         return _JSXHRCtor(self)
+
+    def _js_get_computed_style(self, el, *rest):
+        """Host `getComputedStyle(el)`: wraps the node so property reads and
+        `getPropertyValue()` resolve against the cascaded `.style` dict."""
+        if hasattr(el, "js_unwrap"):
+            el = el.js_unwrap()
+        if el is UNDEFINED or el is None or not hasattr(el, "node"):
+            return _JSComputedStyle(None)
+        return _JSComputedStyle(el.node)
+
+    def _js_request_frame(self, cb, *rest):
+        """rAF rides the virtual-clock timer machinery so GUI polling (which
+        calls interp.advance every 60ms) fires the callback on schedule."""
+        try:
+            return self._js_interp.call(
+                self._js_interp.globals["setTimeout"], cb, 16)
+        except Exception:  # noqa: BLE001 - no timer infra in headless mode
+            return 0
+
+    def _js_cancel_frame(self, handle, *rest):
+        try:
+            return self._js_interp.call(
+                self._js_interp.globals["clearTimeout"], handle)
+        except Exception:  # noqa: BLE001 - no timer infra in headless mode
+            return None
+
+    def _js_add_listener(self, *args):
+        return None
+
+    def _js_remove_listener(self, *args):
+        return None
+
+    def _js_match_media(self, query):
+        return _JSStaticProps({
+            "matches": False,
+            "media": str(query),
+            "addListener": lambda *a: None,
+            "removeListener": lambda *a: None,
+            "addEventListener": lambda *a: None,
+        })
 
     def _drain_js(self):
         """UI thread: settle JS network results and run pending microtasks /

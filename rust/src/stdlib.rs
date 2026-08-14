@@ -51,6 +51,99 @@ fn ctor(name: &str, call: NativeFn, ctor_: NativeFn, get: Option<NativeGet>, set
     }))
 }
 
+// -- base64 (btoa/atob) -----------------------------------------------------
+
+const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+fn base64_encode(data: &[u8]) -> String {
+    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(B64[(n >> 18) as usize & 63] as char);
+        out.push(B64[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 { B64[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 2 { B64[n as usize & 63] as char } else { '=' });
+    }
+    out
+}
+
+fn base64_char(c: u8) -> Option<u32> {
+    match c {
+        b'A'..=b'Z' => Some((c - b'A') as u32),
+        b'a'..=b'z' => Some((c - b'a') as u32 + 26),
+        b'0'..=b'9' => Some((c - b'0') as u32 + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
+    }
+}
+
+fn base64_decode(text: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(text.len() * 3 / 4);
+    let mut acc: u32 = 0;
+    let mut bits = 0;
+    for c in text.bytes() {
+        if c == b'=' {
+            break;
+        }
+        let Some(v) = base64_char(c) else { continue };
+        acc = (acc << 6) | v;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8 & 0xFF);
+        }
+    }
+    out
+}
+
+// -- percent-encoding (encodeURI/decodeURI/...) ------------------------------
+
+fn is_unreserved(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'.' | b'!' | b'~' | b'*' | b'\'' | b'(' | b')')
+}
+
+/// Characters encodeURI leaves alone in addition to the unreserved set.
+fn is_uri_reserved(c: u8) -> bool {
+    matches!(c, b';' | b',' | b'/' | b'?' | b':' | b'@' | b'&' | b'=' | b'+' | b'$' | b'#')
+}
+
+fn percent_encode(text: &str, component: bool) -> String {
+    let mut out = String::new();
+    for b in text.as_bytes() {
+        if is_unreserved(*b) || (!component && is_uri_reserved(*b)) {
+            out.push(*b as char);
+        } else {
+            out.push_str(&format!("%{:02X}", b));
+        }
+    }
+    out
+}
+
+fn percent_decode(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(h), Some(l)) = (hi, lo) {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    // Decode UTF-8 byte runs to characters (invalid bytes stay as-is).
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 // -- console / window / localStorage ---------------------------------------
 
 fn console_log(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
@@ -249,6 +342,7 @@ fn number_get(this: &Rc<Interpreter>, _obj: &JsValue, name: &str) -> Result<JsVa
     Ok(match name {
         "isNaN" => native("isNaN", number_is_nan),
         "isFinite" => native("isFinite", number_is_finite),
+        "isInteger" => native("isInteger", number_is_integer),
         "parseInt" => native("parseInt", parse_int_call),
         "parseFloat" => native("parseFloat", parse_float_call),
         "MAX_VALUE" => JsValue::Number(1.7976931348623157e308),
@@ -348,6 +442,87 @@ fn parse_float_call(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) 
                 }
             }
             None => Ok(JsValue::Number(f64::NAN)),
+        }
+    })
+}
+
+// -- base64 ----------------------------------------------------------------
+
+fn btoa_call(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
+    let this = this.clone();
+    Box::pin(async move {
+        let text = this.repr(&first(&args));
+        // btoa operates on code units 0..=255; mask higher values (lenient).
+        let bytes: Vec<u8> = text.encode_utf16().map(|u| u as u8).collect();
+        Ok(JsValue::str(base64_encode(&bytes)))
+    })
+}
+
+fn atob_call(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
+    let this = this.clone();
+    Box::pin(async move {
+        let text = this.repr(&first(&args));
+        let decoded = base64_decode(&text);
+        // atob returns a "binary string": one Latin-1 char per byte.
+        let out: String = decoded.iter().map(|b| *b as char).collect();
+        Ok(JsValue::str(out))
+    })
+}
+
+// -- URI encoding ----------------------------------------------------------
+
+fn encode_uri_component(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
+    let this = this.clone();
+    Box::pin(async move {
+        Ok(JsValue::str(percent_encode(&this.repr(&first(&args)), true)))
+    })
+}
+
+fn encode_uri(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
+    let this = this.clone();
+    Box::pin(async move {
+        Ok(JsValue::str(percent_encode(&this.repr(&first(&args)), false)))
+    })
+}
+
+fn decode_uri_component(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
+    let this = this.clone();
+    Box::pin(async move {
+        Ok(JsValue::str(percent_decode(&this.repr(&first(&args)))))
+    })
+}
+
+fn decode_uri(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
+    let this = this.clone();
+    Box::pin(async move {
+        Ok(JsValue::str(percent_decode(&this.repr(&first(&args)))))
+    })
+}
+
+// -- isNaN / isFinite ------------------------------------------------------
+
+fn global_is_nan(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
+    let _ = this;
+    Box::pin(async move { Ok(JsValue::Bool(to_number(&first(&args)).is_nan())) })
+}
+
+fn global_is_finite(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
+    let _ = this;
+    Box::pin(async move {
+        let n = to_number(&first(&args));
+        Ok(JsValue::Bool(!n.is_nan() && !n.is_infinite()))
+    })
+}
+
+// -- Number.isInteger ------------------------------------------------------
+
+fn number_is_integer(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
+    let _ = this;
+    Box::pin(async move {
+        let v = first(&args);
+        match v {
+            JsValue::Number(n) => Ok(JsValue::Bool(n.fract() == 0.0 && !n.is_nan() && !n.is_infinite())),
+            _ => Ok(JsValue::Bool(false)),
         }
     })
 }
@@ -540,6 +715,44 @@ fn obj_has_own(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> Ev
     })
 }
 
+fn obj_is(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
+    let _ = this;
+    Box::pin(async move {
+        let a = args.first().cloned().unwrap_or(JsValue::Undefined);
+        let b = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+        match (&a, &b) {
+            (JsValue::Number(x), JsValue::Number(y)) => {
+                if x.is_nan() && y.is_nan() {
+                    return Ok(JsValue::Bool(true));
+                }
+                if *x == 0.0 && *y == 0.0 && x.is_sign_negative() != y.is_sign_negative() {
+                    return Ok(JsValue::Bool(false));
+                }
+                Ok(JsValue::Bool(x == y))
+            }
+            _ => Ok(JsValue::Bool(strict_eq(&a, &b))),
+        }
+    })
+}
+
+fn obj_from_entries(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
+    let this = this.clone();
+    Box::pin(async move {
+        let mut out = BTreeMap::new();
+        if let JsValue::Array(items) = first(&args) {
+            for pair in items.borrow().iter() {
+                if let JsValue::Array(entry) = pair {
+                    let e = entry.borrow();
+                    let key = this.repr(e.first().unwrap_or(&JsValue::Undefined));
+                    let val = e.get(1).cloned().unwrap_or(JsValue::Undefined);
+                    out.insert(key, val);
+                }
+            }
+        }
+        Ok(JsValue::Object(Rc::new(RefCell::new(out))))
+    })
+}
+
 fn object_proto_has_own(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
     let this = this.clone();
     Box::pin(async move {
@@ -576,6 +789,9 @@ fn object_get(this: &Rc<Interpreter>, _obj: &JsValue, name: &str) -> Result<JsVa
         "defineProperty" => native("defineProperty", obj_define_property),
         "freeze" => native("freeze", obj_freeze),
         "hasOwnProperty" => native("hasOwnProperty", obj_has_own),
+        "hasOwn" => native("hasOwn", obj_has_own),
+        "is" => native("is", obj_is),
+        "fromEntries" => native("fromEntries", obj_from_entries),
         "prototype" => {
             let mut proto = BTreeMap::new();
             proto.insert(
@@ -1210,6 +1426,89 @@ fn promise_all_static(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>
     })
 }
 
+fn promise_all_settled_static(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
+    let this = this.clone();
+    Box::pin(async move {
+        let p = JsPromise::new();
+        let items: Vec<JsValue> = match first(&args) {
+            JsValue::Array(a) => a.borrow().clone(),
+            _ => vec![],
+        };
+        let n = items.len();
+        if n == 0 {
+            promise_resolve(&this, &p, JsValue::array(vec![]));
+            return Ok(JsValue::Promise(p));
+        }
+        let results = Rc::new(RefCell::new(vec![JsValue::Undefined; n]));
+        let remaining = Rc::new(Cell::new(n));
+        for (i, item) in items.iter().enumerate() {
+            let pj = as_promise(&this, item);
+            let this2 = this.clone();
+            let p2 = p.clone();
+            let results2 = results.clone();
+            let remaining2 = remaining.clone();
+            promise_on_settle(&this, &pj, Rc::new(move |value, rejected| {
+                let mut entry = BTreeMap::new();
+                if rejected {
+                    entry.insert("status".to_string(), JsValue::str("rejected"));
+                    entry.insert("reason".to_string(), value);
+                } else {
+                    entry.insert("status".to_string(), JsValue::str("fulfilled"));
+                    entry.insert("value".to_string(), value);
+                }
+                results2.borrow_mut()[i] = JsValue::Object(Rc::new(RefCell::new(entry)));
+                remaining2.set(remaining2.get() - 1);
+                if remaining2.get() == 0 {
+                    promise_resolve(
+                        &this2,
+                        &p2,
+                        JsValue::array(results2.borrow().clone()),
+                    );
+                }
+            }));
+        }
+        Ok(JsValue::Promise(p))
+    })
+}
+
+fn promise_any_static(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
+    let this = this.clone();
+    Box::pin(async move {
+        let p = JsPromise::new();
+        let items: Vec<JsValue> = match first(&args) {
+            JsValue::Array(a) => a.borrow().clone(),
+            _ => vec![],
+        };
+        let n = items.len();
+        if n == 0 {
+            promise_reject(&this, &p, JsValue::str("All promises were rejected"));
+            return Ok(JsValue::Promise(p));
+        }
+        let remaining = Rc::new(Cell::new(n));
+        for item in items {
+            let pj = as_promise(&this, &item);
+            let this2 = this.clone();
+            let p2 = p.clone();
+            let remaining2 = remaining.clone();
+            promise_on_settle(&this, &pj, Rc::new(move |value, rejected| {
+                if !rejected {
+                    promise_resolve(&this2, &p2, value);
+                    return;
+                }
+                remaining2.set(remaining2.get() - 1);
+                if remaining2.get() == 0 {
+                    promise_reject(
+                        &this2,
+                        &p2,
+                        JsValue::str("All promises were rejected"),
+                    );
+                }
+            }));
+        }
+        Ok(JsValue::Promise(p))
+    })
+}
+
 fn promise_race_static(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
     let this = this.clone();
     Box::pin(async move {
@@ -1272,7 +1571,9 @@ fn promise_get_static(this: &Rc<Interpreter>, _obj: &JsValue, name: &str) -> Res
         "resolve" => native("resolve", promise_resolve_static),
         "reject" => native("reject", promise_reject_static),
         "all" => native("all", promise_all_static),
+        "allSettled" => native("allSettled", promise_all_settled_static),
         "race" => native("race", promise_race_static),
+        "any" => native("any", promise_any_static),
         _ => JsValue::Undefined,
     })
 }
@@ -1339,6 +1640,14 @@ pub fn init_globals(this: &Rc<Interpreter>) -> Result<(), JsError> {
     globals.insert("Object".to_string(), ctor("Object", object_call, object_call, Some(object_get), None));
     globals.insert("parseInt".to_string(), native("parseInt", parse_int_call));
     globals.insert("parseFloat".to_string(), native("parseFloat", parse_float_call));
+    globals.insert("isNaN".to_string(), native("isNaN", global_is_nan));
+    globals.insert("isFinite".to_string(), native("isFinite", global_is_finite));
+    globals.insert("btoa".to_string(), native("btoa", btoa_call));
+    globals.insert("atob".to_string(), native("atob", atob_call));
+    globals.insert("encodeURIComponent".to_string(), native("encodeURIComponent", encode_uri_component));
+    globals.insert("decodeURIComponent".to_string(), native("decodeURIComponent", decode_uri_component));
+    globals.insert("encodeURI".to_string(), native("encodeURI", encode_uri));
+    globals.insert("decodeURI".to_string(), native("decodeURI", decode_uri));
     globals.insert("NaN".to_string(), JsValue::Number(f64::NAN));
     globals.insert("Infinity".to_string(), JsValue::Number(f64::INFINITY));
     globals.insert("Promise".to_string(), ctor("Promise", promise_ctor, promise_ctor, Some(promise_get_static), None));
