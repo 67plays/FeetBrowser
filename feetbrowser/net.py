@@ -331,6 +331,29 @@ class URL:
         (images), skipping the text decoding that request() applies."""
         return self.request(redirects_left, raw=True)
 
+    def request_impersonated(self):
+        """Fetch via curl_cffi impersonating a Chrome browser.
+
+        Our raw socket/ssl stack sends a ClientHello that sites like Google
+        fingerprint as a bot, so they serve an "enable JavaScript" stub
+        instead of their real (JS-driven) application. curl_cffi is built
+        against BoringSSL and reproduces Chrome's TLS + HTTP/2 + header
+        fingerprints, which residential clients on such sites are served the
+        full app. Returns (headers_dict, body_str, content_type).
+
+        Requires the optional `curl_cffi` package; falls back to
+        `request()` if it isn't installed.
+        """
+        try:
+            from curl_cffi import requests as cffi
+        except ImportError:
+            return self.request()
+        headers = dict(DEFAULT_HEADERS)
+        r = cffi.get(str(self), impersonate="chrome", headers=headers,
+                     timeout=30, allow_redirects=True)
+        ctype = r.headers.get("content-type", "text/html").split(";")[0].strip()
+        return dict(r.headers), r.text, ctype
+
     def _request_file(self, raw=False):
         try:
             with open(self.path, "rb") as f:
