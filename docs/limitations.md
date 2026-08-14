@@ -24,7 +24,7 @@ is a hard prerequisite on every platform. `run.sh` and `run.cmd` build it
 into a local `.venv` on first run. Windows needs a second install that the
 other two platforms do not: rustup selects the MSVC toolchain but does not
 provide the linker it calls, and Windows ships no linker of its own, so the
-first `run.cmd` stops at `error: linker \`link.exe\` not found` until the
+first `run.cmd` stops at ``error: linker `link.exe` not found`` until the
 Visual Studio build tools are installed. See [usage.md](usage.md) for the
 exact download and the one workload to tick. Whether the GNU toolchain can
 stand in for it here is untested and not claimed: official CPython is built
