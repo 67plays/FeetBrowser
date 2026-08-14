@@ -1,8 +1,10 @@
 mod ast;
 mod dom;
+mod image;
 mod interp;
 mod parser;
 mod pybind;
+mod pyutil;
 mod stdlib;
 mod token;
 mod value;
@@ -22,5 +24,16 @@ fn feetbrowser_engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(dom::dom_get, m)?)?;
     m.add_function(wrap_pyfunction!(dom::dom_set, m)?)?;
     m.add_function(wrap_pyfunction!(dom::dom_call, m)?)?;
+
+    // -- image codecs --
+    m.add("ImageError", py.get_type::<image::ImageError>())?;
+    m.add("MAX_PIXELS", image::MAX_PIXELS)?;
+    m.add("MAX_INFLATED", image::MAX_INFLATED)?;
+    m.add_function(wrap_pyfunction!(image::py_decode, m)?)?;
+    m.add_function(wrap_pyfunction!(image::py_decode_png, m)?)?;
+    m.add_function(wrap_pyfunction!(image::py_decode_gif, m)?)?;
+    m.add_function(wrap_pyfunction!(image::py_decode_pnm, m)?)?;
+    m.add_function(wrap_pyfunction!(image::py_sniff, m)?)?;
+    m.add_function(wrap_pyfunction!(image::py_resize, m)?)?;
     Ok(())
 }

@@ -19,8 +19,11 @@ from feetbrowser.window import Event, Window
 # -- helpers ---------------------------------------------------------------
 
 def _png(width, height, depth, color, samples, palette=None, trns=None,
-         interlace=0):
-    """Build a PNG so the decoder can be tested against known pixels."""
+         interlace=0, idat=None):
+    """Build a PNG so the decoder can be tested against known pixels.
+
+    `idat` replaces the compressed pixel data outright, which is how the
+    malformed-input tests hand the decoder something no encoder wrote."""
     def chunk(tag, payload):
         body = tag + payload
         return (struct.pack(">I", len(payload)) + body
@@ -29,9 +32,11 @@ def _png(width, height, depth, color, samples, palette=None, trns=None,
     channels = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}[color]
     stride = (width * channels * depth + 7) // 8
     raw = bytearray()
-    for y in range(height):
-        raw.append(0)
-        raw += samples[y * stride:(y + 1) * stride]
+    if idat is None:
+        for y in range(height):
+            raw.append(0)
+            raw += samples[y * stride:(y + 1) * stride]
+        idat = zlib.compress(bytes(raw))
     out = b"\x89PNG\r\n\x1a\n" + chunk(
         b"IHDR", struct.pack(">IIBBBBB", width, height, depth, color, 0, 0,
                              interlace))
@@ -39,7 +44,26 @@ def _png(width, height, depth, color, samples, palette=None, trns=None,
         out += chunk(b"PLTE", palette)
     if trns:
         out += chunk(b"tRNS", trns)
-    return out + chunk(b"IDAT", zlib.compress(bytes(raw))) + chunk(b"IEND", b"")
+    return out + chunk(b"IDAT", idat) + chunk(b"IEND", b"")
+
+
+def _gif():
+    """A 2x2 GIF whose LZW stream is four literal codes and an end marker."""
+    palette = bytes([255, 0, 0, 0, 0, 255]) + bytes(6)
+    stream, acc, bits = bytearray(), 0, 0
+    for code in (0, 1, 1, 0, 5):     # 4-entry table: clear=4, end=5, 3 bits
+        acc |= code << bits
+        bits += 3
+        while bits >= 8:
+            stream.append(acc & 0xFF)
+            acc >>= 8
+            bits -= 8
+    if bits:
+        stream.append(acc & 0xFF)
+    return (b"GIF89a" + struct.pack("<HHBBB", 2, 2, 0x80 | 0x01, 0, 0)
+            + palette
+            + b"\x2C" + struct.pack("<HHHHB", 0, 0, 2, 2, 0)
+            + bytes([2, len(stream)]) + bytes(stream) + b"\x00" + b"\x3B")
 
 
 def _pixel(surface, x, y):
@@ -441,6 +465,178 @@ def test_resize_nearest_neighbour():
 def test_resize_is_identity_at_same_size():
     rgba = bytearray(bytes([1, 2, 3, 4]) * 4)
     assert imagecodec.resize(rgba, 2, 2, 2, 2) is rgba
+
+# -- malformed images ------------------------------------------------------
+#
+# Everything below feeds the decoders bytes no encoder would ever produce.
+# Images are the one part of a page that arrives as raw binary from a
+# stranger, so the decoders are where a hostile file gets its chance: the
+# rule is that a broken image is an ImageError and never a crash, a hang or
+# an allocation the file chose the size of. That mattered when this was
+# Python and it matters more now that it is Rust, where an unchecked index
+# is a panic no `except` can catch.
+
+def _rejects(data, why):
+    try:
+        imagecodec.decode(data)
+    except imagecodec.ImageError:
+        return
+    raise AssertionError(why)
+
+
+def test_decode_png_rejects_truncation_in_the_header():
+    """Cut a good PNG short at each structural boundary up to the end of
+    IHDR: the signature, the length word, the chunk tag, mid-payload."""
+    good = _png(4, 3, 8, 2, bytes(36))
+    for cut in (0, 1, 7, 8, 12, 20, 25):
+        _rejects(good[:cut], f"truncation at {cut} bytes should be rejected")
+
+
+def test_decode_png_pads_a_truncated_image():
+    """Past the header a short file is not an error: a header we believe
+    plus fewer pixels than it promised comes back padded, which is what a
+    half-arrived image on a slow connection looks like."""
+    good = _png(4, 3, 8, 2, bytes(range(36)))
+    width, height, rgba = imagecodec.decode(good[:len(good) - 20])
+    assert (width, height) == (4, 3)
+    assert len(rgba) == 4 * 3 * 4
+
+
+def test_decode_png_ignores_chunk_crcs():
+    """We have never checked CRCs and must not start: a stray bad checksum
+    is common in the wild and the pixels are usually perfectly fine."""
+    good = _png(2, 2, 8, 2, bytes(12))
+    _w, _h, rgba = imagecodec.decode(good[:-4] + b"\x00\x00\x00\x00")
+    assert len(rgba) == 2 * 2 * 4
+
+
+def test_decode_png_rejects_headers_it_cannot_honour():
+    _rejects(_png(2, 2, 8, 2, bytes(12), interlace=3),
+             "unknown interlace method should be rejected")
+    _rejects(_png(2, 2, 7, 2, bytes(12)), "bit depth 7 should be rejected")
+    header = struct.pack(">IIBBBBB", 2, 2, 8, 9, 0, 0, 0)
+    body = b"IHDR" + header
+    _rejects(b"\x89PNG\r\n\x1a\n" + struct.pack(">I", len(header)) + body
+             + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF),
+             "colour type 9 should be rejected")
+
+
+def test_decode_png_rejects_absurd_dimensions():
+    """Twenty million pixels is the cap, and a header is a claim rather
+    than a fact: a 65535x65535 IHDR must not become a 17-gigabyte buffer."""
+    _rejects(_png(0xFFFF, 0xFFFF, 8, 2, b""), "4G pixels should be rejected")
+    _rejects(_png(0, 0, 8, 2, b""), "a zero-area image should be rejected")
+    header = struct.pack(">IIBBBBB", 0x80000000, 4, 8, 2, 0, 0, 0)
+    body = b"IHDR" + header
+    _rejects(b"\x89PNG\r\n\x1a\n" + struct.pack(">I", len(header)) + body
+             + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF),
+             "a width past 2^31 should be rejected")
+
+
+def test_decode_png_rejects_undecodable_pixel_data():
+    _rejects(_png(2, 2, 8, 2, bytes(12), idat=b"junkjunkjunk"),
+             "an IDAT that is not deflate data should be rejected")
+    _rejects(_png(2, 2, 8, 2, bytes(12),
+                  idat=zlib.compress(bytes([9, 1, 2, 3, 4, 5, 6,
+                                            9, 1, 2, 3, 4, 5, 6]))),
+             "filter type 9 does not exist and should be rejected")
+
+
+def test_decode_png_inflate_is_bounded():
+    """A third of a megabyte on the wire that would expand past
+    MAX_INFLATED has to stop at the ceiling rather than eat the machine."""
+    packer = zlib.compressobj(9)
+    megabyte = b"\x00" * (1 << 20)
+    parts = [packer.compress(megabyte)
+             for _ in range((imagecodec.MAX_INFLATED >> 20) + 4)]
+    parts.append(packer.flush())
+    bomb = b"".join(parts)
+    assert len(bomb) < (1 << 20), "the bomb should be small on the wire"
+    _rejects(_png(64, 64, 8, 2, b"", idat=bomb),
+             "a zip bomb should be rejected, not decoded")
+
+
+def test_decode_gif_rejects_truncation():
+    good = _gif()
+    for cut in (0, 3, 6, 10, 13, 20, 26, 30):
+        _rejects(good[:cut], f"truncation at {cut} bytes should be rejected")
+
+
+def test_decode_gif_rejects_impossible_code_sizes():
+    """A GIF palette holds 256 colours at most, so an initial LZW code size
+    above 8 is a file asking us to size a table from a number it invented."""
+    for min_code in (9, 12, 200, 255):
+        raw = bytearray(_gif())
+        raw[raw.index(b"\x2C") + 10] = min_code
+        _rejects(bytes(raw),
+                 f"LZW code size {min_code} should be rejected")
+
+
+def test_decode_gif_rejects_absurd_geometry():
+    _rejects(b"GIF89a" + struct.pack("<HHBBB", 0xFFFF, 0xFFFF, 0, 0, 0)
+             + b"\x3B", "a 4G-pixel canvas should be rejected")
+    _rejects(b"GIF89a" + struct.pack("<HHBBB", 4, 4, 0, 0, 0) + b"\x3B",
+             "a GIF with no image block should be rejected")
+    _rejects(b"GIF89a" + struct.pack("<HHBBB", 2, 2, 0x80 | 0x01, 0, 0)
+             + bytes(12) + b"\x2C"
+             + struct.pack("<HHHHB", 60000, 60000, 2, 2, 0)
+             + bytes([2, 1]) + b"\x00\x00\x3B",
+             "a frame placed 60000 pixels off canvas should be rejected")
+
+
+def test_decode_pnm_rejects_malformed_headers():
+    _rejects(b"P6", "a header with nothing after it should be rejected")
+    _rejects(b"P6\n2 1\n", "a missing maxval should be rejected")
+    _rejects(b"P6\nx y\n255\n" + bytes(6), "junk dimensions are rejected")
+    _rejects(b"P6\n0 0\n255\n", "a zero-area image should be rejected")
+    _rejects(b"P6\n99999 99999\n255\n" + bytes(6),
+             "ten billion pixels should be rejected")
+    _rejects(b"P3\n2 1\n255\nred green blue\n", "junk samples are rejected")
+    _rejects(b"P9\n2 1\n255\n" + bytes(6), "P9 is not a Netpbm type")
+
+
+def test_decode_pnm_accepts_the_awkward_but_legal():
+    """Comments mid-header, 16-bit samples and bitmaps are all in the spec
+    and all three take a different path through the reader."""
+    _w, _h, rgba = imagecodec.decode(b"P6\n# who\n2 1\n# what\n255\n"
+                                     + bytes([1, 2, 3, 4, 5, 6]))
+    assert tuple(rgba[:4]) == (1, 2, 3, 255)
+    _w, _h, rgba = imagecodec.decode(b"P5\n2 1\n65535\n"
+                                     + bytes([255, 255, 0, 0]))
+    assert rgba[0] == 255 and rgba[4] == 0
+    _w, _h, rgba = imagecodec.decode(b"P4\n8 1\n" + bytes([0b10000000]))
+    assert rgba[0] == 0 and rgba[4] == 255, "in PBM a set bit is black"
+    _w, _h, rgba = imagecodec.decode(b"P6\n4 4\n255\n" + bytes(6))
+    assert len(rgba) == 4 * 4 * 4, "short pixel data is padded, not fatal"
+
+
+def test_decoders_survive_arbitrary_corruption():
+    """Flip bytes at random through each format and insist that the only
+    thing which ever comes back is a picture or an ImageError."""
+    import random
+
+    seeds = [_png(4, 3, 8, 2, bytes(36)),
+             _png(4, 2, 8, 3, bytes([0, 1, 2, 3, 0, 1, 2, 3]),
+                  palette=bytes(12)),
+             _png(2, 2, 16, 6, bytes(32)),
+             _gif(),
+             b"P6\n3 2\n255\n" + bytes(18),
+             b"P3\n2 2\n255\n1 2 3 4 5 6 7 8\n"]
+    rng = random.Random(20260813)
+    for _ in range(3000):
+        data = bytearray(rng.choice(seeds))
+        for _flip in range(rng.randint(1, 5)):
+            data[rng.randrange(len(data))] = rng.randrange(256)
+        if rng.random() < 0.3:
+            del data[rng.randrange(len(data)):]
+        try:
+            imagecodec.decode(bytes(data))
+        except imagecodec.ImageError:
+            pass
+        except Exception as exc:                 # noqa: BLE001
+            raise AssertionError(
+                f"{type(exc).__name__} escaped the decoder for "
+                f"{bytes(data)!r}: {exc}")
 
 
 # -- colours ---------------------------------------------------------------
