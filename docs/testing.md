@@ -86,9 +86,14 @@ NSWindows somewhere rather than only proving its skip is clean. Pillow and
 cairosvg stay optional: one job installs them to cover the JPEG/WebP/SVG
 branches, and every other job runs without them.
 
-Each of those jobs builds both engines and runs `test_js.py` twice, once
-against each, because the point of having two is that they answer the same
-questions. The Zig engine's own tests are a job of their own instead: they
-never cross into Python, so running them once says as much as running them
-on all eight interpreters would, which is the same reason the Rust and Go
-toolchains have a job each.
+The Linux jobs build both engines and run `test_js.py` twice, once against
+each, because the point of having two is that they answer the same questions.
+The macOS lines run the Rust engine only: Zig 0.14 on that runner image
+cannot find the SDK it needs to link against libSystem and fails before it
+compiles anything of ours. Locally `test.sh` builds both on macOS perfectly
+well, so this is a gap in CI rather than in the engine.
+
+The Zig engine's own tests are a job of their own. They never cross into
+Python, so running them once says as much as running them on all eight
+interpreters would, which is the same reason the Rust and Go toolchains have
+a job each.
