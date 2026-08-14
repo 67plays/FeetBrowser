@@ -268,7 +268,7 @@ def _handle_hub(url, browser):
 
 def _config_page(url, name, browser):
     """Render the config page for a toe, or apply a set action."""
-    # toehub://config/<name>[/set/<key>/<value>]
+    # toehub://config/<name>[/set/<key>?value=<v>]
     parts = [urllib.parse.unquote(p) for p in (url.path or "").split("/")
              if p]
     if not parts:
@@ -277,9 +277,15 @@ def _config_page(url, name, browser):
     ctx = _find_context(browser, toe_name)
     if ctx is None:
         return {}, _msg(f"<b>{toe_name}</b> is not installed."), "text/html"
-    if len(parts) >= 4 and parts[1] == "set":
-        key, value = parts[2], "/".join(parts[3:])
-        ctx.set_config(key, value)
+    if len(parts) >= 3 and parts[1] == "set":
+        key, _, query = parts[2].partition("?")
+        key = urllib.parse.unquote(key)
+        params = urllib.parse.parse_qs(query)
+        if "value" in params:
+            ctx.set_config(key, params["value"][0])
+        elif len(parts) >= 4:
+            # Backward-compatible path style: set/<key>/<value>
+            ctx.set_config(key, "/".join(parts[3:]))
     options = ctx.config_options()
     if not options:
         return {}, _config_page_html(toe_name, "<div class='box'>This toe "
@@ -307,21 +313,27 @@ def _config_page_html(name, body):
 
 def _config_option_html(name, key, opt, value):
     value_html = _esc(str(value))
-    control = ""
+    key_esc = _esc(key)
     if opt.kind == "bool":
         toggle = "0" if value else "1"
         label = "ON" if value else "OFF"
-        control = (f'<a href="toehub://config/{name}/set/{key}/{toggle}">'
-                   f'toggle to {label}</a>')
+        control = (f'<a href="toehub://config/{name}/set/{key_esc}'
+                   f'?value={toggle}">toggle to {label}</a>')
     elif opt.kind == "choice":
         choices = "".join(
-            f'<a href="toehub://config/{name}/set/{key}/'
-            f'{_url_escape(str(v))}">{_esc(l)}</a> '
+            f'<a href="toehub://config/{name}/set/{key_esc}'
+            f'?value={_url_escape(str(v))}">{_esc(l)}</a> '
             for v, l in opt.options)
         control = choices
     else:
-        control = (f'<a href="toehub://config/{name}/set/{key}/'
-                   f'__PLACEHOLDER__">set</a>')
+        # str / int: a real text input + submit button, prefilled with the
+        # current value. GET submits value as a query param.
+        control = (
+            f'<form action="toehub://config/{name}/set/{key_esc}" '
+            f'method="get">'
+            f'<input type="text" name="value" value="{value_html}" '
+            f'size="24">'
+            f' <input type="submit" value="save"></form>')
     help_html = f'<div class="dim">{_esc(opt.help)}</div>' if opt.help else ""
     return (f'<div class="box"><b>{_esc(opt.label)}</b> '
             f'<span class="v">= {value_html}</span><br>{control}'
