@@ -158,13 +158,24 @@ Copy-Item $Wheel $wheelCopy -Force
 Expand-Archive -Path $wheelCopy -DestinationPath $wheelTmp -Force
 Remove-Item -Force $wheelCopy
 
-# Everything at the top of the wheel that is not packaging metadata: the .pyd
-# and, if a future engine ever grows one, a DLL beside it.
-$payload = @(Get-ChildItem -Path $wheelTmp -File)
-if (-not ($payload | Where-Object { $_.Extension -eq '.pyd' })) {
-    Fail "$wheelName contains no .pyd at its root"
+# Everything in the wheel that is not packaging metadata, copied across with
+# its shape intact. Where maturin puts the extension module depends on the
+# project layout it infers -- a pure Rust crate gets a bare
+# feetbrowser_engine.cp3NN-win_amd64.pyd at the root of the wheel, a mixed
+# project gets a package directory with the .pyd inside it -- and this does
+# not care which, as long as there is exactly one engine .pyd somewhere and
+# it lands on sys.path in the same shape the wheel had it. dist-info is the
+# only thing dropped: it describes an installation we are not performing.
+$payload = @(Get-ChildItem -Path $wheelTmp -Force |
+    Where-Object { $_.Name -notlike '*.dist-info' -and $_.Name -notlike '*.data' })
+$engines = @(Get-ChildItem -Path $wheelTmp -Recurse -File -Filter 'feetbrowser_engine*.pyd')
+Write-Host "    wheel payload: $(($payload | ForEach-Object { $_.Name }) -join ', ')"
+if ($engines.Count -ne 1) {
+    $listing = (Get-ChildItem -Path $wheelTmp -Recurse -Force |
+        ForEach-Object { $_.FullName.Substring($wheelTmp.Length + 1) }) -join "`n      "
+    Fail "expected one feetbrowser_engine*.pyd in $wheelName, found $($engines.Count):`n      $listing"
 }
-foreach ($file in $payload) { Copy-Item $file.FullName $stage -Force }
+foreach ($item in $payload) { Copy-Item -Recurse -Force $item.FullName $stage }
 Remove-Item -Recurse -Force $wheelTmp
 
 # Copy first and clean after: Copy-Item's -Exclude only reaches the top level

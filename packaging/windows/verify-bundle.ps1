@@ -140,7 +140,11 @@ Check "the folder is complete" {
     # python3.dll forwarder as well and the count would never be one.
     $dll = @(Get-ChildItem -Path $Root -File | Where-Object { $_.Name -match '^python3\d+\.dll$' })
     if ($dll.Count -ne 1) { throw "expected one python3NN.dll, found $($dll.Count)" }
-    $pyd = @(Get-ChildItem -Path $Root -Filter 'feetbrowser_engine*.pyd')
+    # -Recurse because whether the engine sits at the top of the folder or in a
+    # package directory of its own is maturin's business, not ours. What matters
+    # is that there is exactly one of it and that importing it works, which the
+    # next checks do for real.
+    $pyd = @(Get-ChildItem -Path $Root -Recurse -File -Filter 'feetbrowser_engine*.pyd')
     if ($pyd.Count -ne 1) { throw "expected one feetbrowser_engine .pyd, found $($pyd.Count)" }
     Write-Host "   $($dll[0].Name), $($pyd[0].Name)"
 }

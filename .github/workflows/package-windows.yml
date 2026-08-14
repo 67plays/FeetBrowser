@@ -134,7 +134,8 @@ jobs:
           # characters at the end of a name, so 'python3??.dll' picks up the
           # python3.dll forwarder too.
           $cpython = @($files | Where-Object { $_.Name -match '^python3\d+\.dll$' })[0].Name
-          $engine = @($files | Where-Object { $_.Name -like 'feetbrowser_engine*.pyd' })[0].Name
+          $engine = @(Get-ChildItem -Recurse -File -Filter 'feetbrowser_engine*.pyd' `
+                      build/windows/FeetBrowser)[0].Name
           $lines = @(
             "| | |",
             "|-|-|",

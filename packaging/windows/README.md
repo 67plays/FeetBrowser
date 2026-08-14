@@ -50,6 +50,7 @@ FeetBrowser\
     FeetBrowser.exe            the launcher
     FeetBrowser._pth           sys.path
     python313.dll              CPython
+    python3.dll                the stable-ABI forwarder, unused but shipped
     python313.zip              its standard library
     python313._pth             sys.path again, under CPython's own name
     python.exe, pythonw.exe    CPython's interpreters, kept for debugging
