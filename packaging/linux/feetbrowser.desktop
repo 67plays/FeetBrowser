@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=FeetBrowser
+GenericName=Web Browser
+Comment=A web browser built from scratch
+Exec=AppRun %u
+TryExec=AppRun
+Icon=feetbrowser
+Terminal=false
+StartupNotify=true
+Categories=Network;WebBrowser;
+MimeType=x-scheme-handler/http;x-scheme-handler/https;text/html;
+Keywords=Internet;WWW;Browser;Web;Page;
