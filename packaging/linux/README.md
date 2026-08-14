@@ -32,8 +32,9 @@ the requirement. The desktop-file half of that idea is not lost: it is what
 this. It is a build tool in exactly the sense `cargo` and `maturin` already
 are: it runs in the build container, no user ever downloads it, and nothing it
 produces is a library the browser imports. The AppImage it emits is our
-directory tree, squashfs, and a ~180 KB runtime whose entire job is to mount
-that tree — no framework, no toolkit, nothing linked into the browser.
+directory tree, squashfs, and a ~920 KB statically linked runtime whose entire
+job is to mount that tree — no framework, no toolkit, nothing linked into the
+browser.
 
 `.deb` and `.rpm` are out of scope for this change. They are a different
 distribution model with a different set of promises (dependency resolution,
@@ -118,18 +119,21 @@ So: the host's X libraries, ours for everything the browser itself is made of.
 A machine with no libX11 gets the browser's existing sentence about there
 being no window available, and `--screenshot` still works there.
 
-**Wayland.** The browser has no Wayland backend, so it runs as an X11 client
-under XWayland. That is not an assumption about how Wayland compositors are
-configured in general — it is what was tested here, and it was tested the only
-way this environment allows: against `Xvfb`, which speaks the same X11 protocol
-XWayland does. GNOME, KDE Plasma and wlroots-based compositors all ship
-XWayland and start it on demand for exactly this case, so an X11 client with
-`$DISPLAY` set finds a server. What has **not** been verified in this change is
-a real session on a real Wayland compositor — no such session was available.
-If `$DISPLAY` is unset (a session running with XWayland disabled), the browser
-says there is no window available and `--screenshot` still works. Treat
-"works under Wayland via XWayland" as strongly expected and untested, not as
-measured.
+**Wayland.** The browser has no Wayland backend, so on a Wayland session it
+runs as an X11 client through **XWayland**. GNOME, KDE Plasma and
+wlroots-based compositors all ship XWayland and start it on demand for exactly
+this case, and it sets `$DISPLAY` for the clients that need it.
+
+Being exact about what that claim rests on: **no real Wayland session was
+available here, so this has not been tested on one.** What was tested is the
+X11 side of it — a genuine window on a genuine X server, with the pixels read
+back off it — using `Xvfb`, which speaks the X11 protocol XWayland speaks but
+is not XWayland. The expectation that XWayland carries this client is
+reasoning from what XWayland is for, not a measurement. Treat it as strongly
+expected and untested.
+
+If `$DISPLAY` is unset — a session with XWayland disabled — the browser says
+there is no window available, and `--screenshot` still works.
 
 ## Fonts
 
@@ -260,8 +264,8 @@ inside — the shape `wheels.yml` already uses.
 
 `.github/workflows/package-linux.yml` runs both on `workflow_dispatch`, on
 `v*` tags, and on pull requests that touch `packaging/linux/**`. It uploads
-the AppImage, the measured glibc floor, and the three verification
-screenshots, and attaches the AppImage to the release on a tag.
+the AppImage, the measured glibc floor, and the verification screenshots, and
+attaches the AppImage to the release on a tag.
 
 ## Minimum glibc
 
@@ -273,15 +277,28 @@ binaries is the oldest glibc that can start the bundle. The build prints it
 and writes it to `dist/glibc-floor.txt`:
 
 ```
-payload (NNN ELF files): glibc 2.28
-AppImage runtime: glibc 2.28
+payload (70 ELF files): glibc 2.28
+AppImage runtime: glibc none
 ```
+
+`none` is not a gap in the measurement: the AppImage runtime is statically
+linked, so it asks the dynamic loader for nothing at all and the floor is
+entirely the payload's.
 
 That is why the build happens in manylinux_2_28 and not on the CI runner: the
 same tree built on `ubuntu-latest` would demand that runner's glibc and refuse
 to start on RHEL 8, Debian 10 or anything else older, which is exactly the
 failure this whole arrangement exists to avoid. glibc 2.28 is Debian 10,
 RHEL/CentOS 8, Ubuntu 18.10 and every release of anything since.
+
+## Size
+
+**32 MB** downloaded; 111 MB once mounted. Roughly two thirds of that is
+CPython and its standard library, and most of the rest is the Rust extension
+and the seven font faces. The squashfs is zstd-compressed and the runtime
+mounts it, so the uncompressed figure is what the filesystem reports rather
+than disk a user has to find — except under `APPIMAGE_EXTRACT_AND_RUN`, which
+really does unpack it to a temporary directory.
 
 ## Architectures
 
