@@ -1,7 +1,14 @@
-//! Image decoders: PNG, GIF and the Netpbm family, decoded to raw RGBA.
+//! Image decoders: PNG, GIF, JPEG and the Netpbm family, decoded to raw RGBA.
 //!
-//! A straight port of what `imagecodec.py` did, byte for byte. The reason it
-//! is worth having in Rust is not only speed: this is the one part of the
+//! PNG, GIF and Netpbm are a straight port of what `imagecodec.py` did, byte
+//! for byte. JPEG was written here: baseline and progressive Huffman-coded
+//! frames, with an AAN inverse transform and libjpeg's triangle filter for
+//! the halved chroma channels. What it does not do -- arithmetic coding,
+//! CMYK, 12-bit samples, lossless and hierarchical modes -- it refuses,
+//! because a picture decoded wrong is worse than a picture not decoded.
+//!
+//! The reason all of it is worth having in Rust is not only speed: this is
+//! the one part of the
 //! renderer that parses bytes an arbitrary site handed us, and Python's
 //! bounds-checked indexing was doing real work for us there. Every read here
 //! goes through `at`/`slice`/`be16` and friends, which return an Option or a
@@ -118,6 +125,8 @@ pub fn decode_bytes(data: &[u8]) -> PyResult<(i64, i64, Vec<u8>)> {
         png(data)
     } else if signature_gif(data) {
         gif(data)
+    } else if signature_jpeg(data) {
+        jpeg(data)
     } else if signature_pnm(data) {
         pnm(data)
     } else {
@@ -150,6 +159,14 @@ pub fn py_decode_gif(py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<(i64, 
 }
 
 #[pyfunction]
+#[pyo3(name = "decode_jpeg")]
+pub fn py_decode_jpeg(py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<(i64, i64, Py<PyBytes>)> {
+    let buf = bytes_arg(data)?;
+    let (w, h, rgba) = jpeg(&buf)?;
+    Ok((w, h, PyBytes::new(py, &rgba).unbind()))
+}
+
+#[pyfunction]
 #[pyo3(name = "decode_pnm")]
 pub fn py_decode_pnm(py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<(i64, i64, Py<PyBytes>)> {
     let buf = bytes_arg(data)?;
@@ -161,7 +178,7 @@ pub fn py_decode_pnm(py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<(i64, 
 #[pyo3(name = "sniff")]
 pub fn py_sniff(data: &Bound<'_, PyAny>) -> PyResult<bool> {
     let buf = bytes_arg(data)?;
-    Ok(signature_png(&buf) || signature_gif(&buf) || signature_pnm(&buf))
+    Ok(signature_png(&buf) || signature_gif(&buf) || signature_jpeg(&buf) || signature_pnm(&buf))
 }
 
 // -- PNG -------------------------------------------------------------------
@@ -900,6 +917,1143 @@ fn trunc_to_byte(v: f64) -> i64 {
     } else {
         v.trunc() as i64
     }
+}
+
+// -- JPEG ------------------------------------------------------------------
+
+// Coefficients arrive in zig-zag order and have to be put back on the 8x8
+// grid before the transform sees them.
+const ZIGZAG: [usize; 64] = [
+    0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 32, 25, 18, 11, 4, 5, 12, 19, 26, 33, 40, 48, 41, 34, 27,
+    20, 13, 6, 7, 14, 21, 28, 35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37, 44, 51, 58,
+    59, 52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63,
+];
+
+// The inverse transform is the AAN factorisation, the one libjpeg's float
+// IDCT uses. It costs five multiplications per one-dimensional pass where a
+// matrix multiply costs sixty-four, and the constants it leaves behind fold
+// into the quantisation table -- which is why a table is scaled once, when it
+// is read, and never again.
+const AAN: [f64; 8] = [
+    1.0,
+    1.387_039_845,
+    1.306_562_965,
+    1.175_875_602,
+    1.0,
+    0.785_694_958,
+    0.541_196_100,
+    0.275_899_379,
+];
+
+/// The transform's own clamp, and the reason it is a mask rather than a
+/// bound. Valid data lands within a few hundred of the sample range, but
+/// corrupt data is not bounded at all; the offset of 2048 puts every
+/// plausible sample on the right value and the mask puts an implausible one
+/// on *some* value rather than saturating a whole block to black or white.
+/// libjpeg masks its range-limit table for the same reason.
+fn range_limit(v: f64) -> u8 {
+    ((trunc_to_byte(v) & 4095) - 2048).clamp(0, 255) as u8
+}
+
+fn signature_jpeg(data: &[u8]) -> bool {
+    data.len() >= 2 && data[0] == 0xFF && data[1] == 0xD8
+}
+
+/// Short input, which for a photograph off the network is ordinary rather
+/// than exceptional. Anything past the frame header decodes to as much of
+/// the picture as arrived; anything before it has nothing to draw.
+fn truncated() -> PyErr {
+    malformed("JPEG ended inside its headers")
+}
+
+/// One channel of the frame, and everything decoding it needs.
+struct Component {
+    cid: u8,
+    h: usize,
+    v: usize,
+    tq: usize,
+    /// Blocks across and down, padded out to whole MCUs.
+    bw: usize,
+    bh: usize,
+    /// Blocks that cover picture rather than padding, which is what a scan
+    /// carrying this component alone is counted in.
+    cols: usize,
+    rows: usize,
+    coefs: Vec<i32>,
+    plane: Vec<u8>,
+    stride: usize,
+    pred: i32,
+}
+
+/// The entropy-coded bits of one scan.
+///
+/// A scan is split at its restart markers and unstuffed before any of it is
+/// decoded, so this walks plain bytes and never has to watch for 0xFF --
+/// worth having, because reading a byte is the thing the decoder does most.
+/// Running off the end yields zero bits instead of failing, which is what
+/// makes a photograph whose download was cut short decode to as much of
+/// itself as arrived.
+struct Bits {
+    chunks: Vec<Vec<u8>>,
+    index: usize,
+    pos: usize,
+    /// At most 23 live bits, so the shift below cannot reach the top of the
+    /// word: a fill only runs while there are fewer than 16, and adds 8.
+    bits: u32,
+    nbits: u32,
+}
+
+impl Bits {
+    fn new(chunks: Vec<Vec<u8>>) -> Bits {
+        Bits { chunks, index: 0, pos: 0, bits: 0, nbits: 0 }
+    }
+
+    /// Continue with the bits after the next restart marker.
+    fn restart(&mut self) {
+        self.index += 1;
+        self.pos = 0;
+        self.bits = 0;
+        self.nbits = 0;
+    }
+
+    fn byte(&self) -> u32 {
+        match self.chunks.get(self.index) {
+            Some(chunk) => chunk.get(self.pos).copied().unwrap_or(0) as u32,
+            None => 0,
+        }
+    }
+
+    /// The next `count` bits, most significant first. `count` is never more
+    /// than 16, which every caller checks before it gets here.
+    fn take(&mut self, count: u32) -> u32 {
+        while self.nbits < count {
+            self.bits = (self.bits << 8) | self.byte();
+            self.pos += 1;
+            self.nbits += 8;
+        }
+        self.nbits -= count;
+        let out = self.bits >> self.nbits;
+        self.bits &= (1 << self.nbits) - 1;
+        out
+    }
+
+    /// One Huffman symbol, through the flat lookup built below.
+    fn huffman(&mut self, table: &[u16]) -> PyResult<u8> {
+        while self.nbits < 16 {
+            self.bits = (self.bits << 8) | self.byte();
+            self.pos += 1;
+            self.nbits += 8;
+        }
+        let entry = table[((self.bits >> (self.nbits - 16)) & 0xFFFF) as usize];
+        if entry == 0 {
+            return Err(bad("bad Huffman code in JPEG scan"));
+        }
+        self.nbits -= (entry >> 8) as u32;
+        self.bits &= (1 << self.nbits) - 1;
+        Ok((entry & 0xFF) as u8)
+    }
+}
+
+/// Expand a JPEG Huffman table into one flat lookup on 16 bits.
+///
+/// A code is at most 16 bits long, so a table indexed by the next 16 bits of
+/// the stream answers any of them in a single subscript. The obvious
+/// alternative -- walking the code lengths a bit at a time -- is the
+/// innermost loop in the decoder and runs millions of times per photograph,
+/// which is the difference between slow and unusable. Each entry is the code
+/// length in the high byte and the symbol in the low one, and a zero entry is
+/// a code the file never defined.
+fn build_huffman(counts: &[u8], symbols: &[u8]) -> PyResult<Vec<u16>> {
+    let mut table = vec![0u16; 65536];
+    let mut code: usize = 0;
+    let mut k = 0;
+    for length in 1..=16usize {
+        let span = 1usize << (16 - length);
+        for _ in 0..counts[length - 1] {
+            let symbol = match symbols.get(k) {
+                Some(s) => *s as u16,
+                None => return Err(bad("truncated JPEG Huffman table")),
+            };
+            let start = code * span;
+            if start + span > 65536 {
+                return Err(bad("over-long JPEG Huffman code"));
+            }
+            table[start..start + span].fill(((length as u16) << 8) | symbol);
+            code += 1;
+            k += 1;
+        }
+        code <<= 1;
+    }
+    Ok(table)
+}
+
+/// JPEG's sign convention: the low half of each magnitude class is negative,
+/// and the encoder wrote it with no sign bit.
+fn extend(value: u32, count: u32) -> i32 {
+    let value = value as i32;
+    if value < 1 << (count - 1) {
+        value - (1 << count) + 1
+    } else {
+        value
+    }
+}
+
+/// A magnitude class wide enough to be a table the file never meant. Twelve
+/// bits is the most a legal 8-bit frame uses; the check exists because a
+/// hostile table can name any of 256 symbols and the bit reader would be
+/// asked for a shift the machine does not have.
+fn magnitude(size: u8) -> PyResult<u32> {
+    if size > 16 {
+        return Err(bad(format!("bad JPEG magnitude category {}", size)));
+    }
+    Ok(size as u32)
+}
+
+/// Index of the code byte of the next marker at or after `pos`.
+fn next_marker(data: &[u8], mut pos: usize) -> PyResult<usize> {
+    let end = data.len();
+    while pos < end && data[pos] != 0xFF {
+        pos += 1;
+    }
+    while pos < end && data[pos] == 0xFF {
+        pos += 1; // a run of 0xFF bytes is legal fill before the code
+    }
+    if pos >= end {
+        return Err(bad("JPEG ended in the middle of a marker"));
+    }
+    Ok(pos)
+}
+
+/// Split a scan's entropy-coded bytes at its restart markers.
+///
+/// Returns the chunks, each already unstuffed, and the offset of whatever
+/// marker ended the scan. Within a chunk every 0xFF is followed by a 0x00 the
+/// encoder inserted, so undoing that is one pass.
+fn scan_chunks(data: &[u8], pos: usize) -> (Vec<Vec<u8>>, usize) {
+    fn unstuff(run: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(run.len());
+        let mut i = 0;
+        while i < run.len() {
+            out.push(run[i]);
+            i += if run[i] == 0xFF && run.get(i + 1) == Some(&0x00) { 2 } else { 1 };
+        }
+        out
+    }
+
+    let mut chunks = Vec::new();
+    let end = data.len();
+    let mut start = pos;
+    let mut i = pos;
+    let mut stopped = false;
+    while i + 1 < end {
+        if data[i] != 0xFF {
+            i += 1;
+        } else if data[i + 1] == 0x00 {
+            i += 2;
+        } else if data[i + 1] == 0xFF {
+            i += 1;
+        } else if (0xD0..=0xD7).contains(&data[i + 1]) {
+            chunks.push(unstuff(&data[start..i]));
+            i += 2;
+            start = i;
+        } else {
+            stopped = true;
+            break;
+        }
+    }
+    if !stopped {
+        i = end;
+    }
+    chunks.push(unstuff(slice(data, start, i)));
+    (chunks, i)
+}
+
+fn read_quant(seg: &[u8], quant: &mut [Option<Vec<f64>>; 4]) -> PyResult<()> {
+    let mut pos = 0;
+    while pos + 64 <= seg.len() {
+        let precision = seg[pos] >> 4;
+        let index = (seg[pos] & 15) as usize;
+        pos += 1;
+        if index > 3 {
+            return Err(bad(format!("bad JPEG quantisation table index {}", index)));
+        }
+        let mut table = vec![0.0f64; 64];
+        for i in 0..64 {
+            let value = if precision != 0 {
+                let v = be16(seg, pos).ok_or_else(truncated)? as f64;
+                pos += 2;
+                v
+            } else {
+                let v = at(seg, pos).ok_or_else(truncated)? as f64;
+                pos += 1;
+                v
+            };
+            // Scaled here, once, so the transform multiplies straight
+            // through: dequantisation and the AAN's constants are one step.
+            let z = ZIGZAG[i];
+            table[z] = value * AAN[z >> 3] * AAN[z & 7] / 8.0;
+        }
+        quant[index] = Some(table);
+    }
+    Ok(())
+}
+
+fn read_huffman(
+    seg: &[u8],
+    dc_tables: &mut [Option<Vec<u16>>; 4],
+    ac_tables: &mut [Option<Vec<u16>>; 4],
+) -> PyResult<()> {
+    let mut pos = 0;
+    while pos + 17 <= seg.len() {
+        let table_class = seg[pos] >> 4;
+        let index = (seg[pos] & 15) as usize;
+        let counts = &seg[pos + 1..pos + 17];
+        let total: usize = counts.iter().map(|c| *c as usize).sum();
+        let symbols = slice(seg, pos + 17, pos + 17 + total);
+        pos += 17 + total;
+        if index > 3 || table_class > 1 {
+            return Err(bad(format!(
+                "bad JPEG Huffman table id {}/{}",
+                table_class, index
+            )));
+        }
+        let table = build_huffman(counts, symbols)?;
+        if table_class != 0 {
+            ac_tables[index] = Some(table);
+        } else {
+            dc_tables[index] = Some(table);
+        }
+    }
+    Ok(())
+}
+
+/// The SOF segment: what the picture is, before any of it is decoded.
+fn read_frame(seg: &[u8]) -> PyResult<(i64, i64, Vec<Component>)> {
+    let precision = at(seg, 0).ok_or_else(truncated)?;
+    let count = at(seg, 5).ok_or_else(truncated)? as usize;
+    let height = be16(seg, 1).ok_or_else(truncated)? as i64;
+    let width = be16(seg, 3).ok_or_else(truncated)? as i64;
+    if precision != 8 {
+        return Err(bad(format!(
+            "unsupported JPEG sample precision {}",
+            precision
+        )));
+    }
+    if count != 1 && count != 3 {
+        // Four components is CMYK or YCCK, which needs Adobe's inverted-ink
+        // convention on top of everything here; two is not a thing.
+        return Err(bad(format!("unsupported JPEG with {} components", count)));
+    }
+    if height == 0 {
+        // The height is allowed to arrive in a DNL marker after the scan.
+        // Almost nothing writes one, and guessing is worse than saying so.
+        return Err(bad("JPEG does not declare its height"));
+    }
+    check_size(width, height)?;
+    let mut comps = Vec::with_capacity(count);
+    for i in 0..count {
+        let cid = at(seg, 6 + 3 * i).ok_or_else(truncated)?;
+        let sampling = at(seg, 7 + 3 * i).ok_or_else(truncated)?;
+        let tq = at(seg, 8 + 3 * i).ok_or_else(truncated)? as usize;
+        let (h, v) = ((sampling >> 4) as usize, (sampling & 15) as usize);
+        if !(1..=4).contains(&h) || !(1..=4).contains(&v) {
+            return Err(bad(format!("bad JPEG sampling factors {}x{}", h, v)));
+        }
+        if tq > 3 {
+            return Err(bad(format!("bad JPEG quantisation table index {}", tq)));
+        }
+        comps.push(Component {
+            cid,
+            h,
+            v,
+            tq,
+            bw: 0,
+            bh: 0,
+            cols: 0,
+            rows: 0,
+            coefs: Vec::new(),
+            plane: Vec::new(),
+            stride: 0,
+            pred: 0,
+        });
+    }
+    Ok((width, height, comps))
+}
+
+fn ceil_div(value: usize, divisor: usize) -> usize {
+    value / divisor + usize::from(value % divisor != 0)
+}
+
+/// Give every component its block grid and somewhere to decode into.
+///
+/// The grid is padded out to whole MCUs, because that is how the encoder
+/// wrote it; the padding lies outside the picture and is never read back.
+fn plan(width: usize, height: usize, comps: &mut [Component]) -> PyResult<(usize, usize, usize, usize)> {
+    let hmax = comps.iter().map(|c| c.h).max().unwrap_or(1);
+    let vmax = comps.iter().map(|c| c.v).max().unwrap_or(1);
+    let mcux = ceil_div(width, 8 * hmax);
+    let mcuy = ceil_div(height, 8 * vmax);
+    for comp in comps.iter_mut() {
+        comp.bw = mcux * comp.h;
+        comp.bh = mcuy * comp.v;
+        comp.cols = ceil_div(ceil_div(width * comp.h, hmax), 8);
+        comp.rows = ceil_div(ceil_div(height * comp.v, vmax), 8);
+        // Bounded by the picture area a component covers, which check_size
+        // has already capped, but the multiplication is done in checked
+        // arithmetic because the sampling factors come off the network.
+        let cells = comp
+            .bw
+            .checked_mul(comp.bh)
+            .and_then(|n| n.checked_mul(64))
+            .ok_or_else(|| bad("JPEG block grid is too large"))?;
+        comp.coefs = vec![0i32; cells];
+    }
+    Ok((hmax, vmax, mcux, mcuy))
+}
+
+/// Which component of the frame this entry of a scan header names, and the
+/// tables it decodes that component with.
+struct ScanComp {
+    ci: usize,
+    dc: usize,
+    ac: usize,
+}
+
+/// The SOS segment: which components this scan carries, which tables it
+/// decodes them with, and which coefficients it is bringing.
+fn read_scan_header(
+    seg: &[u8],
+    comps: &[Component],
+    progressive: bool,
+) -> PyResult<(Vec<ScanComp>, usize, usize, u32, u32)> {
+    let count = at(seg, 0).ok_or_else(truncated)? as usize;
+    let mut scan = Vec::with_capacity(count);
+    for i in 0..count {
+        let cid = at(seg, 1 + 2 * i).ok_or_else(truncated)?;
+        let tables = at(seg, 2 + 2 * i).ok_or_else(truncated)?;
+        let ci = match comps.iter().position(|c| c.cid == cid) {
+            Some(ci) => ci,
+            None => {
+                return Err(bad(format!(
+                    "JPEG scan names component {}, which the frame does not have",
+                    cid
+                )))
+            }
+        };
+        scan.push(ScanComp { ci, dc: (tables >> 4) as usize, ac: (tables & 15) as usize });
+    }
+    let (mut ss, mut se) = (
+        at(seg, 1 + 2 * count).ok_or_else(truncated)? as usize,
+        at(seg, 2 + 2 * count).ok_or_else(truncated)? as usize,
+    );
+    let approx = at(seg, 3 + 2 * count).ok_or_else(truncated)?;
+    let (mut ah, mut al) = ((approx >> 4) as u32, (approx & 15) as u32);
+    if !progressive {
+        ss = 0;
+        se = 63;
+        ah = 0;
+        al = 0;
+    }
+    if ss > se || se > 63 {
+        return Err(bad(format!(
+            "bad JPEG spectral selection {}..{}",
+            ss, se
+        )));
+    }
+    if al > 13 {
+        // A shift wider than the coefficients are is a corrupt header, not a
+        // picture; the arithmetic below would be undefined rather than wrong.
+        return Err(bad(format!("bad JPEG successive approximation {}", al)));
+    }
+    Ok((scan, ss, se, ah, al))
+}
+
+/// A Huffman table a scan header named, which the file has to have sent.
+fn table<'a>(tables: &'a [Option<Vec<u16>>; 4], index: usize) -> PyResult<&'a [u16]> {
+    tables
+        .get(index)
+        .and_then(|t| t.as_deref())
+        .ok_or_else(|| bad("JPEG scan wants a Huffman table that is not in the file"))
+}
+
+/// A whole sequential scan: every coefficient of every block it covers.
+fn decode_sequential(
+    bits: &mut Bits,
+    scan: &[ScanComp],
+    comps: &mut [Component],
+    dc_tables: &[Option<Vec<u16>>; 4],
+    ac_tables: &[Option<Vec<u16>>; 4],
+    restart: usize,
+    mcux: usize,
+    mcuy: usize,
+) -> PyResult<()> {
+    if scan.len() == 1 {
+        let (ci, dct, act) = (scan[0].ci, table(dc_tables, scan[0].dc)?, table(ac_tables, scan[0].ac)?);
+        let (rows, cols, bw) = (comps[ci].rows, comps[ci].cols, comps[ci].bw);
+        for row in 0..rows {
+            for col in 0..cols {
+                let unit = row * cols + col;
+                if restart != 0 && unit != 0 && unit % restart == 0 {
+                    bits.restart();
+                    comps[ci].pred = 0;
+                }
+                decode_block(bits, &mut comps[ci], dct, act, (row * bw + col) * 64)?;
+            }
+        }
+        return Ok(());
+    }
+    for unit in 0..mcux * mcuy {
+        if restart != 0 && unit != 0 && unit % restart == 0 {
+            bits.restart();
+            for entry in scan {
+                comps[entry.ci].pred = 0;
+            }
+        }
+        let (my, mx) = (unit / mcux, unit % mcux);
+        for entry in scan {
+            let (dct, act) = (table(dc_tables, entry.dc)?, table(ac_tables, entry.ac)?);
+            let comp = &mut comps[entry.ci];
+            let (h, v, bw) = (comp.h, comp.v, comp.bw);
+            for by in 0..v {
+                let row = my * v + by;
+                for bx in 0..h {
+                    decode_block(bits, comp, dct, act, (row * bw + mx * h + bx) * 64)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One 8x8 block: a DC difference, then runs of AC coefficients.
+fn decode_block(
+    bits: &mut Bits,
+    comp: &mut Component,
+    dc_table: &[u16],
+    ac_table: &[u16],
+    base: usize,
+) -> PyResult<()> {
+    let size = magnitude(bits.huffman(dc_table)?)?;
+    if size != 0 {
+        comp.pred = comp.pred.wrapping_add(extend(bits.take(size), size));
+    }
+    comp.coefs[base] = comp.pred;
+    let mut k = 1usize;
+    while k < 64 {
+        let rs = bits.huffman(ac_table)?;
+        let size = (rs & 15) as u32;
+        if size == 0 {
+            if rs != 0xF0 {
+                break; // end of block
+            }
+            k += 16; // sixteen zeroes and no coefficient
+            continue;
+        }
+        k += (rs >> 4) as usize;
+        if k > 63 {
+            break;
+        }
+        comp.coefs[base + ZIGZAG[k]] = extend(bits.take(size), size);
+        k += 1;
+    }
+    Ok(())
+}
+
+/// One progressive scan.
+///
+/// A progressive file sends the same coefficients over several scans: a band
+/// at a time (spectral selection, `ss` to `se`) and the high bits before the
+/// low ones (successive approximation, down to bit `al`). Every scan lands in
+/// the same coefficient array and nothing is drawn until all of them have
+/// been read, so this is progressive decoding without progressive display.
+#[allow(clippy::too_many_arguments)]
+fn decode_progressive(
+    bits: &mut Bits,
+    scan: &[ScanComp],
+    comps: &mut [Component],
+    dc_tables: &[Option<Vec<u16>>; 4],
+    ac_tables: &[Option<Vec<u16>>; 4],
+    restart: usize,
+    mcux: usize,
+    mcuy: usize,
+    ss: usize,
+    se: usize,
+    ah: u32,
+    al: u32,
+) -> PyResult<()> {
+    let mut eobrun: u32 = 0; // the end-of-band run, which carries across blocks
+    if ss == 0 && scan.len() > 1 {
+        for unit in 0..mcux * mcuy {
+            if restart != 0 && unit != 0 && unit % restart == 0 {
+                bits.restart();
+                for entry in scan {
+                    comps[entry.ci].pred = 0;
+                }
+            }
+            let (my, mx) = (unit / mcux, unit % mcux);
+            for entry in scan {
+                let comp = &mut comps[entry.ci];
+                let (h, v, bw) = (comp.h, comp.v, comp.bw);
+                for by in 0..v {
+                    let row = my * v + by;
+                    for bx in 0..h {
+                        let base = (row * bw + mx * h + bx) * 64;
+                        if ah != 0 {
+                            dc_refine(bits, comp, base, al);
+                        } else {
+                            dc_first(bits, comp, table(dc_tables, entry.dc)?, base, al)?;
+                        }
+                    }
+                }
+            }
+        }
+        return Ok(());
+    }
+    // Everything else is one component, counted in that component's blocks.
+    let entry = &scan[0];
+    let comp = &mut comps[entry.ci];
+    let (rows, cols, bw) = (comp.rows, comp.cols, comp.bw);
+    for row in 0..rows {
+        for col in 0..cols {
+            let unit = row * cols + col;
+            if restart != 0 && unit != 0 && unit % restart == 0 {
+                bits.restart();
+                eobrun = 0;
+                comp.pred = 0;
+            }
+            let base = (row * bw + col) * 64;
+            if ss == 0 {
+                if ah != 0 {
+                    dc_refine(bits, comp, base, al);
+                } else {
+                    dc_first(bits, comp, table(dc_tables, entry.dc)?, base, al)?;
+                }
+            } else if ah != 0 {
+                ac_refine(bits, comp, table(ac_tables, entry.ac)?, base, ss, se, al, &mut eobrun)?;
+            } else {
+                ac_first(bits, comp, table(ac_tables, entry.ac)?, base, ss, se, al, &mut eobrun)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A DC refinement carries one raw bit per block and no Huffman code.
+fn dc_refine(bits: &mut Bits, comp: &mut Component, base: usize, al: u32) {
+    if bits.take(1) != 0 {
+        comp.coefs[base] |= 1 << al;
+    }
+}
+
+fn dc_first(
+    bits: &mut Bits,
+    comp: &mut Component,
+    dc_table: &[u16],
+    base: usize,
+    al: u32,
+) -> PyResult<()> {
+    let size = magnitude(bits.huffman(dc_table)?)?;
+    if size != 0 {
+        comp.pred = comp.pred.wrapping_add(extend(bits.take(size), size));
+    }
+    comp.coefs[base] = comp.pred.wrapping_shl(al);
+    Ok(())
+}
+
+/// The first pass over a band: the same runs a sequential scan uses, plus an
+/// end-of-band run that can skip whole blocks at a time.
+#[allow(clippy::too_many_arguments)]
+fn ac_first(
+    bits: &mut Bits,
+    comp: &mut Component,
+    ac_table: &[u16],
+    base: usize,
+    ss: usize,
+    se: usize,
+    al: u32,
+    eobrun: &mut u32,
+) -> PyResult<()> {
+    if *eobrun != 0 {
+        *eobrun -= 1;
+        return Ok(());
+    }
+    let mut k = ss;
+    while k <= se {
+        let rs = bits.huffman(ac_table)?;
+        let (run, size) = ((rs >> 4) as usize, (rs & 15) as u32);
+        if size == 0 {
+            if run != 15 {
+                *eobrun = (1 << run) - 1;
+                if run != 0 {
+                    *eobrun += bits.take(run as u32);
+                }
+                return Ok(());
+            }
+            k += 16;
+            continue;
+        }
+        k += run;
+        if k > se {
+            return Ok(());
+        }
+        comp.coefs[base + ZIGZAG[k]] = extend(bits.take(size), size) << al;
+        k += 1;
+    }
+    Ok(())
+}
+
+/// The correction pass over a band, which is the fiddly one.
+///
+/// Coefficients that are already nonzero take one bit each, in stream order,
+/// saying whether they gain this pass's bit; the runs between them are
+/// counted only over coefficients that are still zero, and a coefficient that
+/// arrives in a refinement pass can only ever be plus or minus one bit.
+#[allow(clippy::too_many_arguments)]
+fn ac_refine(
+    bits: &mut Bits,
+    comp: &mut Component,
+    ac_table: &[u16],
+    base: usize,
+    ss: usize,
+    se: usize,
+    al: u32,
+    eobrun: &mut u32,
+) -> PyResult<()> {
+    let plus = 1i32 << al;
+    let minus = -1i32 << al;
+    let mut k = ss;
+    if *eobrun == 0 {
+        while k <= se {
+            let rs = bits.huffman(ac_table)?;
+            let (mut run, size) = ((rs >> 4) as i32, (rs & 15) as u32);
+            let mut value = 0i32;
+            if size == 0 {
+                if run != 15 {
+                    // The current block is part of this run and its remaining
+                    // coefficients still take correction bits, so the run is
+                    // counted down at the bottom rather than here.
+                    *eobrun = 1 << run;
+                    if run != 0 {
+                        *eobrun += bits.take(run as u32);
+                    }
+                    break;
+                }
+            } else {
+                value = if bits.take(1) != 0 { plus } else { minus };
+            }
+            while k <= se {
+                let index = base + ZIGZAG[k];
+                let coef = comp.coefs[index];
+                if coef != 0 {
+                    if bits.take(1) != 0 && coef & plus == 0 {
+                        comp.coefs[index] = coef + if coef > 0 { plus } else { minus };
+                    }
+                } else {
+                    run -= 1;
+                    if run < 0 {
+                        break;
+                    }
+                }
+                k += 1;
+            }
+            if value != 0 && k <= se {
+                comp.coefs[base + ZIGZAG[k]] = value;
+            }
+            k += 1;
+        }
+    }
+    if *eobrun != 0 {
+        while k <= se {
+            let index = base + ZIGZAG[k];
+            let coef = comp.coefs[index];
+            if coef != 0 && bits.take(1) != 0 && coef & plus == 0 {
+                comp.coefs[index] = coef + if coef > 0 { plus } else { minus };
+            }
+            k += 1;
+        }
+        *eobrun -= 1;
+    }
+    Ok(())
+}
+
+/// Dequantise and transform every block of one component.
+///
+/// What comes out is that component's samples, a byte each, on the grid
+/// padded to whole blocks; the colour conversion reads only the part of it
+/// the picture covers.
+fn idct_plane(comp: &mut Component, quant: &[f64]) {
+    const SQRT2: f64 = 1.414_213_562;
+    let stride = comp.bw * 8;
+    let mut plane = vec![0u8; stride * comp.bh * 8];
+    let mut work = [0.0f64; 64];
+    for by in 0..comp.bh {
+        let top = by * 8 * stride;
+        for bx in 0..comp.bw {
+            let base = (by * comp.bw + bx) * 64;
+            let block = &comp.coefs[base..base + 64];
+            if block[1..].iter().all(|c| *c == 0) {
+                // A flat block is the common case in any photograph's sky or
+                // shadow, and it needs no transform at all.
+                let value = range_limit(block[0] as f64 * quant[0] + 2176.5);
+                let mut row = top + bx * 8;
+                for _ in 0..8 {
+                    plane[row..row + 8].fill(value);
+                    row += stride;
+                }
+                continue;
+            }
+
+            // Columns first, into the workspace, then rows out of it.
+            for i in 0..8 {
+                if block[i + 8] == 0
+                    && block[i + 16] == 0
+                    && block[i + 24] == 0
+                    && block[i + 32] == 0
+                    && block[i + 40] == 0
+                    && block[i + 48] == 0
+                    && block[i + 56] == 0
+                {
+                    let value = block[i] as f64 * quant[i];
+                    for j in 0..8 {
+                        work[i + j * 8] = value;
+                    }
+                    continue;
+                }
+                let t0 = block[i] as f64 * quant[i];
+                let t1 = block[i + 16] as f64 * quant[i + 16];
+                let t2 = block[i + 32] as f64 * quant[i + 32];
+                let t3 = block[i + 48] as f64 * quant[i + 48];
+                let t10 = t0 + t2;
+                let t11 = t0 - t2;
+                let t13 = t1 + t3;
+                let t12 = (t1 - t3) * SQRT2 - t13;
+                let (t0, t3) = (t10 + t13, t10 - t13);
+                let (t1, t2) = (t11 + t12, t11 - t12);
+                let t4 = block[i + 8] as f64 * quant[i + 8];
+                let t5 = block[i + 24] as f64 * quant[i + 24];
+                let t6 = block[i + 40] as f64 * quant[i + 40];
+                let t7 = block[i + 56] as f64 * quant[i + 56];
+                let z13 = t6 + t5;
+                let z10 = t6 - t5;
+                let z11 = t4 + t7;
+                let z12 = t4 - t7;
+                let t7 = z11 + z13;
+                let t11 = (z11 - z13) * SQRT2;
+                let z5 = (z10 + z12) * 1.847_759_065;
+                let t10 = 1.082_392_200 * z12 - z5;
+                let t12 = -2.613_125_930 * z10 + z5;
+                let t6 = t12 - t7;
+                let t5 = t11 - t6;
+                let t4 = t10 + t5;
+                work[i] = t0 + t7;
+                work[i + 56] = t0 - t7;
+                work[i + 8] = t1 + t6;
+                work[i + 48] = t1 - t6;
+                work[i + 16] = t2 + t5;
+                work[i + 40] = t2 - t5;
+                work[i + 32] = t3 + t4;
+                work[i + 24] = t3 - t4;
+            }
+
+            let mut out = top + bx * 8;
+            for i in (0..64).step_by(8) {
+                let t0 = work[i];
+                let t1 = work[i + 2];
+                let t2 = work[i + 4];
+                let t3 = work[i + 6];
+                let t10 = t0 + t2;
+                let t11 = t0 - t2;
+                let t13 = t1 + t3;
+                let t12 = (t1 - t3) * SQRT2 - t13;
+                let (t0, t3) = (t10 + t13, t10 - t13);
+                let (t1, t2) = (t11 + t12, t11 - t12);
+                let t4 = work[i + 1];
+                let t5 = work[i + 3];
+                let t6 = work[i + 5];
+                let t7 = work[i + 7];
+                let z13 = t6 + t5;
+                let z10 = t6 - t5;
+                let z11 = t4 + t7;
+                let z12 = t4 - t7;
+                let t7 = z11 + z13;
+                let t11 = (z11 - z13) * SQRT2;
+                let z5 = (z10 + z12) * 1.847_759_065;
+                let t10 = 1.082_392_200 * z12 - z5;
+                let t12 = -2.613_125_930 * z10 + z5;
+                let t6 = t12 - t7;
+                let t5 = t11 - t6;
+                let t4 = t10 + t5;
+                plane[out] = range_limit(t0 + t7 + 2176.5);
+                plane[out + 7] = range_limit(t0 - t7 + 2176.5);
+                plane[out + 1] = range_limit(t1 + t6 + 2176.5);
+                plane[out + 6] = range_limit(t1 - t6 + 2176.5);
+                plane[out + 2] = range_limit(t2 + t5 + 2176.5);
+                plane[out + 5] = range_limit(t2 - t5 + 2176.5);
+                plane[out + 4] = range_limit(t3 + t4 + 2176.5);
+                plane[out + 3] = range_limit(t3 - t4 + 2176.5);
+                out += stride;
+            }
+        }
+    }
+    comp.plane = plane;
+    comp.stride = stride;
+    comp.coefs = Vec::new(); // the coefficients are spent, and they are large
+}
+
+/// How one component's samples are stretched back to the picture's size.
+enum Upsample {
+    /// Not subsampled: the row is already the right length.
+    Full,
+    /// Any sampling factor that is not a plain halving. libjpeg does not
+    /// filter those either, and they are rare enough on the web that the
+    /// difference has never been worth measuring.
+    Nearest { xmap: Vec<usize>, v: usize, vmax: usize },
+    /// Halved across, and possibly down as well.
+    Triangle { halved: bool, cols: usize, rows: usize },
+}
+
+fn upsample_for(comp: &Component, width: usize, height: usize, hmax: usize, vmax: usize) -> Upsample {
+    if comp.h == hmax && comp.v == vmax {
+        Upsample::Full
+    } else if comp.h * 2 != hmax || (comp.v != vmax && comp.v * 2 != vmax) {
+        Upsample::Nearest {
+            xmap: (0..width).map(|x| x * comp.h / hmax).collect(),
+            v: comp.v,
+            vmax,
+        }
+    } else {
+        Upsample::Triangle {
+            halved: comp.v != vmax,
+            cols: ceil_div(width * comp.h, hmax),
+            rows: ceil_div(height * comp.v, vmax),
+        }
+    }
+}
+
+/// Write one full-width row of one component's samples.
+///
+/// A component halved in either direction is put back with the triangle
+/// filter: the sample nearer the output pixel counts three times and the one
+/// on the far side once. Replicating the sample instead is cheaper and
+/// visibly wrong -- measured over seventy-seven photographs off the web it
+/// moves a channel by as much as 87 levels away from what libjpeg produces,
+/// on the saturated edges where the eye reads it as a coloured fringe.
+///
+/// The rounding is deliberately lopsided, and libjpeg leans the two patterns
+/// opposite ways: when only the columns were halved the left of each output
+/// pair rounds down and the right rounds up, and when both were halved it is
+/// the other way about. Copying one bias to both costs an extra level on a
+/// quarter of the pixels, so each pattern keeps the constants it was written
+/// with.
+fn upsample_row(comp: &Component, mode: &Upsample, y: usize, out: &mut [u8], col: &mut Vec<u32>) {
+    let (plane, stride) = (&comp.plane, comp.stride);
+    match mode {
+        Upsample::Full => {
+            let row = y * stride;
+            out.copy_from_slice(&plane[row..row + out.len()]);
+        }
+        Upsample::Nearest { xmap, v, vmax } => {
+            let row = (y * v / vmax) * stride;
+            for (d, x) in out.iter_mut().zip(xmap) {
+                *d = plane[row + x];
+            }
+        }
+        Upsample::Triangle { halved, cols, rows } => {
+            let (cols, rows) = (*cols, *rows);
+            let near = if *halved { y / 2 } else { y }.min(rows - 1);
+            // At the top and bottom edges, and whenever only the columns were
+            // halved, the far row is the near one and the sum below comes to
+            // four times the sample -- which is the scale the horizontal pass
+            // wants either way, so neither case needs a branch of its own.
+            let far = if *halved {
+                if y & 1 == 1 { (near + 1).min(rows - 1) } else { near.saturating_sub(1) }
+            } else {
+                near
+            };
+            let this = &plane[near * stride..near * stride + cols];
+            let other = &plane[far * stride..far * stride + cols];
+            col.clear();
+            col.extend(this.iter().zip(other).map(|(a, b)| 3 * *a as u32 + *b as u32));
+            let (roundl, roundr) = if *halved { (8u32, 7u32) } else { (4u32, 8u32) };
+            for i in 0..cols {
+                let middle = 3 * col[i];
+                let left = (middle + col[i.saturating_sub(1)] + roundl) >> 4;
+                let right = (middle + col[(i + 1).min(cols - 1)] + roundr) >> 4;
+                if let Some(d) = out.get_mut(i * 2) {
+                    *d = left as u8;
+                }
+                if let Some(d) = out.get_mut(i * 2 + 1) {
+                    *d = right as u8;
+                }
+            }
+        }
+    }
+}
+
+/// Upsample the subsampled channels and convert to RGBA.
+fn jpeg_to_rgba(
+    width: usize,
+    height: usize,
+    comps: &[Component],
+    hmax: usize,
+    vmax: usize,
+    ycbcr: bool,
+) -> Vec<u8> {
+    let mut rgba = vec![0u8; width * height * 4];
+    let modes: Vec<Upsample> =
+        comps.iter().map(|c| upsample_for(c, width, height, hmax, vmax)).collect();
+    let mut rows: Vec<Vec<u8>> = comps.iter().map(|_| vec![0u8; width]).collect();
+    let mut scratch: Vec<Vec<u32>> = comps.iter().map(|_| Vec::new()).collect();
+
+    for y in 0..height {
+        for (i, comp) in comps.iter().enumerate() {
+            upsample_row(comp, &modes[i], y, &mut rows[i], &mut scratch[i]);
+        }
+        let mut d = y * width * 4;
+        if comps.len() == 1 {
+            for x in 0..width {
+                let grey = rows[0][x];
+                rgba[d] = grey;
+                rgba[d + 1] = grey;
+                rgba[d + 2] = grey;
+                rgba[d + 3] = 255;
+                d += 4;
+            }
+            continue;
+        }
+        for x in 0..width {
+            if ycbcr {
+                let luma = rows[0][x] as i32;
+                let cb = rows[1][x] as i32 - 128;
+                let cr = rows[2][x] as i32 - 128;
+                rgba[d] = (luma + ((91881 * cr + 32768) >> 16)).clamp(0, 255) as u8;
+                rgba[d + 1] =
+                    (luma + ((-22554 * cb - 46802 * cr + 32768) >> 16)).clamp(0, 255) as u8;
+                rgba[d + 2] = (luma + ((116130 * cb + 32768) >> 16)).clamp(0, 255) as u8;
+            } else {
+                // An Adobe file with transform 0, or one whose components are
+                // labelled R, G and B: the samples are already RGB.
+                rgba[d] = rows[0][x];
+                rgba[d + 1] = rows[1][x];
+                rgba[d + 2] = rows[2][x];
+            }
+            rgba[d + 3] = 255;
+            d += 4;
+        }
+    }
+    rgba
+}
+
+/// Decode a Huffman-coded baseline, extended-sequential or progressive JPEG.
+/// Every other member of the family fails rather than guessing.
+fn jpeg(data: &[u8]) -> PyResult<(i64, i64, Vec<u8>)> {
+    if !signature_jpeg(data) {
+        return Err(bad("not a JPEG"));
+    }
+    let mut quant: [Option<Vec<f64>>; 4] = [None, None, None, None];
+    let mut dc_tables: [Option<Vec<u16>>; 4] = [None, None, None, None];
+    let mut ac_tables: [Option<Vec<u16>>; 4] = [None, None, None, None];
+    let mut comps: Option<Vec<Component>> = None;
+    let (mut width, mut height) = (0i64, 0i64);
+    let (mut hmax, mut vmax, mut mcux, mut mcuy) = (1usize, 1usize, 1usize, 1usize);
+    let mut progressive = false;
+    let mut restart = 0usize;
+    let mut transform: Option<u8> = None;
+    let mut pos = 2usize;
+    while pos < data.len() {
+        pos = next_marker(data, pos)?;
+        let marker = data[pos];
+        pos += 1;
+        if marker == 0xD9 {
+            break; // end of image
+        }
+        if marker == 0x01 || (0xD0..=0xD7).contains(&marker) {
+            continue; // no payload of their own
+        }
+        let length = match be16(data, pos) {
+            Some(length) => length as usize,
+            None => break,
+        };
+        let seg = slice(data, pos + 2, pos + length);
+        let mut end = pos + length;
+        match marker {
+            0xDB => read_quant(seg, &mut quant)?,
+            0xC4 => read_huffman(seg, &mut dc_tables, &mut ac_tables)?,
+            0xDD => restart = be16(seg, 0).ok_or_else(truncated)? as usize,
+            0xEE if seg.starts_with(b"Adobe") => transform = at(seg, 11),
+            0xC0 | 0xC1 | 0xC2 => {
+                progressive = marker == 0xC2;
+                let (w, h, mut planned) = read_frame(seg)?;
+                let (a, b, c, d) = plan(w as usize, h as usize, &mut planned)?;
+                width = w;
+                height = h;
+                hmax = a;
+                vmax = b;
+                mcux = c;
+                mcuy = d;
+                comps = Some(planned);
+            }
+            0xCC => return Err(bad("arithmetic-coded JPEG is not supported")),
+            0xC0..=0xCF if marker != 0xC8 => {
+                return Err(bad(format!(
+                    "unsupported JPEG mode (SOF{})",
+                    marker - 0xC0
+                )))
+            }
+            0xDA => {
+                let comps = match comps.as_mut() {
+                    Some(comps) => comps,
+                    None => return Err(bad("JPEG scan before its frame header")),
+                };
+                let (scan, ss, se, ah, al) = read_scan_header(seg, comps, progressive)?;
+                if scan.is_empty() {
+                    return Err(bad("JPEG scan carries no components"));
+                }
+                let (chunks, next) = scan_chunks(data, end);
+                end = next;
+                let mut bits = Bits::new(chunks);
+                for entry in &scan {
+                    comps[entry.ci].pred = 0;
+                }
+                if progressive {
+                    decode_progressive(
+                        &mut bits, &scan, comps, &dc_tables, &ac_tables, restart, mcux, mcuy,
+                        ss, se, ah, al,
+                    )?;
+                } else {
+                    decode_sequential(
+                        &mut bits, &scan, comps, &dc_tables, &ac_tables, restart, mcux, mcuy,
+                    )?;
+                }
+            }
+            _ => {}
+        }
+        pos = end;
+    }
+    let mut comps = match comps {
+        Some(comps) => comps,
+        None => return Err(bad("JPEG has no frame header")),
+    };
+
+    for comp in comps.iter_mut() {
+        let table = match quant[comp.tq].clone() {
+            Some(table) => table,
+            None => {
+                return Err(bad(format!(
+                    "JPEG component wants quantisation table {}, which is not in the file",
+                    comp.tq
+                )))
+            }
+        };
+        idct_plane(comp, &table);
+    }
+    // Three components are YCbCr unless the file says otherwise: Adobe's
+    // marker with transform 0, or components labelled R, G and B.
+    let ycbcr = comps.len() == 3
+        && transform != Some(0)
+        && comps.iter().map(|c| c.cid).collect::<Vec<u8>>() != vec![b'R', b'G', b'B'];
+    let rgba = jpeg_to_rgba(width as usize, height as usize, &comps, hmax, vmax, ycbcr);
+    Ok((width, height, rgba))
 }
 
 // -- resampling ------------------------------------------------------------

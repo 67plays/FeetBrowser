@@ -59,6 +59,32 @@ preset solid-color palettes only — there's no custom color editor, and page
 colors aren't themed (only the browser chrome and the built-in pages). These
 are natural next milestones — the architecture has clean seams for each.
 
+## Images
+
+Four formats decode: PNG, GIF, JPEG and Netpbm. Nothing else does, and an
+image we cannot read draws as its `alt` text rather than as an error or a
+blank space. The decoders are ours, so this list does not change with what is
+installed on the machine — it is the same on a fresh checkout as on a
+workstation with every graphics library on it.
+
+WebP is the loss that shows. It used to decode when Pillow happened to be
+present, and Google in particular serves a great deal of it, so pages that
+looked complete on some machines now show alt text on all of them. That is
+deliberate: the alternative was a browser whose rendering depended on
+somebody else's `pip install`. BMP, ICO and TIFF go the same way and are
+rarely missed.
+
+SVG does not render, and there is no plan for it to. A partial SVG renderer
+draws wrong pictures rather than no picture, and a wrong picture is worse
+than a placeholder because it looks like it worked;
+`docs/dependencies.md` sets out the full argument and the line count.
+
+Within JPEG the modes that are refused rather than approximated are
+arithmetic coding, CMYK and YCCK, 12-bit samples, and the lossless and
+hierarchical frame types. Progressive JPEG does decode. EXIF orientation is
+ignored, so a photograph that relies on it appears rotated. Animated GIFs
+show their first frame and do not move.
+
 ## The JavaScript engine
 
 There are two, and `FEETBROWSER_JS` picks between them: `rust` (the default)

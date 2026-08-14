@@ -682,20 +682,27 @@ def test_wide_netpbm_samples_scale_to_maxval():
     eq(full[0], 255, "maxval is white")
 
 
-def test_webp_image_decode():
-    """WebP (used heavily by Google) must decode to a PhotoImage when Pillow
-    is available, instead of staying a placeholder."""
-    import io
-    try:
-        from PIL import Image as PILImage
-    except ImportError:
-        return  # Pillow is optional
-    im = PILImage.new("RGBA", (4, 4), (0, 0, 255, 255))
-    buf = io.BytesIO()
-    im.save(buf, format="WEBP")
-    photo = Tab._decode_image(buf.getvalue(), "image/webp")
-    assert photo is not None, "WebP should decode"
-    eq((photo.width(), photo.height()), (4, 4), "WebP dimensions preserved")
+def test_what_an_img_tag_decodes_and_what_it_does_not():
+    """WebP decoded here when Pillow happened to be installed, and does not
+    decode at all now. That is a real loss on Google's pages, written down in
+    docs/limitations.md rather than hidden, and what matters is the shape of
+    the failure: an image we cannot read comes back as None so the layout
+    draws its alt text, and never as an exception out of a decoder.
+
+    The content type is not consulted on the way in, because servers get it
+    wrong often enough that believing it costs more pictures than ignoring it
+    does."""
+    photo = Tab._decode_image(_fixture("photo.jpg"), "image/jpeg")
+    assert photo is not None, "a JPEG has to decode"
+    eq((photo.width(), photo.height()), (320, 224), "JPEG dimensions")
+    mislabelled = Tab._decode_image(_fixture("photo.jpg"), "image/png")
+    assert mislabelled is not None, "a mislabelled JPEG still has to decode"
+    eq((mislabelled.width(), mislabelled.height()), (320, 224))
+    eq(Tab._decode_image(b"RIFF\x24\x00\x00\x00WEBPVP8 " + b"\x00" * 24,
+                         "image/webp"), None, "WebP is alt text now")
+    eq(Tab._decode_image(b"<svg xmlns='http://www.w3.org/2000/svg'/>",
+                         "image/svg+xml"), None, "SVG is alt text now")
+    eq(Tab._decode_image(b"", "image/png"), None, "no bytes at all")
 
 
 def test_float_text_wraps_and_clears():
@@ -3162,6 +3169,272 @@ def test_an_untouched_select_submits_its_fallback_choice():
     act = tab.click(cx, cy)
     fields = urllib.parse.parse_qsl(act.payload, keep_blank_values=True)
     eq(fields, [("size", "M")], "the first choosable option, not the disabled one")
+
+
+def _fixture(name):
+    """The bytes of a file in tests/fixtures."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "fixtures", name)
+    with open(path, "rb") as handle:
+        return handle.read()
+
+
+def test_jpeg_photograph_decodes():
+    """A photograph, decoded by us and nobody else.
+
+    tests/fixtures/photo.jpg is a crop of NASA/JPL-Caltech PIA22228, which is
+    in the public domain, taken exactly as the server sent it: baseline,
+    Huffman coded, 4:2:0, which is the shape of very nearly every photograph
+    on the web. The colours below are libjpeg's own answers, and one of them
+    sits on a chroma edge where replicating a chroma sample instead of
+    filtering it lands 46 levels away -- so this notices a decoder that has
+    become merely close, which a size check never would.
+    """
+    from feetbrowser import imagecodec
+    width, height, rgba = imagecodec.decode(_fixture("photo.jpg"))
+    eq((width, height), (320, 224), "photo.jpg size")
+    eq(len(rgba), 320 * 224 * 4, "four bytes a pixel")
+    eq(rgba[3::4].count(255), 320 * 224, "a JPEG carries no transparency")
+    for (x, y), colour in (((0, 0), (195, 153, 113)),
+                           ((319, 223), (167, 108, 66)),
+                           ((19, 191), (85, 53, 28)),
+                           ((64, 113), (156, 124, 73))):
+        at = (y * width + x) * 4
+        eq(tuple(rgba[at:at + 3]), colour, "pixel (%d,%d)" % (x, y))
+
+
+def test_jpeg_progressive_and_restarts_are_the_same_picture():
+    """Two rearrangements of the baseline fixture, both made by jpegtran,
+    which moves coefficients between scans without changing any of them. All
+    three files are therefore the same photograph and have to decode to
+    identical bytes: nothing about spectral selection, successive
+    approximation, end-of-band runs or restart intervals is allowed to move a
+    single sample. Restart markers are worth their own file because they are
+    the one thing in the entropy decoder that a picture without them never
+    exercises -- and the bit reader is where they go wrong."""
+    from feetbrowser import imagecodec
+    width, height, base = imagecodec.decode(_fixture("photo.jpg"))
+    for name in ("photo-progressive.jpg", "photo-restart.jpg"):
+        other_width, other_height, other = imagecodec.decode(_fixture(name))
+        eq((other_width, other_height), (width, height), "%s size" % name)
+        differing = sum(1 for i in range(len(base)) if base[i] != other[i])
+        assert not differing, (
+            "%d of %d bytes of %s differ from the baseline coding of the "
+            "same photograph" % (differing, len(base), name))
+
+
+def test_jpeg_greyscale_and_horizontal_subsampling():
+    """Two more codings of the same photograph. One component instead of
+    three has no chroma to put back and must come out with equal channels;
+    4:2:2 halves the chroma across but not down, and goes through the
+    horizontal half of the filter alone -- where libjpeg rounds the left and
+    right of each output pair in opposite directions. Re-encoding moves the
+    picture about a level, so anything much beyond that is the filter."""
+    from feetbrowser import imagecodec
+    _w, _h, base = imagecodec.decode(_fixture("photo.jpg"))
+    width, height, grey = imagecodec.decode(_fixture("photo-grey.jpg"))
+    eq((width, height), (320, 224), "greyscale size")
+    coloured = sum(1 for i in range(0, len(grey), 4)
+                   if not grey[i] == grey[i + 1] == grey[i + 2])
+    assert not coloured, "%d greyscale pixels came out coloured" % coloured
+    width, height, half = imagecodec.decode(_fixture("photo-422.jpg"))
+    eq((width, height), (320, 224), "4:2:2 size")
+    off = sum(abs(base[i] - half[i])
+              for i in range(len(base)) if i % 4 != 3) / (width * height * 3)
+    assert off < 3.0, (
+        "the 4:2:2 coding is %.2f levels a channel from the 4:2:0 one, which "
+        "is more than re-encoding explains" % off)
+
+
+def test_a_cut_off_jpeg_decodes_as_far_as_it_arrived():
+    """A connection that drops mid-photograph is ordinary, and the half that
+    arrived is worth drawing -- which is what every other browser does. So a
+    truncated scan is not an error: the bit reader runs out and hands back
+    zeroes, the rest of the picture comes out flat, and the top of it is
+    still exactly what the whole file decodes to."""
+    from feetbrowser import imagecodec
+    whole = _fixture("photo.jpg")
+    width, height, full = imagecodec.decode(whole)
+    _w, _h, part = imagecodec.decode(whole[:len(whole) // 2])
+    eq((_w, _h), (width, height), "the header said how big it is")
+    rows = sum(1 for y in range(height)
+               if full[y * width * 4:(y + 1) * width * 4]
+               == part[y * width * 4:(y + 1) * width * 4])
+    assert rows > height // 3, (
+        "only %d of %d rows survived half the file" % (rows, height))
+
+
+def test_jpeg_unsupported_modes_raise_image_error():
+    """The JPEG family is much larger than the part of it the web uses, and
+    what is not implemented has to say so. The alternative -- running
+    arithmetic-coded coefficients through a Huffman decoder, say -- is a
+    picture made of noise, presented as though it were the page's."""
+    from feetbrowser import imagecodec
+    good = bytearray(_fixture("photo.jpg"))
+    frame = 2
+    while good[frame + 1] != 0xC0:      # walk the segments to the frame header
+        frame += 2 + ((good[frame + 2] << 8) | good[frame + 3])
+    cases = {"arithmetic coding": (frame + 1, 0xC9),
+             "lossless": (frame + 1, 0xC3),
+             "hierarchical": (frame + 1, 0xC5),
+             "12-bit samples": (frame + 4, 12),
+             "four components": (frame + 9, 4)}
+    for name, (at, value) in cases.items():
+        broken = bytearray(good)
+        broken[at] = value
+        try:
+            imagecodec.decode(bytes(broken))
+        except imagecodec.ImageError:
+            continue
+        except Exception as exc:  # noqa: BLE001 - that is the point
+            raise AssertionError("%s raised %r, not ImageError" % (name, exc))
+        raise AssertionError("%s decoded instead of being refused" % name)
+
+
+def _one_block_jpeg(coefs, quant):
+    """A whole JPEG file carrying a single 8x8 greyscale block.
+
+    Written here so the transform below can be handed coefficients chosen to
+    catch it out, which no photograph off the web can be made to contain.
+    Both Huffman tables are picked to make the coding trivial rather than
+    short: sixteen four-bit DC codes and 255 eight-bit AC ones, assigned in
+    order, so the canonical code for a symbol is the symbol's own value and
+    writing one is writing four or eight bits.
+    """
+    zigzag = [0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 32, 25, 18, 11, 4, 5,
+              12, 19, 26, 33, 40, 48, 41, 34, 27, 20, 13, 6, 7, 14, 21, 28,
+              35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37, 44, 51,
+              58, 59, 52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63]
+    out = []
+    pending = [0, 0]  # bits so far, how many of them
+
+    def put(value, count):
+        pending[0] = (pending[0] << count) | (value & ((1 << count) - 1))
+        pending[1] += count
+        while pending[1] >= 8:
+            pending[1] -= 8
+            byte = (pending[0] >> pending[1]) & 0xFF
+            out.append(byte)
+            if byte == 0xFF:
+                out.append(0x00)  # the stuffing every decoder has to undo
+
+    def magnitude(value):
+        size = abs(value).bit_length()
+        return size, (value if value > 0 else value + (1 << size) - 1)
+
+    size, bits = magnitude(coefs[0])
+    put(size, 4)
+    if size:
+        put(bits, size)
+    run = 0
+    for k in range(1, 64):
+        value = coefs[zigzag[k]]
+        if not value:
+            run += 1
+            continue
+        while run > 15:
+            put(0xF0, 8)   # sixteen zeroes and no coefficient
+            run -= 16
+        size, bits = magnitude(value)
+        put((run << 4) | size, 8)
+        put(bits, size)
+        run = 0
+    if run:
+        put(0x00, 8)       # end of block
+    if pending[1]:
+        put((1 << (8 - pending[1])) - 1, 8 - pending[1])
+
+    def segment(marker, body):
+        return bytes([0xFF, marker]) + bytes([(len(body) + 2) >> 8,
+                                              (len(body) + 2) & 0xFF]) + body
+
+    return b"".join([
+        b"\xff\xd8",
+        segment(0xDB, bytes([0]) + bytes(quant[z] for z in zigzag)),
+        segment(0xC0, bytes([8, 0, 8, 0, 8, 1, 1, 0x11, 0])),
+        segment(0xC4, bytes([0x00] + [0] * 3 + [16] + [0] * 12
+                            + list(range(16)))),
+        segment(0xC4, bytes([0x10] + [0] * 7 + [255] + [0] * 8
+                            + list(range(255)))),
+        segment(0xDA, bytes([1, 1, 0x00, 0, 63, 0])),
+        bytes(out),
+        b"\xff\xd9"])
+
+
+def test_jpeg_transform_matches_the_textbook_one():
+    """The inverse transform is the AAN factorisation, which reaches the
+    definition's answer by a much shorter route -- five multiplications a
+    pass rather than sixty-four. Fast and wrong looks exactly like fast, so
+    it is held against the definition, on coefficients quantised the way an
+    encoder would have quantised them. That range is the only one where the
+    comparison means anything: on coefficients no encoder could emit, both
+    transforms run thousands of levels outside the sample range, where the
+    only thing left answering is the clamp.
+
+    Three shapes, because the transform takes a shortcut on two of them: a
+    block whose AC coefficients are all zero is a flat colour and skips the
+    transform entirely, a block with zeroed columns skips those columns, and
+    a block with nothing zero in it takes the long way through.
+    """
+    import math
+    import random
+    from feetbrowser import imagecodec
+    cosine = [[math.cos((2 * x + 1) * u * math.pi / 16)
+               * (math.sqrt(0.5) if u == 0 else 1.0)
+               for u in range(8)] for x in range(8)]
+
+    def forward(samples, quant):
+        """What an encoder would have written for these samples."""
+        cols = [[sum((samples[y * 8 + x] - 128) * cosine[x][u]
+                     for x in range(8)) / 2.0 for u in range(8)]
+                for y in range(8)]
+        return [int(round(sum(cols[y][u] * cosine[y][v] for y in range(8))
+                          / 2.0 / quant[v * 8 + u]))
+                for v in range(8) for u in range(8)]
+
+    def textbook(coefs, quant):
+        """The transform as its definition states it: a double sum."""
+        f = [coefs[i] * quant[i] for i in range(64)]
+        rows = [[sum(f[v * 8 + u] * cosine[x][u] for u in range(8)) / 2.0
+                 for x in range(8)] for v in range(8)]
+        return [min(255, max(0, int(round(
+            sum(rows[v][x] * cosine[y][v] for v in range(8)) / 2.0 + 128))))
+            for y in range(8) for x in range(8)]
+
+    random.seed(20260814)
+    worst = 0
+    for case in range(60):
+        quant = [random.choice([1, 2, 3, 4, 6, 10, 16, 25, 40, 99])
+                 for _ in range(64)]
+        samples = [random.randrange(256) for _ in range(64)]
+        if case % 3 == 1:
+            samples = [samples[0]] * 64            # flat: DC and nothing else
+        coefs = forward(samples, quant)
+        if case % 3 == 2:
+            for u in range(0, 8, 2):               # empty every other column
+                for v in range(8):
+                    coefs[v * 8 + u] = 0
+        width, height, rgba = imagecodec.decode(_one_block_jpeg(coefs, quant))
+        eq((width, height), (8, 8), "the hand-built file is one block")
+        ours = list(rgba[0::4])
+        worst = max(worst, max(abs(a - b)
+                               for a, b in zip(ours, textbook(coefs, quant))))
+    assert worst <= 1, (
+        "the fast transform is %d levels from the definition" % worst)
+
+
+def test_images_do_not_reach_for_a_third_party_library():
+    """Pillow decoded JPEG here and cairosvg rasterised SVG. Nothing does
+    now, and this is the assertion that says so: on the one CI job that
+    installs both, an import added back by reflex fails the suite instead of
+    passing quietly. Everywhere else neither is installed and this costs
+    nothing to run."""
+    from feetbrowser import imagecodec
+    imagecodec.decode(_fixture("photo.jpg"))
+    Tab._decode_image(_fixture("photo.jpg"), "image/jpeg")
+    for module in ("PIL", "PIL.Image", "cairosvg"):
+        assert module not in sys.modules, \
+            "%s was imported on the way to decoding an image" % module
 
 
 def main():

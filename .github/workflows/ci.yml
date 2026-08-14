@@ -281,12 +281,16 @@ jobs:
       - name: Go tests
         run: go test ./...
 
-  # Pillow and cairosvg are optional and stay optional: the browser decodes
-  # PNG, GIF and PNM itself and only reaches for them for JPEG, WebP and SVG.
-  # Every job above runs with neither installed, which is what proves the
-  # browser still works without them. This one installs both so the branches
-  # behind them are executed at least once.
-  optional-image-libraries:
+  # This job used to install Pillow and cairosvg so the JPEG, WebP and SVG
+  # branches behind them ran at least once. There are no such branches now:
+  # JPEG is decoded here and the rest draw as alt text. Every job above runs
+  # without the two libraries and would keep passing if an import of one crept
+  # back in, because on those runners it would fail and be swallowed by the
+  # same try/except that used to be the point. So the job is inverted. It
+  # installs both, making an accidental import succeed, and then insists the
+  # suite runs without either module ever appearing in sys.modules. It is the
+  # only place that can tell "we do not need them" from "they are not here".
+  unused-image-libraries:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -295,13 +299,16 @@ jobs:
           python-version: '3.12'
           extras: Pillow cairosvg
 
-      - name: Unit tests with Pillow and cairosvg present
+      - name: Confirm both libraries are importable on this runner
+        run: $PY -c "import PIL.Image, cairosvg"
+
+      - name: Unit tests, which assert neither is reached for
         run: $PY tests/test_units.py
 
-      - name: Renderer tests with Pillow and cairosvg present
+      - name: Renderer tests with both installed
         run: $PY tests/test_render.py
 
-      - name: End-to-end pixels with Pillow and cairosvg present
+      - name: End-to-end pixels, which assert the same after a real page load
         run: $PY tests/test_e2e.py
 
   # The only job that leaves the machine. Its two suites run against fixtures

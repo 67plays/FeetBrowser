@@ -22,11 +22,11 @@ if [ "${FEETBROWSER_JS:-rust}" != "zig" ]; then
   # misbehaves in ways that look like page bugs rather than build problems,
   # so sources newer than the engine count the same as no engine at all.
   # Unseal a venv made before the line below grew --system-site-packages. A
-  # default venv cannot see the system's site-packages, which is where the
-  # optional image decoders live, and a venv is only ever created once -- so
-  # without this the fix reaches fresh checkouts and nobody who already hit
-  # the bug. Re-running venv over an existing directory rewrites pyvenv.cfg
-  # and leaves everything installed in it exactly where it was.
+  # default venv cannot see the system's site-packages, which is where an
+  # optional package like curl_cffi lives, and a venv is only ever created
+  # once -- so without this the fix reaches fresh checkouts and nobody who
+  # already hit the bug. Re-running venv over an existing directory rewrites
+  # pyvenv.cfg and leaves everything installed in it exactly where it was.
   if [ -f .venv/pyvenv.cfg ] &&
      grep -qi '^include-system-site-packages *= *false' .venv/pyvenv.cfg; then
     python3 -m venv --system-site-packages .venv
@@ -89,10 +89,10 @@ would go wrong in ways that look like the page's fault, so it gets rebuilt.
 REBUILDING
     fi
     # --system-site-packages, because the venv exists to hold one compiled
-    # extension and must not hide anything else. JPEG and SVG decoding are
-    # optional and come from Pillow and cairosvg if the machine has them; a
-    # sealed venv silently takes them away, and the symptom is a page whose
-    # photographs are all "[img]".
+    # extension and must not hide anything else. Images no longer need this --
+    # every format we draw is decoded in that extension -- but net.py will use
+    # curl_cffi for the impersonating fetch when the machine has it, and a
+    # sealed venv silently takes that away.
     python3 -m venv --system-site-packages .venv
     .venv/bin/pip install -q maturin
     if ! .venv/bin/maturin develop --release --manifest-path rust/Cargo.toml; then

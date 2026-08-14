@@ -114,9 +114,16 @@ documentation and checked by reading.
 CI runs the offline suite on every interpreter the engine supports (3.9
 through 3.14) and on macOS and Windows as well as Linux, so `test_cocoa.py`
 and `test_win32.py` open real windows somewhere rather than only proving
-their skips are clean. Pillow and cairosvg stay optional: one job installs
-them to cover the JPEG/WebP/SVG branches, and every other job runs without
-them.
+their skips are clean.
+
+One job, `unused-image-libraries`, exists to be the negative. Every other job
+runs on a machine with no Pillow and no cairosvg, which means an import of
+either would fail there and prove nothing — a browser that cannot reach for a
+library and a browser that does not are indistinguishable when the library is
+absent. So that job installs both, checks they really are importable, and runs
+the suites; `test_units.py` and `test_e2e.py` both assert afterwards that
+neither module reached `sys.modules`, the second of them after fetching and
+drawing a page with a photograph on it.
 
 The Linux jobs build both engines and run `test_js.py` twice, once against
 each, because the point of having two is that they answer the same questions.
