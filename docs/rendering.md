@@ -329,16 +329,68 @@ error and returns. As on macOS there is one event queue per *connection*, so
 a module-level registry maps each window id back to its Python window and the
 root's loop feeds any popups.
 
+## win32.py — the same window, a different operating system
+
+Win32 is a plain C API, so ctypes is enough again: load `user32`, `gdi32` and
+`kernel32`, declare the signatures, call the functions. No pywin32. The
+signatures are as non-optional here as they are on macOS and for the same
+reason — a missing `restype` truncates a 64-bit `HWND` to a handle that
+belongs to nobody.
+
+Presenting costs one conversion, which is the one thing this backend does
+that Cocoa's does not. A device-independent bitmap is BGR rather than RGB,
+and its rows run bottom-up unless the height in the header is negative, so
+the framebuffer cannot go to GDI untouched. It is converted to 32-bit BGRX
+and pushed with `StretchDIBits` under a negative `biHeight`. **32bpp rather
+than 24bpp is deliberate:** DIB rows are padded to a four-byte boundary, so a
+24-bit frame whose width is not a multiple of four needs per-row padding and
+smears diagonally down the window if you forget, while at 32bpp the stride is
+always `width * 4` and the frame is one buffer with no row loop at all. The
+conversion is three strided slice assignments, which run in C.
+
+Per-monitor-v2 DPI awareness is set before the first window opens, falling
+back through `SetProcessDpiAwareness` and `SetProcessDPIAware` on older
+systems. Without it Windows renders the whole browser at 96 DPI and has the
+compositor scale the result, which is a blurry browser on any display made
+this decade. What it does *not* do is scale the page: one CSS pixel is one
+device pixel, so text on a 200% display is sharp and small.
+
+Input is where the two backends differ most, because Windows splits a
+keypress in two. `WM_KEYDOWN` carries a virtual key code and `WM_CHAR`
+carries the character the user's keyboard layout produced, so named keys and
+anything held under Control or Alt are resolved from the virtual key — under
+Control the character message carries a control code, `0x0C` rather than
+`l` — and everything else waits for `WM_CHAR`, which is the only thing that
+knows about the layout. A character outside the basic plane arrives as two
+`WM_CHAR`s, one surrogate each. Modifiers are read from `GetKeyState` rather
+than tracked, which keeps them right when the window loses focus with a key
+held. The wheel is the one mouse message carrying *screen* coordinates.
+
+There is one message queue per *thread*, so as on macOS a module-level
+registry maps each `HWND` back to its Python window and one shared window
+procedure routes each message to whichever window it belongs to. The
+procedure itself is stored on the module, not on a window: a ctypes callback
+that gets collected leaves Windows calling into freed memory.
+
+Everything above that is arithmetic or a lookup table — the stride, the
+colour conversion, the wheel scaling, both keysym tables — is a plain
+module-level function, so the part that can only run on Windows is as small
+as it can be made. Those functions are tested from `tests/test_units.py` on
+whatever platform the suite is running on.
+
 `gui.py` picks all of this up, and this is now all it does. `window.Tk()` is
 always the headless root, so tests and `--screenshot` never open anything, and
 only `gui.new_window()` asks for a real one. Backends declare themselves in
-one table and answer `available()` for themselves, so Cocoa is tried and then
-X11 and the first that can run wins. `FEETBROWSER_DISPLAY=x11` or `=cocoa`
-demands one by name and fails loudly rather than falling back to a headless
-root that renders a black screenshot; `FEETBROWSER_DISPLAY=none` forces
-headless even where a window is possible. With no `$DISPLAY`, or an X server
-that will not answer, the browser says which of those it was and renders
-headless instead of raising.
+one table and answer `available()` for themselves, so Cocoa is tried, then
+Win32, then X11, and the first that can run wins — the order only matters
+between Cocoa and X11, since macOS is the one system that can offer both and
+XQuartz there is a deliberate choice rather than a default.
+`FEETBROWSER_DISPLAY=x11`, `=cocoa` or `=win32` demands one by name and fails
+loudly rather than falling back to a headless root that renders a black
+screenshot; `FEETBROWSER_DISPLAY=none` forces headless even where a window is
+possible. With no display — no `$DISPLAY`, an X server that will not answer,
+or a platform with no backend at all — the browser says which of those it was
+and renders headless instead of raising.
 
 ## Testing it
 
@@ -348,9 +400,17 @@ coverage, nonzero winding, the glyph cache, PNG round-tripping, every PNG
 filter type, Adam7, hand-built GIF LZW, JPEG against corrupted photographs,
 scene-graph ordering and tag deletion, and the timer and binding model.
 
+The platform windows get their own suites, each of which opens real windows on
+its own operating system and skips with a message everywhere else:
+`tests/test_cocoa.py` on macOS and `tests/test_win32.py` on Windows. The
+Win32 one blits through real GDI into a memory bitmap and reads the pixels
+back, because red and blue swapping places or the rows coming out upside down
+are exactly the mistakes a DIB lets you make quietly. CI runs both jobs.
+
 The end-to-end check is a screenshot: `python3 -m feetbrowser --screenshot
 <url> out.png` runs the real browser — chrome, tabs, toolbar, page, scrollbar —
-settles the image loads, and writes a PNG. CI does this on every push.
+settles the image loads, and writes a PNG. CI does this on every push, on both
+platforms it can run on.
 
 It is also the check that made moving this layer into Rust safe to do. A
 rewrite of a rasteriser is only correct if it produces the same bytes, so the

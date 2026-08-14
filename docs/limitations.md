@@ -10,6 +10,49 @@ manage extensions ("toes") from the built-in ToeHub — install, uninstall,
 enable, and disable them without a restart — and restyle the whole browser
 with **Shoes** color themes (`about:shoes`, or `Ctrl+Shift+S`).
 
+**Runs on:** macOS, Linux and Windows, with a real window of its own on each
+(`cocoa.py`, `x11.py` and `win32.py`, all ctypes and no toolkit), and
+anywhere at all headless — `--screenshot` and the whole test suite need no
+display. X11 covers Wayland desktops through XWayland; a native Wayland
+backend is not written. On a platform with none of the three,
+`gui.platform_root()` finds nothing and you get the headless root, so the
+browser runs but does not open.
+
+**Needs building:** the JavaScript engine is a Rust extension
+(`feetbrowser_engine`), and there is no Python fallback, so a Rust toolchain
+is a hard prerequisite on every platform. `run.sh` and `run.cmd` build it
+into a local `.venv` on first run. Windows needs a second install that the
+other two platforms do not: rustup selects the MSVC toolchain but does not
+provide the linker it calls, and Windows ships no linker of its own, so the
+first `run.cmd` stops at ``error: linker `link.exe` not found`` until the
+Visual Studio build tools are installed. See [usage.md](usage.md) for the
+exact download and the one workload to tick.
+
+The GNU toolchain is a real alternative rather than a dead end, which is worth
+saying because the opposite is usually assumed: official CPython is built with
+MSVC, but `pyo3-ffi` does not read MSVC's import libraries, it generates its
+own with `dlltool`, so a `stable-x86_64-pc-windows-gnu` build produces an
+extension that imports and passes the whole suite. It is not the cheaper road,
+though. It needs MinGW-w64's binutils on `PATH`; without them the build gets
+past the linker and stops at `error calling dlltool 'dlltool.exe': program not
+found` instead. The `dlltool.exe` rustup itself installs beside the toolchain
+does not stand in for them — it shells out to an assembler that ships in the
+same package and fails without it. So the GNU route swaps one download for
+another rather than removing one, and MSVC is what this project builds against
+in CI. The GNU path was checked by experiment on a Windows runner, not here.
+
+**Windows, specifically:** the process asks for per-monitor-v2 DPI awareness,
+so Windows hands over the real pixels rather than scaling a 96-DPI frame up.
+Nothing scales the *page*, though, so one CSS pixel is one device pixel and a
+site on a 200% display renders correspondingly small. A window dragged
+between monitors of different scale is resized to the rectangle
+`WM_DPICHANGED` supplies, so the frame and the client area stay in agreement,
+but that path has never run anywhere except by reading: CI's runners are
+headless and 96 DPI. There is no IME support for composed input, no
+drag-and-drop, no printing, and no jump list or taskbar integration. `cargo`
+builds under a deep checkout can run into the 260-character path limit; keep
+the repo somewhere short, or turn long paths on.
+
 **Doesn't (yet):** flexbox wrapping, `<textarea>`/`<select>` selection (beyond
 read-only), or the full ECMAScript feature set (see below). Shoes themes are
 preset solid-color palettes only — there's no custom color editor, and page

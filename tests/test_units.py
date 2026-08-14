@@ -2141,6 +2141,310 @@ def test_async_load_in_gui_mode():
         root.destroy()
 
 
+# -- the Win32 backend, in the parts that are not Win32 --------------------
+#
+# tests/test_win32.py opens real windows and only runs on Windows. Everything
+# below is the arithmetic and the translation tables behind that window, and
+# those are plain functions on purpose: they run, and are checked, on every
+# platform the suite runs on.
+
+def test_dib_stride_rounds_rows_up_to_four_bytes():
+    from feetbrowser.win32 import dib_stride
+    eq(dib_stride(4, 24), 12, "a multiple of four needs no padding")
+    eq(dib_stride(5, 24), 16, "15 bytes of pixels round up to 16")
+    eq(dib_stride(999, 24), 3000, "2997 bytes of pixels round up to 3000")
+    # The reason this backend presents 32bpp: no row ever needs padding, so
+    # the frame is one buffer and the whole class of off-by-one row smears
+    # cannot happen.
+    for width in range(1, 40):
+        eq(dib_stride(width, 32), width * 4,
+           f"32bpp width {width} should need no padding")
+
+
+def test_rgb_becomes_bgr_without_moving_a_pixel():
+    from feetbrowser.win32 import bgra_from_rgb
+    # Two pixels: pure red, then pure green.
+    out = bgra_from_rgb(bytearray([255, 0, 0, 0, 255, 0]), 2, 1)
+    eq(bytes(out), b"\x00\x00\xff\x00\x00\xff\x00\x00", "channel order")
+    eq(len(out), 2 * 1 * 4, "four bytes per pixel")
+
+
+def test_the_dib_is_top_down_and_row_order_survives():
+    """A DIB is bottom-up by default and we declare a negative height
+    instead, so the rows must come out in the order they went in. Getting
+    this wrong flips the whole page upside down."""
+    from feetbrowser.win32 import bgra_from_rgb
+    pixels = bytearray([1, 2, 3, 4, 5, 6,        # row 0
+                        7, 8, 9, 10, 11, 12])    # row 1
+    out = bgra_from_rgb(pixels, 2, 2)
+    eq(bytes(out[0:4]), b"\x03\x02\x01\x00", "first pixel of the first row")
+    eq(bytes(out[8:12]), b"\x09\x08\x07\x00", "first pixel of the second row")
+
+
+def test_a_padded_source_stride_is_compacted():
+    from feetbrowser.win32 import bgra_from_rgb
+    # Three bytes of pixels per row plus two bytes of slack.
+    pixels = bytearray([10, 20, 30, 99, 99,
+                        40, 50, 60, 99, 99])
+    out = bgra_from_rgb(pixels, 1, 2, stride=5)
+    eq(bytes(out), b"\x1e\x14\x0a\x00\x3c\x32\x28\x00", "slack was skipped")
+
+
+def test_the_bitmap_header_is_the_size_windows_expects():
+    """GDI reads biSize to tell a BITMAPINFOHEADER from its successors, so a
+    header that is not 40 bytes is rejected outright."""
+    import ctypes
+    from feetbrowser.win32 import BITMAPINFOHEADER
+    eq(ctypes.sizeof(BITMAPINFOHEADER), 40)
+
+
+def test_packed_coordinates_can_be_negative():
+    """A drag that leaves the window on the left or the top reports a
+    negative coordinate, packed as an unsigned 16-bit field."""
+    from feetbrowser.win32 import lparam_point, signed_word
+    eq(signed_word(0xFFFF), -1)
+    eq(signed_word(0x8000), -32768)
+    eq(signed_word(0x7FFF), 32767)
+    eq(lparam_point((300 << 16) | 120), (120, 300))
+    eq(lparam_point((0xFFFB << 16) | 0xFFF6), (-10, -5), "off the top-left")
+
+
+def test_a_wheel_notch_stays_in_the_pixel_range():
+    """browser.py treats |delta| < 30 as a pixel count and anything larger as
+    line units, so a notch has to stay under 30 or one flick moves the page
+    by a screenful."""
+    from feetbrowser.win32 import wheel_delta
+    eq(wheel_delta(120), 20, "one notch forward")
+    eq(wheel_delta(-120), -20, "one notch back")
+    eq(wheel_delta(0), 0)
+    for raw in (120, -120, 360, -360, 3600, -3600, 7, -7):
+        delta = wheel_delta(raw)
+        assert abs(delta) < 30, f"{raw} became {delta}, out of the pixel range"
+        assert (delta > 0) == (raw > 0), f"{raw} lost its direction"
+
+
+def test_modifier_bits_are_the_ones_the_browser_reads():
+    from feetbrowser.win32 import modifier_state
+    from feetbrowser.window import STATE_ALT, STATE_CONTROL, STATE_SHIFT
+    eq(modifier_state(False, False, False), 0)
+    eq(modifier_state(True, False, False), STATE_SHIFT)
+    eq(modifier_state(False, True, False), STATE_CONTROL)
+    eq(modifier_state(False, False, True), STATE_ALT)
+    # browser.py tests `event.state & 0x4` directly for its shortcuts.
+    assert modifier_state(False, True, False) & 0x4
+
+
+def test_named_virtual_keys_map_to_tk_keysyms():
+    from feetbrowser.win32 import keysym_for_vk
+    from feetbrowser.window import STATE_CONTROL, STATE_SHIFT
+    eq(keysym_for_vk(0x0D, 0), "Return")
+    eq(keysym_for_vk(0x26, 0), "Up")
+    eq(keysym_for_vk(0x21, 0), "Prior", "PageUp is Tk's Prior")
+    eq(keysym_for_vk(0x7B, 0), "F12")
+    eq(keysym_for_vk(0x09, 0), "Tab")
+    # browser.py binds <Control-ISO_Left_Tab> for previous-tab, which is the
+    # keysym X11 and Tk use for a shifted Tab.
+    eq(keysym_for_vk(0x09, STATE_SHIFT), "ISO_Left_Tab")
+    eq(keysym_for_vk(0x09, STATE_SHIFT | STATE_CONTROL), "ISO_Left_Tab")
+
+
+def test_a_plain_letter_waits_for_the_character_message():
+    """WM_CHAR is the only thing that has been through the user's keyboard
+    layout, so an unmodified printable key is left to it."""
+    from feetbrowser.win32 import keysym_for_vk
+    from feetbrowser.window import STATE_ALT, STATE_CONTROL, STATE_SHIFT
+    eq(keysym_for_vk(0x4C, 0), None, "plain L")
+    eq(keysym_for_vk(0x4C, STATE_SHIFT), None, "shifted L")
+    # Under Control the character message carries a control code (Ctrl-L is
+    # 0x0C, not "l"), so the letter has to come from the virtual key.
+    eq(keysym_for_vk(0x4C, STATE_CONTROL), "l", "Ctrl-L reaches <Control-l>")
+    eq(keysym_for_vk(0x54, STATE_CONTROL), "t")
+    eq(keysym_for_vk(0x53, STATE_CONTROL | STATE_SHIFT), "S",
+       "Tk names a shifted letter by its shifted character")
+    eq(keysym_for_vk(0x31, STATE_CONTROL), "1", "digits are not cased")
+    eq(keysym_for_vk(0x25, STATE_ALT), "Left", "Alt-Left is still a named key")
+    eq(keysym_for_vk(0xBA, STATE_CONTROL), None, "no guess at an OEM key")
+
+
+def test_character_messages_become_keysyms():
+    from feetbrowser.win32 import keysym_for_char
+    from feetbrowser.window import STATE_CONTROL
+    eq(keysym_for_char("z", 0), ("z", "z"))
+    eq(keysym_for_char("é", 0), ("é", "é"), "the layout's own character")
+    eq(keysym_for_char(" ", 0), ("space", " "), "Tk calls a space 'space'")
+    eq(keysym_for_char("", 0), None, "half a surrogate pair carries nothing")
+    # Return, Tab, Escape and Backspace each arrive twice: once as a named
+    # virtual key and once as a control code. Only the first is the event.
+    eq(keysym_for_char("\r", 0), None)
+    eq(keysym_for_char("\x08", 0), None)
+    eq(keysym_for_char("\x0c", STATE_CONTROL), None,
+       "Ctrl-L was already delivered from the virtual key")
+
+
+def test_key_sequences_are_offered_most_specific_first():
+    """Tk fires exactly one binding, the most specific that matches, and a
+    binding matches when its modifiers are a subset of those held."""
+    from feetbrowser.window import STATE_CONTROL, STATE_SHIFT, key_sequences
+    names = key_sequences("l", STATE_CONTROL)
+    eq(names[0], "<Control-l>")
+    eq(names[-1], "<Key>", "the generic binding is always the last resort")
+    assert "<l>" in names
+    names = key_sequences("Up", 0)
+    eq(names, ["<Up>", "<Key>"], "an unmodified named key")
+    # browser.py binds <Control-Shift-s> for view-source and <Control-s> for
+    # nothing, so the shifted spelling has to be offered and has to win.
+    names = key_sequences("S", STATE_CONTROL | STATE_SHIFT)
+    assert "<Control-Shift-s>" in names, names
+    assert names.index("<Control-Shift-s>") < names.index("<Control-s>"), names
+    # A subset match is what lets <Control-ISO_Left_Tab> catch Ctrl-Shift-Tab.
+    names = key_sequences("ISO_Left_Tab", STATE_CONTROL | STATE_SHIFT)
+    assert "<Control-ISO_Left_Tab>" in names, names
+
+
+def test_win32_module_is_importable_off_windows():
+    """gui.platform_root(), pyflakes and this file all import it, so it has
+    to load on a machine with no windll at all."""
+    from feetbrowser import win32
+    if sys.platform != "win32":
+        eq(win32.available(), False, "no Win32 window off Windows")
+        try:
+            win32.Win32Tk()
+        except win32.Win32Unavailable:
+            pass
+        else:
+            assert False, "a window opened on a platform with no Win32"
+
+
+def test_the_display_variable_picks_a_backend_by_name():
+    from feetbrowser import gui
+    saved = gui.DISPLAY
+    try:
+        gui.DISPLAY = "none"
+        eq(gui.platform_root(), None, "'none' stays headless everywhere")
+
+        gui.DISPLAY = ""
+        root = gui.platform_root()
+        if sys.platform == "darwin":
+            eq(root.__name__, "CocoaTk")
+        elif sys.platform == "win32":
+            eq(root.__name__, "Win32Tk")
+        elif root is not None:
+            # x11.py answers here too, and whether it can is a property of
+            # the machine rather than of the platform: a desktop with a
+            # server running gets X11Tk and headless CI gets None. Both are
+            # right, so the only wrong answer is some *other* backend.
+            eq(root.__name__, "X11Tk")
+
+        for name in ("win32", "windows"):
+            gui.DISPLAY = name
+            if sys.platform == "win32":
+                eq(gui.platform_root().__name__, "Win32Tk")
+            else:
+                # Asking by name and silently getting a headless root is the
+                # kind of thing you discover from an empty screenshot.
+                try:
+                    gui.platform_root()
+                except RuntimeError as e:
+                    assert "Win32" in str(e), f"unhelpful message: {e}"
+                else:
+                    assert False, f"FEETBROWSER_DISPLAY={name} should raise"
+
+        gui.DISPLAY = "cocoa"
+        if sys.platform == "darwin":
+            eq(gui.platform_root().__name__, "CocoaTk")
+        else:
+            try:
+                gui.platform_root()
+            except RuntimeError as e:
+                assert "Cocoa" in str(e), f"unhelpful message: {e}"
+            else:
+                assert False, "FEETBROWSER_DISPLAY=cocoa should raise here"
+    finally:
+        gui.DISPLAY = saved
+
+
+def test_file_urls_understand_a_drive_letter():
+    """Windows paths do not fit the file: grammar: the drive lands where the
+    host goes, or behind an extra slash, and Explorer hands out backslashes.
+    All three have to name the same file."""
+    for raw in ("file:///C:/pages/a.html", "file://C:/pages/a.html",
+                "file://C:\\pages\\a.html", "file:///C|/pages/a.html"):
+        u = URL(raw)
+        eq(u.scheme, "file", raw)
+        eq(u.path, "/C:/pages/a.html" if "|" not in raw
+           else "/C|/pages/a.html", raw)
+        # Whatever went in, one canonical spelling comes out, and it parses
+        # back to the same place.
+        eq(URL(str(u)).path, u.path, f"{raw} does not round-trip")
+    eq(str(URL("file://C:/pages/a.html")), "file:///C:/pages/a.html")
+    # POSIX paths are untouched.
+    eq(URL("file:///etc/hosts").path, "/etc/hosts")
+    eq(URL("file:///tmp/a b.html").path, "/tmp/a b.html")
+    eq(URL("file://localhost/etc/hosts").path, "/etc/hosts", "host ignored")
+    eq(URL("file:/etc/hosts").path, "/etc/hosts", "the one-slash form")
+
+
+def test_a_file_url_converts_back_to_a_filesystem_path():
+    """The URL path and the filesystem path are different strings: the
+    leading slash in file:///C:/x is not part of the path, and the separator
+    is whatever this platform uses."""
+    sep = os.sep
+    eq(URL("file:///C:/pages/a.html").local_path(),
+       sep.join(["C:", "pages", "a.html"]))
+    eq(URL("file://C:\\pages\\a.html").local_path(),
+       sep.join(["C:", "pages", "a.html"]))
+    eq(URL("file:///C|/x.html").local_path(), sep.join(["C:", "x.html"]),
+       "the older bar spelling is still a drive")
+    eq(URL("file:///etc/hosts").local_path(), sep.join(["", "etc", "hosts"]))
+    # Percent-escapes come off, which is what makes the links a directory
+    # listing writes openable again.
+    eq(URL("file:///tmp/a%20b.html").local_path(),
+       sep.join(["", "tmp", "a b.html"]))
+
+
+def test_relative_links_resolve_inside_a_drive():
+    base = URL("file:///C:/pages/index.html")
+    eq(str(base.resolve("next.html")), "file:///C:/pages/next.html")
+    eq(str(base.resolve("../other/x.html")), "file:///C:/other/x.html")
+    eq(str(base.resolve("/C:/top.html")), "file:///C:/top.html")
+
+
+def test_local_pages_may_only_reach_their_own_directory():
+    """The same-origin rule for file: pages is a string prefix over URL
+    paths. Comparing them with os.path.dirname would compare a backslash
+    prefix against a slash path on Windows and deny everything."""
+    tab = Tab(700, None)
+    tab.base_url = URL("file:///C:/pages/index.html")
+    assert tab._js_scheme_allowed(URL("file:///C:/pages/data.json"))
+    assert tab._js_scheme_allowed(URL("file:///C:/pages/sub/deep.json"))
+    assert not tab._js_scheme_allowed(URL("file:///C:/secrets.txt"))
+    assert not tab._js_scheme_allowed(URL("file:///C:/pagesother/x.txt"))
+    tab.base_url = URL("file:///home/u/pages/index.html")
+    assert tab._js_scheme_allowed(URL("file:///home/u/pages/data.json"))
+    assert not tab._js_scheme_allowed(URL("file:///home/u/secret.txt"))
+
+
+def test_a_local_file_can_actually_be_opened():
+    import tempfile
+    fd, path = tempfile.mkstemp(suffix=".html")
+    try:
+        with os.fdopen(fd, "w", encoding="utf8") as f:
+            f.write("<h1>local</h1>")
+        # What a browser is handed is a path, and turning one into a URL is
+        # exactly where a Windows path stops looking like a URL.
+        url = URL("file:///" + path.replace(os.sep, "/").lstrip("/"))
+        _headers, body, ctype = url.request()
+        eq(ctype, "text/html")
+        assert "local" in body, f"read back {body!r}"
+        eq(URL(str(url)).local_path(), path, "round-trips through str()")
+    finally:
+        os.unlink(path)
+
+
+def test_a_missing_file_reports_rather_than_raises():
+    _headers, body, ctype = URL("file:///no/such/file.html").request()
+    eq(ctype, "text/html")
+    assert "Cannot open file" in body, body
 def _lis(dom):
     return [n for n in tree_to_list(dom, [])
             if isinstance(n, Element) and n.tag == "li"]

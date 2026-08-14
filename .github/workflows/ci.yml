@@ -24,9 +24,10 @@ defaults:
 
 jobs:
   # The whole offline suite, on every interpreter the engine claims to
-  # support (rust/pyproject.toml says >=3.9) and on both platforms that have
-  # a window backend. macOS is here for one specific reason: cocoa.py is a
-  # 22-test window backend that Linux can only ever prove skips cleanly.
+  # support (rust/pyproject.toml says >=3.9) and on all three platforms that
+  # have a window backend. macOS and Windows are here for one specific
+  # reason each: cocoa.py and win32.py are window backends that Linux can
+  # only ever prove skip cleanly.
   test:
     name: ${{ matrix.os }} py${{ matrix.python }}
     runs-on: ${{ matrix.os }}
@@ -42,9 +43,8 @@ jobs:
           - { os: ubuntu-latest, python: '3.14' }
           - { os: macos-latest, python: '3.12' }
           - { os: macos-latest, python: '3.14' }
-          # A Windows entry goes here when win32.py lands: the composite
-          # action already resolves .venv/Scripts and every step below is
-          # written against $PY.
+          - { os: windows-latest, python: '3.12' }
+          - { os: windows-latest, python: '3.14' }
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/build
@@ -84,12 +84,16 @@ jobs:
       - name: Renderer tests
         run: $PY tests/test_render.py
 
-      # test_cocoa opens real NSWindows on the macOS runners and skips on
-      # Linux; test_x11 runs its whole offline half everywhere.
+      # test_cocoa opens real NSWindows on the macOS runners and test_win32
+      # opens real HWNDs on the Windows ones; each skips off its own
+      # platform, and test_x11 runs its whole offline half everywhere. Until
+      # this matrix grew a Windows entry, the 31 tests in test_win32.py had
+      # never been executed by anything.
       - name: Platform window tests
         run: |
           $PY tests/test_cocoa.py
           $PY tests/test_x11.py
+          $PY tests/test_win32.py
 
       - name: Unit tests
         run: $PY tests/test_units.py
@@ -132,6 +136,43 @@ jobs:
         run: |
           $PY tests/fixture_server.py tests/smoke.py \
             '{base}example.com/' '{base}iana.org/domains/example.html'
+
+      # What a Windows user actually types, and the only thing here that
+      # runs run.cmd at all. Everything above goes through $PY directly, so
+      # without this the batch scripts could rot without a job noticing. The
+      # venv already exists by now, which also makes this a check that the
+      # script reuses one instead of rebuilding from scratch.
+      - name: The Windows entry point runs
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: run.cmd --version
+
+      # The other half of run.cmd: what it says when the toolchain is not
+      # there. That is the first thing a new contributor on Windows meets --
+      # rustup does not install the linker and Windows does not ship one, so
+      # the build stops -- and nothing else here goes near the branch, because
+      # this runner has both a linker and a built engine already. Copying the
+      # script somewhere with no .venv and hiding cargo from PATH takes it on
+      # purpose. It is also the only thing that checks the batch parses: an
+      # unmatched label or a stray parenthesis in a block cmd.exe never
+      # reaches would otherwise ship unnoticed.
+      - name: The toolchain message says what to install
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: |
+          mkdir "%RUNNER_TEMP%\notoolchain"
+          copy /y run.cmd "%RUNNER_TEMP%\notoolchain\" >nul
+          set "PATH=%pythonLocation%;%SystemRoot%\System32"
+          call "%RUNNER_TEMP%\notoolchain\run.cmd" > "%RUNNER_TEMP%\said.txt" 2>&1
+          if not errorlevel 1 exit /b 1
+          type "%RUNNER_TEMP%\said.txt"
+          findstr /c:"Desktop development with C++" "%RUNNER_TEMP%\said.txt" >nul || exit /b 1
+          findstr /c:"rustup.rs" "%RUNNER_TEMP%\said.txt" >nul || exit /b 1
+          rem The GNU toolchain is the other answer people are given, and it
+          rem fails at dlltool rather than at link.exe. Someone sent down that
+          rem road by the paragraph above needs the rest of the story in the
+          rem same message, so assert it is still in there.
+          findstr /c:"dlltool.exe" "%RUNNER_TEMP%\said.txt" >nul || exit /b 1
 
   # The job above proves the browser needs no display. This one proves it can
   # use one: a real X server, a real window, real events, and a photograph of
