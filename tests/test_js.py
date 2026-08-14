@@ -8,7 +8,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from feetbrowser import gui
 
 from feetbrowser.net import URL
-from feetbrowser.browser import Tab
+from feetbrowser.browser import Tab, tree_to_list
+from feetbrowser.htmlparser import Element
 from feetbrowser.layout import DrawText
 from feetbrowser.jsengine import Interpreter, JSException, UNDEFINED
 
@@ -904,6 +905,80 @@ def _make_tab(body, url="https://example.com/page"):
     tab.url = u
     tab._build(u, body, "text/html")
     return tab
+
+
+# -- <select> and the DOM ---------------------------------------------------
+
+_SELECT = (
+    '<select id="s">'
+    '<option value="a">Apple</option>'
+    '<option value="b" selected>Banana</option>'
+    '<option value="c">Cherry</option>'
+    '</select>'
+)
+
+
+def _option(tab, value):
+    return next(n for n in tree_to_list(tab.nodes, [])
+                if isinstance(n, Element) and n.tag == "option"
+                and n.attributes.get("value") == value)
+
+
+def _select(tab):
+    return next(n for n in tree_to_list(tab.nodes, [])
+                if isinstance(n, Element) and n.tag == "select")
+
+
+def test_select_value_reads_the_selected_option():
+    tab = _make_tab(
+        _SELECT +
+        '<script>window.got = document.getElementById("s").value;</script>')
+    eq(tab._js_interp.globals["got"], "b",
+       "select.value must read the `selected` option")
+
+
+def test_choosing_an_option_fires_change():
+    tab = _make_tab(
+        _SELECT +
+        '<script>window.seen = "";'
+        'document.getElementById("s").addEventListener("change", function(){'
+        '  window.seen = document.getElementById("s").value; });</script>')
+    tab.choose_option(_select(tab), _option(tab, "c"))
+    eq(tab._js_interp.globals["seen"], "c",
+       "a change listener must run, and see the new value")
+
+
+def test_the_onchange_attribute_fires_too():
+    tab = _make_tab(
+        '<select id="s" onchange="window.hit = 1">'
+        '<option value="a">Apple</option><option value="b">Banana</option>'
+        '</select><script>window.hit = 0;</script>')
+    tab.choose_option(_select(tab), _option(tab, "b"))
+    eq(tab._js_interp.globals["hit"], 1, "the onchange attribute must run")
+
+
+def test_change_does_not_fire_when_the_choice_did_not_move():
+    tab = _make_tab(
+        _SELECT +
+        '<script>window.n = 0;'
+        'document.getElementById("s").addEventListener("change", function(){'
+        '  window.n = window.n + 1; });</script>')
+    tab.choose_option(_select(tab), _option(tab, "b"))  # already selected
+    eq(tab._js_interp.globals["n"], 0,
+       "re-picking the current option is not a change")
+
+
+def test_writing_select_value_moves_the_selection():
+    tab = _make_tab(
+        _SELECT +
+        '<script>document.getElementById("s").value = "c";</script>')
+    tab.render()
+    assert "selected" in _option(tab, "c").attributes, \
+        "a script writing .value must move the selection"
+    assert "selected" not in _option(tab, "b").attributes, \
+        "and take it off the option that had it"
+    assert "Cherry" in _texts(tab), \
+        f"the closed control must repaint with the new label: {_texts(tab)}"
 
 
 def main():

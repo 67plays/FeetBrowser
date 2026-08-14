@@ -8,11 +8,12 @@ from feetbrowser import gui
 from feetbrowser.net import URL
 from feetbrowser.htmlparser import HTMLParser, Element, Text
 from feetbrowser.cssparser import CSSParser, style
-from feetbrowser.layout import DrawText, get_font, _measure
+from feetbrowser.layout import DrawText, get_font, _measure, \
+    selected_options, option_value
 from feetbrowser.browser import (
     Tab, Browser, _AboutURL, _BookmarksURL, _HistoryURL,
     bookmarks_html, history_html,
-    tree_to_list, find_base_href, FormAction
+    tree_to_list, find_base_href, FormAction, SelectAction, SelectPopup
 )
 
 
@@ -179,6 +180,9 @@ def test_browser_tab_cycle_wraps():
     stub.tabs = tabs
     stub.active_tab = tabs[0]
     stub.draw_calls = 0
+    # Switching tabs takes any open <select> list down with it.
+    stub.select_popup = SelectPopup()
+    stub._dismiss_select_popup = lambda: Browser._dismiss_select_popup(stub)
 
     def draw():
         stub.draw_calls += 1
@@ -1974,6 +1978,238 @@ def test_async_load_in_gui_mode():
     finally:
         srv.shutdown()
         root.destroy()
+
+
+# -- <select> drop-downs ----------------------------------------------------
+
+_SELECT_PAGE = (
+    '<form><select name="fruit">'
+    '<option value="a">Apple</option>'
+    '<option value="b" selected>Banana</option>'
+    '<option value="c" disabled>Cherry</option>'
+    '<option value="d">Damson</option>'
+    '</select></form>'
+)
+
+
+class _SelectBrowser(Browser):
+    """A Browser with the painting taken out.
+
+    Everything the drop-down does -- opening, walking, committing,
+    dismissing -- is real Browser code; only the calls that would put pixels
+    on a canvas are counted instead of drawn.
+    """
+
+    def __init__(self, tab):
+        self.active_tab = tab
+        self.select_popup = SelectPopup()
+        self.paints = 0
+        self.canvas = type("C", (), {"winfo_width": lambda s: 1000,
+                                     "winfo_height": lambda s: 720})()
+
+    def chrome_height(self):
+        return 0
+
+    def _draw_page(self):
+        self.paints += 1
+
+    def _draw_chrome(self):
+        self.paints += 1
+
+    def _draw_select_popup(self):
+        self.paints += 1
+
+
+def _select_node(tab):
+    return next(n for n in tree_to_list(tab.nodes, [])
+                if isinstance(n, Element) and n.tag == "select")
+
+
+def _select_centre(tab):
+    """Middle of the laid-out <select> control, in page coordinates."""
+    node = _select_node(tab)
+    lx, ty, rx, by = tab._control_rect(node)
+    return (lx + rx) / 2, (ty + by) / 2
+
+
+def _open_dropdown(body=_SELECT_PAGE):
+    """Load a page and click its select, returning (browser, tab)."""
+    tab = _make_tab(body)
+    browser = _SelectBrowser(tab)
+    x, y = _select_centre(tab)
+    dest = tab.click(x, y)
+    assert isinstance(dest, SelectAction), f"click gave {dest!r}, not a select"
+    browser._open_select_popup(dest)
+    return browser, tab
+
+
+def _labels(tab):
+    return [c.text for c in tab.display_list if isinstance(c, DrawText)]
+
+
+def test_select_paints_the_selected_options_label():
+    tab = _make_tab(_SELECT_PAGE)
+    assert "Banana" in _labels(tab), \
+        f"`selected` option's label not painted: {_labels(tab)}"
+    # With nothing marked, the first option is what a form would submit, so
+    # it is what the closed control has to show.
+    plain = _make_tab('<select><option>Ant</option><option>Bee</option>'
+                      '</select>')
+    assert "Ant" in _labels(plain), f"no fallback label: {_labels(plain)}"
+
+
+def test_clicking_a_select_opens_its_list():
+    browser, tab = _open_dropdown()
+    popup = browser.select_popup
+    assert popup.open_, "the list did not open"
+    eq([row.label for row in popup.rows],
+       ["Apple", "Banana", "Cherry", "Damson"], "rows")
+    eq(popup.rows[popup.hover].label, "Banana",
+       "the highlight starts on the selected option")
+    assert popup.y >= 0 and popup.width > 0, "the list has a place to be"
+
+
+def test_a_disabled_select_does_not_open():
+    tab = _make_tab('<select disabled><option>Nope</option></select>')
+    x, y = _select_centre(tab)
+    eq(tab.click(x, y), None, "a disabled select must not drop down")
+
+
+def test_arrow_keys_walk_the_list_and_skip_disabled_options():
+    browser, _tab = _open_dropdown()
+    popup = browser.select_popup
+    Browser._on_down(browser, None)
+    # Cherry is disabled, so Down from Banana lands past it.
+    eq(popup.rows[popup.hover].label, "Damson", "down skips disabled options")
+    Browser._on_up(browser, None)
+    eq(popup.rows[popup.hover].label, "Banana", "up comes back")
+    Browser._on_up(browser, None)
+    eq(popup.rows[popup.hover].label, "Apple", "up again")
+    Browser._on_up(browser, None)
+    eq(popup.rows[popup.hover].label, "Damson", "the ends wrap around")
+    Browser._on_home(browser, None)
+    eq(popup.rows[popup.hover].label, "Apple", "Home goes to the top")
+    Browser._on_end(browser, None)
+    eq(popup.rows[popup.hover].label, "Damson", "End goes to the bottom")
+
+
+def test_enter_commits_the_highlighted_option():
+    browser, tab = _open_dropdown()
+    Browser._on_down(browser, None)          # Banana -> Damson
+    Browser._on_enter(browser, None)
+    assert not browser.select_popup.open_, "committing closes the list"
+    chosen = selected_options(_select_node(tab))
+    eq([option_value(o) for o in chosen], ["d"], "the DOM moved `selected`")
+    eq(_select_node(tab).attributes.get("value"), "d", "select.value follows")
+    assert "Damson" in _labels(tab), \
+        f"the painted label did not follow: {_labels(tab)}"
+
+
+def test_escape_dismisses_the_list_without_changing_the_value():
+    browser, tab = _open_dropdown()
+    Browser._on_down(browser, None)          # highlight moves...
+    Browser._on_escape(browser, None)        # ...but is never taken
+    assert not browser.select_popup.open_, "Escape closes the list"
+    eq([option_value(o) for o in selected_options(_select_node(tab))], ["b"],
+       "Escape leaves the value alone")
+    assert _select_node(tab).attributes.get("data-focused") is None, \
+        "dismissing the list also drops the focus ring"
+
+
+def test_clicking_an_option_selects_it_and_clicking_away_does_not():
+    browser, tab = _open_dropdown()
+    popup = browser.select_popup
+    row_y = popup.y + popup.PAD + popup.ROW_H // 2  # first row: Apple
+    browser._select_popup_click(popup.x + 10, row_y)
+    assert not popup.open_, "choosing closes the list"
+    eq([option_value(o) for o in selected_options(_select_node(tab))], ["a"],
+       "clicking a row selects it")
+
+    # Now open it again and click somewhere else entirely.
+    browser, tab = _open_dropdown()
+    popup = browser.select_popup
+    browser._select_popup_click(popup.x + popup.width + 40, popup.y + 4)
+    assert not popup.open_, "clicking away dismisses the list"
+    eq([option_value(o) for o in selected_options(_select_node(tab))], ["b"],
+       "clicking away leaves the value alone")
+
+
+def test_a_disabled_option_cannot_be_clicked():
+    browser, tab = _open_dropdown()
+    popup = browser.select_popup
+    cherry = next(i for i, r in enumerate(popup.rows) if r.label == "Cherry")
+    y = popup.y + popup.PAD + (cherry + 0.5) * popup.ROW_H
+    browser._select_popup_click(popup.x + 10, y)
+    assert popup.open_, "a disabled option swallows the click, list stays up"
+    eq([option_value(o) for o in selected_options(_select_node(tab))], ["b"],
+       "a disabled option cannot be chosen")
+
+
+def test_scrolling_the_page_dismisses_the_list():
+    browser, tab = _open_dropdown(
+        "<p>tall</p>" * 200 + _SELECT_PAGE)
+    assert browser.select_popup.open_
+    Browser._scroll(browser, 80)
+    assert not browser.select_popup.open_, "a scroll takes the list down"
+    eq([option_value(o) for o in selected_options(_select_node(tab))], ["b"],
+       "and leaves the value alone")
+
+
+def test_optgroup_labels_are_listed_but_cannot_be_chosen():
+    browser, _tab = _open_dropdown(
+        '<select>'
+        '<optgroup label="Warm"><option>Red</option>'
+        '<option>Orange</option></optgroup>'
+        '<optgroup label="Cool"><option>Blue</option></optgroup>'
+        '</select>')
+    popup = browser.select_popup
+    eq([r.label for r in popup.rows],
+       ["Warm", "Red", "Orange", "Cool", "Blue"], "headings are listed")
+    eq([r.label for r in popup.rows if r.enabled], ["Red", "Orange", "Blue"],
+       "headings are not selectable")
+    eq(popup.rows[popup.hover].label, "Red",
+       "the highlight starts on the first real option, not a heading")
+    Browser._on_down(browser, None)
+    Browser._on_down(browser, None)
+    eq(popup.rows[popup.hover].label, "Blue", "walking steps over headings")
+
+
+def test_a_long_list_scrolls_the_highlight_into_view():
+    options = "".join(f"<option>opt{i}</option>" for i in range(200))
+    browser, _tab = _open_dropdown(f"<select>{options}</select>")
+    popup = browser.select_popup
+    assert popup.visible < len(popup.rows), "a 200-row list cannot all fit"
+    Browser._on_end(browser, None)
+    assert popup.top <= popup.hover < popup.top + popup.visible, \
+        "the last option must be scrolled into the window"
+
+
+def test_a_long_list_stays_inside_the_page_area():
+    options = "".join(f"<option>opt{i}</option>" for i in range(200))
+    tab = _make_tab(f"<select>{options}</select>")
+    browser = _SelectBrowser(tab)
+    # The real window has a tab bar and an address bar above the page; a list
+    # long enough to reach them has to stop, not bury them.
+    browser.chrome_height = lambda: 90
+    x, y = _select_centre(tab)
+    browser._open_select_popup(tab.click(x, y))
+    popup = browser.select_popup
+    assert popup.open_, "the list did not open"
+    assert popup.y >= 90, f"the list starts at y={popup.y}, over the chrome"
+    assert popup.y + popup.height <= 720, \
+        f"the list ends at y={popup.y + popup.height}, past the window"
+
+
+def test_resetting_a_form_puts_the_select_back():
+    browser, tab = _open_dropdown()
+    Browser._on_down(browser, None)
+    Browser._on_enter(browser, None)
+    eq(_select_node(tab).attributes.get("value"), "d", "moved first")
+    form = next(n for n in tree_to_list(tab.nodes, [])
+                if isinstance(n, Element) and n.tag == "form")
+    tab.reset_form(form)
+    eq([option_value(o) for o in selected_options(_select_node(tab))], ["b"],
+       "reset returns to the markup's own choice")
 
 
 def main():

@@ -18,13 +18,14 @@ import html
 import threading
 from . import gui
 import urllib.parse
-from collections import deque
+from collections import deque, namedtuple
 
 from .net import URL
 from .htmlparser import HTMLParser, Text, Element
 from .cssparser import CSSParser, style, parse_inline, set_viewport, \
     media_matches, get_viewport
-from .layout import DocumentLayout, paint_tree, get_font, DrawText, _measure
+from .layout import DocumentLayout, paint_tree, get_font, DrawText, _measure, \
+    select_options, selected_options, option_label, option_value
 from . import shoes as shoes
 from .jsdom import JSDocument, JSLocation
 from .jsengine import Interpreter, JSException, UNDEFINED
@@ -188,6 +189,22 @@ class FormAction:
     def __init__(self, url, payload):
         self.url = url
         self.payload = payload
+
+
+class SelectAction:
+    """Returned by Tab.click() when a <select> is clicked: drop its list.
+
+    The Tab cannot open the list itself -- the list is painted on the browser
+    canvas, above the chrome, and only the Browser knows how big that is --
+    so it hands back the control and the box it occupies in page coordinates
+    and lets the Browser place the popup.
+    """
+
+    __slots__ = ("node", "rect")
+
+    def __init__(self, node, rect):
+        self.node = node
+        self.rect = rect
 
 
 class Tab:
@@ -531,6 +548,7 @@ class Tab:
 
     def render(self):
         self.selection = None
+        self._sync_selects()
         self.document = DocumentLayout(self.nodes, WIDTH)
         self.document.image_cache = self.image_cache
         self.document.layout()
@@ -794,27 +812,32 @@ class Tab:
             self._js_mutated()
 
     def _dispatch_js_click(self, node):
-        """Run click handlers (addEventListener + onclick attrs) registered on
-        `node` or any ancestor. Returns True if any handler attempted to run."""
+        return self._dispatch_js_event(node, "click")
+
+    def _dispatch_js_event(self, node, event_type):
+        """Run handlers for `event_type` (addEventListener + the matching
+        on<type> attribute) registered on `node` or any ancestor, bubbling
+        outwards. Returns True if any handler attempted to run."""
         interp = self._js_interp
         if interp is None:
             return False
+        attr_name = "on" + event_type
         handled = False
         cur = node
         while cur is not None:
             if isinstance(cur, Element):
                 handlers = getattr(cur, "_js_handlers", None)
                 if handlers:
-                    for fn in handlers.get("click", []):
+                    for fn in handlers.get(event_type, []):
                         try:
                             interp.call(fn)
                         except JSException as e:
                             interp.logs.append(f"JS error: {e}")
                         handled = True
-                onclick = cur.attributes.get("onclick")
-                if onclick:
+                inline = cur.attributes.get(attr_name)
+                if inline:
                     try:
-                        interp.run(onclick)
+                        interp.run(inline)
                     except JSException as e:
                         interp.logs.append(f"JS error: {e}")
                     handled = True
@@ -1087,7 +1110,9 @@ class Tab:
                     else self.url.resolve(href)
         # A JS click handler (if any) consumes the click and cancels navigation.
         if node is not None and self._dispatch_js_click(node):
-            return None
+            # A drop-down still drops down: the handler ran, but there is no
+            # navigation for it to have cancelled.
+            return result if isinstance(result, SelectAction) else None
         return result
 
     def link_at(self, x, y):
@@ -1215,12 +1240,35 @@ class Tab:
             if form:
                 return self._submit_form(form)
             return None
+        if control.tag == "select":
+            if "disabled" in control.attributes:
+                return None
+            rect = self._control_rect(control)
+            if rect is None:
+                return None
+            self._focus(control)
+            return SelectAction(control, rect)
         # Focusable field.
+        self._focus(control)
+        return None
+
+    def _focus(self, control):
+        """Move form focus to `control`. The `data-focused` marker is what the
+        painter reads to draw the focus ring, so moving it means a re-render."""
         if self.focused_input is not None:
             self.focused_input.attributes.pop("data-focused", None)
         self.focused_input = control
         control.attributes["data-focused"] = ""
         self.render()
+
+    def _control_rect(self, node):
+        """The laid-out box of a form control in page coordinates, or None
+        when it is not in the current layout."""
+        if not self.document:
+            return None
+        for lx, ty, rx, by, other in self.document.input_boxes:
+            if other is node:
+                return (lx, ty, rx, by)
         return None
 
     def reset_form(self, form):
@@ -1237,7 +1285,87 @@ class Tab:
                     node.attributes["value"] = ""
             elif node.tag == "textarea":
                 node.attributes["value"] = ""
+            elif node.tag == "select":
+                # Back to the markup's own choice: whatever the author marked
+                # `selected`, or the first option when they marked none.
+                for opt, _group in select_options(node):
+                    if "data-selected" in opt.attributes:
+                        opt.attributes["selected"] = ""
+                    else:
+                        opt.attributes.pop("selected", None)
+                node.attributes.pop("value", None)
         self.render()
+
+    def choose_option(self, select, option):
+        """Commit a drop-down choice into the DOM and tell the page about it.
+
+        The `selected` attribute is the document's own record of the choice,
+        so moving it is what makes `select.value` read right from JavaScript
+        and what a form submission later finds. `change` fires only when the
+        choice actually moved, as it does in a real browser.
+        """
+        options = [opt for opt, _group in select_options(select)]
+        if option not in options or "disabled" in option.attributes:
+            return False
+        if "multiple" in select.attributes:
+            changed = True
+            if "selected" in option.attributes:
+                del option.attributes["selected"]
+            else:
+                option.attributes["selected"] = ""
+        else:
+            changed = "selected" not in option.attributes
+            for opt in options:
+                opt.attributes.pop("selected", None)
+            option.attributes["selected"] = ""
+        # The selection just moved, so it -- not the mirrored attribute a
+        # script may have left behind -- is the truth to sync from.
+        select.attributes.pop("value", None)
+        self.render()
+        if changed:
+            self._dispatch_js_event(select, "change")
+        return changed
+
+    def _sync_selects(self):
+        """Keep every <select>'s `value` attribute and its selected <option>
+        agreeing, in whichever direction moved last.
+
+        Two parties read the choice and they read it in different places.
+        JavaScript asks for `.value`, which the DOM bridge answers from the
+        attribute dictionary; the painter and the form submitter ask which
+        option carries `selected`. Rather than teach the bridge about
+        <select>, the value attribute is kept as a mirror of the selection --
+        and when a script writes it, the mirror is believed and the selection
+        follows it.
+        """
+        if self.nodes is None:
+            return
+        for node in tree_to_list(self.nodes, []):
+            if not isinstance(node, Element) or node.tag != "select":
+                continue
+            options = [opt for opt, _group in select_options(node)]
+            if not options:
+                continue
+            if "data-selected" not in node.attributes:
+                # Remember the markup's own choice once, so resetting the
+                # form can put it back after the reader has moved it.
+                for opt in options:
+                    if "selected" in opt.attributes:
+                        opt.attributes["data-selected"] = ""
+                node.attributes["data-selected"] = ""
+            chosen = selected_options(node)
+            current = option_value(chosen[0]) if chosen else ""
+            wanted = node.attributes.get("value")
+            if wanted is not None and wanted != current and \
+                    "multiple" not in node.attributes:
+                match = next((opt for opt in options
+                              if option_value(opt) == wanted), None)
+                if match is not None:
+                    for opt in options:
+                        opt.attributes.pop("selected", None)
+                    match.attributes["selected"] = ""
+                    current = wanted
+            node.attributes["value"] = current
 
     def blur_input(self):
         if self.focused_input is not None:
@@ -1247,7 +1375,9 @@ class Tab:
 
     def type_char(self, ch):
         inp = self.focused_input
-        if inp is None:
+        if inp is None or inp.tag == "select":
+            # A select has a focus ring but no text to edit, and its `value`
+            # attribute mirrors the chosen option -- typing must not touch it.
             return False
         value = inp.attributes.get("value", "")
         if inp.tag == "textarea":
@@ -1262,7 +1392,7 @@ class Tab:
 
     def delete_char(self):
         inp = self.focused_input
-        if inp is None:
+        if inp is None or inp.tag == "select":
             return False
         value = inp.attributes.get("value", "")
         inp.attributes["value"] = value[:-1]
@@ -1514,6 +1644,231 @@ class ContextMenu:
             y0 += self.ITEM_H
 
 
+# One line of an open drop-down. A row with no `option` is an <optgroup>
+# heading: it is drawn, but it can never be highlighted or chosen.
+_SelectRow = namedtuple("_SelectRow", "option label enabled heading")
+
+
+def _select_rows(node):
+    """Flatten a <select> into the lines its drop-down shows."""
+    rows = []
+    group = None
+    for option, group_label in select_options(node):
+        if group_label is not None and group_label != group:
+            rows.append(_SelectRow(None, group_label, False, True))
+        group = group_label
+        rows.append(_SelectRow(option, option_label(option),
+                               "disabled" not in option.attributes, False))
+    return rows
+
+
+class SelectPopup:
+    """The list a <select> drops down, drawn by hand on the browser canvas.
+
+    There is no native widget to borrow here, so the list is the same sort of
+    thing as the context menu: rectangles and text in the current shoe's menu
+    colours, created last so they land on top of the page. It holds nothing
+    but presentation state -- which row is highlighted, and how far a list
+    too tall for the window has been scrolled. Choosing an option is the
+    Tab's business, because that is a change to the document.
+    """
+
+    ROW_H = 22
+    PAD = 3
+    PAD_X = 9
+    INDENT = 12
+
+    def __init__(self, browser=None):
+        self.browser = browser
+        self.node = None
+        self.rows = []
+        self.chosen_ids = frozenset()
+        self.hover = -1
+        self.top = 0        # index of the first row drawn
+        self.visible = 0    # how many rows fit
+        self.x = self.y = self.width = self.height = 0
+        self.open_ = False
+
+    def c(self, key):
+        """Colour from the owning browser's active shoe (or a fallback)."""
+        if self.browser is not None:
+            return self.browser.c(key)
+        fallback = {
+            "menu_bg": "#ffffff", "menu_border": "#666666",
+            "menu_text": "#111111", "menu_hover": "#1a73e8",
+            "menu_sep": "#dddddd", "menu_shadow": "#d0d0d0",
+            "menu_disabled": "#aaaaaa",
+        }
+        return fallback.get(key, key)
+
+    def open(self, node, rect, bounds):
+        """Drop the list for `node`, whose control occupies `rect`.
+
+        Both boxes are in canvas coordinates, and `bounds` is the region the
+        list may use -- the page area, not the whole window, so a list too
+        long to fit stops at the chrome instead of burying the address bar.
+        Returns False (and opens nothing) for a select with no options.
+        """
+        rows = _select_rows(node)
+        if not rows:
+            return False
+        bx0, by0, bx1, by1 = bounds
+        self.node = node
+        self.rows = rows
+        # Which options count as chosen is worked out once, here, because it
+        # is the same question the closed control answers -- and it has an
+        # answer even when the markup marks nothing.
+        self.chosen_ids = frozenset(id(opt) for opt in selected_options(node))
+        self.hover = next(
+            (i for i, row in enumerate(rows)
+             if row.option is not None and id(row.option) in self.chosen_ids),
+            -1)
+        if self.hover < 0:
+            self.hover = self._step(-1, 1)
+
+        font = self._font()
+        # Room for the widest label, plus the tick every option leaves space
+        # for so the list does not shift as the choice moves.
+        indent = self.INDENT if any(row.heading for row in rows) else 0
+        width = max(rect[2] - rect[0], 80)
+        for row in rows:
+            width = max(width, _measure(font, "✓ " + row.label)
+                        + 2 * self.PAD_X + (0 if row.heading else indent))
+        self.width = min(width, max(80, bx1 - bx0 - 4))
+
+        # A list taller than the space is windowed rather than clipped: the
+        # rows around the highlight are the ones worth seeing.
+        room = max(by1 - by0 - 8, self.ROW_H)
+        self.visible = max(1, min(len(rows),
+                                  int((room - 2 * self.PAD) // self.ROW_H)))
+        self.height = self.visible * self.ROW_H + 2 * self.PAD
+
+        self.x = max(bx0 + 2, min(rect[0], bx1 - self.width - 2))
+        # Below the control if it fits, above it if not -- the same rule a
+        # real drop-down follows, and the reason the control stays visible.
+        if rect[3] + self.height <= by1 - 2:
+            self.y = rect[3]
+        elif rect[1] - self.height >= by0 + 2:
+            self.y = rect[1] - self.height
+        else:
+            self.y = max(by0 + 2, by1 - self.height - 2)
+
+        self.top = 0
+        self._scroll_into_view()
+        self.open_ = True
+        return True
+
+    def close(self):
+        self.open_ = False
+        self.node = None
+        self.rows = []
+        self.chosen_ids = frozenset()
+        self.hover = -1
+        self.top = 0
+
+    def point_in_popup(self, x, y):
+        return (self.open_ and self.x <= x <= self.x + self.width
+                and self.y <= y <= self.y + self.height)
+
+    def hit(self, x, y):
+        """Index of the row under (x, y), or -1."""
+        if not self.point_in_popup(x, y):
+            return -1
+        i = self.top + int((y - self.y - self.PAD) // self.ROW_H)
+        if self.top <= i < min(len(self.rows), self.top + self.visible):
+            return i
+        return -1
+
+    def set_hover(self, x, y):
+        """Track the mouse. Returns True when the drawn highlight moved."""
+        i = self.hit(x, y)
+        if i >= 0 and not self.rows[i].enabled:
+            return False
+        if i < 0 or i == self.hover:
+            return False
+        self.hover = i
+        return True
+
+    def _font(self):
+        return get_font(12, "normal", "roman", "Helvetica")
+
+    def _step(self, start, delta):
+        """First selectable row at or after `start` walking by `delta`,
+        wrapping around the ends; -1 when the list has none."""
+        n = len(self.rows)
+        for k in range(1, n + 1):
+            i = (start + k * delta) % n
+            if self.rows[i].enabled:
+                return i
+        return -1
+
+    def move(self, delta):
+        """Move the highlight to the next/previous selectable option."""
+        i = self._step(self.hover if self.hover >= 0 else -1, delta)
+        if i < 0:
+            return
+        self.hover = i
+        self._scroll_into_view()
+
+    def move_to_end(self, last=False):
+        """Jump the highlight to the first (or last) selectable option."""
+        i = self._step(0, -1) if last else self._step(-1, 1)
+        if i >= 0:
+            self.hover = i
+            self._scroll_into_view()
+
+    def _scroll_into_view(self):
+        if self.hover < 0 or self.visible <= 0:
+            return
+        if self.hover < self.top:
+            self.top = self.hover
+        elif self.hover >= self.top + self.visible:
+            self.top = self.hover - self.visible + 1
+        self.top = max(0, min(self.top, max(0, len(self.rows) - self.visible)))
+
+    def chosen(self):
+        """The highlighted <option>, or None when nothing is on a real one."""
+        if 0 <= self.hover < len(self.rows) and self.rows[self.hover].enabled:
+            return self.rows[self.hover].option
+        return None
+
+    def draw(self, canvas):
+        if not self.open_:
+            return
+        c = canvas
+        x, y, w = self.x, self.y, self.width
+        tags = ("select-popup",)
+        c.create_rectangle(x - 1, y - 1, x + w + 1, y + self.height + 1,
+                           fill=self.c("menu_shadow"), width=0, tags=tags)
+        c.create_rectangle(x, y, x + w, y + self.height,
+                           fill=self.c("menu_bg"),
+                           outline=self.c("menu_border"), width=1, tags=tags)
+        font = self._font()
+        indented = any(row.heading for row in self.rows)
+        y0 = y + self.PAD
+        for i in range(self.top, min(len(self.rows), self.top + self.visible)):
+            row = self.rows[i]
+            if row.heading:
+                c.create_text(x + self.PAD_X, y0 + self.ROW_H / 2,
+                              text=row.label, anchor="w",
+                              font=get_font(12, "bold", "roman", "Helvetica"),
+                              fill=self.c("menu_disabled"), tags=tags)
+                y0 += self.ROW_H
+                continue
+            if i == self.hover:
+                c.create_rectangle(x + 1, y0, x + w - 1, y0 + self.ROW_H,
+                                   fill=self.c("menu_hover"), width=0,
+                                   tags=tags)
+                fill = self.c("menu_bg")
+            else:
+                fill = self.c("menu_text" if row.enabled else "menu_disabled")
+            tick = "✓ " if id(row.option) in self.chosen_ids else ""
+            c.create_text(x + self.PAD_X + (self.INDENT if indented else 0),
+                          y0 + self.ROW_H / 2, text=tick + row.label,
+                          anchor="w", font=font, fill=fill, tags=tags)
+            y0 += self.ROW_H
+
+
 class Browser:
     def __init__(self, window=None):
         self.tabs = []
@@ -1561,6 +1916,7 @@ class Browser:
         self.bold_font = get_font(14, "bold", "roman", "Helvetica")
 
         self.context_menu = ContextMenu(self)
+        self.select_popup = SelectPopup(self)
 
         self._bind()
 
@@ -1649,6 +2005,7 @@ class Browser:
                    max(TAB_LEFT, self.canvas.winfo_width() - NEW_TAB_W))
 
     def new_tab(self, url, focus_address=False):
+        self._dismiss_select_popup()
         tab = Tab(self.tab_height(), self)
         page = self._coerce_url(url)
         if isinstance(page, _AboutURL):
@@ -1666,6 +2023,7 @@ class Browser:
     def close_tab(self):
         if not self.active_tab:
             return
+        self._dismiss_select_popup()
         idx = self.tabs.index(self.active_tab)
         self.tabs.remove(self.active_tab)
         if not self.tabs:
@@ -1692,6 +2050,7 @@ class Browser:
 
     def _apply_resize(self):
         self._resize_after = None
+        self._dismiss_select_popup()
         global WIDTH, HEIGHT
         WIDTH = self.canvas.winfo_width()
         HEIGHT = self.canvas.winfo_height()
@@ -1704,14 +2063,26 @@ class Browser:
         self.draw()
 
     def _on_down(self, e):
+        if self._select_popup_move(1):
+            return "break"
         if self.focus == "address":
             return
         self._scroll(SCROLL_STEP)
 
     def _on_up(self, e):
+        if self._select_popup_move(-1):
+            return "break"
         if self.focus == "address":
             return
         self._scroll(-SCROLL_STEP)
+
+    def _select_popup_move(self, delta):
+        """Walk an open drop-down's highlight; True when the key was ours."""
+        if not self.select_popup.open_:
+            return False
+        self.select_popup.move(delta)
+        self._draw_select_popup()
+        return True
 
     def _on_left(self, e):
         if self.focus == "address":
@@ -1736,6 +2107,10 @@ class Browser:
         return "break"
 
     def _on_home(self, e):
+        if self.select_popup.open_:
+            self.select_popup.move_to_end(last=False)
+            self._draw_select_popup()
+            return "break"
         if self.focus == "address" or not self.active_tab:
             return
         self.active_tab.set_scroll(0)
@@ -1743,6 +2118,10 @@ class Browser:
         return "break"
 
     def _on_end(self, e):
+        if self.select_popup.open_:
+            self.select_popup.move_to_end(last=True)
+            self._draw_select_popup()
+            return "break"
         if self.focus == "address" or not self.active_tab:
             return
         self.active_tab.set_scroll(self.active_tab.content_height())
@@ -1753,6 +2132,9 @@ class Browser:
         self._scroll(-e.delta if abs(e.delta) < 30 else -int(e.delta / 30) * SCROLL_STEP)
 
     def _scroll(self, delta):
+        # Scrolling the page out from under a drop-down would leave it
+        # pointing at nothing, so the list goes rather than travels.
+        self._dismiss_select_popup()
         if self.active_tab:
             self.active_tab.scroll_by(delta)
             self._draw_page()
@@ -1786,6 +2168,9 @@ class Browser:
         if self.context_menu.open_:
             self._context_menu_click(e.x, e.y)
             return
+        if self.select_popup.open_:
+            self._select_popup_click(e.x, e.y)
+            return
         was_address = self.focus == "address"
         self.focus = None
         self._drag_moved = False
@@ -1796,6 +2181,9 @@ class Browser:
             return
         ctrl = bool(getattr(e, "state", 0) & 0x4)
         dest = self.active_tab.click(e.x, e.y - self.chrome_height())
+        if isinstance(dest, SelectAction):
+            self._open_select_popup(dest)
+            return
         if isinstance(dest, FormAction):
             self.active_tab.selection = None
             self._navigate(self.active_tab, dest.url, payload=dest.payload)
@@ -1827,6 +2215,9 @@ class Browser:
             self.context_menu.close()
             self.draw()
             return
+        if self.select_popup.open_:
+            self._close_select_popup()
+            return
         band_h = toes.band_height(self.chrome_bands())
         if e.y < band_h + 40:
             # Tab bar: middle-click a tab to close it, empty space (or the
@@ -1843,6 +2234,8 @@ class Browser:
         if not self.active_tab or e.y < self.chrome_height():
             return
         dest = self.active_tab.click(e.x, e.y - self.chrome_height())
+        if isinstance(dest, SelectAction):
+            return  # middle-clicking a drop-down opens nothing
         if isinstance(dest, FormAction):
             self._navigate(self.active_tab, dest.url, payload=dest.payload)
         elif dest:
@@ -1877,6 +2270,8 @@ class Browser:
             self._draw_chrome()
             return
         # Dragging on the page extends the text selection.
+        if self.select_popup.open_:
+            return
         if self.active_tab and e.y >= self.chrome_height():
             self._drag_moved = True
             self.active_tab.extend_selection(e.x, e.y - self.chrome_height())
@@ -1949,6 +2344,10 @@ class Browser:
             self._draw_chrome()
 
     def _on_motion(self, e):
+        if self.select_popup.open_:
+            if self.select_popup.set_hover(e.x, e.y):
+                self._draw_select_popup()
+            return
         if self.context_menu.open_:
             if self.context_menu.set_hover(e.x, e.y):
                 # Redraw just the menu, not the whole page, on hover moves.
@@ -1971,6 +2370,7 @@ class Browser:
     # -- context menu ----------------------------------------------------
 
     def _on_context_menu(self, e):
+        self._dismiss_select_popup()
         items = self._context_items(e.x, e.y)
         self.context_menu.open(e.x, e.y, items,
                                self.canvas.winfo_width(),
@@ -2015,6 +2415,93 @@ class Browser:
         tab = self.active_tab
         if tab and isinstance(tab.url, URL):
             self._navigate(tab, URL("view-source:" + str(tab.url)))
+
+    # -- <select> drop-down ----------------------------------------------
+
+    def _open_select_popup(self, action):
+        """Drop the list for the clicked <select>.
+
+        The control's box arrives in page coordinates; shifting it by the
+        scroll and the chrome height puts it where the reader actually sees
+        it, which is the only frame the popup knows about.
+        """
+        tab = self.active_tab
+        if not tab:
+            return
+        # A click handler may have re-laid the page out from under us, so ask
+        # where the control is now rather than trusting the captured box.
+        lx, ty, rx, by = tab._control_rect(action.node) or action.rect
+        dy = self.chrome_height() - tab.scroll
+        rect = (lx, ty + dy, rx, by + dy)
+        bounds = (0, self.chrome_height(),
+                  self.canvas.winfo_width(), self.canvas.winfo_height())
+        if not self.select_popup.open(action.node, rect, bounds):
+            return
+        self._draw_page()
+
+    def _dismiss_select_popup(self):
+        """Drop the list, leaving the value alone and the canvas untouched.
+
+        For the callers that are about to repaint anyway -- scrolling,
+        resizing, navigating -- since those are exactly the moments a
+        drop-down has to go away.
+        """
+        if not self.select_popup.open_:
+            return
+        self.select_popup.close()
+        if self.active_tab:
+            self.active_tab.blur_input()
+
+    def _close_select_popup(self):
+        """Dismiss the list without changing the value, and repaint."""
+        if not self.select_popup.open_:
+            return
+        self._dismiss_select_popup()
+        self._draw_page()
+
+    def _commit_select(self):
+        """Take the highlighted option. A `multiple` select keeps the list up
+        so the reader can go on toggling; a single-choice one closes."""
+        popup = self.select_popup
+        option, node = popup.chosen(), popup.node
+        # The document can move under an open list (a script rewriting the
+        # form, a load finishing); if the control is no longer laid out there
+        # is nothing left to choose in.
+        if option is None or not self.active_tab or \
+                self.active_tab._control_rect(node) is None:
+            self._close_select_popup()
+            return
+        multiple = "multiple" in node.attributes
+        self.active_tab.choose_option(node, option)
+        if multiple:
+            self._draw_page()
+        else:
+            self._close_select_popup()
+
+    def _select_popup_click(self, x, y):
+        """A click while the list is open: on a row it chooses, anywhere else
+        it dismisses."""
+        popup = self.select_popup
+        i = popup.hit(x, y)
+        if i < 0:
+            self._close_select_popup()
+            return
+        if not popup.rows[i].enabled:
+            return  # a heading or a disabled option: swallow the click
+        popup.hover = i
+        self._commit_select()
+
+    def _draw_select_popup(self):
+        """Repaint the drop-down layer alone.
+
+        The canvas is retained, so the list is simply its own set of tagged
+        items: dropping the tag uncovers the page underneath without
+        repainting a pixel of it, and creating the items again puts the list
+        back on top of whatever was drawn in between. That is why every path
+        that repaints the page or the chrome ends by calling this.
+        """
+        self.canvas.delete("select-popup")
+        self.select_popup.draw(self.canvas)
 
     def _context_items(self, x, y):
         """Build the context-menu entries for a right-click at (x, y)."""
@@ -2084,6 +2571,10 @@ class Browser:
         return items
 
     def _on_key(self, e):
+        if self.select_popup.open_:
+            # Arrows, Enter and Escape have their own bindings; everything
+            # else is swallowed so it cannot leak into the page behind.
+            return
         if self.context_menu.open_:
             keysym = getattr(e, "keysym", "")
             if keysym == "Up":
@@ -2297,7 +2788,9 @@ class Browser:
             self.address_view = caret_x - box_w + 8
 
     def _on_escape(self, e):
-        if self.context_menu.open_:
+        if self.select_popup.open_:
+            self._close_select_popup()
+        elif self.context_menu.open_:
             self.context_menu.close()
             self.draw()
         elif self.focus == "address":
@@ -2308,6 +2801,9 @@ class Browser:
             self._draw_page()
 
     def _on_enter(self, e):
+        if self.select_popup.open_:
+            self._commit_select()
+            return
         if self.focus == "address":
             if not self.address_text.strip():
                 return
@@ -2410,6 +2906,7 @@ class Browser:
     def _cycle_tab(self, step):
         if not self.tabs or not self.active_tab:
             return "break"
+        self._dismiss_select_popup()
         i = self.tabs.index(self.active_tab)
         self.active_tab = self.tabs[(i + step) % len(self.tabs)]
         self.draw()
@@ -2473,11 +2970,13 @@ class Browser:
             pass
 
     def _back(self):
+        self._dismiss_select_popup()
         if self.active_tab:
             self.active_tab.go_back()
             self.draw()
 
     def _forward(self):
+        self._dismiss_select_popup()
         if self.active_tab:
             self.active_tab.go_forward()
             self.draw()
@@ -2501,6 +3000,7 @@ class Browser:
     def _next_tab(self, direction):
         if not self.tabs:
             return
+        self._dismiss_select_popup()
         idx = self.tabs.index(self.active_tab)
         self.active_tab = self.tabs[(idx + direction) % len(self.tabs)]
         self.draw()
@@ -2508,6 +3008,7 @@ class Browser:
     def _navigate(self, tab, url, payload=None):
         """Load `url` on `tab`; image fetching + repaint happen when the
         document is ready (see Tab._complete_load)."""
+        self._dismiss_select_popup()
         tab.load(url, payload=payload)
         self.draw()
 
@@ -2534,6 +3035,7 @@ class Browser:
                 c.addtag_withtag("toe-draw", item_id)
         self._draw_chrome()
         self.context_menu.draw(self.canvas)
+        self._draw_select_popup()
         self._update_title()
 
     def _update_title(self):
@@ -2557,6 +3059,8 @@ class Browser:
         for item_id in c.find_all():
             if item_id not in before:
                 c.addtag_withtag("toe-draw", item_id)
+        # An open drop-down must stay on top of the page it floats over.
+        self._draw_select_popup()
         self._update_title()
 
     def _draw_page_region(self, rect):
@@ -2614,6 +3118,9 @@ class Browser:
         for item_id in c.find_all():
             if item_id not in before:
                 c.addtag_withtag("chrome", item_id)
+        # After the tagging, so the drop-down is not mistaken for chrome and
+        # wiped by the next chrome repaint.
+        self._draw_select_popup()
 
     def _repaint_selection(self):
         """Redraw just the selection highlight layer. The page behind the

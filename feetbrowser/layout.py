@@ -21,7 +21,7 @@ INLINE_ELEMENTS = {
     "a", "b", "i", "em", "strong", "span", "small", "big", "sub", "sup",
     "code", "tt", "kbd", "samp", "u", "abbr", "cite", "q", "s", "strike",
     "font", "label", "br", "img", "input", "button", "mark", "time", "var",
-    "select", "textarea", "option",
+    "select", "textarea", "option", "optgroup",
 }
 
 _FONT_CACHE = {}
@@ -1154,6 +1154,73 @@ def _gradient_rects(box, direction, stops):
                 rects.append(DrawRect(box.x + total - ba1, box.y,
                                       box.x + total - ba0, box.y + h, col))
     return rects
+
+
+# -- <select> ---------------------------------------------------------------
+#
+# The painter here and the drop-down list in browser.py have to agree on what
+# a <select> currently holds, so the reading of it lives in one place. The
+# `selected` attribute on an <option> is the single source of truth; the
+# select's own `value` attribute is a mirror the Tab keeps in step, because
+# that attribute is what JavaScript sees when it reads `.value`.
+
+
+def select_options(node):
+    """The <option>s of a <select>, in document order, each paired with the
+    label of the <optgroup> it came out of (None when it was not in one).
+
+    Groups are flattened rather than nested because nothing about choosing an
+    option cares about the nesting -- only the drawing of the list does, and
+    the group label is all it needs.
+    """
+    out = []
+    for child in node.children:
+        if not isinstance(child, Element):
+            continue
+        if child.tag == "option":
+            out.append((child, None))
+        elif child.tag == "optgroup":
+            label = child.attributes.get("label", "")
+            for inner in child.children:
+                if isinstance(inner, Element) and inner.tag == "option":
+                    out.append((inner, label))
+    return out
+
+
+def option_label(option):
+    """The text an <option> shows. HTML lets the label be given either as the
+    element's text or, when there is none, as its `label` attribute."""
+    text = "".join(c.text for c in option.children
+                   if isinstance(c, Text)).strip()
+    return text or option.attributes.get("label", "")
+
+
+def option_value(option):
+    """What an <option> submits: its `value` attribute, or its label when it
+    has no `value` at all."""
+    if "value" in option.attributes:
+        return option.attributes["value"]
+    return option_label(option)
+
+
+def selected_options(node):
+    """The chosen <option>s of a <select>.
+
+    A single-choice select always has one even when the markup marks none:
+    browsers fall back to the first option the user could have picked, and
+    forms submit that, so the painter must show it too.
+    """
+    options = [opt for opt, _group in select_options(node)]
+    chosen = [opt for opt in options if "selected" in opt.attributes]
+    multiple = "multiple" in node.attributes
+    if chosen:
+        return chosen if multiple else chosen[-1:]
+    if multiple:
+        return []
+    for opt in options:
+        if "disabled" not in opt.attributes:
+            return [opt]
+    return []
 
 
 class LayoutBox:
@@ -2851,7 +2918,8 @@ class BlockLayout(LayoutBox):
         self.cursor_x = x + w + _measure(font, " ")
 
     def _paint_control(self, node, label, wpad, hpad, rect, outline,
-                       dx, dy, tcolor, dropdown=False):
+                       dx, dy, tcolor, dropdown=False, thickness=1,
+                       glyph="#555555"):
         """Paint a button/select-shaped control from a resolved label."""
         font = get_font(13, "normal", "roman")
         w = self._fit_control(_measure(font, label) + wpad)
@@ -2859,9 +2927,10 @@ class BlockLayout(LayoutBox):
         y = self.cursor_y
         texts = [(self.cursor_x + dx, y + dy, label, font, tcolor)]
         if dropdown:
-            texts.append((self.cursor_x + w - 14, y + 4, "▾", font, "#555555"))
+            texts.append((self.cursor_x + w - 14, y + 4, "▾", font, glyph))
         self._box_control(self.cursor_x, y, w, h, font, node,
-                          rect=rect, outline=outline, texts=texts)
+                          rect=rect, outline=outline, thickness=thickness,
+                          texts=texts)
 
     def _inline_input(self, node):
         itype = node.attributes.get("type", "text").lower()
@@ -2966,16 +3035,22 @@ class BlockLayout(LayoutBox):
         self.cursor_x += total_w + _measure(font, " ")
 
     def _inline_select(self, node):
-        opts = [c for c in node.children
-                if isinstance(c, Element) and c.tag == "option"]
-        chosen = [o for o in opts if "selected" in o.attributes] or opts[:1]
-        label = chosen[0].attributes.get("value", "") if chosen else ""
-        if not label and chosen:
-            label = "".join(c.text for c in chosen[0].children
-                            if isinstance(c, Text))
-        self._paint_control(node, label or "▾", 20, 8,
-                            "#f2f2f2", "#999999", 4, 4, "#111111",
-                            dropdown=True)
+        # The closed control shows the *labels* of the chosen options, not
+        # their values: the value is what the form submits, the label is what
+        # the page told the reader to look for.
+        label = ", ".join(option_label(opt) for opt in selected_options(node))
+        disabled = "disabled" in node.attributes
+        open_ = "data-focused" in node.attributes
+        # A select with nothing to show still needs a box wide enough for the
+        # arrow, so pad the empty label out rather than collapsing to a sliver.
+        self._paint_control(node, label or "    ", 24, 8,
+                            "#e9e9e9" if disabled else "#f2f2f2",
+                            "#c8c8c8" if disabled else
+                            ("#3b82f6" if open_ else "#999999"),
+                            6, 4,
+                            "#8a8a8a" if disabled else "#111111",
+                            dropdown=True, thickness=2 if open_ else 1,
+                            glyph="#bbbbbb" if disabled else "#555555")
 
     # -- painting --------------------------------------------------------
 
