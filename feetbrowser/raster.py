@@ -1,18 +1,23 @@
 """Software rasteriser: a pixel buffer and the operations that mark it.
 
-This replaces the drawing half of Tk. A Surface is a flat RGB bytearray plus
-a clip rectangle; everything else -- rectangles, lines, glyphs, images -- is
+This replaces the drawing half of Tk. A Surface is a flat RGB buffer plus a
+clip rectangle; everything else -- rectangles, lines, glyphs, images -- is
 composited into it here.
 
-The performance shape worth knowing: filling is done with whole-row slice
-assignment, which runs at memcpy speed, while anti-aliased glyph coverage is
-blended a pixel at a time and dominates the cost of a text page. That is why
-glyph coverage bitmaps are rasterised once and cached per (face, size, glyph)
--- drawing a character the second time is a blend of an existing bitmap, never
-a re-run of the scanline fill.
+The Surface itself lives in Rust, in the `feetbrowser_engine` extension, and
+so does its framebuffer: `surface.pixels` is a read-only memoryview onto the
+buffer Rust owns, which is what lets the window backend blit a frame without
+copying it. The class is otherwise exactly what it was -- same methods, same
+arguments, same clip semantics.
+
+The performance shape worth knowing: filling a rectangle is a run of memory
+writes, while anti-aliased glyph coverage is blended a pixel at a time and
+dominates the cost of a text page. That is why glyph coverage bitmaps are
+rasterised once and cached per (face, size, glyph) -- drawing a character the
+second time is a blend of an existing bitmap, never a re-run of the scanline
+fill.
 """
-import struct
-import zlib
+from feetbrowser_engine import Surface
 
 from . import fontengine
 
@@ -20,226 +25,8 @@ from . import fontengine
 # coverage is computed analytically, so 4 rows is enough to look smooth.
 SUBSAMPLES = 4
 
-
-_BLEND_TABLES = {}
-
-
-def _blend_tables(color, alpha):
-    """Per-channel translate tables mapping a destination byte to the result
-    of blending `color` over it at `alpha`."""
-    key = (color, alpha)
-    try:
-        return _BLEND_TABLES[key]
-    except KeyError:
-        pass
-    inv = 255 - alpha
-    tables = tuple(bytes((v * inv + c * alpha) // 255 for v in range(256))
-                   for c in color)
-    if len(_BLEND_TABLES) < 4096:
-        _BLEND_TABLES[key] = tables
-    return tables
-
-
-class Surface:
-    """An RGB pixel buffer with a clip rectangle."""
-
-    def __init__(self, width, height, background=(255, 255, 255)):
-        self.width = max(1, int(width))
-        self.height = max(1, int(height))
-        self.stride = self.width * 3
-        self.pixels = bytearray(self.stride * self.height)
-        self.clip = (0, 0, self.width, self.height)
-        self.fill_all(background)
-
-    # -- clipping --------------------------------------------------------
-
-    def set_clip(self, x0, y0, x1, y1):
-        """Restrict drawing to a rectangle; returns the previous clip."""
-        old = self.clip
-        self.clip = (max(0, int(x0)), max(0, int(y0)),
-                     min(self.width, int(x1)), min(self.height, int(y1)))
-        return old
-
-    def reset_clip(self, saved=None):
-        self.clip = saved if saved else (0, 0, self.width, self.height)
-
-    # -- fills -----------------------------------------------------------
-
-    def fill_all(self, color):
-        r, g, b = color
-        self.pixels[:] = bytes((r, g, b)) * (self.width * self.height)
-
-    def fill_rect(self, x0, y0, x1, y1, color, alpha=255):
-        """Axis-aligned fill. Opaque fills go row-at-a-time via slice assign."""
-        cx0, cy0, cx1, cy1 = self.clip
-        x0 = max(int(x0), cx0)
-        y0 = max(int(y0), cy0)
-        x1 = min(int(x1), cx1)
-        y1 = min(int(y1), cy1)
-        if x0 >= x1 or y0 >= y1 or alpha <= 0:
-            return
-        w = x1 - x0
-        span = w * 3
-        if alpha >= 255:
-            row = bytes(color) * w
-            for y in range(y0, y1):
-                o = y * self.stride + x0 * 3
-                self.pixels[o:o + span] = row
-            return
-        # Translucent fill. Blending each pixel in Python costs milliseconds
-        # on a full-page shadow, so instead each channel gets a 256-entry
-        # translate table and is blended as a strided slice -- three C-level
-        # passes per row rather than three Python operations per pixel.
-        tr, tg, tb = _blend_tables(color, alpha)
-        px = self.pixels
-        for y in range(y0, y1):
-            o = y * self.stride + x0 * 3
-            end = o + span
-            px[o:end:3] = px[o:end:3].translate(tr)
-            px[o + 1:end:3] = px[o + 1:end:3].translate(tg)
-            px[o + 2:end:3] = px[o + 2:end:3].translate(tb)
-
-    def outline_rect(self, x0, y0, x1, y1, color, thickness=1, alpha=255):
-        t = max(1, int(thickness))
-        self.fill_rect(x0, y0, x1, y0 + t, color, alpha)
-        self.fill_rect(x0, y1 - t, x1, y1, color, alpha)
-        self.fill_rect(x0, y0 + t, x0 + t, y1 - t, color, alpha)
-        self.fill_rect(x1 - t, y0 + t, x1, y1 - t, color, alpha)
-
-    def draw_line(self, x0, y0, x1, y1, color, thickness=1, alpha=255):
-        """Straight line. Axis-aligned cases become fills; the rest steps."""
-        x0, y0, x1, y1 = int(x0), int(y0), int(x1), int(y1)
-        t = max(1, int(thickness))
-        if y0 == y1:
-            self.fill_rect(min(x0, x1), y0, max(x0, x1) + 1, y0 + t,
-                           color, alpha)
-            return
-        if x0 == x1:
-            self.fill_rect(x0, min(y0, y1), x0 + t, max(y0, y1) + 1,
-                           color, alpha)
-            return
-        dx, dy = abs(x1 - x0), abs(y1 - y0)
-        sx = 1 if x0 < x1 else -1
-        sy = 1 if y0 < y1 else -1
-        err = dx - dy
-        while True:
-            self.fill_rect(x0, y0, x0 + t, y0 + t, color, alpha)
-            if x0 == x1 and y0 == y1:
-                break
-            e2 = err * 2
-            if e2 > -dy:
-                err -= dy
-                x0 += sx
-            if e2 < dx:
-                err += dx
-                y0 += sy
-
-    # -- coverage compositing --------------------------------------------
-
-    def blit_coverage(self, cov, cw, ch, x, y, color):
-        """Composite an 8-bit coverage bitmap in a solid colour."""
-        if cw <= 0 or ch <= 0:
-            return
-        cx0, cy0, cx1, cy1 = self.clip
-        x, y = int(x), int(y)
-        sx0 = max(0, cx0 - x)
-        sy0 = max(0, cy0 - y)
-        sx1 = min(cw, cx1 - x)
-        sy1 = min(ch, cy1 - y)
-        if sx0 >= sx1 or sy0 >= sy1:
-            return
-        px = self.pixels
-        r, g, b = color
-        stride = self.stride
-        for row in range(sy0, sy1):
-            src = row * cw
-            dst = (y + row) * stride + (x + sx0) * 3
-            for col in range(sx0, sx1):
-                a = cov[src + col]
-                if a:
-                    if a >= 255:
-                        px[dst] = r
-                        px[dst + 1] = g
-                        px[dst + 2] = b
-                    else:
-                        inv = 255 - a
-                        px[dst] = (px[dst] * inv + r * a) // 255
-                        px[dst + 1] = (px[dst + 1] * inv + g * a) // 255
-                        px[dst + 2] = (px[dst + 2] * inv + b * a) // 255
-                dst += 3
-
-    def blit_rgba(self, data, iw, ih, x, y, opaque=False):
-        """Composite raw RGBA bytes.
-
-        `opaque` promises every alpha byte is 255, which lets a row be
-        converted to RGB by deleting its alpha bytes and copied in one
-        assignment -- the difference between a photo costing microseconds
-        and costing milliseconds.
-        """
-        cx0, cy0, cx1, cy1 = self.clip
-        x, y = int(x), int(y)
-        sx0 = max(0, cx0 - x)
-        sy0 = max(0, cy0 - y)
-        sx1 = min(iw, cx1 - x)
-        sy1 = min(ih, cy1 - y)
-        if sx0 >= sx1 or sy0 >= sy1:
-            return
-        px = self.pixels
-        if opaque:
-            count = sx1 - sx0
-            for row in range(sy0, sy1):
-                src = (row * iw + sx0) * 4
-                line = bytearray(data[src:src + count * 4])
-                del line[3::4]
-                dst = (y + row) * self.stride + (x + sx0) * 3
-                px[dst:dst + count * 3] = line
-            return
-        for row in range(sy0, sy1):
-            src = (row * iw + sx0) * 4
-            dst = (y + row) * self.stride + (x + sx0) * 3
-            for _ in range(sx1 - sx0):
-                a = data[src + 3]
-                if a:
-                    if a >= 255:
-                        px[dst] = data[src]
-                        px[dst + 1] = data[src + 1]
-                        px[dst + 2] = data[src + 2]
-                    else:
-                        inv = 255 - a
-                        px[dst] = (px[dst] * inv + data[src] * a) // 255
-                        px[dst + 1] = (px[dst + 1] * inv + data[src + 1] * a) // 255
-                        px[dst + 2] = (px[dst + 2] * inv + data[src + 2] * a) // 255
-                src += 4
-                dst += 3
-
-    # -- output ----------------------------------------------------------
-
-    def to_png(self):
-        """Encode as PNG bytes. zlib is standard library, so this is cheap."""
-        raw = bytearray()
-        stride = self.stride
-        for y in range(self.height):
-            raw.append(0)  # filter type 0 (None)
-            o = y * stride
-            raw += self.pixels[o:o + stride]
-        return _png_chunks(self.width, self.height, bytes(raw))
-
-    def save_png(self, path):
-        with open(path, "wb") as f:
-            f.write(self.to_png())
-
-
-def _png_chunks(width, height, raw):
-    def chunk(tag, payload):
-        body = tag + payload
-        return (struct.pack(">I", len(payload)) + body
-                + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF))
-
-    header = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
-    return (b"\x89PNG\r\n\x1a\n"
-            + chunk(b"IHDR", header)
-            + chunk(b"IDAT", zlib.compress(raw, 6))
-            + chunk(b"IEND", b""))
+__all__ = ["Surface", "SUBSAMPLES", "rasterize", "glyph_bitmap", "draw_text",
+           "measure_text"]
 
 
 # -- outline rasterisation ------------------------------------------------

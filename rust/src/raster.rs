@@ -1,0 +1,547 @@
+//! Software rasteriser: a pixel buffer and the operations that mark it.
+//!
+//! This is the drawing half of what used to be Tk. A Surface owns a flat RGB
+//! buffer -- three bytes a pixel, no padding -- plus a clip rectangle, and
+//! every mark the browser makes goes through one of the methods here.
+//!
+//! Two things shape the code. The first is that the buffer stays on this side
+//! of the boundary: it is allocated once, handed to Python only as a
+//! memoryview, and never resized, so a paint is a sequence of cheap calls
+//! rather than a bytearray shuttled back and forth. The second is that every
+//! coordinate arrives from layout, which got it from a stylesheet, which got
+//! it from a page: nothing here may index on a number a page chose. Rectangles
+//! are clipped in i64 before anything becomes an offset, and each offset is
+//! range-checked once per row rather than trusted.
+
+use crate::pyutil::{bytes_arg, rgb, to_int};
+use pyo3::exceptions::PyMemoryError;
+use pyo3::ffi;
+use pyo3::prelude::*;
+use pyo3::types::{PyBytes, PyMemoryView};
+use std::os::raw::c_int;
+
+/// An RGB pixel buffer with a clip rectangle.
+#[pyclass(module = "feetbrowser_engine")]
+pub struct Surface {
+    #[pyo3(get)]
+    width: i64,
+    #[pyo3(get)]
+    height: i64,
+    #[pyo3(get)]
+    stride: i64,
+    px: Vec<u8>,
+    clip: (i64, i64, i64, i64),
+}
+
+/// Clamp a rectangle to the clip and return it as byte offsets, or None when
+/// nothing is left of it. Every drawing method starts here, which is what
+/// keeps the indexing below honest.
+fn clipped(
+    surface: &Surface,
+    x0: i64,
+    y0: i64,
+    x1: i64,
+    y1: i64,
+) -> Option<(i64, i64, i64, i64)> {
+    let (cx0, cy0, cx1, cy1) = surface.clip;
+    let x0 = x0.max(cx0);
+    let y0 = y0.max(cy0);
+    let x1 = x1.min(cx1);
+    let y1 = y1.min(cy1);
+    if x0 >= x1 || y0 >= y1 {
+        return None;
+    }
+    Some((x0, y0, x1, y1))
+}
+
+#[inline]
+fn blend(dst: u8, src: u8, alpha: i64, inv: i64) -> u8 {
+    // Integer arithmetic on purpose: this is the expression the Python
+    // renderer used, floor division and all, and rounding it differently
+    // would move every anti-aliased edge in the browser by a shade.
+    ((dst as i64 * inv + src as i64 * alpha) / 255) as u8
+}
+
+#[pymethods]
+impl Surface {
+    #[new]
+    #[pyo3(signature = (width, height, background = None))]
+    fn new(
+        width: &Bound<'_, PyAny>,
+        height: &Bound<'_, PyAny>,
+        background: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Self> {
+        let width = to_int(width)?.max(1);
+        let height = to_int(height)?.max(1);
+        let stride = width
+            .checked_mul(3)
+            .ok_or_else(|| PyMemoryError::new_err("surface too wide"))?;
+        let bytes = stride
+            .checked_mul(height)
+            .and_then(|n| usize::try_from(n).ok())
+            .ok_or_else(|| PyMemoryError::new_err("surface too large"))?;
+        let colour = match background {
+            Some(obj) => rgb(obj)?,
+            None => [255, 255, 255],
+        };
+        let mut px = Vec::new();
+        px.try_reserve_exact(bytes)
+            .map_err(|_| PyMemoryError::new_err("surface too large"))?;
+        px.resize(bytes, 0);
+        for p in px.chunks_exact_mut(3) {
+            p[0] = colour[0];
+            p[1] = colour[1];
+            p[2] = colour[2];
+        }
+        Ok(Surface {
+            width,
+            height,
+            stride,
+            px,
+            clip: (0, 0, width, height),
+        })
+    }
+
+    #[getter]
+    fn clip(&self) -> (i64, i64, i64, i64) {
+        self.clip
+    }
+
+    /// The framebuffer, as a memoryview onto the buffer Rust owns.
+    ///
+    /// Callers read it whole (the window backend blits it, tests inspect
+    /// single pixels), and a memoryview lets them do that without copying a
+    /// megabyte per frame. It is read-only: everything that writes pixels is
+    /// a method on this class.
+    #[getter]
+    fn pixels<'py>(slf: Bound<'py, Self>) -> PyResult<Bound<'py, PyMemoryView>> {
+        PyMemoryView::from(&slf)
+    }
+
+    unsafe fn __getbuffer__(
+        slf: PyRefMut<'_, Self>,
+        view: *mut ffi::Py_buffer,
+        flags: c_int,
+    ) -> PyResult<()> {
+        // The buffer is allocated once in `new` and never grows, so the
+        // pointer we hand out stays valid for as long as the surface does.
+        unsafe {
+            ffi::PyBuffer_FillInfo(
+                view,
+                slf.as_ptr(),
+                slf.px.as_ptr() as *mut std::ffi::c_void,
+                slf.px.len() as ffi::Py_ssize_t,
+                1, // read-only
+                flags,
+            );
+        }
+        Ok(())
+    }
+
+    unsafe fn __releasebuffer__(&self, _view: *mut ffi::Py_buffer) {}
+
+    // -- clipping --------------------------------------------------------
+
+    /// Restrict drawing to a rectangle; returns the previous clip.
+    fn set_clip(
+        &mut self,
+        x0: &Bound<'_, PyAny>,
+        y0: &Bound<'_, PyAny>,
+        x1: &Bound<'_, PyAny>,
+        y1: &Bound<'_, PyAny>,
+    ) -> PyResult<(i64, i64, i64, i64)> {
+        let old = self.clip;
+        self.clip = (
+            to_int(x0)?.max(0),
+            to_int(y0)?.max(0),
+            to_int(x1)?.min(self.width),
+            to_int(y1)?.min(self.height),
+        );
+        Ok(old)
+    }
+
+    #[pyo3(signature = (saved = None))]
+    fn reset_clip(&mut self, saved: Option<&Bound<'_, PyAny>>) -> PyResult<()> {
+        // Python treated an empty tuple as "no saved clip" by testing the
+        // value for truth, and canvas.py relies on passing None.
+        self.clip = match saved {
+            Some(obj) if obj.is_truthy()? => {
+                let t: (i64, i64, i64, i64) = obj.extract()?;
+                t
+            }
+            _ => (0, 0, self.width, self.height),
+        };
+        Ok(())
+    }
+
+    // -- fills -----------------------------------------------------------
+
+    fn fill_all(&mut self, color: &Bound<'_, PyAny>) -> PyResult<()> {
+        let c = rgb(color)?;
+        for p in self.px.chunks_exact_mut(3) {
+            p[0] = c[0];
+            p[1] = c[1];
+            p[2] = c[2];
+        }
+        Ok(())
+    }
+
+    /// Axis-aligned fill, opaque or blended.
+    #[pyo3(signature = (x0, y0, x1, y1, color, alpha = None))]
+    fn fill_rect(
+        &mut self,
+        x0: &Bound<'_, PyAny>,
+        y0: &Bound<'_, PyAny>,
+        x1: &Bound<'_, PyAny>,
+        y1: &Bound<'_, PyAny>,
+        color: &Bound<'_, PyAny>,
+        alpha: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        let alpha = match alpha {
+            Some(a) => to_int(a)?,
+            None => 255,
+        };
+        let (x0, y0, x1, y1) = (to_int(x0)?, to_int(y0)?, to_int(x1)?, to_int(y1)?);
+        if alpha <= 0 || clipped(self, x0, y0, x1, y1).is_none() {
+            return Ok(());
+        }
+        let c = rgb(color)?;
+        self.fill_span(x0, y0, x1, y1, c, alpha);
+        Ok(())
+    }
+
+    #[pyo3(signature = (x0, y0, x1, y1, color, thickness = None, alpha = None))]
+    fn outline_rect(
+        &mut self,
+        x0: &Bound<'_, PyAny>,
+        y0: &Bound<'_, PyAny>,
+        x1: &Bound<'_, PyAny>,
+        y1: &Bound<'_, PyAny>,
+        color: &Bound<'_, PyAny>,
+        thickness: Option<&Bound<'_, PyAny>>,
+        alpha: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        let alpha = match alpha {
+            Some(a) => to_int(a)?,
+            None => 255,
+        };
+        let t = match thickness {
+            Some(v) => to_int(v)?.max(1),
+            None => 1,
+        };
+        // The four sides are laid out exactly as the Python was: top and
+        // bottom run the full width, the two uprights fit between them.
+        let (ax0, ay0, ax1, ay1) = (to_int(x0)?, to_int(y0)?, to_int(x1)?, to_int(y1)?);
+        let c = rgb(color)?;
+        self.fill_span(ax0, ay0, ax1, ay0.saturating_add(t), c, alpha);
+        self.fill_span(ax0, ay1.saturating_sub(t), ax1, ay1, c, alpha);
+        self.fill_span(ax0, ay0.saturating_add(t), ax0.saturating_add(t),
+                       ay1.saturating_sub(t), c, alpha);
+        self.fill_span(ax1.saturating_sub(t), ay0.saturating_add(t), ax1,
+                       ay1.saturating_sub(t), c, alpha);
+        Ok(())
+    }
+
+    /// Straight line. Axis-aligned cases become fills; the rest steps.
+    #[pyo3(signature = (x0, y0, x1, y1, color, thickness = None, alpha = None))]
+    fn draw_line(
+        &mut self,
+        x0: &Bound<'_, PyAny>,
+        y0: &Bound<'_, PyAny>,
+        x1: &Bound<'_, PyAny>,
+        y1: &Bound<'_, PyAny>,
+        color: &Bound<'_, PyAny>,
+        thickness: Option<&Bound<'_, PyAny>>,
+        alpha: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        let alpha = match alpha {
+            Some(a) => to_int(a)?,
+            None => 255,
+        };
+        let t = match thickness {
+            Some(v) => to_int(v)?.max(1),
+            None => 1,
+        };
+        let c = rgb(color)?;
+        let (mut x0, mut y0) = (to_int(x0)?, to_int(y0)?);
+        let (x1, y1) = (to_int(x1)?, to_int(y1)?);
+        if y0 == y1 {
+            self.fill_span(x0.min(x1), y0, x0.max(x1).saturating_add(1),
+                           y0.saturating_add(t), c, alpha);
+            return Ok(());
+        }
+        if x0 == x1 {
+            self.fill_span(x0, y0.min(y1), x0.saturating_add(t),
+                           y0.max(y1).saturating_add(1), c, alpha);
+            return Ok(());
+        }
+        // Bresenham, with the step counted rather than trusted: the loop
+        // below cannot run longer than the line is long, whatever arithmetic
+        // a page's coordinates lead to.
+        let dx = (x1 - x0).saturating_abs();
+        let dy = (y1 - y0).saturating_abs();
+        let sx: i64 = if x0 < x1 { 1 } else { -1 };
+        let sy: i64 = if y0 < y1 { 1 } else { -1 };
+        let mut err = dx - dy;
+        let mut budget = dx.saturating_add(dy).saturating_add(1);
+        loop {
+            self.fill_span(x0, y0, x0.saturating_add(t), y0.saturating_add(t),
+                           c, alpha);
+            if (x0 == x1 && y0 == y1) || budget <= 0 {
+                break;
+            }
+            budget -= 1;
+            let e2 = err.saturating_mul(2);
+            if e2 > -dy {
+                err -= dy;
+                x0 += sx;
+            }
+            if e2 < dx {
+                err += dx;
+                y0 += sy;
+            }
+        }
+        Ok(())
+    }
+
+    // -- coverage compositing --------------------------------------------
+
+    /// Composite an 8-bit coverage bitmap in a solid colour.
+    fn blit_coverage(
+        &mut self,
+        cov: &Bound<'_, PyAny>,
+        cw: &Bound<'_, PyAny>,
+        ch: &Bound<'_, PyAny>,
+        x: &Bound<'_, PyAny>,
+        y: &Bound<'_, PyAny>,
+        color: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let cw = to_int(cw)?;
+        let ch = to_int(ch)?;
+        if cw <= 0 || ch <= 0 {
+            return Ok(());
+        }
+        let cov = bytes_arg(cov)?;
+        let c = rgb(color)?;
+        let (x, y) = (to_int(x)?, to_int(y)?);
+        let (cx0, cy0, cx1, cy1) = self.clip;
+        let sx0 = 0.max(cx0 - x);
+        let sy0 = 0.max(cy0 - y);
+        let sx1 = cw.min(cx1 - x);
+        let sy1 = ch.min(cy1 - y);
+        if sx0 >= sx1 || sy0 >= sy1 {
+            return Ok(());
+        }
+        for row in sy0..sy1 {
+            let src = (row * cw) as usize;
+            let dst = ((y + row) * self.stride + (x + sx0) * 3) as usize;
+            let count = (sx1 - sx0) as usize;
+            let line = match self.px.get_mut(dst..dst + count * 3) {
+                Some(l) => l,
+                None => continue,
+            };
+            for col in 0..count {
+                // A coverage bitmap shorter than it claims is not something
+                // our own rasteriser produces, but reading past it would be a
+                // panic, so a missing byte simply means no coverage.
+                let a = match cov.get(src + sx0 as usize + col) {
+                    Some(&a) => a as i64,
+                    None => continue,
+                };
+                if a == 0 {
+                    continue;
+                }
+                let d = col * 3;
+                if a >= 255 {
+                    line[d] = c[0];
+                    line[d + 1] = c[1];
+                    line[d + 2] = c[2];
+                } else {
+                    let inv = 255 - a;
+                    line[d] = blend(line[d], c[0], a, inv);
+                    line[d + 1] = blend(line[d + 1], c[1], a, inv);
+                    line[d + 2] = blend(line[d + 2], c[2], a, inv);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Composite raw RGBA bytes.
+    ///
+    /// `opaque` promises every alpha byte is 255, which turns the inner loop
+    /// into a strided copy with no arithmetic at all -- the difference
+    /// between a photo costing microseconds and costing milliseconds.
+    #[pyo3(signature = (data, iw, ih, x, y, opaque = false))]
+    fn blit_rgba(
+        &mut self,
+        data: &Bound<'_, PyAny>,
+        iw: &Bound<'_, PyAny>,
+        ih: &Bound<'_, PyAny>,
+        x: &Bound<'_, PyAny>,
+        y: &Bound<'_, PyAny>,
+        opaque: bool,
+    ) -> PyResult<()> {
+        let iw = to_int(iw)?;
+        let ih = to_int(ih)?;
+        if iw <= 0 || ih <= 0 {
+            return Ok(());
+        }
+        let data = bytes_arg(data)?;
+        let (x, y) = (to_int(x)?, to_int(y)?);
+        let (cx0, cy0, cx1, cy1) = self.clip;
+        let sx0 = 0.max(cx0 - x);
+        let sy0 = 0.max(cy0 - y);
+        let sx1 = iw.min(cx1 - x);
+        let sy1 = ih.min(cy1 - y);
+        if sx0 >= sx1 || sy0 >= sy1 {
+            return Ok(());
+        }
+        let count = (sx1 - sx0) as usize;
+        for row in sy0..sy1 {
+            let src = ((row * iw + sx0) * 4) as usize;
+            let dst = ((y + row) * self.stride + (x + sx0) * 3) as usize;
+            let line = match self.px.get_mut(dst..dst + count * 3) {
+                Some(l) => l,
+                None => continue,
+            };
+            // An image whose buffer is shorter than its declared size only
+            // happens if something lied about it; the pixels we do not have
+            // are left as they were rather than read.
+            let available = data.len().saturating_sub(src) / 4;
+            for col in 0..count.min(available) {
+                let s = src + col * 4;
+                let d = col * 3;
+                let a = data[s + 3] as i64;
+                if opaque || a >= 255 {
+                    if !opaque && a == 0 {
+                        continue;
+                    }
+                    line[d] = data[s];
+                    line[d + 1] = data[s + 1];
+                    line[d + 2] = data[s + 2];
+                } else if a > 0 {
+                    let inv = 255 - a;
+                    line[d] = blend(line[d], data[s], a, inv);
+                    line[d + 1] = blend(line[d + 1], data[s + 1], a, inv);
+                    line[d + 2] = blend(line[d + 2], data[s + 2], a, inv);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    // -- output ----------------------------------------------------------
+
+    /// Encode as PNG bytes.
+    fn to_png<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        let stride = self.stride as usize;
+        let mut raw = Vec::with_capacity((stride + 1) * self.height as usize);
+        for y in 0..self.height as usize {
+            raw.push(0); // filter type 0 (None)
+            let o = y * stride;
+            match self.px.get(o..o + stride) {
+                Some(line) => raw.extend_from_slice(line),
+                None => break,
+            }
+        }
+        png_bytes(py, self.width, self.height, &raw)
+    }
+
+    fn save_png(&self, py: Python<'_>, path: &str) -> PyResult<()> {
+        let data = self.to_png(py)?;
+        std::fs::write(path, data.as_bytes())?;
+        Ok(())
+    }
+}
+
+impl Surface {
+    /// The body of `fill_rect` once the arguments are plain numbers, so the
+    /// methods built out of rectangles do not pay for conversion four times.
+    fn fill_span(&mut self, x0: i64, y0: i64, x1: i64, y1: i64, c: [u8; 3],
+                 alpha: i64) {
+        if alpha <= 0 {
+            return;
+        }
+        let (x0, y0, x1, y1) = match clipped(self, x0, y0, x1, y1) {
+            Some(r) => r,
+            None => return,
+        };
+        let span = ((x1 - x0) * 3) as usize;
+        let inv = 255 - alpha.min(255);
+        for y in y0..y1 {
+            let o = (y * self.stride + x0 * 3) as usize;
+            let row = match self.px.get_mut(o..o + span) {
+                Some(r) => r,
+                None => continue,
+            };
+            if alpha >= 255 {
+                for p in row.chunks_exact_mut(3) {
+                    p[0] = c[0];
+                    p[1] = c[1];
+                    p[2] = c[2];
+                }
+            } else {
+                for p in row.chunks_exact_mut(3) {
+                    p[0] = blend(p[0], c[0], alpha, inv);
+                    p[1] = blend(p[1], c[1], alpha, inv);
+                    p[2] = blend(p[2], c[2], alpha, inv);
+                }
+            }
+        }
+    }
+}
+
+/// CRC-32 as PNG defines it, which is the same polynomial zlib uses.
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for &b in data {
+        crc ^= b as u32;
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xEDB8_8320
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    !crc
+}
+
+/// Wrap raw scanlines in the four chunks a truecolour PNG needs.
+///
+/// The deflate step goes back to Python's zlib rather than a Rust crate, and
+/// deliberately: two deflate implementations agree on what inflates back but
+/// not on the bytes they emit, and the screenshots this writes are compared
+/// byte for byte against the ones the Python renderer produced. The work is
+/// in C either way.
+fn png_bytes<'py>(
+    py: Python<'py>,
+    width: i64,
+    height: i64,
+    raw: &[u8],
+) -> PyResult<Bound<'py, PyBytes>> {
+    let zlib = py.import("zlib")?;
+    let packed = zlib.call_method1("compress", (PyBytes::new(py, raw), 6))?;
+    let packed: Vec<u8> = packed.extract()?;
+
+    let mut out: Vec<u8> = Vec::with_capacity(packed.len() + 64);
+    out.extend_from_slice(b"\x89PNG\r\n\x1a\n");
+    let mut header = Vec::with_capacity(13);
+    header.extend_from_slice(&(width as u32).to_be_bytes());
+    header.extend_from_slice(&(height as u32).to_be_bytes());
+    header.extend_from_slice(&[8, 2, 0, 0, 0]);
+    for (tag, payload) in [
+        (b"IHDR", header.as_slice()),
+        (b"IDAT", packed.as_slice()),
+        (b"IEND", [].as_slice()),
+    ] {
+        out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        let mut body = Vec::with_capacity(4 + payload.len());
+        body.extend_from_slice(tag);
+        body.extend_from_slice(payload);
+        out.extend_from_slice(&body);
+        out.extend_from_slice(&crc32(&body).to_be_bytes());
+    }
+    Ok(PyBytes::new(py, &out))
+}

@@ -5,6 +5,7 @@ mod interp;
 mod parser;
 mod pybind;
 mod pyutil;
+mod raster;
 mod stdlib;
 mod token;
 mod value;
@@ -35,5 +36,8 @@ fn feetbrowser_engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(image::py_decode_pnm, m)?)?;
     m.add_function(wrap_pyfunction!(image::py_sniff, m)?)?;
     m.add_function(wrap_pyfunction!(image::py_resize, m)?)?;
+
+    // -- rasteriser --
+    m.add_class::<raster::Surface>()?;
     Ok(())
 }
