@@ -451,6 +451,34 @@ _VENDOR_PREFIXES = ("-webkit-", "-moz-", "-ms-", "-o-", "-khtml-")
 # still applies, so simple_selector() emits nothing for this token.
 _SKIP_PSEUDO = object()
 
+def _strip_comments(value):
+    """Drop /* ... */ from a declaration value, leaving quoted text alone.
+
+    `content: "a/*b*/c"` is a string that happens to contain the characters,
+    not a comment, and it is the one place they can legally appear.
+    """
+    out = []
+    i, n, quote = 0, len(value), None
+    while i < n:
+        ch = value[i]
+        if quote:
+            if ch == quote:
+                quote = None
+            out.append(ch)
+        elif ch in "\"'":
+            quote = ch
+            out.append(ch)
+        elif value[i:i + 2] == "/*":
+            end = value.find("*/", i + 2)
+            i = n if end == -1 else end + 2
+            out.append(" ")
+            continue
+        else:
+            out.append(ch)
+        i += 1
+    return "".join(out)
+
+
 _ATTR_SEL_RE = re.compile(
     r"\[\s*([-_A-Za-z0-9]+)\s*"
     r"(?:([~|^$*]?=)\s*(?:\"([^\"]*)\"|'([^']*)'|([^\]\s]+))\s*)?\]")
@@ -504,7 +532,13 @@ class CSSParser:
             elif depth == 0 and c in ";}":
                 break
             self.i += 1
-        value = self.s[vstart:self.i].strip()
+        value = self.s[vstart:self.i]
+        if "/*" in value:
+            # A comment is not part of the value, and inside a calc() it looks
+            # like a division: `calc(10px + /* logo */ 18px)` is how a page
+            # explains where its numbers came from.
+            value = _strip_comments(value)
+        value = value.strip()
         if not value or not prop:
             return None
         if value.endswith("!important"):

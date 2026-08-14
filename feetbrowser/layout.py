@@ -322,7 +322,149 @@ class DrawImage:
             tags=tags)
 
 
+# `calc()` and its relatives. A page written this decade puts arithmetic in
+# nearly every length it cares about -- `calc(100% - 240px)` for a column
+# beside a fixed sidebar, `min(100%, 60rem)` for a measure that stops growing
+# -- and a length we cannot read falls back to zero, which collapses the box.
+_MATH_FUNCS = ("calc", "min", "max", "clamp")
+_MATH_RE = re.compile(r"^(-?)(%s)\(" % "|".join(_MATH_FUNCS))
+
+
+def _is_math(value):
+    return bool(_MATH_RE.match((value or "").strip().lower()))
+
+
+def _calc_tokens(expr):
+    """Split a calc() body into operands, operators, commas and parens.
+
+    `+` and `-` are operators only with a space in front of them, which is
+    exactly the rule CSS uses -- without it there is no telling `10px -5px`
+    (two lengths) from `10px - 5px` (one subtraction).
+    """
+    tokens = []
+    i, n = 0, len(expr)
+    while i < n:
+        ch = expr[i]
+        if ch.isspace():
+            i += 1
+            continue
+        if ch in "(),*/":
+            tokens.append(ch)
+            i += 1
+            continue
+        if ch in "+-" and (not tokens or i == 0 or expr[i - 1].isspace()) \
+                and i + 1 < n and expr[i + 1].isspace():
+            tokens.append(ch)
+            i += 1
+            continue
+        j = i
+        depth = 0
+        while j < n:
+            c = expr[j]
+            if c == "(":
+                depth += 1
+            elif c == ")" and depth:
+                depth -= 1
+            elif not depth and (c.isspace() or c in "(),*/"):
+                break
+            elif not depth and c in "+-" and expr[j - 1].isspace():
+                break
+            j += 1
+        tokens.append(expr[i:j])
+        i = j
+    return tokens
+
+
+class _CalcParser:
+    """Arithmetic over lengths. Operands go through the ordinary length
+    parser, so everything it understands -- px, rem, %, vh -- works here."""
+
+    def __init__(self, tokens, base, default):
+        self.tokens = tokens
+        self.pos = 0
+        self.base = base
+        self.default = default
+
+    def _peek(self):
+        return self.tokens[self.pos] if self.pos < len(self.tokens) else None
+
+    def sum(self):
+        value = self.product()
+        while self._peek() in ("+", "-"):
+            op = self.tokens[self.pos]
+            self.pos += 1
+            right = self.product()
+            value = value + right if op == "+" else value - right
+        return value
+
+    def product(self):
+        value = self.unary()
+        while self._peek() in ("*", "/"):
+            op = self.tokens[self.pos]
+            self.pos += 1
+            right = self.unary()
+            if op == "*":
+                value *= right
+            else:
+                value = value / right if right else 0.0
+        return value
+
+    def unary(self):
+        tok = self._peek()
+        if tok is None:
+            return 0.0
+        self.pos += 1
+        if tok == "(":
+            value = self.sum()
+            if self._peek() == ")":
+                self.pos += 1
+            return value
+        if tok == ")":
+            return 0.0
+        return _resolve_len(tok, self.base, 0.0)
+
+    def args(self):
+        """Comma-separated sums, for min()/max()/clamp()."""
+        values = [self.sum()]
+        while self._peek() == ",":
+            self.pos += 1
+            values.append(self.sum())
+        return values
+
+
+def _eval_math(value, base, default=0.0):
+    """Resolve `calc()`, `min()`, `max()` or `clamp()` to pixels."""
+    v = (value or "").strip()
+    sign = 1.0
+    if v.startswith("-"):
+        sign, v = -1.0, v[1:]
+    name, _, rest = v.partition("(")
+    name = name.strip().lower()
+    if not rest.endswith(")"):
+        return default
+    parser = _CalcParser(_calc_tokens(rest[:-1]), base, default)
+    try:
+        if name == "calc":
+            return sign * parser.sum()
+        args = parser.args()
+        if not args:
+            return default
+        if name == "min":
+            return sign * min(args)
+        if name == "max":
+            return sign * max(args)
+        # clamp(low, preferred, high)
+        low, pref, high = (args + args[-1:] * 2)[:3]
+        return sign * max(low, min(pref, high))
+    except (ValueError, TypeError, ZeroDivisionError):
+        return default
+
+
 def parse_px(value, default=0.0):
+    if _is_math(value):
+        # No percentage base on this path; `calc(50% - 8px)` needs the width
+        # only _resolve_len knows, so it lands on the default there.
+        return _eval_math(value, 0.0, default)
     try:
         if value.endswith("px"):
             return float(value[:-2])
@@ -353,6 +495,8 @@ def _resolve_len(value, base, default=0.0):
     """Parse a CSS length for a horizontal axis: px/rem/bare numbers via
     parse_px, and percentages resolved against `base` (the containing width)."""
     v = (value or "").strip()
+    if _is_math(v):
+        return _eval_math(v, base, default)
     if v.endswith("%"):
         try:
             return float(v[:-1]) / 100.0 * base

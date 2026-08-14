@@ -675,6 +675,31 @@ def _boxes(html, css, width=620, tag="div"):
     return sorted(found, key=lambda b: (b[1], b[0]))
 
 
+def test_css_does_arithmetic():
+    from feetbrowser.layout import _resolve_len
+    cases = [
+        ("calc(100% - 240px)", 1000, 760.0),
+        ("calc(10px + 18px + 0.25rem)", 0, 32.0),
+        ("calc(100%/3)", 900, 300.0),
+        ("calc(-1 * 32px)", 0, -32.0),
+        ("min(100%, 60rem)", 1600, 960.0),
+        ("max(50%, 200px)", 300, 200.0),
+        ("clamp(200px, 50%, 400px)", 1000, 400.0),
+    ]
+    for value, base, want in cases:
+        eq(_resolve_len(value, base, -1), want, value)
+
+
+def test_a_calculated_width_is_used():
+    """The value has to survive the parser, not just the resolver -- and a
+    page explains its arithmetic in the middle of it."""
+    boxes = _boxes("<div><p>x</p></div>",
+                   "p { width: calc(100% - /* the gutter */ 120px) }",
+                   width=620, tag="p")
+    # 620 less the body's own 8px margins is the containing block.
+    eq(boxes[0][2], 484.0, boxes)
+
+
 def test_a_float_starts_below_the_content_it_follows():
     """A "Page 2" link floated at the foot of a listing belongs at the foot.
     Laying every float out before the flow put it over the first story."""
