@@ -250,6 +250,8 @@ def parse_px(value, default=0.0):
     try:
         if value.endswith("px"):
             return float(value[:-2])
+        if value.endswith("rem"):
+            return float(value[:-3]) * 16.0
         if value.endswith("%"):
             return default
         return float(value)
@@ -509,6 +511,10 @@ class BlockLayout(LayoutBox):
             # A float shrinks to fit its content and is pinned to a given
             # x/y; its children are laid out within that box.
             self.x, self.y, self.width = self._float_pos
+        if getattr(self, "_absolute_pos", None) is not None:
+            # An absolutely positioned box is out of flow and pinned to the
+            # containing block; it never pushes siblings or grows the parent.
+            self.x, self.y, self.width = self._absolute_pos
         _dispatch_layout(self)
 
     def layout_mode(self):
@@ -543,6 +549,13 @@ class BlockLayout(LayoutBox):
                 fb = self._layout_float(child)
                 float_boxes.append(fb)
                 continue
+            if isinstance(child, Element) and \
+                    child.style.get("position") in ("absolute", "fixed"):
+                # position:absolute/fixed boxes are out of flow: they don't
+                # push siblings or stretch the parent (e.g. hidden dropdowns
+                # and overlays that must not take up layout space).
+                self.children.append(self._layout_absolute(child))
+                continue
             box = BlockLayout(child, self, previous)
             clear = child.style.get("clear") if isinstance(child, Element) else ""
             if clear:
@@ -550,12 +563,14 @@ class BlockLayout(LayoutBox):
             self.children.append(box)
             previous = box
         content_h = 0
+        last_flow = None
         for box in self.children:
             box.layout()
-        if self.children:
-            last = self.children[-1]
-            content_h = (last.y + last.height
-                         + parse_px(last.node.style.get("margin-bottom", "0"))
+            if getattr(box, "_absolute_pos", None) is None:
+                last_flow = box
+        if last_flow is not None:
+            content_h = (last_flow.y + last_flow.height
+                         + parse_px(last_flow.node.style.get("margin-bottom", "0"))
                          - self.y)
         for f in self.float_regions:
             content_h = max(content_h, f["bottom"] - self.y)
@@ -563,6 +578,19 @@ class BlockLayout(LayoutBox):
         self.height = content_h + _block_padding(self.node)
 
     # -- floats ----------------------------------------------------------
+
+    def _layout_absolute(self, el):
+        """Lay out a `position:absolute/fixed` element out of the flow, pinned
+        to this box's origin plus any top/left offsets. Real sites use these
+        for dropdowns, modals and tooltips so they never stretch the parent;
+        hidden ones are skipped by painting."""
+        box = BlockLayout(el, self, None)
+        x = self.x + parse_px(el.style.get("left", ""), 0)
+        y = self.y + parse_px(el.style.get("top", ""), 0)
+        right = parse_px(el.style.get("right", ""), 0)
+        w = max(0.0, self.width - right) if right else self.width
+        box._absolute_pos = (x, y, w)
+        return box
 
     def _layout_float(self, el):
         """Position a `float: left/right` box out of flow, shrink-to-fit its
@@ -576,7 +604,8 @@ class BlockLayout(LayoutBox):
         mi, ma = self._measure_width(el)
         w = max(1.0, min(avail, max(mi, ma)))
         css_w = el.style.get("width")
-        if css_w:
+        if css_w and css_w.strip() not in (
+                "auto", "fit-content", "min-content", "max-content"):
             w = max(1.0, min(avail, parse_px(css_w, avail)))
 
         clear = el.style.get("clear")
@@ -679,20 +708,55 @@ class BlockLayout(LayoutBox):
                 c += cs
             grid.append(row_cells)
 
-        # Column min/max content widths (spanning cells skip width input).
+        # Column min/max content widths (spanning cells share their width
+        # across the columns they cover so a single full-width cell still
+        # gives the table usable columns).
         col_min = [0.0] * num_cols
         col_max = [0.0] * num_cols
         for row_cells in grid:
             for c, cs, rs, el in row_cells:
-                if cs != 1:
-                    continue
                 mi, ma = self._measure_width(el)
-                col_min[c] = max(col_min[c], mi)
-                col_max[c] = max(col_max[c], ma)
+                # The content box is the column minus CELL_PAD on each side,
+                # so the measured single-line width only fits if the padding
+                # is added back to the column's min/max widths.
+                mi += 2 * self.CELL_PAD
+                ma += 2 * self.CELL_PAD
+                share = max(1, cs)
+                for k in range(c, c + cs):
+                    col_min[k] = max(col_min[k], mi / share)
+                    col_max[k] = max(col_max[k], ma / share)
 
         # Compute final column widths up front so cell content is measured at
-        # its real width instead of wrapping onto a line per word.
-        self._widths = self._distribute_column_widths(self.width, col_min, col_max)
+        # its real width instead of wrapping onto a line per word. Auto tables
+        # shrink to fit their content (width: fit-content); an explicit width
+        # (px or %) stretches the table to that width when content is short.
+        avail = self.width
+        explicit = None
+        css_w = node.style.get("width")
+        if css_w:
+            cw = css_w.strip()
+            if cw.endswith("%"):
+                try:
+                    explicit = avail * min(100.0, max(0.0, float(cw[:-1]))) / 100.0
+                except ValueError:
+                    pass
+            elif cw == "fit-content":
+                explicit = None
+            else:
+                explicit = parse_px(cw, avail)
+        self._widths = self._distribute_column_widths(avail, col_min, col_max)
+        if explicit is not None:
+            used = sum(self._widths)
+            if explicit > used:
+                grow = [max(0.0, m - n0) for m, n0 in zip(self._widths, col_min)]
+                gsum = sum(grow) or 1.0
+                extra = explicit - used
+                self._widths = [mi + extra * (g / gsum)
+                                for mi, g in zip(self._widths, grow)]
+        # Auto tables shrink to their used column widths; the table box must
+        # match the cells so borders/backgrounds don't extend past the content.
+        if sum(self._widths) > 0:
+            self.width = min(self.width, sum(self._widths))
 
         cells = []  # (ri, col, cs, rs, el, content_block, content_h, col_w)
         for ri, row_cells in enumerate(grid):
@@ -799,8 +863,7 @@ class BlockLayout(LayoutBox):
         if avail <= total_min or total_max <= total_min:
             return list(col_min)
         if avail >= total_max:
-            extra = (avail - total_max) / n
-            return [m + extra for m in col_max]
+            return list(col_max)
         grow = [max(0.0, m - n0) for m, n0 in zip(col_max, col_min)]
         gsum = sum(grow) or 1.0
         extra = avail - total_min
@@ -1101,6 +1164,34 @@ class BlockLayout(LayoutBox):
 
         self.height += _block_padding(node)
 
+    def _parse_grid_areas(self, value):
+        """Parse `grid-template-areas` (whitespace-separated quoted strings,
+        one row per string, '.' is an empty cell) into a map of area name ->
+        (row, rowspan, col, colspan)."""
+        if not value:
+            return {}
+        rows = []
+        for open_q, close_q in re.findall(r"'([^']*)'|\"([^\"]*)\"", value):
+            rows.append((open_q if open_q else close_q).split())
+        areas = {}
+        for r, row in enumerate(rows):
+            for c, name in enumerate(row):
+                if name == "." or name in areas:
+                    continue
+                cspan = 1
+                while c + cspan < len(row) and row[c + cspan] == name:
+                    cspan += 1
+                rspan = 1
+                while r + rspan < len(rows):
+                    nxt = rows[r + rspan]
+                    if c + cspan <= len(nxt) and \
+                            all(x == name for x in nxt[c:c + cspan]):
+                        rspan += 1
+                    else:
+                        break
+                areas[name] = (r, rspan, c, cspan)
+        return areas
+
     def _layout_grid(self):
         """Subset CSS grid: `grid-template-columns` (px/%/fr/auto), row
         auto-placement with `grid-column`/`grid-row` (start, span, or
@@ -1116,11 +1207,29 @@ class BlockLayout(LayoutBox):
                 tok = tok.strip()
                 if not tok:
                     continue
+                # minmax(<min>, <max>): a track between two bounds. Use the
+                # definite bound (max first, then min), which is right for
+                # the common `minmax(0, 1fr)` and `minmax(15.5rem, auto)`.
+                if tok.startswith("minmax(") and tok.endswith(")"):
+                    parts = [p.strip() for p in tok[len("minmax("):-1].split(",")]
+                    chosen = None
+                    for p in reversed(parts):
+                        if p.lower() not in ("auto", "min-content", "max-content",
+                                             "fit-content"):
+                            chosen = p
+                            break
+                    if chosen is None:
+                        out.append(("auto", 0.0))
+                        continue
+                    tok = chosen
                 for kind, suffix, cut in (("fr", "fr", -2), ("pct", "%", -1),
-                                          ("px", "px", -2)):
+                                          ("px", "px", -2), ("rem", "rem", -3)):
                     if tok.endswith(suffix):
                         try:
-                            out.append((kind, float(tok[:cut])))
+                            v = float(tok[:cut])
+                            if kind == "rem":
+                                kind, v = "px", v * 16.0
+                            out.append((kind, v))
                         except ValueError:
                             out.append(("auto", 0.0))
                         break
@@ -1130,7 +1239,33 @@ class BlockLayout(LayoutBox):
 
         col_def = parse_tracks(node.style.get("grid-template-columns", ""))
         row_def = parse_tracks(node.style.get("grid-template-rows", ""))
+        # The `grid-template` shorthand (`<rows> / <columns>`) is common on
+        # real sites (Wikipedia's header) and was silently dropped, leaving
+        # the grid at a single auto column that collapses wide content.
+        template = node.style.get("grid-template", "")
+        if "/" in template:
+            t_rows, t_cols = template.split("/", 1)
+            if not row_def:
+                row_def = parse_tracks(t_rows)
+            if not col_def:
+                col_def = parse_tracks(t_cols)
         row_gap, col_gap = self._gaps(node)
+
+        # `grid-template-areas` maps named cells to a row/column span:
+        # "'siteNotice siteNotice' 'columnStart pageContent' 'footer footer'"
+        # -> siteNotice spans both columns of row 0, etc. Items reference a
+        # cell by name via `grid-area`, and are placed there (row-major when
+        # the name is duplicated, as real browsers do).
+        areas = self._parse_grid_areas(node.style.get("grid-template-areas", ""))
+        # The number of columns/rows implied by the areas template must be
+        # created even if the item tracks weren't declared.
+        if areas:
+            rows = max(r + rspan for r, rspan, _, _ in areas.values())
+            cols = max(c + cspan for _, _, c, cspan in areas.values())
+            if not col_def and cols:
+                col_def = [("auto", 0.0)] * cols
+            if not row_def and rows:
+                row_def = [("auto", 0.0)] * rows
 
         items = self._flex_items()
         if not items:
@@ -1145,10 +1280,10 @@ class BlockLayout(LayoutBox):
             except (TypeError, ValueError):
                 return None
 
-        def placement_of(el):
+        def placement_of(el, areas):
             """Return (col_start, col_span, row_start, row_span), 0-based
             starts; None means auto. Understands 'start/end', 'start/span N',
-            'span N', or bare numbers."""
+            'span N', or bare numbers, plus a `grid-area` name."""
             def sides(prop):
                 v = el.style.get(prop)
                 start = span = None
@@ -1178,6 +1313,13 @@ class BlockLayout(LayoutBox):
                 return start, span or 1
             cs, cspan = sides("grid-column")
             rs, rspan = sides("grid-row")
+            area = el.style.get("grid-area")
+            if area and "/" not in area and area in areas:
+                ars, arspan, acs, acspan = areas[area]
+                if cs is None:
+                    cs, cspan = acs, acspan
+                if rs is None:
+                    rs, rspan = ars, arspan
             return cs, cspan, rs, rspan
 
         # Auto-place into rows of `col_def` columns, extending tracks when an
@@ -1188,7 +1330,7 @@ class BlockLayout(LayoutBox):
         cur_r, cur_c = 0, 0
         ncols_so_far = len(col_def)
         for el in items:
-            cs, cspan, rs, rspan = placement_of(el)
+            cs, cspan, rs, rspan = placement_of(el, areas)
             ncols_so_far = max(ncols_so_far, cspan)
             if rs is not None:
                 row = max(0, rs)
@@ -1378,7 +1520,18 @@ class BlockLayout(LayoutBox):
         if not word:
             return
         w = _measure(font, word)
-        _, x1 = self._line_bounds()
+        x0, x1 = self._line_bounds()
+        if not nowrap and x0 >= x1:
+            # A float covers the whole line (e.g. a full-width floated table):
+            # don't draw the word on top of the float, drop below it first.
+            bottom = self.cursor_y
+            for f in self._all_float_regions():
+                if f["top"] <= self.cursor_y < f["bottom"]:
+                    bottom = max(bottom, f["bottom"])
+            if bottom > self.cursor_y:
+                self.cursor_y = bottom
+            self.cursor_x = self._line_bounds()[0]
+            x0, x1 = self._line_bounds()
         if not nowrap and self.cursor_x + w > x1:
             if self.line:
                 self.flush()
@@ -1716,7 +1869,18 @@ class DocumentLayout(LayoutBox):
         return []
 
 
-def paint_tree(layout_box, display_list):
-    display_list.extend(layout_box.paint())
+def paint_tree(layout_box, display_list, hidden=False):
+    """Flatten a box tree into paint commands, honouring `visibility`: a box
+    with `visibility:hidden` (or one nested under a hidden box, unless it
+    explicitly opts back in with `visibility:visible`) is not painted."""
+    node = getattr(layout_box, "node", None)
+    if isinstance(node, Element):
+        vis = node.style.get("visibility")
+        if vis == "hidden":
+            hidden = True
+        elif vis == "visible":
+            hidden = False
+    if not hidden:
+        display_list.extend(layout_box.paint())
     for child in layout_box.children:
-        paint_tree(child, display_list)
+        paint_tree(child, display_list, hidden)
