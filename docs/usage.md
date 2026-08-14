@@ -39,52 +39,28 @@ for images to load, and writes a PNG.
 
 ## Environment variables
 
-The browser reads four variables of its own, and none of them has to be set
+The browser reads three variables of its own, and none of them has to be set
 for it to work: every one has a default that is the right answer on a normal
-machine. They exist because the browser has two of several things — two
-drawing backends, two window backends, two JavaScript engines — and a choice
-that is only ever made at build time cannot be tested both ways. A fifth, the
-standard `DISPLAY`, is not ours but decides whether the X11 window can open,
-so it is described here too.
+machine. They exist because the browser has two of some things — two window
+backends, two JavaScript engines — and a choice that is only ever made at
+build time cannot be tested both ways. A fourth, the standard `DISPLAY`, is
+not ours but decides whether the X11 window can open, so it is described here
+too.
 
-The four are read as text, stripped of surrounding whitespace and lowercased,
+The three are read as text, stripped of surrounding whitespace and lowercased,
 so `Zig` and ` zig ` are the same as `zig`. Each is read once and the choice
 is then fixed for the life of the process; changing one from inside a running
 browser does nothing.
 
-### `FEETBROWSER_BACKEND`
-
-Which drawing backend renders the browser, from `feetbrowser/gui.py`.
-
-| value | effect |
-| --- | --- |
-| `raster` | our own font engine, rasteriser and event loop (the default) |
-| `tk` | the original tkinter widgets |
-| `auto` | `raster`, falling back to `tk` if the raster backend cannot start |
-
-`auto` is for machines where the raster backend may have nothing to draw
-with: it tries raster first and falls back if that raises, which in practice
-means the font engine found no usable fonts. With `raster` the same machine
-gets an error saying so, which is the more useful answer when you did not ask
-for a fallback.
-
-An unrecognised value is treated as `raster` rather than rejected. Only `tk`
-and `auto` are tested for by name, and everything else takes the default
-path, so a typo like `rastor` silently gets you the default backend.
-
-`--screenshot` needs the raster backend and refuses to run under `tk`, saying
-so, because only our own canvas can hand its pixels back.
-
-The `tk` backend is on its way out — separate work removes it, after which
-this variable will accept only the raster path. What is written here is what
-the code in this branch does today.
+There is nothing here that picks a renderer. There is one — our own font
+engine, rasteriser and event loop — and every window backend, and the
+headless root, draws through it.
 
 ### `FEETBROWSER_DISPLAY`
 
-Which native window backend opens a window, also from `feetbrowser/gui.py`.
-This is a separate question from `FEETBROWSER_BACKEND`: that one picks what
-draws, this one picks what the drawing is shown in, and neither implies the
-other.
+Which native window backend opens a window, from `feetbrowser/gui.py`. It
+picks where the pixels are put, not what draws them: the renderer is the same
+either way, and the same again when there is no window at all.
 
 | value | effect |
 | --- | --- |
@@ -98,10 +74,10 @@ fallback, and it is reported as a sentence rather than a traceback. Silently
 handing back a headless root is how you end up with an empty screenshot and
 no idea why.
 
-An unrecognised value behaves differently from an unrecognised backend name,
-and less helpfully: it matches no backend, so every backend is skipped and
-the browser runs headless without complaining. `FEETBROWSER_DISPLAY=wayland`
-therefore opens no window and says nothing about it.
+An unrecognised value is the exception to that, and not a helpful one: it
+matches no backend, so every backend is skipped and the browser runs headless
+without complaining. `FEETBROWSER_DISPLAY=wayland` therefore opens no window
+and says nothing about it.
 
 ### `FEETBROWSER_JS`
 

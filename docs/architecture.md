@@ -78,9 +78,7 @@ Tk, Qt, GTK, SDL, Cairo or FreeType anywhere, and the only thing the renderer
 asks of the operating system is a font file to parse. Two
 optional imports are tried and shrugged off when absent — Pillow for JPEG and
 cairosvg for SVG, formats `imagecodec.py` does not decode itself. Without them
-those images simply do not appear; everything else is unaffected. The old Tk
-path is still selectable with `FEETBROWSER_BACKEND=tk` for side-by-side
-comparison.
+those images simply do not appear; everything else is unaffected.
 
 ## Layout of the code
 
@@ -95,11 +93,11 @@ feetbrowser/
   fontengine.py  font discovery and the family index; parsing is Rust
   raster.py      thin shim over the Rust surface, glyph cache and PNG output
   imagecodec.py  thin shim over the Rust PNG / GIF / PNM decoders
-  canvas.py      retained scene graph, fonts, colors, images (Tk semantics)
-  window.py      windows, Tk-shaped events, after() timers, main loop
+  canvas.py      retained scene graph, fonts, colors, images
+  window.py      windows, event bindings, after() timers, main loop
   cocoa.py       the macOS window: AppKit through ctypes, no PyObjC
   x11.py         the Linux window: Xlib through ctypes, no python-xlib
-  gui.py         backend facade (raster by default, tk still selectable)
+  gui.py         which native window to open, or none at all
   browser.py     window, chrome, tabs, history, event loop, layered repaint
   toes.py        extension hooking (Toes): discovery, dispatch, CLI
   toehub.py      the ToeHub: catalog fetch, install/uninstall/toggle

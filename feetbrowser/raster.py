@@ -1,8 +1,8 @@
 """Software rasteriser: a pixel buffer and the operations that mark it.
 
-This replaces the drawing half of Tk. A Surface is a flat RGB buffer plus a
-clip rectangle; everything else -- rectangles, lines, glyphs, images -- is
-composited into it here.
+Every pixel the browser shows is marked here. A Surface is a flat RGB buffer
+plus a clip rectangle; everything else -- rectangles, lines, glyphs, images --
+is composited into it here.
 
 All of it lives in Rust now, in the `feetbrowser_engine` extension, including
 the framebuffer: `surface.pixels` is a read-only memoryview onto the buffer

@@ -13,7 +13,7 @@ and the only thing it asks of the operating system is a font file to read.
 ```
 layout.py            display list (paint commands, CSS px)
      |
-canvas.py            retained scene graph  --  Tk canvas semantics
+canvas.py            retained scene graph, composited on demand
      |                 Font, PhotoImage, Canvas, create_*/delete/itemconfig
      |
 raster.py            Surface: spans, scanline AA, glyph cache, PNG out
@@ -50,10 +50,10 @@ Python data that the matcher compiles on first use. The rules list is compiled
 once and cached against its identity, so a script that mutates the DOM
 re-cascades without re-reading the stylesheet.
 
-`window.py` sits beside all of it and supplies what Tk supplied besides
-drawing: a binding table using Tk's own sequence names, `after()` timers, and
-a main loop. `gui.py` is the seam — a facade that picks a backend, so the old
-Tk path is still selectable with `FEETBROWSER_BACKEND=tk` for comparison.
+`window.py` sits beside all of it and supplies everything that is not
+drawing: a binding table keyed by event sequence names, `after()` timers, and
+a main loop. `gui.py` is what is left of the seam — it decides which *native*
+window the frames are put in, and nothing else.
 
 ## fontengine.py — reading the font
 
@@ -155,8 +155,8 @@ Everything returns `(width, height, rgba)`.
   and Adam7 interlacing. An inflate with a ceiling on it does the
   decompression; the rest is ours.
 - **GIF**: a hand-written variable-width LZW decoder, global and local colour
-  tables, transparency index, and interlacing. First frame only, which is what
-  Tk did too.
+  tables, transparency index, and interlacing. First frame only: an animated
+  GIF shows its first frame and does not move.
 - **PNM**: P1–P6, because it is four lines of code and makes tests easy.
 
 Scaling is nearest-neighbour, matching the `subsample`/`zoom` semantics the
@@ -184,7 +184,7 @@ image.
 ## canvas.py — the scene graph
 
 This is the widest surface area, because it is the part everything above it
-already talks to. It reproduces the Tk canvas contract the browser depends on:
+already talks to. The contract it keeps is:
 
 - Items carry an integer id and a tag set, and paint in creation order.
 - `delete(tag)` wipes a layer. The browser's layered repaint — page, chrome,
@@ -192,8 +192,8 @@ already talks to. It reproduces the Tk canvas contract the browser depends on:
 - `find_all()` returns ids in creation order, which is how the browser diffs
   before and after a toe's `on_draw` to tag whatever the toe created.
 - Colours accept `#rgb`, `#rrggbb`, `#rrrrggggbbbb` and the 148 CSS names, and
-  raise `TclError` on nonsense — the display list already catches that and
-  falls back, so those paths keep working.
+  raise `CanvasError` on nonsense — every `execute` in the display list
+  catches that and paints in black rather than dropping the box.
 
 `Font` is where the two halves have to agree. `measure()` and `draw()` both
 resolve each character through the same `face_for()` — which consults the
@@ -214,12 +214,12 @@ Glyph fallback is not a nicety. No single text face has the toolbar's `⟳`,
 deadline, and a loop that drains them. That is the entire event model, and it
 runs with no display at all — which is what makes `tests/test_render.py` and
 the rest of the suite possible on a machine with no GUI. Handler exceptions are
-reported and swallowed, matching Tk's report-and-continue, so one broken toe
-cannot take down the browser.
+reported and swallowed rather than propagated, so one broken toe cannot take
+down the browser.
 
 Platform windows subclass it and add two things: a source of real input
 (`poll_events()`) and somewhere to push the surface (`present()`). Everything
-above only ever sees the Tk-shaped API, so adding a platform is additive.
+above only ever sees `Window`'s own API, so adding a platform is additive.
 
 ## cocoa.py — a real window, still with no toolkit
 
@@ -239,13 +239,12 @@ AppKit draws asynchronously, and a frame whose canvas is not dirty is not
 uploaded at all.
 
 Input is the mirror image of that: Cocoa event types and virtual key codes
-become `<Button-1>`, `<Control-l>`, `<MouseWheel>`. Two pieces of Tk behaviour
-are reproduced deliberately, because the browser depends on both. A binding
-fires when its modifiers are a *subset* of the ones held, which is what lets
-`<Control-ISO_Left_Tab>` catch Control-Shift-Tab; and only the most specific
-binding fires, so a window that bound `<Up>` and `<Key>` sees one keypress
-once. Command maps to Tk's Control, because that is where a Mac user's muscle
-memory puts it.
+become `<Button-1>`, `<Control-l>`, `<MouseWheel>`. Two binding rules matter
+here, because the browser depends on both. A binding fires when its modifiers
+are a *subset* of the ones held, which is what lets `<Control-ISO_Left_Tab>`
+catch Control-Shift-Tab; and only the most specific binding fires, so a window
+that bound `<Up>` and `<Key>` sees one keypress once. Command arrives as
+`Control`, because that is where a Mac user's muscle memory puts it.
 
 There is one event queue per *application*, not per window, so a module-level
 registry maps each `NSWindow` back to its Python window and the root's loop
@@ -260,14 +259,15 @@ pump over `XPending`/`XNextEvent`. No python-xlib, no compiled shim, and no
 XCB — the same rule the rest of the repo lives by. XWayland means this covers
 most Wayland desktops as well; a native Wayland backend is not written.
 
-Translation is *lighter* here than on macOS, because Tk is an X11 program and
-it shows. Tk's `event.state` bits are literally X's modifier mask, and Tk's
+Translation is *lighter* here than on macOS, and the reason is historical:
+the event vocabulary in `window.py` was inherited from a toolkit that was
+itself an X11 program, so `event.state` is literally X's modifier mask and the
 keysym names — `Return`, `Left`, `ISO_Left_Tab` — are X's keysym names. So
 `XLookupString` (which applies the user's keyboard layout, and is the reason
 a shifted `a` arrives as the keysym `A`) plus `XKeysymToString` is nearly the
-whole job. Two habits of Tk's are added back: a printable key is named by its
-character, and a modifier pressed on its own is not a keypress, which X thinks
-it is. The binding rules themselves — which sequences a keypress tries, most
+whole job. Two conventions have to be added back on top: a printable key is
+named by its character, and a modifier pressed on its own is not a keypress,
+which X thinks it is. The binding rules themselves — which sequences a keypress tries, most
 specific first — live in `window.py` and are shared with `cocoa.py` rather
 than written twice. The wheel is buttons 4 and 5 on X, translated to
 `<MouseWheel>` with a delta small enough that `browser.py` reads it as pixels.
@@ -292,24 +292,23 @@ on the same machine is a worse browser than a slightly slower one.
 
 There is no close event in X: the window manager asks through a
 `WM_DELETE_WINDOW` client message, and a client that ignores it gets killed
-instead of asked. `XSetWMProtocols` opts in, and the message runs the same
-`protocol()` handler Tk would. Xlib's default error handler calls `exit()`,
+instead of asked. `XSetWMProtocols` opts in, and the message runs the
+window's `protocol()` handler. Xlib's default error handler calls `exit()`,
 which would take the browser down over a stale window id, so ours records the
 error and returns. As on macOS there is one event queue per *connection*, so
 a module-level registry maps each window id back to its Python window and the
 root's loop feeds any popups.
 
-`gui.py` picks all of this up: `gui.Tk()` is always the headless root, so tests
-and `--screenshot` never open anything, and only `gui.new_window()` asks for a
-real one. Backends declare themselves in one table and answer `available()`
-for themselves, so Cocoa is tried and then X11 and the first that can run
-wins. `FEETBROWSER_DISPLAY=x11` or `=cocoa` demands one by name and fails
-loudly rather than falling back to a headless root that renders a black
-screenshot; `FEETBROWSER_DISPLAY=none` forces headless even where a window is
-possible. All of that selects among *our* windows, so it has nothing to say to
-`FEETBROWSER_BACKEND=tk`, which opens whatever tkinter opens. With no
-`$DISPLAY`, or an X server that will not answer, the browser says which of
-those it was and renders headless instead of raising.
+`gui.py` picks all of this up, and this is now all it does. `window.Tk()` is
+always the headless root, so tests and `--screenshot` never open anything, and
+only `gui.new_window()` asks for a real one. Backends declare themselves in
+one table and answer `available()` for themselves, so Cocoa is tried and then
+X11 and the first that can run wins. `FEETBROWSER_DISPLAY=x11` or `=cocoa`
+demands one by name and fails loudly rather than falling back to a headless
+root that renders a black screenshot; `FEETBROWSER_DISPLAY=none` forces
+headless even where a window is possible. With no `$DISPLAY`, or an X server
+that will not answer, the browser says which of those it was and renders
+headless instead of raising.
 
 ## Testing it
 

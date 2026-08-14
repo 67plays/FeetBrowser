@@ -15,8 +15,6 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from feetbrowser import gui
-
 
 def _skip(reason):
     print("SKIP test_cocoa.py: %s" % reason)
@@ -25,8 +23,6 @@ def _skip(reason):
 
 if sys.platform != "darwin":
     _skip("not macOS")
-if gui.backend() != "raster":
-    _skip("needs FEETBROWSER_BACKEND=raster")
 
 from feetbrowser import browser as browsermod  # noqa: E402
 from feetbrowser import cocoa  # noqa: E402

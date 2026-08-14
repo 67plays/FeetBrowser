@@ -881,9 +881,9 @@ def test_color_empty_is_transparent_and_junk_raises():
     assert canvasmod.color(None) is None
     try:
         canvasmod.color("not-a-colour")
-    except canvasmod.TclError:
+    except canvasmod.CanvasError:
         return
-    raise AssertionError("a bad colour name must raise TclError, as Tk does")
+    raise AssertionError("a bad colour name must raise CanvasError")
 
 
 # -- canvas ----------------------------------------------------------------
@@ -933,12 +933,12 @@ def test_canvas_addtag_by_item_id():
 
 
 def test_canvas_rejects_bad_colour_at_creation():
-    """The display list catches TclError to fall back to black, so the error
+    """The display list catches CanvasError to fall back to black, so the error
     has to arrive from create_*, not from render()."""
     c = canvasmod.Canvas(width=10, height=10)
     try:
         c.create_rectangle(0, 0, 5, 5, fill="rgb-ish?")
-    except canvasmod.TclError:
+    except canvasmod.CanvasError:
         return
     raise AssertionError("create_rectangle accepted an invalid colour")
 
@@ -1159,11 +1159,9 @@ def test_window_destroy_takes_children_with_it():
     assert not child.winfo_exists() and not root.winfo_exists()
 
 
-def test_gui_backend_exports_everything_used():
-    for name in ("Tk", "Toplevel", "Canvas", "PhotoImage", "TclError",
-                 "Font"):
+def test_gui_exports_the_window_names_browser_uses():
+    for name in ("Toplevel", "new_window", "has_display", "display_problem"):
         assert getattr(gui, name, None) is not None, f"gui.{name} missing"
-    assert gui.backend() in ("raster", "tk")
 
 
 # -- images end to end -----------------------------------------------------
