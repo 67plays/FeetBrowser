@@ -11,6 +11,7 @@ import gzip
 import os
 import socket
 import ssl
+import threading
 import time
 import urllib.parse
 import zlib
@@ -19,6 +20,66 @@ import zlib
 # Cache-Control (max-age). Good enough to avoid re-fetching stylesheets.
 _CACHE = {}
 CACHE_MAX_SIZE = 1000
+
+# Bounded cache of resolved host addresses. Image-heavy pages fetch dozens of
+# resources from the same host; without this, every request pays a fresh
+# getaddrinfo (a blocking, sometimes multi-second DNS round-trip). Entries are
+# (timestamp, (family, socktype, proto, sockaddr)) tuples; a failed connect
+# drops the entry and falls back to the full resolver. A lock guards access
+# because image fetches run on background threads, and a TTL keeps rotated DNS
+# from pinning the browser to a stale endpoint forever.
+_DNS_CACHE = {}
+_DNS_CACHE_MAX = 512
+_DNS_TTL = 300.0  # seconds
+_DNS_LOCK = threading.Lock()
+
+
+def _connect(host, port):
+    """Open a TCP socket to (host, port), reusing a cached address when one
+    is available and falling back to socket.create_connection (which retries
+    across all resolved addresses) otherwise."""
+    key = (host, port)
+    now = time.time()
+    with _DNS_LOCK:
+        entry = _DNS_CACHE.get(key)
+        if entry is not None and now - entry[0] > _DNS_TTL:
+            _DNS_CACHE.pop(key, None)
+            entry = None
+        if entry is None:
+            infos = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
+            if not infos:
+                raise socket.gaierror(socket.EAI_NONAME, "Name or service not known")
+            info = infos[0][:3] + (infos[0][4],)
+            if len(_DNS_CACHE) < _DNS_CACHE_MAX:
+                _DNS_CACHE[key] = (now, info)
+            entry = (now, info)
+    info = entry[1]
+    s = None
+    try:
+        s = socket.socket(info[0], info[1], info[2])
+        s.settimeout(20)
+        s.connect(info[3])
+        return s
+    except OSError:
+        # Cached address unreachable (rotated DNS / load balancer): drop it
+        # and let the full resolver try every address the host reports.
+        if s is not None:
+            s.close()
+        with _DNS_LOCK:
+            if _DNS_CACHE.get(key) == entry:
+                _DNS_CACHE.pop(key, None)
+        s = socket.create_connection((host, port), timeout=20)
+        # Cache the address the fallback actually connected to, so a repeat
+        # request skips the failed attempt.
+        try:
+            peer = s.getpeername()
+            with _DNS_LOCK:
+                if len(_DNS_CACHE) < _DNS_CACHE_MAX:
+                    _DNS_CACHE[key] = (time.time(),
+                                       (s.family, s.type, s.proto, peer))
+        except OSError:
+            pass
+        return s
 
 DEFAULT_HEADERS = {
     "User-Agent": "FeetBrowser/0.1.1 (https://github.com/JuiceyDew/FeetBrowser)",
@@ -253,8 +314,7 @@ class URL:
             else:
                 del _CACHE[cache_key]
 
-        # create_connection handles both IPv4 and IPv6 hosts.
-        s = socket.create_connection((self.host, self.port), timeout=20)
+        s = _connect(self.host, self.port)
         if self.scheme == "https":
             ctx = ssl.create_default_context()
             s = ctx.wrap_socket(s, server_hostname=self.host)
