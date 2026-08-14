@@ -2133,6 +2133,75 @@ def test_async_load_in_gui_mode():
         root.destroy()
 
 
+def test_images_over_http_reach_the_display_list():
+    """The shape of a real page: HTML off the wire, then images off the wire.
+
+    Both halves are asynchronous and they finish in that order, so a caller
+    that waits on `tab.loading` alone stops exactly one step early -- with
+    the document rendered and every <img> still a placeholder. This is the
+    regression that made photographs vanish from the raster backend.
+    """
+    import struct
+    import time
+    import zlib
+
+    def png(width, height, rgb):
+        def chunk(tag, payload):
+            body = tag + payload
+            return (struct.pack(">I", len(payload)) + body
+                    + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF))
+        raw = b"".join(b"\x00" + bytes(rgb) * width for _ in range(height))
+        return (b"\x89PNG\r\n\x1a\n"
+                + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height,
+                                             8, 2, 0, 0, 0))
+                + chunk(b"IDAT", zlib.compress(raw))
+                + chunk(b"IEND", b""))
+
+    pixels = png(6, 6, (0, 128, 255))
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/pic.png":
+                body, ctype = pixels, "image/png"
+            else:
+                body = b"<h1>page</h1><p><img src='/pic.png'>"
+                ctype = "text/html"
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    from feetbrowser.layout import DrawImage
+
+    srv = _start_server(H)
+    browser = Browser()
+    try:
+        port = srv.server_address[1]
+        browser.new_tab(f"http://127.0.0.1:{port}/page")
+        tab = browser.tabs[0]
+        assert tab.loading, "http in GUI mode loads off the UI thread"
+        # Pump only until the document lands -- the old settle condition.
+        deadline = time.time() + 10
+        while tab.loading and time.time() < deadline:
+            browser.window.flush_timers()
+            time.sleep(0.01)
+        assert not tab.loading, "document should have arrived"
+        assert tab.pending_images(), "and its image should still be coming"
+        assert browser.settle(20.0), "settle should not have timed out"
+        eq(len(tab.image_cache), 1, "image decoded and cached")
+        images = [c for c in tab.display_list if isinstance(c, DrawImage)]
+        eq(len(images), 1, "image painted")
+        assert not any("[img" in getattr(c, "text", "")
+                       for c in tab.display_list), "placeholder replaced"
+    finally:
+        srv.shutdown()
+        browser.window.destroy()
+
+
 # -- <select> drop-downs ----------------------------------------------------
 
 _SELECT_PAGE = (

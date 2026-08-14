@@ -52,6 +52,11 @@ MAX_CACHED_IMAGES = 300
 # still fetching far faster than the layout can paint.
 MAX_CONCURRENT_IMAGE_FETCHES = 6
 _image_fetch_sem = threading.Semaphore(MAX_CONCURRENT_IMAGE_FETCHES)
+# How long Browser.settle() waits for a page to stop having work outstanding.
+# It is a ceiling, not a delay: settling returns the moment the last image is
+# in, and only a page pointing at something that never answers waits it out.
+# Generous, because the alternative is a screenshot of a half-drawn page.
+SETTLE_TIMEOUT = 30.0
 
 # Deeply nested documents walk DOM/layout trees recursively; give Python a
 # comfortable margin so pathological pages degrade gracefully instead of
@@ -978,6 +983,18 @@ class Tab:
         for key, url in self._image_queue:
             threading.Thread(
                 target=self._fetch_image, args=(key, url), daemon=True).start()
+
+    def pending_images(self):
+        """True while image fetches started by load_images() are outstanding.
+
+        A tab whose document has arrived is not finished: `loading` goes
+        false the moment the HTML is in, and only then does load_images()
+        start fetching what the page points at. Entries leave the queue in
+        _drain_images(), on the UI thread, at the moment decoded pixels reach
+        the image cache -- so waiting on this is waiting for the render that
+        stops drawing "[img]" placeholders.
+        """
+        return bool(self._image_queue)
 
     def _fetch_image(self, key, url):
         """Background thread: fetch bytes, hand them back to the UI thread via
@@ -2132,6 +2149,10 @@ class Browser:
         # canvas entirely while the page is idle instead of repainting every
         # 120ms forever.
         self._repaint_needed = True
+        # Whether the _poll_images() after-chain is already running. It is
+        # started by whoever needs it first -- run(), or settle() in a
+        # headless render -- and there must only ever be one of it.
+        self._polling_images = False
 
         # Toes: one Context per loaded toe, all optional hooks.
         self.toes = toes.discover_toes()
@@ -3679,11 +3700,47 @@ class Browser:
             self._draw_page()
         self.window.after(120, self._repaint_tick)
 
+    def busy(self):
+        """True while any tab still has work that changes what is on screen.
+
+        Two different things count, and conflating them is what made
+        screenshots come out full of placeholders: a document still on the
+        wire, and images still on the wire for a document that has already
+        arrived.
+        """
+        return any(tab.loading or tab.pending_images() for tab in self.tabs)
+
+    def settle(self, timeout=SETTLE_TIMEOUT):
+        """Run the timer queue until nothing is outstanding, or `timeout`.
+
+        Without a platform event loop nothing drains the timers, and image
+        loading lives entirely on them: fetches finish on background threads
+        and only become pixels when _poll_images() picks them up on the UI
+        thread. Anything that wants a finished frame without calling run()
+        -- --screenshot, tests -- has to pump here first.
+
+        Returns True if everything settled, False if the timeout arrived
+        first (a page can always point at an image that never answers).
+        """
+        if not self._polling_images:
+            self._poll_images()
+        deadline = time.monotonic() + timeout
+        while True:
+            wait = self.window.flush_timers()
+            if not self.busy():
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(min(wait, 0.01) if wait is not None else 0.01)
+
     def _poll_images(self):
         """Periodic UI-thread sweep: pick up decoded image bytes left by the
         fetch threads, re-render, and spin the loading indicator while any
         tab is still fetching. The `after` chain lives for the whole session,
         which keeps the loop alive across navigations."""
+        # Whoever gets here first owns the chain; settle() checks this so a
+        # headless render does not start a second one alongside run()'s.
+        self._polling_images = True
         loading = False
         for tab in self.tabs:
             tab._drain_images()
@@ -4435,7 +4492,7 @@ def shoes_html(theme, active):
 """
 
 
-def screenshot(url, path, width=WIDTH, height=HEIGHT, settle=3.0):
+def screenshot(url, path, width=WIDTH, height=HEIGHT, settle=SETTLE_TIMEOUT):
     """Load `url` and write the rendered window to `path` as a PNG.
 
     No display is opened. The raster backend draws into an ordinary buffer,
@@ -4458,16 +4515,9 @@ def screenshot(url, path, width=WIDTH, height=HEIGHT, settle=3.0):
     # now, or the page lays out for the default viewport and gets cropped.
     browser._apply_resize()
     browser.new_tab(url)
-    # Images and deferred scripts land on the timer queue; give them a
-    # bounded window to arrive before the frame is captured.
-    browser._poll_images()
-    deadline = time.time() + settle
-    while time.time() < deadline:
-        browser.window.flush_timers()
-        if not any(tab.loading for tab in browser.tabs):
-            break
-        time.sleep(0.02)
-    browser.window.flush_timers()  # final drain of decoded images
+    # Images and deferred scripts land on the timer queue, so the frame is
+    # only finished once that queue has run itself out.
+    browser.settle(settle)
     browser.draw()
     browser.canvas.render().save_png(path)
     return browser

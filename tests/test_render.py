@@ -1,8 +1,9 @@
 """Offline tests for the rendering stack: fonts, raster, image codecs, canvas.
 
-These cover the layers that replaced Tk. They need no display and no network,
-but they do need at least one installed font, which every platform we support
-has.
+These cover the layers that replaced Tk. They need no display and reach
+nothing outside this machine -- the few that need a page to arrive over HTTP
+serve it from a loopback server they start themselves -- but they do need at
+least one installed font, which every platform we support has.
 """
 import os
 import struct
@@ -769,6 +770,134 @@ def test_gui_backend_exports_everything_used():
                  "Font"):
         assert getattr(gui, name, None) is not None, f"gui.{name} missing"
     assert gui.backend() in ("raster", "tk")
+
+
+# -- images end to end -----------------------------------------------------
+#
+# imagecodec is tested above against known pixels, and passed happily while
+# every <img> on the screen was the "[img]" placeholder: decoding was never
+# the broken part. What follows drives the whole path instead -- page load,
+# the fetch that runs off the UI thread, the timer sweep that publishes the
+# decoded image, layout, and the blit -- and looks at the pixels that come
+# out the far end.
+
+IMAGE_RGB = (255, 0, 255)
+IMAGE_SIZE = 8
+
+
+def _page_with_image(directory, rgb=IMAGE_RGB, size=IMAGE_SIZE):
+    """Write an HTML file whose <img> is a data: PNG of a solid colour."""
+    import base64
+    samples = bytes(rgb) * size * size
+    src = "data:image/png;base64," + base64.b64encode(
+        _png(size, size, 8, 2, samples)).decode()
+    path = os.path.join(directory, "page.html")
+    with open(path, "w") as handle:
+        handle.write(f"<!doctype html><title>img</title><p><img src='{src}'>")
+    return path
+
+
+def _serve_page_with_image(delay, rgb=IMAGE_RGB, size=IMAGE_SIZE):
+    """A loopback server: an HTML page, and a PNG that takes `delay` to send.
+
+    The delay is the whole point. Images arrive after the document that asked
+    for them, and anything that captures a frame in between captures
+    placeholders -- so a test that lets the image win the race tests nothing.
+    """
+    import http.server
+    import threading
+    import time
+
+    pixels = _png(size, size, 8, 2, bytes(rgb) * size * size)
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path.endswith(".png"):
+                time.sleep(delay)
+                body, ctype = pixels, "image/png"
+            else:
+                body = b'<!doctype html><title>img</title><p><img src="/i.png">'
+                ctype = "text/html"
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server
+
+
+def _count_pixels(surface, rgb):
+    return sum(1 for y in range(surface.height) for x in range(surface.width)
+               if _pixel(surface, x, y) == rgb)
+
+
+def test_screenshot_paints_images_rather_than_placeholders():
+    """A screenshot must contain the page's image, not its alt text.
+
+    The regression this guards was not in any decoder: --screenshot stopped
+    waiting the moment the *document* had arrived, which is the moment image
+    loading begins, so every frame was captured with an empty image cache and
+    every <img> laid out as "[img]".
+    """
+    import shutil
+    import tempfile
+    from feetbrowser.browser import screenshot
+
+    work = tempfile.mkdtemp(prefix="fb-shot-")
+    server = _serve_page_with_image(0.3)
+    try:
+        out = os.path.join(work, "shot.png")
+        url = "http://127.0.0.1:%d/page" % server.server_address[1]
+        browser = screenshot(url, out, settle=20.0)
+        placeholders = [c for c in browser.tabs[0].display_list
+                        if "[img" in getattr(c, "text", "")]
+        assert not placeholders, f"placeholder still drawn: {placeholders}"
+        width, height, rgba = imagecodec.decode(open(out, "rb").read())
+        assert (width, height) == (browser.canvas.winfo_width(),
+                                   browser.canvas.winfo_height())
+        painted = sum(1 for i in range(0, len(rgba), 4)
+                      if tuple(rgba[i:i + 3]) == IMAGE_RGB)
+        assert painted == IMAGE_SIZE * IMAGE_SIZE, \
+            f"expected an {IMAGE_SIZE}px square, found {painted} pixels"
+    finally:
+        server.shutdown()
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def test_settle_waits_for_images_a_finished_document_asked_for():
+    """`loading` going false does not mean the page is finished.
+
+    A document is fetched first and its images afterwards, so there is a
+    window in which nothing is "loading" and the page is still all
+    placeholders. Browser.settle() has to span it.
+    """
+    import shutil
+    import tempfile
+    from feetbrowser.browser import Browser
+
+    work = tempfile.mkdtemp(prefix="fb-settle-")
+    try:
+        page = _page_with_image(work)
+        browser = Browser()
+        browser.new_tab("file://" + page)
+        tab = browser.tabs[0]
+        assert not tab.loading, "a file: document loads synchronously"
+        assert tab.pending_images(), "images are queued, so work remains"
+        assert browser.busy(), "and the browser has to call that busy"
+        assert browser.settle(20.0), "settle should not have timed out"
+        assert not browser.busy() and not tab.pending_images()
+        assert tab.image_cache, "settling means the image is decoded"
+        browser.draw()
+        assert _count_pixels(browser.canvas.render(),
+                             IMAGE_RGB) == IMAGE_SIZE * IMAGE_SIZE
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
 
 
 def main():
