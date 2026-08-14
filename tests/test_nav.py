@@ -9,6 +9,15 @@ from feetbrowser.htmlparser import Element
 from feetbrowser.layout import DrawText
 
 
+# The page this walks away from and back to. The live web by default, so a
+# developer running ./test.sh exercises real DNS, real TLS and a real remote
+# server. CI passes the offline mirror in tests/fixtures instead, because a
+# pull request should not fail over somebody else's outage, and should not
+# send them traffic on every push either. Every assertion below is the same
+# in both modes: the mirror is laid out under the host names it stands in for.
+SITE = sys.argv[1] if len(sys.argv) > 1 else "https://example.com"
+
+
 FORM_PAGE = """<!doctype html><html><body>
 <form method="get" action="/echo">
   <p><label>Search <input name="q"></label></p>
@@ -131,7 +140,7 @@ def test_form_round_trip():
 def main():
     root = gui.Tk(); root.withdraw()
     tab = Tab(700)
-    tab.load("https://example.com")
+    tab.load(SITE)
     assert tab.title == "Example Domain", tab.title
     pt = find_link_point(tab, "more")
     assert pt, "link text not found in display list"
@@ -153,7 +162,7 @@ def main():
     assert "iana.org" in str(tab.url)
 
     # view-source
-    tab.load("view-source:https://example.com")
+    tab.load("view-source:" + SITE)
     assert any("<!doctype" in c.text.lower() or "<html" in c.text.lower()
                for c in tab.display_list if isinstance(c, DrawText)), \
         "view-source did not show markup"
