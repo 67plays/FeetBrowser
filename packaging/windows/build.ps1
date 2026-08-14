@@ -140,7 +140,11 @@ Expand-Archive -Path $embedZip -DestinationPath $stage -Force
 # python.cat is a signature catalogue for the CPython files as python.org
 # shipped them. Keeping it means anyone can verify that half of the bundle
 # against Microsoft's own tooling, which is worth more than the 500 KB.
-$pythonDll = @(Get-ChildItem -Path $stage -Filter 'python3??.dll')
+# -match, not -Filter: Windows wildcards let '?' match *zero* characters at the
+# end of a name, so 'python3??.dll' happily matches python3.dll -- the stable
+# ABI forwarder, which the embeddable package also ships -- as well as
+# python313.dll, and the count below would always be two.
+$pythonDll = @(Get-ChildItem -Path $stage -File | Where-Object { $_.Name -match '^python3\d+\.dll$' })
 if ($pythonDll.Count -ne 1) { Fail "expected one python3NN.dll in the embeddable package, found $($pythonDll.Count)" }
 $stdlibZip = [IO.Path]::GetFileNameWithoutExtension($pythonDll[0].Name) + '.zip'
 if (-not (Test-Path (Join-Path $stage $stdlibZip))) { Fail "no $stdlibZip in the embeddable package" }

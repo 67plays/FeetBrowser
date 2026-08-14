@@ -127,15 +127,21 @@ jobs:
       - name: Size
         run: |
           $zip = Get-Item build/windows/FeetBrowser-windows-x64.zip
+          $files = Get-ChildItem -File build/windows/FeetBrowser
           $dir = Get-ChildItem -Recurse -File build/windows/FeetBrowser |
                  Measure-Object -Property Length -Sum
+          # -match rather than -Filter: a Windows wildcard '?' also matches zero
+          # characters at the end of a name, so 'python3??.dll' picks up the
+          # python3.dll forwarder too.
+          $cpython = @($files | Where-Object { $_.Name -match '^python3\d+\.dll$' })[0].Name
+          $engine = @($files | Where-Object { $_.Name -like 'feetbrowser_engine*.pyd' })[0].Name
           $lines = @(
             "| | |",
             "|-|-|",
             ("| zip | {0:N1} MB |" -f ($zip.Length / 1MB)),
             ("| unpacked | {0:N1} MB in {1} files |" -f ($dir.Sum / 1MB), $dir.Count),
-            ("| CPython | {0} |" -f (Get-ChildItem build/windows/FeetBrowser -Filter 'python3??.dll')[0].Name),
-            ("| engine | {0} |" -f (Get-ChildItem build/windows/FeetBrowser -Filter 'feetbrowser_engine*.pyd')[0].Name)
+            "| CPython | $cpython |",
+            "| engine | $engine |"
           )
           $lines | Tee-Object -FilePath $env:GITHUB_STEP_SUMMARY -Append
 

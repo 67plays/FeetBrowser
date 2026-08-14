@@ -135,7 +135,10 @@ Check "the folder is complete" {
                           'install.ps1', 'uninstall.ps1')) {
         if (-not (Test-Path (Join-Path $Root $needed))) { throw "missing $needed" }
     }
-    $dll = @(Get-ChildItem -Path $Root -Filter 'python3??.dll')
+    # -match rather than -Filter: in a Windows wildcard '?' also matches zero
+    # characters at the end of a name, so 'python3??.dll' would match the
+    # python3.dll forwarder as well and the count would never be one.
+    $dll = @(Get-ChildItem -Path $Root -File | Where-Object { $_.Name -match '^python3\d+\.dll$' })
     if ($dll.Count -ne 1) { throw "expected one python3NN.dll, found $($dll.Count)" }
     $pyd = @(Get-ChildItem -Path $Root -Filter 'feetbrowser_engine*.pyd')
     if ($pyd.Count -ne 1) { throw "expected one feetbrowser_engine .pyd, found $($pyd.Count)" }
