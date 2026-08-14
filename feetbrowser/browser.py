@@ -2310,10 +2310,10 @@ WELCOME_HTML = """
         <b>Home / End</b> jump to top / bottom &nbsp; <b>Esc</b> blur</li>
     <li><b>Middle-click</b> or <b>Ctrl-click</b> a link to open it in a new tab</li>
   </ul>
-  <p class="sub">Forms are wired up: focus a text field to type, press
-  Enter to submit, and checkboxes toggle. Images, floats, flexbox, CSS grid,
-  and `<table>` tables render too. JavaScript runs too: scripts execute on
-  load, can rewrite the page via the DOM, and handle clicks.</p>
+  <p class="sub">Forms are wired up, you can focus a text field to type, press
+  Enter to submit, and toggle checkboxes. Images, floats, flexbox, CSS grid,
+  and tables also render. JavaScript is a work in progress: scripts might execute on
+  load, could rewrite the page via the DOM, and occasionally handle clicks.</p>
   <p class="sub">Type a URL or a search term in the address bar to begin.</p>
 </body></html>
 """
