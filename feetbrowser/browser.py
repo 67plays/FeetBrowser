@@ -14,8 +14,10 @@ import sys
 import json
 import html
 import threading
+import time
 import tkinter
 import urllib.parse
+import uuid
 from collections import deque
 
 from .net import URL
@@ -382,6 +384,7 @@ class Tab:
         self._js_log_cursor = 0
         self._js_interp = None
         self._js_doc = None
+        self._last_js_render = 0.0
         self._js_fetch_results.clear()
         self._js_xhr_results.clear()
 
@@ -467,13 +470,15 @@ class Tab:
             return
         self._js_interp = Interpreter()
         doc = JSDocument(self.nodes, base_url=self.base_url,
-                         mark_dirty=self._js_mutated)
+                         mark_dirty=self._js_mutated,
+                         interp=self._js_interp)
         self._js_doc = doc
         self._js_interp.globals["document"] = doc
         self._js_interp.globals["window"] = doc
         # Browser-provided host APIs (network + nothing Tk).
         self._js_interp.globals["fetch"] = self._js_fetch
         self._js_interp.globals["XMLHttpRequest"] = self._js_xhr_ctor()
+        self._register_js_host(self._js_interp, doc)
         for el in scripts:
             try:
                 code = None
@@ -573,6 +578,147 @@ class Tab:
     def _js_xhr_ctor(self):
         return _JSXHRCtor(self)
 
+    def _register_js_host(self, interp, doc):
+        """Register browser-environment globals (window/document companions)
+        so real-world pages can poke at them without throwing."""
+        url = self.base_url or self.url
+        url_str = str(url) if url else ""
+        interp.globals["performance"] = {
+            "now": lambda: time.time() * 1000,
+            "timing": {
+                "navigationStart": time.time() * 1000,
+                "domContentLoadedEventEnd": 0,
+                "loadEventEnd": 0,
+            },
+            "navigation": {"type": 0, "redirectCount": 0},
+            "mark": lambda *a: None,
+            "measure": lambda *a: None,
+            "getEntriesByName": lambda *a: [],
+            "getEntriesByType": lambda *a: [],
+            "timeOrigin": time.time() * 1000,
+        }
+        interp.globals["navigator"] = {
+            "userAgent": "FeetBrowser/0.1.1",
+            "platform": "Linux x86_64",
+            "language": "en-US",
+            "languages": ["en-US", "en"],
+            "vendor": "FeetBrowser",
+            "appName": "Netscape",
+            "appVersion": "5.0 (X11; Linux x86_64) FeetBrowser/0.1.1",
+            "product": "Gecko",
+            "onLine": True,
+            "cookieEnabled": True,
+            "hardwareConcurrency": 4,
+            "maxTouchPoints": 0,
+            "webdriver": False,
+            "connection": {"effectiveType": "4g", "downlink": 10,
+                           "rtt": 50},
+            "sendBeacon": lambda *a: True,
+            "clipboard": {"writeText": lambda *a: None},
+            "permissions": {"query": lambda *a: {"state": "denied"}},
+        }
+        interp.globals["location"] = self._js_location(url_str)
+        interp.globals["history"] = {
+            "length": 0,
+            "state": None,
+            "back": lambda: None,
+            "forward": lambda: None,
+            "go": lambda *a: None,
+            "pushState": lambda *a: None,
+            "replaceState": lambda *a: None,
+        }
+        interp.globals["screen"] = {
+            "width": 1000, "height": 720,
+            "availWidth": 1000, "availHeight": 720,
+            "colorDepth": 24, "pixelDepth": 24,
+        }
+        interp.globals["innerWidth"] = 1000
+        interp.globals["innerHeight"] = 720
+        interp.globals["outerWidth"] = 1000
+        interp.globals["outerHeight"] = 720
+        interp.globals["devicePixelRatio"] = 1
+        interp.globals["pageXOffset"] = 0
+        interp.globals["pageYOffset"] = 0
+        interp.globals["scrollX"] = 0
+        interp.globals["scrollY"] = 0
+        interp.globals["matchMedia"] = lambda query: _js_match_media(str(query))
+        interp.globals["getComputedStyle"] = \
+            lambda el, pseudo=None: _js_computed_style(el)
+        interp.globals["requestAnimationFrame"] = \
+            lambda fn: interp._native_set_timeout(fn, 0)
+        interp.globals["cancelAnimationFrame"] = interp._native_clear_timer
+        interp.globals["requestIdleCallback"] = \
+            lambda fn: interp._native_set_timeout(fn, 0)
+        interp.globals["cancelIdleCallback"] = interp._native_clear_timer
+        interp.globals["Event"] = _JSEventCtor()
+        interp.globals["CustomEvent"] = _JSEventCtor()
+        interp.globals["MouseEvent"] = _JSEventCtor()
+        interp.globals["KeyboardEvent"] = _JSEventCtor()
+        interp.globals["alert"] = lambda *a: UNDEFINED
+        interp.globals["confirm"] = lambda *a: False
+        interp.globals["prompt"] = lambda *a: UNDEFINED
+        interp.globals["open"] = lambda *a: None
+        interp.globals["close"] = lambda: None
+        interp.globals["print"] = lambda: None
+        interp.globals["scrollTo"] = lambda *a: None
+        interp.globals["scrollBy"] = lambda *a: None
+        interp.globals["focus"] = lambda: None
+        interp.globals["blur"] = lambda: None
+        interp.globals["addEventListener"] = doc._add_event_listener
+        interp.globals["removeEventListener"] = doc._remove_event_listener
+        interp.globals["dispatchEvent"] = doc._dispatch_event
+        interp.globals["globalThis"] = doc
+        interp.globals["parent"] = doc
+        interp.globals["top"] = doc
+        interp.globals["self"] = doc
+        interp.globals["frames"] = doc
+        interp.globals["origin"] = "null"
+        interp.globals["caches"] = {
+            "open": lambda *a: _js_fresh_promise(interp),
+            "match": lambda *a: _js_fresh_promise(interp),
+        }
+        interp.globals["localStorage"] = _js_storage()
+        interp.globals["sessionStorage"] = _js_storage()
+        interp.globals["indexedDB"] = {
+            "open": lambda *a: _js_fresh_promise(interp),
+        }
+        interp.globals["crypto"] = {
+            "getRandomValues": lambda arr: _js_random_values(arr),
+            "randomUUID": lambda: str(uuid.uuid4()),
+        }
+        interp.globals["queueMicrotask"] = interp._native_queue_microtask
+
+    def _js_location(self, url_str):
+        import urllib.parse as _up
+        try:
+            parts = _up.urlsplit(url_str)
+            origin = f"{parts.scheme}://{parts.netloc}"
+        except Exception:
+            parts = None
+            origin = ""
+        if parts is None or not parts.scheme:
+            return {"href": url_str, "hostname": "", "protocol": "",
+                    "pathname": "", "search": "", "hash": "",
+                    "host": "", "origin": "", "port": "",
+                    "reload": lambda: None, "assign": lambda u=None: None,
+                    "replace": lambda u=None: None,
+                    "toString": lambda: url_str}
+        return {
+            "href": url_str,
+            "hostname": parts.hostname or "",
+            "protocol": parts.scheme + ":",
+            "pathname": parts.path,
+            "search": "?" + parts.query if parts.query else "",
+            "hash": "",
+            "host": parts.netloc,
+            "origin": origin,
+            "port": str(parts.port or ""),
+            "reload": lambda: None,
+            "assign": lambda u=None: None,
+            "replace": lambda u=None: None,
+            "toString": lambda: url_str,
+        }
+
     def _drain_js(self):
         """UI thread: settle JS network results and run pending microtasks /
         due timers, re-rendering if any handler mutated the DOM."""
@@ -596,7 +742,12 @@ class Tab:
             self.js_logs.append(f"JS error: {e}")
             self._add_error(f"JS {e}")
         if self._js_doc is not None and self._js_doc._flag["dirty"]:
-            self._js_mutated()
+            # Rate-limit restyles+relayouts so a page whose JS mutates the
+            # DOM every timer tick (animation loops) can't saturate the UI
+            # thread re-rendering continuously.
+            if time.time() - self._last_js_render > 0.1:
+                self._last_js_render = time.time()
+                self._js_mutated()
 
     def _dispatch_js_click(self, node):
         """Run click handlers (addEventListener + onclick attrs) registered on
@@ -2799,6 +2950,124 @@ class _JSXHR:
                 except JSException as e:
                     if interp is not None:
                         interp.logs.append(f"JS error: {e}")
+
+
+def _js_match_media(query):
+    return {
+        "matches": False,
+        "media": query,
+        "onchange": None,
+        "addEventListener": lambda *a: None,
+        "removeEventListener": lambda *a: None,
+        "addListener": lambda *a: None,
+        "removeListener": lambda *a: None,
+    }
+
+
+def _js_computed_style(el):
+    style = getattr(el, "js_get", None)
+    computed = {}
+
+    def getter(name):
+        if style is not None:
+            try:
+                v = style("style")
+                if v is not None and hasattr(v, "js_get"):
+                    return v.js_get(str(name))
+            except Exception:
+                pass
+        return computed.get(str(name), "")
+
+    return {
+        "getPropertyValue": lambda name: getter(name),
+        "getPropertyPriority": lambda name: "",
+    }
+
+
+def _js_storage():
+    store = {}
+
+    def get(name):
+        if name == "length":
+            return len(store)
+        if name == "getItem":
+            return lambda k: store.get(str(k), None)
+        if name == "setItem":
+            return lambda k, v: store.__setitem__(str(k), str(v))
+        if name == "removeItem":
+            return lambda k: store.pop(str(k), None)
+        if name == "clear":
+            return lambda: store.clear()
+        if name == "key":
+            return lambda i: list(store)[int(i)] if int(i) < len(store) else None
+        return store.get(str(name), None)
+
+    def set(name, value):
+        store[str(name)] = str(value)
+
+    return {"js_get": get, "js_set": set}
+
+
+def _js_fresh_promise(interp):
+    p = interp.create_promise()
+    p.resolve(UNDEFINED)
+    return p
+
+
+def _js_random_values(arr):
+    if not isinstance(arr, list):
+        return arr
+    for i in range(len(arr)):
+        arr[i] = int.from_bytes(os.urandom(4), "little") & 0xFFFFFFFF
+    return arr
+
+
+class _JSEventCtor:
+    """Minimal Event/CustomEvent/MouseEvent constructor."""
+
+    def js_new(self, *args):
+        event_type = args[0] if args else ""
+        return _JSEvent(event_type)
+
+    def js_call(self, *args):
+        return self.js_new(*args)
+
+
+class _JSEvent:
+    def __init__(self, event_type):
+        self.type = str(event_type)
+        self.bubbles = False
+        self.cancelable = False
+        self.defaultPrevented = False
+        self.target = None
+        self.currentTarget = None
+        self.timeStamp = time.time() * 1000
+
+    def js_get(self, name):
+        if name == "type":
+            return self.type
+        if name == "bubbles":
+            return self.bubbles
+        if name == "cancelable":
+            return self.cancelable
+        if name == "defaultPrevented":
+            return self.defaultPrevented
+        if name == "target":
+            return self.target
+        if name == "currentTarget":
+            return self.currentTarget
+        if name == "timeStamp":
+            return self.timeStamp
+        if name == "preventDefault":
+            return self._prevent_default
+        if name == "stopPropagation":
+            return lambda: None
+        if name == "stopImmediatePropagation":
+            return lambda: None
+        return UNDEFINED
+
+    def _prevent_default(self):
+        self.defaultPrevented = True
 
 
 class _AboutURL:

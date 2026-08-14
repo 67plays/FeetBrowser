@@ -82,9 +82,20 @@ def _connect(host, port):
         return s
 
 DEFAULT_HEADERS = {
-    "User-Agent": "FeetBrowser/0.1.1 (https://github.com/JuiceyDew/FeetBrowser)",
-    "Accept": "text/html,application/xhtml+xml,text/css,*/*;q=0.8",
+    # Modern browser defaults. Sites like Google serve their full (JS-driven)
+    # application only to clients that look like real browsers — a bare
+    # user agent gets bounced to an "enable JavaScript" page instead.
+    "User-Agent": ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 "
+                   "FeetBrowser/0.1.1"),
+    "Accept": ("text/html,application/xhtml+xml,application/xml;q=0.9,"
+               "image/avif,image/webp,*/*;q=0.8"),
+    "Accept-Language": "en-US,en;q=0.9",
     "Accept-Encoding": "gzip, deflate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Dest": "document",
+    "Upgrade-Insecure-Requests": "1",
 }
 
 MAX_REDIRECTS = 10
