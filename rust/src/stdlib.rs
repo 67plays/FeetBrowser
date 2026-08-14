@@ -3,7 +3,6 @@
 
 use crate::interp::*;
 use crate::value::*;
-use pyo3::prelude::*;
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::rc::Rc;
@@ -49,6 +48,99 @@ fn ctor(name: &str, call: NativeFn, ctor_: NativeFn, get: Option<NativeGet>, set
         get,
         set,
     }))
+}
+
+// -- base64 (btoa/atob) -----------------------------------------------------
+
+const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+fn base64_encode(data: &[u8]) -> String {
+    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(B64[(n >> 18) as usize & 63] as char);
+        out.push(B64[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 { B64[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 2 { B64[n as usize & 63] as char } else { '=' });
+    }
+    out
+}
+
+fn base64_char(c: u8) -> Option<u32> {
+    match c {
+        b'A'..=b'Z' => Some((c - b'A') as u32),
+        b'a'..=b'z' => Some((c - b'a') as u32 + 26),
+        b'0'..=b'9' => Some((c - b'0') as u32 + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
+    }
+}
+
+fn base64_decode(text: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(text.len() * 3 / 4);
+    let mut acc: u32 = 0;
+    let mut bits = 0;
+    for c in text.bytes() {
+        if c == b'=' {
+            break;
+        }
+        let Some(v) = base64_char(c) else { continue };
+        acc = (acc << 6) | v;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8 & 0xFF);
+        }
+    }
+    out
+}
+
+// -- percent-encoding (encodeURI/decodeURI/...) ------------------------------
+
+fn is_unreserved(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'.' | b'!' | b'~' | b'*' | b'\'' | b'(' | b')')
+}
+
+/// Characters encodeURI leaves alone in addition to the unreserved set.
+fn is_uri_reserved(c: u8) -> bool {
+    matches!(c, b';' | b',' | b'/' | b'?' | b':' | b'@' | b'&' | b'=' | b'+' | b'$' | b'#')
+}
+
+fn percent_encode(text: &str, component: bool) -> String {
+    let mut out = String::new();
+    for b in text.as_bytes() {
+        if is_unreserved(*b) || (!component && is_uri_reserved(*b)) {
+            out.push(*b as char);
+        } else {
+            out.push_str(&format!("%{:02X}", b));
+        }
+    }
+    out
+}
+
+fn percent_decode(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(h), Some(l)) = (hi, lo) {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    // Decode UTF-8 byte runs to characters (invalid bytes stay as-is).
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 // -- console / window / localStorage ---------------------------------------
@@ -138,7 +230,7 @@ fn ls_length(this: &Rc<Interpreter>, _obj: &JsValue, _args: Vec<JsValue>) -> EvR
     })
 }
 
-fn ls_get(this: &Rc<Interpreter>, _obj: &JsValue, name: &str) -> Result<JsValue, JsError> {
+fn ls_get(_this: &Rc<Interpreter>, _obj: &JsValue, name: &str) -> Result<JsValue, JsError> {
     Ok(match name {
         "getItem" => native("getItem", ls_get_item),
         "setItem" => native("setItem", ls_set_item),
@@ -170,7 +262,7 @@ fn string_call(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> Ev
     })
 }
 
-fn string_from_char_code(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
+fn string_from_char_code(_this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
     Box::pin(async move {
         let mut out = String::new();
         for c in args {
@@ -181,7 +273,7 @@ fn string_from_char_code(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsVal
     })
 }
 
-fn string_from_code_point(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
+fn string_from_code_point(_this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
     Box::pin(async move {
         let mut out = String::new();
         for c in args {
@@ -213,7 +305,7 @@ fn string_raw(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvR
     })
 }
 
-fn string_get(this: &Rc<Interpreter>, _obj: &JsValue, name: &str) -> Result<JsValue, JsError> {
+fn string_get(_this: &Rc<Interpreter>, _obj: &JsValue, name: &str) -> Result<JsValue, JsError> {
     Ok(match name {
         "fromCharCode" => native("fromCharCode", string_from_char_code),
         "fromCodePoint" => native("fromCodePoint", string_from_code_point),
@@ -222,7 +314,7 @@ fn string_get(this: &Rc<Interpreter>, _obj: &JsValue, name: &str) -> Result<JsVa
     })
 }
 
-fn number_call(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
+fn number_call(_this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
     Box::pin(async move {
         Ok(JsValue::Number(match args.first() {
             Some(v) => to_number(v),
@@ -231,24 +323,25 @@ fn number_call(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> Ev
     })
 }
 
-fn number_is_nan(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
+fn number_is_nan(_this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
     Box::pin(async move {
         let v = first(&args);
         Ok(JsValue::Bool(matches!(v, JsValue::Number(n) if n.is_nan())))
     })
 }
 
-fn number_is_finite(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
+fn number_is_finite(_this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
     Box::pin(async move {
         let v = first(&args);
         Ok(JsValue::Bool(matches!(v, JsValue::Number(n) if !n.is_nan() && !n.is_infinite())))
     })
 }
 
-fn number_get(this: &Rc<Interpreter>, _obj: &JsValue, name: &str) -> Result<JsValue, JsError> {
+fn number_get(_this: &Rc<Interpreter>, _obj: &JsValue, name: &str) -> Result<JsValue, JsError> {
     Ok(match name {
         "isNaN" => native("isNaN", number_is_nan),
         "isFinite" => native("isFinite", number_is_finite),
+        "isInteger" => native("isInteger", number_is_integer),
         "parseInt" => native("parseInt", parse_int_call),
         "parseFloat" => native("parseFloat", parse_float_call),
         "MAX_VALUE" => JsValue::Number(1.7976931348623157e308),
@@ -261,7 +354,7 @@ fn number_get(this: &Rc<Interpreter>, _obj: &JsValue, name: &str) -> Result<JsVa
     })
 }
 
-fn boolean_call(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
+fn boolean_call(_this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
     let v = first(&args);
     Box::pin(async move { Ok(JsValue::Bool(truthy(&v))) })
 }
@@ -352,6 +445,87 @@ fn parse_float_call(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) 
     })
 }
 
+// -- base64 ----------------------------------------------------------------
+
+fn btoa_call(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
+    let this = this.clone();
+    Box::pin(async move {
+        let text = this.repr(&first(&args));
+        // btoa operates on code units 0..=255; mask higher values (lenient).
+        let bytes: Vec<u8> = text.encode_utf16().map(|u| u as u8).collect();
+        Ok(JsValue::str(base64_encode(&bytes)))
+    })
+}
+
+fn atob_call(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
+    let this = this.clone();
+    Box::pin(async move {
+        let text = this.repr(&first(&args));
+        let decoded = base64_decode(&text);
+        // atob returns a "binary string": one Latin-1 char per byte.
+        let out: String = decoded.iter().map(|b| *b as char).collect();
+        Ok(JsValue::str(out))
+    })
+}
+
+// -- URI encoding ----------------------------------------------------------
+
+fn encode_uri_component(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
+    let this = this.clone();
+    Box::pin(async move {
+        Ok(JsValue::str(percent_encode(&this.repr(&first(&args)), true)))
+    })
+}
+
+fn encode_uri(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
+    let this = this.clone();
+    Box::pin(async move {
+        Ok(JsValue::str(percent_encode(&this.repr(&first(&args)), false)))
+    })
+}
+
+fn decode_uri_component(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
+    let this = this.clone();
+    Box::pin(async move {
+        Ok(JsValue::str(percent_decode(&this.repr(&first(&args)))))
+    })
+}
+
+fn decode_uri(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
+    let this = this.clone();
+    Box::pin(async move {
+        Ok(JsValue::str(percent_decode(&this.repr(&first(&args)))))
+    })
+}
+
+// -- isNaN / isFinite ------------------------------------------------------
+
+fn global_is_nan(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
+    let _ = this;
+    Box::pin(async move { Ok(JsValue::Bool(to_number(&first(&args)).is_nan())) })
+}
+
+fn global_is_finite(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
+    let _ = this;
+    Box::pin(async move {
+        let n = to_number(&first(&args));
+        Ok(JsValue::Bool(!n.is_nan() && !n.is_infinite()))
+    })
+}
+
+// -- Number.isInteger ------------------------------------------------------
+
+fn number_is_integer(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
+    let _ = this;
+    Box::pin(async move {
+        let v = first(&args);
+        match v {
+            JsValue::Number(n) => Ok(JsValue::Bool(n.fract() == 0.0 && !n.is_nan() && !n.is_infinite())),
+            _ => Ok(JsValue::Bool(false)),
+        }
+    })
+}
+
 // -- Array / Object --------------------------------------------------------
 
 fn array_call(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
@@ -375,13 +549,13 @@ fn array_call(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvR
     })
 }
 
-fn array_is_array(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
+fn array_is_array(_this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
     let v = first(&args);
     Box::pin(async move { Ok(JsValue::Bool(matches!(v, JsValue::Array(_)))) })
 }
 
 fn array_from(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
-    let this = this.clone();
+    let _this = this.clone();
     Box::pin(async move {
         let v = first(&args);
         Ok(match v {
@@ -394,7 +568,7 @@ fn array_from(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvR
     })
 }
 
-fn array_get(this: &Rc<Interpreter>, _obj: &JsValue, name: &str) -> Result<JsValue, JsError> {
+fn array_get(_this: &Rc<Interpreter>, _obj: &JsValue, name: &str) -> Result<JsValue, JsError> {
     Ok(match name {
         "isArray" => native("isArray", array_is_array),
         "from" => native("from", array_from),
@@ -402,7 +576,7 @@ fn array_get(this: &Rc<Interpreter>, _obj: &JsValue, name: &str) -> Result<JsVal
     })
 }
 
-fn object_call(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
+fn object_call(_this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
     Box::pin(async move {
         let v = first(&args);
         Ok(match v {
@@ -414,7 +588,7 @@ fn object_call(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> Ev
 }
 
 fn obj_keys(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
-    let this = this.clone();
+    let _this = this.clone();
     Box::pin(async move {
         let v = first(&args);
         let keys: Vec<String> = match v {
@@ -425,7 +599,7 @@ fn obj_keys(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvRes
     })
 }
 
-fn obj_values(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
+fn obj_values(_this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
     Box::pin(async move {
         let v = first(&args);
         Ok(match v {
@@ -435,7 +609,7 @@ fn obj_values(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvR
     })
 }
 
-fn obj_entries(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
+fn obj_entries(_this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
     Box::pin(async move {
         let v = first(&args);
         Ok(match v {
@@ -450,7 +624,7 @@ fn obj_entries(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> Ev
     })
 }
 
-fn obj_assign(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
+fn obj_assign(_this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
     Box::pin(async move {
         let mut out = BTreeMap::new();
         for o in args {
@@ -464,7 +638,7 @@ fn obj_assign(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvR
     })
 }
 
-fn obj_create(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
+fn obj_create(_this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
     Box::pin(async move {
         let proto = first(&args);
         let proto_map = match proto {
@@ -478,7 +652,7 @@ fn obj_create(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvR
     })
 }
 
-fn obj_get_proto_of(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
+fn obj_get_proto_of(_this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
     Box::pin(async move {
         let v = first(&args);
         Ok(match v {
@@ -488,7 +662,7 @@ fn obj_get_proto_of(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) 
     })
 }
 
-fn obj_set_proto_of(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
+fn obj_set_proto_of(_this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
     Box::pin(async move {
         if args.len() >= 2 {
             if let JsValue::Instance(i) = &args[0] {
@@ -522,7 +696,7 @@ fn obj_define_property(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue
     })
 }
 
-fn obj_freeze(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
+fn obj_freeze(_this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
     let v = first(&args);
     Box::pin(async move { Ok(v) })
 }
@@ -537,6 +711,44 @@ fn obj_has_own(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> Ev
             }
         }
         Ok(JsValue::Bool(false))
+    })
+}
+
+fn obj_is(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
+    let _ = this;
+    Box::pin(async move {
+        let a = args.first().cloned().unwrap_or(JsValue::Undefined);
+        let b = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+        match (&a, &b) {
+            (JsValue::Number(x), JsValue::Number(y)) => {
+                if x.is_nan() && y.is_nan() {
+                    return Ok(JsValue::Bool(true));
+                }
+                if *x == 0.0 && *y == 0.0 && x.is_sign_negative() != y.is_sign_negative() {
+                    return Ok(JsValue::Bool(false));
+                }
+                Ok(JsValue::Bool(x == y))
+            }
+            _ => Ok(JsValue::Bool(strict_eq(&a, &b))),
+        }
+    })
+}
+
+fn obj_from_entries(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
+    let this = this.clone();
+    Box::pin(async move {
+        let mut out = BTreeMap::new();
+        if let JsValue::Array(items) = first(&args) {
+            for pair in items.borrow().iter() {
+                if let JsValue::Array(entry) = pair {
+                    let e = entry.borrow();
+                    let key = this.repr(e.first().unwrap_or(&JsValue::Undefined));
+                    let val = e.get(1).cloned().unwrap_or(JsValue::Undefined);
+                    out.insert(key, val);
+                }
+            }
+        }
+        Ok(JsValue::Object(Rc::new(RefCell::new(out))))
     })
 }
 
@@ -559,12 +771,12 @@ fn object_proto_to_string(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsVa
     Box::pin(async move { Ok(JsValue::str(this.repr(&v))) })
 }
 
-fn object_proto_value_of(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
+fn object_proto_value_of(_this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
     let v = first(&args);
     Box::pin(async move { Ok(v) })
 }
 
-fn object_get(this: &Rc<Interpreter>, _obj: &JsValue, name: &str) -> Result<JsValue, JsError> {
+fn object_get(_this: &Rc<Interpreter>, _obj: &JsValue, name: &str) -> Result<JsValue, JsError> {
     Ok(match name {
         "keys" => native("keys", obj_keys),
         "values" => native("values", obj_values),
@@ -576,6 +788,9 @@ fn object_get(this: &Rc<Interpreter>, _obj: &JsValue, name: &str) -> Result<JsVa
         "defineProperty" => native("defineProperty", obj_define_property),
         "freeze" => native("freeze", obj_freeze),
         "hasOwnProperty" => native("hasOwnProperty", obj_has_own),
+        "hasOwn" => native("hasOwn", obj_has_own),
+        "is" => native("is", obj_is),
+        "fromEntries" => native("fromEntries", obj_from_entries),
         "prototype" => {
             let mut proto = BTreeMap::new();
             proto.insert(
@@ -624,7 +839,7 @@ math_unary!(math_sinh, |x: f64| x.sinh());
 math_unary!(math_cosh, |x: f64| x.cosh());
 math_unary!(math_tanh, |x: f64| x.tanh());
 
-fn math_round(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
+fn math_round(_this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
     Box::pin(async move {
         let x = first_num(&args);
         let r = if x >= 0.0 { (x + 0.5).floor() } else { (x - 0.5).ceil() };
@@ -632,7 +847,7 @@ fn math_round(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvR
     })
 }
 
-fn math_sign(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
+fn math_sign(_this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
     Box::pin(async move {
         let x = first_num(&args);
         let r = if x.is_nan() || x == 0.0 {
@@ -646,7 +861,7 @@ fn math_sign(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvRe
     })
 }
 
-fn math_pow(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
+fn math_pow(_this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
     Box::pin(async move {
         let a = first_num(&args);
         let b = args.get(1).map(to_number).unwrap_or(f64::NAN);
@@ -654,7 +869,7 @@ fn math_pow(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvRes
     })
 }
 
-fn math_atan2(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
+fn math_atan2(_this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
     Box::pin(async move {
         let y = first_num(&args);
         let x = args.get(1).map(to_number).unwrap_or(f64::NAN);
@@ -662,14 +877,14 @@ fn math_atan2(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvR
     })
 }
 
-fn math_hypot(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
+fn math_hypot(_this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
     Box::pin(async move {
         let s: f64 = args.iter().map(to_number).map(|x| x * x).sum();
         Ok(JsValue::Number(s.sqrt()))
     })
 }
 
-fn math_max(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
+fn math_max(_this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
     Box::pin(async move {
         let mut best = f64::NEG_INFINITY;
         for a in args {
@@ -682,7 +897,7 @@ fn math_max(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvRes
     })
 }
 
-fn math_min(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
+fn math_min(_this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
     Box::pin(async move {
         let mut best = f64::INFINITY;
         for a in args {
@@ -695,7 +910,7 @@ fn math_min(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvRes
     })
 }
 
-fn math_random(this: &Rc<Interpreter>, _obj: &JsValue, _args: Vec<JsValue>) -> EvResult {
+fn math_random(_this: &Rc<Interpreter>, _obj: &JsValue, _args: Vec<JsValue>) -> EvResult {
     Box::pin(async move {
         use std::time::{SystemTime, UNIX_EPOCH};
         let t = SystemTime::now()
@@ -712,7 +927,7 @@ fn math_random(this: &Rc<Interpreter>, _obj: &JsValue, _args: Vec<JsValue>) -> E
     })
 }
 
-fn math_fround(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
+fn math_fround(_this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
     Box::pin(async move { Ok(JsValue::Number(first_num(&args))) })
 }
 
@@ -943,7 +1158,7 @@ fn regexp_call(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> Ev
     })
 }
 
-fn date_now(this: &Rc<Interpreter>, _obj: &JsValue, _args: Vec<JsValue>) -> EvResult {
+fn date_now(_this: &Rc<Interpreter>, _obj: &JsValue, _args: Vec<JsValue>) -> EvResult {
     Box::pin(async move {
         use std::time::{SystemTime, UNIX_EPOCH};
         let ms = SystemTime::now()
@@ -955,25 +1170,24 @@ fn date_now(this: &Rc<Interpreter>, _obj: &JsValue, _args: Vec<JsValue>) -> EvRe
 }
 
 fn parse_ms(text: &str) -> f64 {
-    use chrono::{NaiveDate, NaiveDateTime, TimeZone, Utc};
+    use chrono::{NaiveDate, NaiveDateTime};
     if let Ok(dt) = NaiveDateTime::parse_from_str(text, "%Y-%m-%dT%H:%M:%S%.fZ") {
-        return dt.timestamp() as f64 * 1000.0;
+        return dt.and_utc().timestamp() as f64 * 1000.0;
     }
     if let Ok(dt) = NaiveDateTime::parse_from_str(text, "%Y-%m-%dT%H:%M:%SZ") {
-        return dt.timestamp() as f64 * 1000.0;
+        return dt.and_utc().timestamp() as f64 * 1000.0;
     }
     if let Ok(dt) = NaiveDateTime::parse_from_str(text, "%Y-%m-%dT%H:%M:%S") {
-        return dt.timestamp() as f64 * 1000.0;
+        return dt.and_utc().timestamp() as f64 * 1000.0;
     }
     if let Ok(d) = NaiveDate::parse_from_str(text, "%Y-%m-%d") {
         if let Some(dt) = d.and_hms_opt(0, 0, 0) {
-            return dt.timestamp() as f64 * 1000.0;
+            return dt.and_utc().timestamp() as f64 * 1000.0;
         }
     }
     if let Ok(dt) = NaiveDateTime::parse_from_str(text, "%a %b %d %Y %H:%M:%S") {
-        return dt.timestamp() as f64 * 1000.0;
+        return dt.and_utc().timestamp() as f64 * 1000.0;
     }
-    let _ = Utc;
     f64::NAN
 }
 
@@ -1010,7 +1224,7 @@ fn make_ms(this: &Rc<Interpreter>, args: &[JsValue], utc: bool) -> f64 {
         let dt = NaiveDate::from_ymd_opt(year, mo + 1, d)
             .and_then(|nd| nd.and_hms_milli_opt(h, mi, s, ms));
         match dt {
-            Some(dt) => dt.timestamp() as f64 * 1000.0,
+            Some(dt) => dt.and_utc().timestamp() as f64 * 1000.0,
             None => f64::NAN,
         }
     }
@@ -1022,7 +1236,7 @@ fn date_make(this: &Rc<Interpreter>, args: &[JsValue], utc: bool) -> JsValue {
 }
 
 fn make_js_date(ms: f64) -> JsValue {
-    use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
+    use chrono::{TimeZone, Utc};
     let local = if ms.is_finite() {
         chrono::Local.timestamp_millis_opt(ms as i64).single()
     } else {
@@ -1067,7 +1281,7 @@ fn date_utc(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvRes
     })
 }
 
-fn date_get(this: &Rc<Interpreter>, _obj: &JsValue, name: &str) -> Result<JsValue, JsError> {
+fn date_get(_this: &Rc<Interpreter>, _obj: &JsValue, name: &str) -> Result<JsValue, JsError> {
     Ok(match name {
         "now" => native("now", date_now),
         "parse" => native("parse", date_parse),
@@ -1079,7 +1293,7 @@ fn date_get(this: &Rc<Interpreter>, _obj: &JsValue, name: &str) -> Result<JsValu
 // -- Map / Set -------------------------------------------------------------
 
 fn map_new(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
-    let this = this.clone();
+    let _this = this.clone();
     Box::pin(async move {
         let m = Rc::new(RefCell::new(JsMap {
             store: RefCell::new(BTreeMap::new()),
@@ -1117,7 +1331,7 @@ fn map_new(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResu
     })
 }
 
-fn map_call(this: &Rc<Interpreter>, _obj: &JsValue, _args: Vec<JsValue>) -> EvResult {
+fn map_call(_this: &Rc<Interpreter>, _obj: &JsValue, _args: Vec<JsValue>) -> EvResult {
     Box::pin(async move {
         Ok(JsValue::Map(Rc::new(RefCell::new(JsMap {
             store: RefCell::new(BTreeMap::new()),
@@ -1125,7 +1339,7 @@ fn map_call(this: &Rc<Interpreter>, _obj: &JsValue, _args: Vec<JsValue>) -> EvRe
     })
 }
 
-fn set_new(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
+fn set_new(_this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
     Box::pin(async move {
         let s = Rc::new(RefCell::new(JsSet {
             store: RefCell::new(BTreeMap::new()),
@@ -1139,7 +1353,7 @@ fn set_new(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResu
     })
 }
 
-fn set_call(this: &Rc<Interpreter>, _obj: &JsValue, _args: Vec<JsValue>) -> EvResult {
+fn set_call(_this: &Rc<Interpreter>, _obj: &JsValue, _args: Vec<JsValue>) -> EvResult {
     Box::pin(async move {
         Ok(JsValue::Set(Rc::new(RefCell::new(JsSet {
             store: RefCell::new(BTreeMap::new()),
@@ -1210,6 +1424,89 @@ fn promise_all_static(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>
     })
 }
 
+fn promise_all_settled_static(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
+    let this = this.clone();
+    Box::pin(async move {
+        let p = JsPromise::new();
+        let items: Vec<JsValue> = match first(&args) {
+            JsValue::Array(a) => a.borrow().clone(),
+            _ => vec![],
+        };
+        let n = items.len();
+        if n == 0 {
+            promise_resolve(&this, &p, JsValue::array(vec![]));
+            return Ok(JsValue::Promise(p));
+        }
+        let results = Rc::new(RefCell::new(vec![JsValue::Undefined; n]));
+        let remaining = Rc::new(Cell::new(n));
+        for (i, item) in items.iter().enumerate() {
+            let pj = as_promise(&this, item);
+            let this2 = this.clone();
+            let p2 = p.clone();
+            let results2 = results.clone();
+            let remaining2 = remaining.clone();
+            promise_on_settle(&this, &pj, Rc::new(move |value, rejected| {
+                let mut entry = BTreeMap::new();
+                if rejected {
+                    entry.insert("status".to_string(), JsValue::str("rejected"));
+                    entry.insert("reason".to_string(), value);
+                } else {
+                    entry.insert("status".to_string(), JsValue::str("fulfilled"));
+                    entry.insert("value".to_string(), value);
+                }
+                results2.borrow_mut()[i] = JsValue::Object(Rc::new(RefCell::new(entry)));
+                remaining2.set(remaining2.get() - 1);
+                if remaining2.get() == 0 {
+                    promise_resolve(
+                        &this2,
+                        &p2,
+                        JsValue::array(results2.borrow().clone()),
+                    );
+                }
+            }));
+        }
+        Ok(JsValue::Promise(p))
+    })
+}
+
+fn promise_any_static(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
+    let this = this.clone();
+    Box::pin(async move {
+        let p = JsPromise::new();
+        let items: Vec<JsValue> = match first(&args) {
+            JsValue::Array(a) => a.borrow().clone(),
+            _ => vec![],
+        };
+        let n = items.len();
+        if n == 0 {
+            promise_reject(&this, &p, JsValue::str("All promises were rejected"));
+            return Ok(JsValue::Promise(p));
+        }
+        let remaining = Rc::new(Cell::new(n));
+        for item in items {
+            let pj = as_promise(&this, &item);
+            let this2 = this.clone();
+            let p2 = p.clone();
+            let remaining2 = remaining.clone();
+            promise_on_settle(&this, &pj, Rc::new(move |value, rejected| {
+                if !rejected {
+                    promise_resolve(&this2, &p2, value);
+                    return;
+                }
+                remaining2.set(remaining2.get() - 1);
+                if remaining2.get() == 0 {
+                    promise_reject(
+                        &this2,
+                        &p2,
+                        JsValue::str("All promises were rejected"),
+                    );
+                }
+            }));
+        }
+        Ok(JsValue::Promise(p))
+    })
+}
+
 fn promise_race_static(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
     let this = this.clone();
     Box::pin(async move {
@@ -1267,12 +1564,14 @@ fn promise_ctor(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> E
     })
 }
 
-fn promise_get_static(this: &Rc<Interpreter>, _obj: &JsValue, name: &str) -> Result<JsValue, JsError> {
+fn promise_get_static(_this: &Rc<Interpreter>, _obj: &JsValue, name: &str) -> Result<JsValue, JsError> {
     Ok(match name {
         "resolve" => native("resolve", promise_resolve_static),
         "reject" => native("reject", promise_reject_static),
         "all" => native("all", promise_all_static),
+        "allSettled" => native("allSettled", promise_all_settled_static),
         "race" => native("race", promise_race_static),
+        "any" => native("any", promise_any_static),
         _ => JsValue::Undefined,
     })
 }
@@ -1339,6 +1638,14 @@ pub fn init_globals(this: &Rc<Interpreter>) -> Result<(), JsError> {
     globals.insert("Object".to_string(), ctor("Object", object_call, object_call, Some(object_get), None));
     globals.insert("parseInt".to_string(), native("parseInt", parse_int_call));
     globals.insert("parseFloat".to_string(), native("parseFloat", parse_float_call));
+    globals.insert("isNaN".to_string(), native("isNaN", global_is_nan));
+    globals.insert("isFinite".to_string(), native("isFinite", global_is_finite));
+    globals.insert("btoa".to_string(), native("btoa", btoa_call));
+    globals.insert("atob".to_string(), native("atob", atob_call));
+    globals.insert("encodeURIComponent".to_string(), native("encodeURIComponent", encode_uri_component));
+    globals.insert("decodeURIComponent".to_string(), native("decodeURIComponent", decode_uri_component));
+    globals.insert("encodeURI".to_string(), native("encodeURI", encode_uri));
+    globals.insert("decodeURI".to_string(), native("decodeURI", decode_uri));
     globals.insert("NaN".to_string(), JsValue::Number(f64::NAN));
     globals.insert("Infinity".to_string(), JsValue::Number(f64::INFINITY));
     globals.insert("Promise".to_string(), ctor("Promise", promise_ctor, promise_ctor, Some(promise_get_static), None));
@@ -1381,7 +1688,7 @@ pub fn init_globals(this: &Rc<Interpreter>) -> Result<(), JsError> {
     let window = getter("window", window_get);
     // attach the setter
     let window_native = match window {
-        JsValue::Native(ref n) => Rc::new(Native {
+        JsValue::Native(ref _n) => Rc::new(Native {
             name: Rc::from("window"),
             call: None,
             ctor: None,

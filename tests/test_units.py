@@ -1,5 +1,6 @@
 """Fast, offline unit tests for URL parsing, HTML, CSS, and internal pages."""
 import http.server
+import urllib.parse
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -8,11 +9,13 @@ from feetbrowser import gui
 from feetbrowser.net import URL
 from feetbrowser.htmlparser import HTMLParser, Element, Text
 from feetbrowser.cssparser import CSSParser, style
-from feetbrowser.layout import DrawText, get_font, _measure
+from feetbrowser.layout import DrawText, get_font, _measure, field_checked, \
+    selected_options, option_value, option_label, listbox_rows, \
+    listbox_scroll, listbox_active, LISTBOX_ROW_H, LISTBOX_PAD
 from feetbrowser.browser import (
     Tab, Browser, _AboutURL, _BookmarksURL, _HistoryURL,
     bookmarks_html, history_html,
-    tree_to_list, find_base_href, FormAction
+    tree_to_list, find_base_href, FormAction, SelectAction, SelectPopup
 )
 
 
@@ -179,6 +182,9 @@ def test_browser_tab_cycle_wraps():
     stub.tabs = tabs
     stub.active_tab = tabs[0]
     stub.draw_calls = 0
+    # Switching tabs takes any open <select> list down with it.
+    stub.select_popup = SelectPopup()
+    stub._dismiss_select_popup = lambda: Browser._dismiss_select_popup(stub)
 
     def draw():
         stub.draw_calls += 1
@@ -454,6 +460,38 @@ def test_pre_whitespace_does_not_wrap():
         stack.extend(b.children)
     texts = [c for c in cmds if isinstance(c, DrawText)]
     eq(len(texts), 1, "pre line kept on one line")
+
+
+def test_nowrap_cloud_wraps_as_unit():
+    """white-space:nowrap (Wikipedia's language cloud) must not spill past the
+    viewport: each link is one unbreakable token, but tokens still wrap to a
+    fresh line once the current line runs out of room."""
+    from feetbrowser.layout import DocumentLayout, DrawText
+    css = '.cloud { width: 200px; } .cloud a { white-space: nowrap; }'
+    rules = CSSParser(css).parse()
+    links = ' '.join(f'<a href="#{i}">languagename{i:02d}</a>' for i in range(30))
+    html = f'<div class="cloud">{links}</div>'
+    dom = HTMLParser(html).parse()
+    style(dom, rules)
+    doc = DocumentLayout(dom, 200)
+    doc.layout()
+    cmds = []
+    stack = [doc]
+    while stack:
+        b = stack.pop()
+        for c in b.paint():
+            cmds.append(c)
+        stack.extend(b.children)
+    texts = [c for c in cmds if isinstance(c, DrawText)]
+    assert texts, "cloud text drawn"
+    max_right = max(c.right for c in texts)
+    assert max_right <= 200, \
+        f"nowrap cloud overflowed viewport: right edge {max_right} > 200"
+    tops = {c.text: c.top for c in texts}
+    # The whole token moves to the next line, so line tops repeat.
+    first_top = tops["languagename00"]
+    later_lines = {t for t in tops.values() if t > first_top}
+    assert later_lines, "cloud wrapped to multiple lines"
 
 
 def test_css_data_uri_semicolon():
@@ -1158,7 +1196,8 @@ def _make_tab(body, url="https://example.com/page"):
 
 
 def _control_box(tab, **attrs):
-    # Unused in the current tests but handy for interactive debugging.
+    """The centre point and node of the first form control whose attributes
+    match, as (x, y, node) -- i.e. where a user would click it."""
     for lx, ty, rx, by, n in tab.document.input_boxes:
         if isinstance(n, Element) and all(
                 n.attributes.get(k) == v for k, v in attrs.items()):
@@ -1338,15 +1377,133 @@ def test_form_submit_merges_existing_query():
 
 def test_checkbox_toggle():
     tab = _make_tab(
-        '<form action="/r"><input type="checkbox" name="c"><input type="submit"></form>')
-    for lx, ty, rx, by, n in tab.document.input_boxes:
-        if isinstance(n, Element) and n.tag == "input" \
-                and n.attributes.get("type") == "checkbox":
-            tab.click((lx + rx) / 2, (ty + by) / 2)
-            eq(n.attributes["value"], "off", "checkbox toggled off")
-            break
-    else:
-        raise AssertionError("no checkbox box found")
+        '<form action="/r"><input type="checkbox" name="c" value="blue">'
+        '<input type="submit"></form>')
+    box = _control_box(tab, type="checkbox")
+    assert box is not None, "no checkbox box found"
+    cx, cy, node = box
+    assert not field_checked(node), "unticked until clicked"
+    tab.click(cx, cy)
+    assert field_checked(node), "click ticks the box"
+    eq(node.attributes.get("value"), "blue", "the submitted value survives")
+    tab.click(cx, cy)
+    assert not field_checked(node), "a second click unticks it"
+
+
+def test_form_controls_do_not_stack_on_one_another():
+    """Controls paint straight into the display list, so the line they sit on
+    has to grow to fit them -- otherwise every control on the page lands at
+    the same y and a click reaches whichever hit box happens to be first."""
+    tab = _make_tab(
+        '<form action="/a"><input name="q"><input type="submit" value="Go">'
+        '</form>'
+        '<form method="post" action="/b"><input name="w">'
+        '<input type="submit" value="Send"></form>')
+    boxes = tab.document.input_boxes
+    eq(len(boxes), 4, "one hit box per control")
+    for i, a in enumerate(boxes):
+        for b in boxes[i + 1:]:
+            assert (a[2] <= b[0] or b[2] <= a[0]
+                    or a[3] <= b[1] or b[3] <= a[1]), \
+                f"controls overlap: {a[:4]} and {b[:4]}"
+    # The point that draws "Send" must submit the form "Send" belongs to.
+    cx, cy, _ = _control_box(tab, value="Send")
+    act = tab.click(cx, cy)
+    assert isinstance(act, FormAction), type(act)
+    eq(str(act.url), "https://example.com/b", "second form's action")
+
+
+def test_form_submit_collects_every_kind_of_field():
+    tab = _make_tab(
+        '<form method="post" action="/save">'
+        '<input name="user" value="ada">'
+        '<input type="hidden" name="csrf" value="t0ken">'
+        '<input type="checkbox" name="cc" value="yes">'
+        '<input type="checkbox" name="news" value="daily" checked>'
+        '<input type="text" name="ghost" value="x" disabled>'
+        '<textarea name="body">from markup</textarea>'
+        '<select name="colour"><option>red<option selected>blue</select>'
+        '<input type="submit" name="do" value="Save">'
+        '<input type="submit" name="do" value="Delete"></form>')
+    cx, cy, _ = _control_box(tab, value="Save")
+    act = tab.click(cx, cy)
+    assert isinstance(act, FormAction), type(act)
+    fields = urllib.parse.parse_qsl(act.payload, keep_blank_values=True)
+    eq(fields, [("user", "ada"), ("csrf", "t0ken"), ("news", "daily"),
+                ("body", "from markup"), ("colour", "blue"), ("do", "Save")],
+       "submitted fields")
+
+
+def _key_stub(tab, clipboard=""):
+    """A Browser stripped down to what _on_key touches, wired to `tab` and to
+    a clipboard that either holds `clipboard` or, when that is None, refuses
+    to be read the way the real one does when nothing text-shaped is on it."""
+    def read():
+        if clipboard is None:
+            raise gui.TclError("CLIPBOARD selection doesn't exist")
+        return clipboard
+
+    class Stub(Browser):
+        def __init__(self):
+            self.focus = None
+            self.active_tab = tab
+            self.toe_contexts = []
+            self.context_menu = type("Menu", (), {"open_": False})()
+            self.select_popup = SelectPopup()
+            self.window = type("Win", (), {"clipboard_get": staticmethod(read)})()
+            self.painted = 0
+
+        def _draw_page(self):
+            self.painted += 1
+
+    return Stub()
+
+
+def _key_event(keysym, char="", ctrl=False):
+    return type("Event", (), {"keysym": keysym, "char": char,
+                              "state": 0x4 if ctrl else 0})()
+
+
+def test_paste_into_page_field():
+    tab = _make_tab('<form action="/s"><input name="q"></form>')
+    cx, cy, node = _control_box(tab, name="q")
+    tab.click(cx, cy)
+    assert tab.focused_input is node, "click focused the field"
+
+    browser = _key_stub(tab, "hello from the clipboard")
+    Browser._on_key(browser, _key_event("v", "\x16", ctrl=True))
+    eq(node.attributes["value"], "hello from the clipboard", "pasted value")
+    eq(browser.painted, 1, "the page was repainted once")
+
+    # Typing still appends after a paste, and pastes accumulate.
+    Browser._on_key(browser, _key_event("exclam", "!"))
+    Browser._on_key(browser, _key_event("v", "\x16", ctrl=True))
+    eq(node.attributes["value"],
+       "hello from the clipboard!hello from the clipboard", "paste appends")
+
+
+def test_paste_folds_newlines_only_in_single_line_fields():
+    tab = _make_tab('<form action="/s"><input name="q">'
+                    '<textarea name="body"></textarea></form>')
+    _cx, _cy, field = _control_box(tab, name="q")
+    tab.focused_input = field
+    assert tab.insert_text("one\ntwo")
+    eq(field.attributes["value"], "one two", "single-line field folds breaks")
+
+    _cx, _cy, area = _control_box(tab, name="body")
+    tab.focused_input = area
+    assert tab.insert_text("one\ntwo")
+    eq(area.attributes["value"], "one\ntwo", "a textarea keeps them")
+
+
+def test_paste_without_a_clipboard_is_a_no_op():
+    tab = _make_tab('<form action="/s"><input name="q" value="kept"></form>')
+    _cx, _cy, node = _control_box(tab, name="q")
+    tab.focused_input = node
+    browser = _key_stub(tab, clipboard=None)
+    Browser._on_key(browser, _key_event("v", "\x16", ctrl=True))
+    eq(node.attributes["value"], "kept", "unreadable clipboard changes nothing")
+    eq(browser.painted, 0, "and costs no repaint")
 
 
 def test_about_blank_typed():
@@ -2275,6 +2432,549 @@ def test_a_missing_file_reports_rather_than_raises():
     _headers, body, ctype = URL("file:///no/such/file.html").request()
     eq(ctype, "text/html")
     assert "Cannot open file" in body, body
+def test_images_over_http_reach_the_display_list():
+    """The shape of a real page: HTML off the wire, then images off the wire.
+
+    Both halves are asynchronous and they finish in that order, so a caller
+    that waits on `tab.loading` alone stops exactly one step early -- with
+    the document rendered and every <img> still a placeholder. This is the
+    regression that made photographs vanish from the raster backend.
+    """
+    import struct
+    import time
+    import zlib
+
+    def png(width, height, rgb):
+        def chunk(tag, payload):
+            body = tag + payload
+            return (struct.pack(">I", len(payload)) + body
+                    + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF))
+        raw = b"".join(b"\x00" + bytes(rgb) * width for _ in range(height))
+        return (b"\x89PNG\r\n\x1a\n"
+                + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height,
+                                             8, 2, 0, 0, 0))
+                + chunk(b"IDAT", zlib.compress(raw))
+                + chunk(b"IEND", b""))
+
+    pixels = png(6, 6, (0, 128, 255))
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/pic.png":
+                body, ctype = pixels, "image/png"
+            else:
+                body = b"<h1>page</h1><p><img src='/pic.png'>"
+                ctype = "text/html"
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    from feetbrowser.layout import DrawImage
+
+    srv = _start_server(H)
+    browser = Browser()
+    try:
+        port = srv.server_address[1]
+        browser.new_tab(f"http://127.0.0.1:{port}/page")
+        tab = browser.tabs[0]
+        assert tab.loading, "http in GUI mode loads off the UI thread"
+        # Pump only until the document lands -- the old settle condition.
+        deadline = time.time() + 10
+        while tab.loading and time.time() < deadline:
+            browser.window.flush_timers()
+            time.sleep(0.01)
+        assert not tab.loading, "document should have arrived"
+        assert tab.pending_images(), "and its image should still be coming"
+        assert browser.settle(20.0), "settle should not have timed out"
+        eq(len(tab.image_cache), 1, "image decoded and cached")
+        images = [c for c in tab.display_list if isinstance(c, DrawImage)]
+        eq(len(images), 1, "image painted")
+        assert not any("[img" in getattr(c, "text", "")
+                       for c in tab.display_list), "placeholder replaced"
+    finally:
+        srv.shutdown()
+        browser.window.destroy()
+
+
+# -- <select> drop-downs ----------------------------------------------------
+
+_SELECT_PAGE = (
+    '<form><select name="fruit">'
+    '<option value="a">Apple</option>'
+    '<option value="b" selected>Banana</option>'
+    '<option value="c" disabled>Cherry</option>'
+    '<option value="d">Damson</option>'
+    '</select></form>'
+)
+
+
+class _SelectBrowser(Browser):
+    """A Browser with the painting taken out.
+
+    Everything the drop-down does -- opening, walking, committing,
+    dismissing -- is real Browser code; only the calls that would put pixels
+    on a canvas are counted instead of drawn.
+    """
+
+    def __init__(self, tab):
+        self.active_tab = tab
+        self.focus = None
+        self.select_popup = SelectPopup()
+        self.paints = 0
+        self.canvas = type("C", (), {"winfo_width": lambda s: 1000,
+                                     "winfo_height": lambda s: 720})()
+
+    def chrome_height(self):
+        return 0
+
+    def _draw_page(self):
+        self.paints += 1
+
+    def _draw_chrome(self):
+        self.paints += 1
+
+    def _draw_select_popup(self):
+        self.paints += 1
+
+
+def _select_node(tab):
+    return next(n for n in tree_to_list(tab.nodes, [])
+                if isinstance(n, Element) and n.tag == "select")
+
+
+def _select_centre(tab):
+    """Middle of the laid-out <select> control, in page coordinates."""
+    node = _select_node(tab)
+    lx, ty, rx, by = tab._control_rect(node)
+    return (lx + rx) / 2, (ty + by) / 2
+
+
+def _open_dropdown(body=_SELECT_PAGE):
+    """Load a page and click its select, returning (browser, tab)."""
+    tab = _make_tab(body)
+    browser = _SelectBrowser(tab)
+    x, y = _select_centre(tab)
+    dest = tab.click(x, y)
+    assert isinstance(dest, SelectAction), f"click gave {dest!r}, not a select"
+    browser._open_select_popup(dest)
+    return browser, tab
+
+
+def _labels(tab):
+    return [c.text for c in tab.display_list if isinstance(c, DrawText)]
+
+
+def test_select_paints_the_selected_options_label():
+    tab = _make_tab(_SELECT_PAGE)
+    assert "Banana" in _labels(tab), \
+        f"`selected` option's label not painted: {_labels(tab)}"
+    # With nothing marked, the first option is what a form would submit, so
+    # it is what the closed control has to show.
+    plain = _make_tab('<select><option>Ant</option><option>Bee</option>'
+                      '</select>')
+    assert "Ant" in _labels(plain), f"no fallback label: {_labels(plain)}"
+
+
+def test_clicking_a_select_opens_its_list():
+    browser, tab = _open_dropdown()
+    popup = browser.select_popup
+    assert popup.open_, "the list did not open"
+    eq([row.label for row in popup.rows],
+       ["Apple", "Banana", "Cherry", "Damson"], "rows")
+    eq(popup.rows[popup.hover].label, "Banana",
+       "the highlight starts on the selected option")
+    assert popup.y >= 0 and popup.width > 0, "the list has a place to be"
+
+
+def test_a_disabled_select_does_not_open():
+    tab = _make_tab('<select disabled><option>Nope</option></select>')
+    x, y = _select_centre(tab)
+    eq(tab.click(x, y), None, "a disabled select must not drop down")
+
+
+def test_arrow_keys_walk_the_list_and_skip_disabled_options():
+    browser, _tab = _open_dropdown()
+    popup = browser.select_popup
+    Browser._on_down(browser, None)
+    # Cherry is disabled, so Down from Banana lands past it.
+    eq(popup.rows[popup.hover].label, "Damson", "down skips disabled options")
+    Browser._on_up(browser, None)
+    eq(popup.rows[popup.hover].label, "Banana", "up comes back")
+    Browser._on_up(browser, None)
+    eq(popup.rows[popup.hover].label, "Apple", "up again")
+    Browser._on_up(browser, None)
+    eq(popup.rows[popup.hover].label, "Damson", "the ends wrap around")
+    Browser._on_home(browser, None)
+    eq(popup.rows[popup.hover].label, "Apple", "Home goes to the top")
+    Browser._on_end(browser, None)
+    eq(popup.rows[popup.hover].label, "Damson", "End goes to the bottom")
+
+
+def test_enter_commits_the_highlighted_option():
+    browser, tab = _open_dropdown()
+    Browser._on_down(browser, None)          # Banana -> Damson
+    Browser._on_enter(browser, None)
+    assert not browser.select_popup.open_, "committing closes the list"
+    chosen = selected_options(_select_node(tab))
+    eq([option_value(o) for o in chosen], ["d"], "the DOM moved `selected`")
+    eq(_select_node(tab).attributes.get("value"), "d", "select.value follows")
+    assert "Damson" in _labels(tab), \
+        f"the painted label did not follow: {_labels(tab)}"
+
+
+def test_escape_dismisses_the_list_without_changing_the_value():
+    browser, tab = _open_dropdown()
+    Browser._on_down(browser, None)          # highlight moves...
+    Browser._on_escape(browser, None)        # ...but is never taken
+    assert not browser.select_popup.open_, "Escape closes the list"
+    eq([option_value(o) for o in selected_options(_select_node(tab))], ["b"],
+       "Escape leaves the value alone")
+    assert _select_node(tab).attributes.get("data-focused") is None, \
+        "dismissing the list also drops the focus ring"
+
+
+def test_clicking_an_option_selects_it_and_clicking_away_does_not():
+    browser, tab = _open_dropdown()
+    popup = browser.select_popup
+    row_y = popup.y + popup.PAD + popup.ROW_H // 2  # first row: Apple
+    browser._select_popup_click(popup.x + 10, row_y)
+    assert not popup.open_, "choosing closes the list"
+    eq([option_value(o) for o in selected_options(_select_node(tab))], ["a"],
+       "clicking a row selects it")
+
+    # Now open it again and click somewhere else entirely.
+    browser, tab = _open_dropdown()
+    popup = browser.select_popup
+    browser._select_popup_click(popup.x + popup.width + 40, popup.y + 4)
+    assert not popup.open_, "clicking away dismisses the list"
+    eq([option_value(o) for o in selected_options(_select_node(tab))], ["b"],
+       "clicking away leaves the value alone")
+
+
+def test_a_disabled_option_cannot_be_clicked():
+    browser, tab = _open_dropdown()
+    popup = browser.select_popup
+    cherry = next(i for i, r in enumerate(popup.rows) if r.label == "Cherry")
+    y = popup.y + popup.PAD + (cherry + 0.5) * popup.ROW_H
+    browser._select_popup_click(popup.x + 10, y)
+    assert popup.open_, "a disabled option swallows the click, list stays up"
+    eq([option_value(o) for o in selected_options(_select_node(tab))], ["b"],
+       "a disabled option cannot be chosen")
+
+
+def test_scrolling_the_page_dismisses_the_list():
+    browser, tab = _open_dropdown(
+        "<p>tall</p>" * 200 + _SELECT_PAGE)
+    assert browser.select_popup.open_
+    Browser._scroll(browser, 80)
+    assert not browser.select_popup.open_, "a scroll takes the list down"
+    eq([option_value(o) for o in selected_options(_select_node(tab))], ["b"],
+       "and leaves the value alone")
+
+
+def test_optgroup_labels_are_listed_but_cannot_be_chosen():
+    browser, _tab = _open_dropdown(
+        '<select>'
+        '<optgroup label="Warm"><option>Red</option>'
+        '<option>Orange</option></optgroup>'
+        '<optgroup label="Cool"><option>Blue</option></optgroup>'
+        '</select>')
+    popup = browser.select_popup
+    eq([r.label for r in popup.rows],
+       ["Warm", "Red", "Orange", "Cool", "Blue"], "headings are listed")
+    eq([r.label for r in popup.rows if r.enabled], ["Red", "Orange", "Blue"],
+       "headings are not selectable")
+    eq(popup.rows[popup.hover].label, "Red",
+       "the highlight starts on the first real option, not a heading")
+    Browser._on_down(browser, None)
+    Browser._on_down(browser, None)
+    eq(popup.rows[popup.hover].label, "Blue", "walking steps over headings")
+
+
+def test_a_long_list_scrolls_the_highlight_into_view():
+    options = "".join(f"<option>opt{i}</option>" for i in range(200))
+    browser, _tab = _open_dropdown(f"<select>{options}</select>")
+    popup = browser.select_popup
+    assert popup.visible < len(popup.rows), "a 200-row list cannot all fit"
+    Browser._on_end(browser, None)
+    assert popup.top <= popup.hover < popup.top + popup.visible, \
+        "the last option must be scrolled into the window"
+
+
+def test_a_long_list_stays_inside_the_page_area():
+    options = "".join(f"<option>opt{i}</option>" for i in range(200))
+    tab = _make_tab(f"<select>{options}</select>")
+    browser = _SelectBrowser(tab)
+    # The real window has a tab bar and an address bar above the page; a list
+    # long enough to reach them has to stop, not bury them.
+    browser.chrome_height = lambda: 90
+    x, y = _select_centre(tab)
+    browser._open_select_popup(tab.click(x, y))
+    popup = browser.select_popup
+    assert popup.open_, "the list did not open"
+    assert popup.y >= 90, f"the list starts at y={popup.y}, over the chrome"
+    assert popup.y + popup.height <= 720, \
+        f"the list ends at y={popup.y + popup.height}, past the window"
+
+
+def test_resetting_a_form_puts_the_select_back():
+    browser, tab = _open_dropdown()
+    Browser._on_down(browser, None)
+    Browser._on_enter(browser, None)
+    eq(_select_node(tab).attributes.get("value"), "d", "moved first")
+    form = next(n for n in tree_to_list(tab.nodes, [])
+                if isinstance(n, Element) and n.tag == "form")
+    tab.reset_form(form)
+    eq([option_value(o) for o in selected_options(_select_node(tab))], ["b"],
+       "reset returns to the markup's own choice")
+
+
+# -- expanded <select>: size and multiple ------------------------------------
+
+_LISTBOX_PAGE = (
+    '<form><select name="city" size="4">'
+    '<option value="a">Amsterdam</option>'
+    '<option value="b" selected>Berlin</option>'
+    '<option value="c" disabled>Copenhagen</option>'
+    '<option value="d">Dublin</option>'
+    '<option value="e">Edinburgh</option>'
+    '<option value="f">Faroe</option>'
+    '</select></form>'
+)
+
+_MULTI_PAGE = (
+    '<select multiple>'
+    '<option value="a" selected>Ant</option>'
+    '<option value="b">Bee</option>'
+    '<option value="c">Cricket</option>'
+    '</select>'
+)
+
+
+class _Ev:
+    """A stand-in for a GUI event, carrying only what a handler reads."""
+
+    def __init__(self, x=0, y=0, delta=0, char="", keysym="", state=0):
+        self.x, self.y, self.delta = x, y, delta
+        self.char, self.keysym, self.state = char, keysym, state
+
+
+def _listbox(body=_LISTBOX_PAGE):
+    """Load a page whose select is expanded, returning (browser, tab)."""
+    tab = _make_tab(body)
+    return _SelectBrowser(tab), tab
+
+
+def _click_row(browser, tab, i, node=None):
+    """Click row `i` of the page's (only) expanded select."""
+    node = node or _select_node(tab)
+    lx, ty, _rx, _by = tab._control_rect(node)
+    top = listbox_scroll(node)
+    y = ty + LISTBOX_PAD + (i - top + 0.5) * LISTBOX_ROW_H
+    tab.click(lx + 6, y - tab.scroll)
+
+
+def _chosen(tab, node=None):
+    return [option_label(o)
+            for o in selected_options(node or _select_node(tab))]
+
+
+def test_size_expands_a_select_into_a_listbox():
+    _browser, tab = _listbox()
+    node = _select_node(tab)
+    eq(listbox_rows(node), 4, "size=4 shows four rows")
+    lx, ty, rx, by = tab._control_rect(node)
+    eq(by - ty, 4 * LISTBOX_ROW_H + 2 * LISTBOX_PAD, "the box is four rows tall")
+    # The rows are on the page, not behind a control that has to be opened.
+    labels = _labels(tab)
+    for name in ("Amsterdam", "Berlin", "Copenhagen", "Dublin"):
+        assert name in labels, f"{name} not painted: {labels}"
+    assert "Edinburgh" not in labels, "the fifth row must be out of view"
+
+
+def test_size_one_is_still_a_drop_down():
+    tab = _make_tab('<select size="1"><option>Ant</option>'
+                    '<option selected>Bee</option></select>')
+    eq(listbox_rows(_select_node(tab)), 0, "size=1 is a combo, not a listbox")
+    x, y = _select_centre(tab)
+    assert isinstance(tab.click(x, y), SelectAction), \
+        "size=1 must still open a drop-down"
+
+
+def test_a_listbox_takes_up_room_in_the_flow():
+    """The listbox is page content, so what follows it must start below it."""
+    tab = _make_tab(_LISTBOX_PAGE + "<p>after</p>")
+    _lx, _ty, _rx, by = tab._control_rect(_select_node(tab))
+    after = next(c for c in tab.display_list
+                 if isinstance(c, DrawText) and c.text == "after")
+    assert after.top >= by, \
+        f"the paragraph after the listbox starts at {after.top}, inside it"
+
+
+def test_clicking_a_listbox_row_selects_it():
+    browser, tab = _listbox()
+    _click_row(browser, tab, 3)              # Dublin
+    eq(_chosen(tab), ["Dublin"], "the clicked row is taken")
+    eq(_select_node(tab).attributes.get("value"), "d", "select.value follows")
+    assert "data-focused" in _select_node(tab).attributes, \
+        "clicking a listbox focuses it, which is what the keyboard needs"
+
+
+def test_a_disabled_option_or_heading_in_a_listbox_swallows_the_click():
+    browser, tab = _listbox()
+    _click_row(browser, tab, 2)              # Copenhagen, disabled
+    eq(_chosen(tab), ["Berlin"], "a disabled row cannot be taken")
+
+    browser, tab = _listbox(
+        '<select size="4"><optgroup label="Warm">'
+        '<option>Red</option></optgroup></select>')
+    _click_row(browser, tab, 0)              # the "Warm" heading
+    eq(_chosen(tab), ["Red"], "a heading cannot be taken")
+
+
+def test_a_disabled_listbox_ignores_clicks():
+    browser, tab = _listbox(
+        '<select size="3" disabled><option>Locked</option>'
+        '<option selected>Also</option></select>')
+    _click_row(browser, tab, 0)
+    eq(_chosen(tab), ["Also"], "a disabled listbox cannot be changed")
+
+
+def test_arrows_move_and_commit_in_a_single_choice_listbox():
+    browser, tab = _listbox()
+    _click_row(browser, tab, 1)              # focus, on Berlin
+    Browser._on_down(browser, None)
+    # Copenhagen is disabled, so Down from Berlin lands past it.
+    eq(_chosen(tab), ["Dublin"], "down skips disabled options and commits")
+    Browser._on_up(browser, None)
+    eq(_chosen(tab), ["Berlin"], "up comes back")
+    Browser._on_home(browser, None)
+    eq(_chosen(tab), ["Amsterdam"], "Home goes to the top")
+    Browser._on_up(browser, None)
+    eq(_chosen(tab), ["Amsterdam"],
+       "the top does not wrap round to the bottom")
+    Browser._on_end(browser, None)
+    eq(_chosen(tab), ["Faroe"], "End goes to the bottom")
+
+
+def test_multiple_expands_with_a_default_row_count():
+    _browser, tab = _listbox(_MULTI_PAGE)
+    node = _select_node(tab)
+    eq(listbox_rows(node), 4, "a multiple with no size still shows rows")
+    lx, ty, rx, by = tab._control_rect(node)
+    eq(by - ty, 4 * LISTBOX_ROW_H + 2 * LISTBOX_PAD, "and is that tall")
+
+
+def test_clicking_a_second_row_of_a_multiple_adds_it():
+    browser, tab = _listbox(_MULTI_PAGE)
+    _click_row(browser, tab, 1)
+    eq(_chosen(tab), ["Ant", "Bee"], "a second click adds rather than moves")
+    _click_row(browser, tab, 0)
+    eq(_chosen(tab), ["Bee"], "clicking a taken row drops it")
+
+
+def test_arrows_in_a_multiple_move_without_choosing_until_space():
+    browser, tab = _listbox(_MULTI_PAGE)
+    # Clicking the row that was already taken focuses the box and drops it,
+    # which is the toggle a multiple is for.
+    _click_row(browser, tab, 0)
+    eq(_chosen(tab), [], "clicking a taken row of a multiple drops it")
+    node = _select_node(tab)
+    Browser._on_down(browser, None)
+    eq(listbox_active(node), 1, "the keyboard moved")
+    eq(_chosen(tab), [],
+       "but walking a multiple must not sweep rows up as it goes")
+    # Space and Enter both land here; _on_key routes the one, _on_enter the
+    # other, and this is the work they share.
+    assert browser._listbox_commit(), "Space belongs to the listbox"
+    eq(_chosen(tab), ["Bee"], "it takes the row the keyboard is on")
+    Browser._on_enter(browser, None)
+    eq(_chosen(tab), [], "and pressing again drops it")
+
+
+def test_a_long_listbox_scrolls_the_active_row_into_view():
+    browser, tab = _listbox()
+    _click_row(browser, tab, 1)
+    node = _select_node(tab)
+    Browser._on_end(browser, None)
+    top = listbox_scroll(node)
+    assert top <= listbox_active(node) < top + listbox_rows(node), \
+        f"row {listbox_active(node)} is outside the window at top={top}"
+
+
+def test_the_wheel_scrolls_a_listbox_instead_of_the_page():
+    # Plenty of page below the control, so a turn that reaches the page has
+    # somewhere to go and the assertion means something.
+    browser, tab = _listbox(_LISTBOX_PAGE + "<p>tall</p>" * 200)
+    node = _select_node(tab)
+    lx, ty, _rx, _by = tab._control_rect(node)
+    aim = lambda: _Ev(x=lx + 6, y=ty - tab.scroll + 10, delta=-3)
+    browser._on_wheel(aim())
+    eq(listbox_scroll(node), 1, "the listbox took the turn")
+    eq(tab.scroll, 0, "and the page stayed put")
+    # Wheeling past the end hands the turn back rather than trapping it.
+    for _ in range(4):
+        browser._on_wheel(aim())
+    eq(listbox_scroll(node), 2, "a six-row list in a four-row box stops here")
+    assert tab.scroll > 0, "the leftover turns went to the page"
+
+
+def test_resetting_a_form_puts_a_listbox_back():
+    browser, tab = _listbox()
+    _click_row(browser, tab, 3)
+    eq(_chosen(tab), ["Dublin"], "moved first")
+    form = next(n for n in tree_to_list(tab.nodes, [])
+                if isinstance(n, Element) and n.tag == "form")
+    tab.reset_form(form)
+    eq(_chosen(tab), ["Berlin"], "reset returns to the markup's own choice")
+    node = _select_node(tab)
+    eq(node.attributes.get("data-active"), None,
+       "and the keyboard goes back to where the markup left it")
+
+
+def test_submitting_a_select_carries_every_choice():
+    """What is submitted has to equal what the control was showing.
+
+    A `multiple` select is one name with several values, and an <option>
+    inside an <optgroup> is not a child of the select at all, so a scan of
+    the select's own children submits neither correctly.
+    """
+    tab = _make_tab(
+        '<form method="post" action="/save">'
+        '<input name="who" value="ada">'
+        '<select name="lang" multiple>'
+        '<option selected>Rust<option>Python<option selected>Zig</select>'
+        '<select name="city">'
+        '<optgroup label="DE"><option value="b">Berlin</option></optgroup>'
+        '<optgroup label="IE"><option value="d" selected>Dublin</option>'
+        '</optgroup></select>'
+        '<input type="submit" name="go" value="Save"></form>')
+    cx, cy, _ = _control_box(tab, value="Save")
+    act = tab.click(cx, cy)
+    assert isinstance(act, FormAction), type(act)
+    fields = urllib.parse.parse_qsl(act.payload, keep_blank_values=True)
+    eq(fields, [("who", "ada"), ("lang", "Rust"), ("lang", "Zig"),
+                ("city", "d"), ("go", "Save")],
+       "every choice submitted, alongside the ordinary fields")
+
+
+def test_an_untouched_select_submits_its_fallback_choice():
+    """Marking nothing `selected` still submits: a single-choice select
+    falls back to the first option the reader could have picked, which is
+    the one the closed control was showing all along."""
+    tab = _make_tab(
+        '<form method="post" action="/save">'
+        '<select name="size"><option disabled>--<option>M<option>L</select>'
+        '<input type="submit" value="Go"></form>')
+    cx, cy, _ = _control_box(tab, value="Go")
+    act = tab.click(cx, cy)
+    fields = urllib.parse.parse_qsl(act.payload, keep_blank_values=True)
+    eq(fields, [("size", "M")], "the first choosable option, not the disabled one")
 
 
 def main():

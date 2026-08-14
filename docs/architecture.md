@@ -97,8 +97,9 @@ feetbrowser/
   imagecodec.py  PNG / GIF / PNM decoders -> RGBA
   canvas.py      retained scene graph, fonts, colors, images (Tk semantics)
   window.py      windows, Tk-shaped events, after() timers, main loop
-  cocoa.py       a real macOS window: AppKit through ctypes, no PyObjC
-  win32.py       a real Windows window: user32/gdi32 through ctypes, no pywin32
+  cocoa.py       the macOS window: AppKit through ctypes, no PyObjC
+  x11.py         the Linux window: Xlib through ctypes, no python-xlib
+  win32.py       the Windows window: user32/gdi32 through ctypes, no pywin32
   gui.py         backend facade (raster by default, tk still selectable)
   browser.py     window, chrome, tabs, history, event loop, layered repaint
   toes.py        extension hooking (Toes): discovery, dispatch, CLI
@@ -118,6 +119,8 @@ toes/            user-installed toes (gitignored; empty on a fresh checkout)
 tests/
   test_render.py offline tests for fonts, rasteriser, image codecs, canvas
   test_cocoa.py  the macOS window, driven by real NSEvents (macOS only)
+  test_x11.py    the X11 window, driven by real X events (skips with no server)
+  x11_shot.py    photographs a real X11 window with XGetImage (CI artifact)
   test_win32.py  the Windows window, driven by real messages (Windows only)
   test_units.py  offline unit tests (URL, HTML, CSS, layout, internal pages)
   test_js.py     offline tests for the JS engine + DOM bridge

@@ -28,7 +28,7 @@ STATE_ALT = 0x8
 def key_sequences(keysym, state):
     """Candidate binding names for a keypress, most specific first.
 
-    Two Tk rules are being reproduced here, and both platform backends need
+    Two Tk rules are being reproduced here, and every platform backend needs
     them, so they live with the binding table rather than beside any one
     operating system. A binding matches when its modifiers are a *subset* of
     the ones actually held, which is what lets ``<Control-ISO_Left_Tab>``
@@ -37,7 +37,7 @@ def key_sequences(keysym, state):
     behaviour, not an optimisation: a browser that bound both ``<Up>`` and
     ``<Key>`` must not see the event twice.
 
-    Single-character keysyms are offered in both cases, because Tk names a
+    A single-character keysym is offered in both cases, because Tk names a
     shifted letter two ways: ``<Control-S>`` is what the keysym spells and
     ``<Control-Shift-s>`` is what browser.py binds for view-source.
     """

@@ -140,8 +140,10 @@ class Context:
             None to fall through to normal fetching.
 
         on_draw(canvas, offset)     -> None
-            Paint directly onto the Tk canvas (after the page, before the
+            Paint directly onto the canvas (after the page, before the
             chrome). `offset` is how much the page is shifted by the chrome.
+            The canvas answers to the Tk drawing API a toe written against
+            tkinter expects; see docs/toes.md for where that stops.
 
         buttons()                   -> [ButtonDef]
             Extra toolbar buttons, drawn on the hand-rolled toolbar.
@@ -245,7 +247,7 @@ class Context:
     def popup(self, url, width=320, height=240):
         """Open a real popup window rendering `url` through the pipeline.
 
-        Popups are separate Tk windows (not redirects) with their own
+        Popups are separate windows (not redirects) with their own
         canvas, a hand-drawn title bar, scrolling, and a scrollbar. They
         share the browser's toe contexts, so toe:// pages, the detective's
         paper trail, and link navigation all work inside them.

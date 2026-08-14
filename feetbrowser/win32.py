@@ -209,6 +209,7 @@ _WINDOWS = {}
 
 _libs = {}
 _state = {}     # the registered class atom and the WNDPROC keeping it alive
+_problem = ""   # why available() last said no; see unavailable_reason()
 
 
 # -- pure helpers ----------------------------------------------------------
@@ -947,10 +948,22 @@ Win32Window.toplevel_class = Win32Toplevel
 
 def available():
     """True when a Win32 window can actually be created here."""
+    global _problem
+    _problem = ""
     if sys.platform != "win32":
         return False
     try:
         _load()
-    except Win32Unavailable:
+    except Win32Unavailable as exc:
+        _problem = str(exc)
         return False
     return True
+
+
+def unavailable_reason():
+    """Why available() last said no, or "" when this is simply not Windows.
+
+    Being on macOS is not a fault worth reporting, so the wrong platform says
+    nothing and only a Windows box that failed to open user32 speaks up.
+    """
+    return _problem

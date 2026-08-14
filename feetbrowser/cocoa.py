@@ -57,11 +57,6 @@ _MOD_CONTROL = 1 << 18
 _MOD_OPTION = 1 << 19
 _MOD_COMMAND = 1 << 20
 
-# Tk's event.state bits, shared with every other platform window.
-_STATE_SHIFT = STATE_SHIFT
-_STATE_CONTROL = STATE_CONTROL
-_STATE_ALT = STATE_ALT
-
 # Virtual key codes -> Tk keysyms, for the keys that carry no character.
 _KEYSYMS = {
     36: "Return", 76: "KP_Enter", 48: "Tab", 51: "BackSpace", 53: "Escape",
@@ -447,13 +442,13 @@ class CocoaWindow(Window):
         flags = msg(event, "modifierFlags", restype=ctypes.c_ulonglong)
         state = 0
         if flags & _MOD_SHIFT:
-            state |= _STATE_SHIFT
+            state |= STATE_SHIFT
         # Command is where a Mac user's muscle memory puts Tk's Control, and
         # the browser reads state & 0x4 for its shortcuts, so both map there.
         if flags & (_MOD_CONTROL | _MOD_COMMAND):
-            state |= _STATE_CONTROL
+            state |= STATE_CONTROL
         if flags & _MOD_OPTION:
-            state |= _STATE_ALT
+            state |= STATE_ALT
         return state
 
     def _on_wheel(self, event):
@@ -488,7 +483,7 @@ class CocoaWindow(Window):
         elif keysym == "Return":
             char = "\r"
         elif keysym == "Tab":
-            keysym = "ISO_Left_Tab" if state & _STATE_SHIFT else "Tab"
+            keysym = "ISO_Left_Tab" if state & STATE_SHIFT else "Tab"
         if not keysym:
             return
         event_obj = Event(keysym=keysym, char=char, state=state, type="<Key>")
@@ -593,12 +588,27 @@ class CocoaTk(CocoaWindow):
 CocoaWindow.toplevel_class = CocoaToplevel
 
 
+_problem = ""
+
+
 def available():
     """True when a Cocoa window can actually be created here."""
+    global _problem
+    _problem = ""
     if sys.platform != "darwin":
         return False
     try:
         _load()
-    except CocoaUnavailable:
+    except CocoaUnavailable as exc:
+        _problem = str(exc)
         return False
     return True
+
+
+def unavailable_reason():
+    """Why available() last said no, or "" when this is simply not macOS.
+
+    "Cocoa needs macOS" is not news to anyone running Linux, so the wrong
+    platform says nothing at all and only a real failure speaks up.
+    """
+    return _problem

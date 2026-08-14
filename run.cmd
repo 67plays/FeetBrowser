@@ -23,6 +23,15 @@ if not errorlevel 1 (
   exit /b %errorlevel%
 )
 
+rem Unseal a venv made before the line below grew --system-site-packages. A
+rem default venv cannot see the system's site-packages, which is where the
+rem optional image decoders live, and a venv is only ever created once -- so
+rem without this the fix reaches fresh checkouts and nobody who already hit
+rem the bug. Re-running venv over an existing directory rewrites pyvenv.cfg
+rem and leaves everything installed in it exactly where it was.
+findstr /i /c:"include-system-site-packages = false" ".venv\pyvenv.cfg" >nul 2>&1
+if not errorlevel 1 python -m venv --system-site-packages .venv
+
 rem Otherwise the venv is what runs the browser, so ask the venv -- and not
 rem the system python -- whether the engine is there.
 if not exist ".venv\Scripts\python.exe" goto build
@@ -30,7 +39,7 @@ if not exist ".venv\Scripts\python.exe" goto build
 if not errorlevel 1 goto run
 
 :build
-python -m venv .venv || exit /b 1
+python -m venv --system-site-packages .venv || exit /b 1
 ".venv\Scripts\python.exe" -m pip install -q maturin || exit /b 1
 ".venv\Scripts\maturin.exe" develop --release --manifest-path rust/Cargo.toml || exit /b 1
 
