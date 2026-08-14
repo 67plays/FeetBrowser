@@ -17,6 +17,13 @@ survive the trip: a background, a border, glyphs, a PNG and a GIF, in shades
 picked so that finding one pixel of the right colour is proof that the layer
 that draws it ran. An image that quietly disappears takes its colour with
 it, and this test says which one and where it should have been.
+
+The photograph is checked the other way round. A JPEG has no flat colours to
+count, so it is decoded here as well and the shot is required to contain the
+pixels the decode produced -- the same photograph, in the same numbers,
+somewhere on the page. That is the assertion that "a real page with real
+photographs draws pixels rather than [img]" reduces to, and it fails if the
+decoder drifts by a level as readily as if it stops working.
 """
 import collections
 import os
@@ -42,6 +49,7 @@ PNG_BODY, PNG_MARK = (255, 0, 128), (0, 255, 255)
 GIF_BODY, GIF_MARK = (20, 200, 100), (255, 150, 0)
 PNG_SIZE, GIF_SIZE = (120, 80), (90, 60)
 PNG_MARK_SIZE, GIF_MARK_SIZE = 24, 18
+JPEG_SIZE = (320, 224)
 
 
 def _decode(path):
@@ -170,11 +178,37 @@ def test_page_renders_every_layer():
     assert text[3] < frame[1], (
         "the heading did not end up above the bordered box\n%s" % detail)
 
+    # The photograph. Counting one colour proves nothing about a JPEG, so
+    # this counts all of them: decode the fixture here, and require the shot
+    # to hold at least as many of each colour as the photograph has. A
+    # decoder that stopped working takes every one of them away, and one
+    # that drifted by a level takes most of them.
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "fixtures", "photo.jpg"), "rb") as fh:
+        jw, jh, photo = imagecodec.decode(fh.read())
+    assert (jw, jh) == JPEG_SIZE, "the fixture photograph changed size"
+    wanted = collections.Counter(
+        (photo[i * 4], photo[i * 4 + 1], photo[i * 4 + 2])
+        for i in range(jw * jh))
+    landed = sum(min(n, count[colour]) for colour, n in wanted.items())
+    assert landed > jw * jh * 0.9, (
+        "photo.jpg: %d of %d decoded pixels reached the screen\n%s"
+        % (landed, jw * jh, detail))
+
+    # A whole page with a photograph on it has now been fetched, decoded,
+    # laid out and drawn. On the CI job that installs Pillow and cairosvg
+    # this is the moment that says the photograph came from our decoder: an
+    # import added back by reflex would have succeeded there and left its
+    # module behind. Everywhere else neither is installed and this is free.
+    leaked = [m for m in ("PIL", "cairosvg") if m in sys.modules]
+    assert not leaked, (
+        "the browser imported %s to draw the page" % ", ".join(leaked))
+
     print("  page %dx%d, background %d px, glyphs %d px, border %d px, "
-          "swatch.png %d px, dot.gif %d px"
+          "swatch.png %d px, dot.gif %d px, photo.jpg %d of %d px"
           % (width, height, count[PAGE_BG], count[TEXT], count[BORDER],
              count[PNG_BODY] + count[PNG_MARK],
-             count[GIF_BODY] + count[GIF_MARK]))
+             count[GIF_BODY] + count[GIF_MARK], landed, jw * jh))
 
 
 def main():

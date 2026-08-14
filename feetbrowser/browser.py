@@ -1048,65 +1048,18 @@ class Tab:
             self._image_done()
 
     @staticmethod
-    def _decode_image(data, ctype):
-        """Decode image bytes to a PhotoImage. PNG, GIF and the Netpbm family
-        are decoded by our own codecs in `imagecodec`; JPEG/WebP/BMP/ICO/TIFF
-        are converted to PNG through Pillow when it is installed; SVG is
-        rasterized via cairosvg when it is installed. Anything we cannot
-        decode returns None and the caller draws the placeholder."""
-        ctype = (ctype or "").split(";")[0].strip().lower()
-        # Formats our own decoders handle.
-        if ctype in ("image/png", "image/gif", "image/x-xbitmap"):
-            try:
-                return PhotoImage(data=data)
-            except Exception:  # noqa: BLE001 - bad bytes; try Pillow below
-                pass
-        # Formats Pillow can convert to PNG (otherwise fall through to the
-        # sniffing decode below, which may still recognise the bytes).
-        if ctype in ("image/jpeg", "image/jpg", "image/webp", "image/bmp",
-                     "image/x-icon", "image/vnd.microsoft.icon", "image/tiff"):
-            photo = Tab._photo_from_pillow(data)
-            if photo is not None:
-                return photo
-        if ctype == "image/svg+xml":
-            photo = Tab._photo_from_svg(data)
-            if photo is not None:
-                return photo
-        # Unknown type: sniff the data; the signature may still name a format
-        # we decode.
+    def _decode_image(data, _ctype):
+        """Decode image bytes to a PhotoImage, or None for the placeholder.
+
+        The content type is not consulted. Servers label images wrongly often
+        enough that the bytes are the only reliable answer, and `imagecodec`
+        sniffs them: what it recognises it decodes, and everything else --
+        SVG, WebP, BMP, ICO, TIFF, and the corners of JPEG we refuse -- draws
+        as the alt text, which is what the caller does with None.
+        """
         try:
             return PhotoImage(data=data)
         except Exception:  # noqa: BLE001 - undecodable data -> placeholder
-            return None
-
-    @staticmethod
-    def _photo_from_pillow(data):
-        """Convert image bytes to a PhotoImage via Pillow. Returns None
-        if Pillow is missing or the data is undecodable."""
-        try:
-            from PIL import Image as PILImage
-            import io
-            # Refuse giant images (decompression bombs): Pillow raises
-            # DecompressionBombWarning/Error past this pixel count, and both
-            # subclass Exception so the fallback placeholder is used.
-            PILImage.MAX_IMAGE_PIXELS = 20_000_000
-            pil = PILImage.open(io.BytesIO(data))
-            pil.load()
-            pil = pil.convert("RGBA")
-            buf = io.BytesIO()
-            pil.save(buf, format="PNG")
-            return PhotoImage(data=buf.getvalue())
-        except Exception:  # noqa: BLE001 - Pillow missing / bad data
-            return None
-
-    @staticmethod
-    def _photo_from_svg(data):
-        """Rasterize SVG bytes to a PhotoImage via cairosvg (optional)."""
-        try:
-            import cairosvg
-            png = cairosvg.svg2png(bytestring=data)
-            return PhotoImage(data=png)
-        except Exception:  # noqa: BLE001 - cairosvg missing / bad data
             return None
 
     def content_height(self):

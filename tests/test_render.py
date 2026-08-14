@@ -16,6 +16,8 @@ from feetbrowser import canvas as canvasmod
 from feetbrowser import fontengine, gui, imagecodec, raster
 from feetbrowser.window import Event, Window
 
+_FIXTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
+
 
 # -- helpers ---------------------------------------------------------------
 
@@ -864,6 +866,44 @@ def test_decoders_survive_arbitrary_corruption():
             raise AssertionError(
                 f"{type(exc).__name__} escaped the decoder for "
                 f"{bytes(data)!r}: {exc}")
+
+
+def test_jpeg_survives_arbitrary_corruption():
+    """The same treatment for JPEG, from the real fixtures rather than from
+    anything built here. It needs its own round because a JPEG is mostly one
+    long entropy-coded run: a flipped bit does not stop the decoder, it
+    changes what every following symbol means, and the sizes and counts it
+    then reads are numbers no encoder ever wrote. Those are the numbers that
+    index a table or size an allocation, so this is the test that says a
+    corrupt photograph loses its picture and not the page it is on.
+    """
+    import random
+
+    seeds = []
+    for name in ("photo.jpg", "photo-progressive.jpg", "photo-grey.jpg",
+                 "photo-restart.jpg"):
+        with open(os.path.join(_FIXTURES, name), "rb") as fh:
+            seeds.append(fh.read())
+    rng = random.Random(20260813)
+    decoded = 0
+    for _ in range(1500):
+        data = bytearray(rng.choice(seeds))
+        for _flip in range(rng.randint(1, 6)):
+            data[rng.randrange(len(data))] = rng.randrange(256)
+        if rng.random() < 0.4:
+            del data[rng.randrange(len(data)):]
+        try:
+            imagecodec.decode(bytes(data))
+            decoded += 1
+        except imagecodec.ImageError:
+            pass
+        except Exception as exc:                 # noqa: BLE001
+            raise AssertionError(
+                f"{type(exc).__name__} escaped the JPEG decoder for "
+                f"{bytes(data)!r}: {exc}")
+    assert decoded > 500, (
+        "only %d of 1500 corrupted photographs decoded at all, which means "
+        "the run is testing rejection and not the decoder" % decoded)
 
 
 # -- colours ---------------------------------------------------------------
