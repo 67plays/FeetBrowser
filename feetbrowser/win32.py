@@ -137,6 +137,14 @@ WM_LBUTTONDOWN, WM_LBUTTONUP = 0x0201, 0x0202
 WM_RBUTTONDOWN, WM_RBUTTONUP = 0x0204, 0x0205
 WM_MBUTTONDOWN, WM_MBUTTONUP = 0x0207, 0x0208
 WM_MOUSEWHEEL = 0x020A
+WM_TIMER = 0x0113
+WM_DPICHANGED = 0x02E0
+
+# The timer that keeps the browser alive inside Windows' own modal loops.
+# Any id will do as long as it is ours; 1 is ours because nothing else in
+# this window uses SetTimer at all.
+_PUMP_TIMER_ID = 1
+_PUMP_TIMER_MS = 15
 
 # WM_MOUSEMOVE's wParam.
 MK_LBUTTON, MK_RBUTTON, MK_MBUTTON = 0x0001, 0x0002, 0x0010
@@ -370,7 +378,6 @@ def _load():
         _libs.clear()
         raise Win32Unavailable("cannot load %s: %s" % (name, exc)) from exc
     _declare()
-    _set_dpi_awareness()
 
 
 def _declare():
@@ -414,6 +421,10 @@ def _declare():
         (user32, "ScreenToClient", BOOL, [hwnd, ctypes.POINTER(POINT)]),
         (user32, "GetKeyState", ctypes.c_short, [ctypes.c_int]),
         (user32, "IsWindow", BOOL, [hwnd]),
+        (user32, "SetTimer", ctypes.c_size_t,
+         [hwnd, ctypes.c_size_t, UINT, ctypes.c_void_p]),
+        (user32, "KillTimer", BOOL, [hwnd, ctypes.c_size_t]),
+        (user32, "ValidateRect", BOOL, [hwnd, ctypes.c_void_p]),
         (user32, "OpenClipboard", BOOL, [hwnd]),
         (user32, "CloseClipboard", BOOL, []),
         (user32, "EmptyClipboard", BOOL, []),
@@ -436,6 +447,23 @@ def _declare():
         fn = getattr(lib, name)
         fn.restype = restype
         fn.argtypes = argtypes
+
+    # Windows 10 1607 and later. Declared separately and by getattr, because
+    # on an older system they are simply absent and asking for one by
+    # attribute raises -- see _dpi_for() and _adjust_rect() for what happens
+    # then.
+    optional = [
+        (user32, "GetDpiForWindow", UINT, [hwnd]),
+        (user32, "GetDpiForSystem", UINT, []),
+        (user32, "AdjustWindowRectExForDpi", BOOL,
+         [ctypes.POINTER(RECT), DWORD, BOOL, DWORD, UINT]),
+    ]
+    for lib, name, restype, argtypes in optional:
+        fn = getattr(lib, name, None)
+        if fn is not None:
+            fn.restype = restype
+            fn.argtypes = argtypes
+            _state.setdefault("optional", set()).add(name)
 
 
 def _set_dpi_awareness():
@@ -464,6 +492,49 @@ def _set_dpi_awareness():
     legacy = getattr(user32, "SetProcessDPIAware", None)
     if legacy is not None:
         legacy()
+
+
+def _has(name):
+    """True when this Windows is new enough to export `name`."""
+    return name in _state.get("optional", ())
+
+
+def _dpi_for(hwnd):
+    """The DPI this window is being displayed at, or 96 if nobody will say.
+
+    96 is the historical "100%" and the right answer for every Windows that
+    predates per-monitor DPI, because on those the whole desktop is one
+    scale and the frame metrics already match it.
+    """
+    user32 = _libs["user32"]
+    if hwnd and _has("GetDpiForWindow"):
+        dpi = user32.GetDpiForWindow(hwnd)
+        if dpi:
+            return dpi
+    if _has("GetDpiForSystem"):
+        dpi = user32.GetDpiForSystem()
+        if dpi:
+            return dpi
+    return 96
+
+
+def _adjust_rect(rect, style, dpi):
+    """Grow `rect` from a client area to the outer window at `dpi`.
+
+    AdjustWindowRectEx is documented as not DPI aware and not to be called
+    from a per-monitor-aware thread, which this one is: it measures the
+    caption and borders at 96 DPI, so on a 150% display the window comes out
+    with a client area some fifteen pixels short. The ForDpi variant takes
+    the scale as an argument and is the only correct call here; the old one
+    is kept for the Windows versions that have no other.
+    """
+    user32 = _libs["user32"]
+    if _has("AdjustWindowRectExForDpi"):
+        user32.AdjustWindowRectExForDpi(ctypes.byref(rect), style, False, 0,
+                                        dpi)
+    else:
+        user32.AdjustWindowRectEx(ctypes.byref(rect), style, False, 0)
+    return rect
 
 
 def _register_class():
@@ -524,8 +595,14 @@ def _handle_key(hwnd):
 class Win32Window(Window):
     """A titled, resizable Windows window presenting a raster surface."""
 
-    def __init__(self, width=1000, height=720, title="FeetBrowser"):
+    def __init__(self, width=1000, height=720, title="FeetBrowser",
+                 owner=None):
         _load()
+        # Not in _load(). Process DPI awareness can be set exactly once and
+        # never unset, and _load() also runs from available(), which gui.py
+        # calls on backends it is only *considering*. Probing for a window
+        # must not permanently change the process; opening one may.
+        _set_dpi_awareness()
         super().__init__(width, height, title)
         user32 = _libs["user32"]
         _register_class()
@@ -539,7 +616,7 @@ class Win32Window(Window):
         self._bitmap = BITMAPINFO()
         self._hwnd = user32.CreateWindowExW(
             0, _CLASS_NAME, title, style, CW_USEDEFAULT, CW_USEDEFAULT,
-            outer[0], outer[1], None, None, _state["hinstance"], None)
+            outer[0], outer[1], owner, None, _state["hinstance"], None)
         if not self._hwnd:
             raise Win32Unavailable("could not create a window: %d"
                                    % ctypes.get_last_error())
@@ -549,14 +626,28 @@ class Win32Window(Window):
         user32.ShowWindow(self._hwnd, SW_SHOW)
         user32.SetForegroundWindow(self._hwnd)
         user32.SetFocus(self._hwnd)
+        # Windows runs modal loops of its own -- dragging the title bar, a
+        # resize border, the system menu -- and inside one of those,
+        # DispatchMessageW does not return until the user lets go. Our
+        # mainloop, and so flush_timers(), stops for the whole of it, which
+        # is not a cosmetic problem: browser.py drains finished page loads,
+        # image decodes and JS timeouts off the timer queue, so holding the
+        # window edge for five seconds stalls the network for five seconds.
+        # WM_TIMER is delivered inside those loops, which is what it is for.
+        user32.SetTimer(self._hwnd, _PUMP_TIMER_ID, _PUMP_TIMER_MS, None)
 
     # -- geometry ----------------------------------------------------------
 
     @staticmethod
-    def _frame_size(width, height, style):
-        """The outer size whose *client* area is width x height."""
+    def _frame_size(width, height, style, hwnd=None):
+        """The outer size whose *client* area is width x height.
+
+        `hwnd` is the window being measured, when there is one; at creation
+        there is not, and the system DPI stands in until the window lands on
+        a monitor and WM_DPICHANGED corrects it.
+        """
         rect = RECT(0, 0, int(width), int(height))
-        _libs["user32"].AdjustWindowRectEx(ctypes.byref(rect), style, False, 0)
+        _adjust_rect(rect, style, _dpi_for(hwnd))
         return rect.right - rect.left, rect.bottom - rect.top
 
     def _content_size(self):
@@ -570,7 +661,8 @@ class Win32Window(Window):
         super().resize(width, height)
         if self._closed:
             return
-        outer = self._frame_size(self.width, self.height, WS_OVERLAPPEDWINDOW)
+        outer = self._frame_size(self.width, self.height, WS_OVERLAPPEDWINDOW,
+                                 self._hwnd)
         _libs["user32"].SetWindowPos(
             self._hwnd, None, 0, 0, outer[0], outer[1],
             SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE)
@@ -601,6 +693,11 @@ class Win32Window(Window):
             self._blit(hdc)
         finally:
             user32.ReleaseDC(self._hwnd, hdc)
+        # This DC is not the WM_PAINT one, so drawing through it leaves any
+        # invalid region invalid and Windows keeps re-posting WM_PAINT for
+        # it. The whole client area has just been drawn; say so, or the
+        # window paints the same pixels a second time on every frame.
+        user32.ValidateRect(self._hwnd, None)
 
     def _blit(self, hdc):
         """Push the converted frame at whatever size the client area is now.
@@ -674,6 +771,17 @@ class Win32Window(Window):
                 Window.resize(self, width, height)
             self._repaint = True
             return 0
+        if message == WM_TIMER:
+            if wparam == _PUMP_TIMER_ID:
+                # Only the timer half of a pump: poll_events() is the caller
+                # we are standing in for, and re-entering it from inside
+                # DispatchMessageW would recurse.
+                self.flush_timers()
+                self.present()
+                return 0
+            return None
+        if message == WM_DPICHANGED:
+            return self._on_dpichanged(lparam)
         if message == WM_GETMINMAXINFO:
             return self._on_minmax(lparam)
         if message == WM_SETCURSOR:
@@ -684,6 +792,15 @@ class Win32Window(Window):
         if message == WM_DESTROY:
             self._closed = True
             _WINDOWS.pop(_handle_key(self._hwnd), None)
+            # Tell the base class as well, which WM_CLOSE does for us on the
+            # polite path but nothing else does. A logoff, an outside
+            # DestroyWindow, or Task Manager ending the window all arrive
+            # straight here -- and with `_destroyed` left False, mainloop()
+            # keeps running against a window that no longer exists, waking a
+            # hundred times a second and never returning. destroy() is
+            # guarded both ways, so the WM_CLOSE path still passes through
+            # once.
+            self.destroy()
             return 0
         if message in (WM_KEYDOWN, WM_SYSKEYDOWN):
             self._on_key(wparam)
@@ -703,15 +820,49 @@ class Win32Window(Window):
         user32 = _libs["user32"]
         paint = PAINTSTRUCT()
         hdc = user32.BeginPaint(self._hwnd, ctypes.byref(paint))
-        if hdc:
-            # Repaint from the last frame rather than re-rendering: WM_PAINT
-            # arrives during a live resize drag, where the loop is not running.
-            self._blit(hdc)
+        try:
+            if hdc:
+                # Repaint from the last frame rather than re-rendering:
+                # WM_PAINT arrives during a live resize drag, where the loop
+                # is not running.
+                self._blit(hdc)
+        finally:
+            # Unconditionally, and even when BeginPaint handed back nothing:
+            # BeginPaint is what clears the update region, and skipping
+            # EndPaint leaves the window permanently invalid, which means
+            # WM_PAINT immediately again, forever, at the speed of the loop.
             user32.EndPaint(self._hwnd, ctypes.byref(paint))
         if self._frame is None:
             # Nothing has been presented yet, so ask for another WM_PAINT once
             # there is something to show rather than leaving the window blank.
             self._repaint = True
+        return 0
+
+    def _on_dpichanged(self, lparam):
+        """Follow the window to its new scale.
+
+        A per-monitor-v2 process is told, not asked: Windows has already
+        decided the window belongs at a different DPI -- dragged to a second
+        monitor, or the display scale changed under it -- and hands over the
+        rectangle it should now occupy. Taking that rectangle is not
+        optional. Ignoring it leaves a window whose non-client frame is
+        drawn at the new scale around a client area still sized for the old
+        one, and the two disagree by whatever the ratio is.
+
+        Nothing here rescales the page: the canvas is measured in real
+        pixels and simply gets more of them, which is the whole point of
+        asking for awareness in the first place.
+        """
+        suggested = ctypes.cast(ctypes.c_void_p(lparam),
+                                ctypes.POINTER(RECT)).contents
+        _libs["user32"].SetWindowPos(
+            self._hwnd, None, suggested.left, suggested.top,
+            suggested.right - suggested.left,
+            suggested.bottom - suggested.top,
+            SWP_NOZORDER | SWP_NOACTIVATE)
+        # WM_SIZE follows from SetWindowPos and carries the new client size,
+        # so the canvas is resized there rather than guessed at here.
+        self._repaint = True
         return 0
 
     def _on_minmax(self, lparam):
@@ -720,7 +871,7 @@ class Win32Window(Window):
         info = ctypes.cast(ctypes.c_void_p(lparam),
                            ctypes.POINTER(MINMAXINFO)).contents
         outer = self._frame_size(self.min_width, self.min_height,
-                                 WS_OVERLAPPEDWINDOW)
+                                 WS_OVERLAPPEDWINDOW, self._hwnd)
         info.ptMinTrackSize.x, info.ptMinTrackSize.y = outer
         return 0
 
@@ -851,6 +1002,7 @@ class Win32Window(Window):
         _WINDOWS.pop(_handle_key(hwnd), None)
         self._frame = None
         if hwnd:
+            _libs["user32"].KillTimer(hwnd, _PUMP_TIMER_ID)
             _libs["user32"].DestroyWindow(hwnd)
 
     def withdraw(self):
@@ -922,7 +1074,13 @@ class Win32Toplevel(Win32Window):
     """A secondary window, used for the browser's link previews."""
 
     def __init__(self, master=None, **kwargs):
-        super().__init__(**kwargs)
+        # Owned, not parented: an owned top-level keeps its own frame and
+        # its own place on the desktop, but stays in front of the window
+        # that opened it and is destroyed with it. That is exactly what a
+        # link preview wants, and it is also what stops a preview being
+        # left behind as an orphan window when the browser quits.
+        owner = getattr(master, "_hwnd", None)
+        super().__init__(owner=owner, **kwargs)
         self.master = master
         if master is not None:
             master.children.append(self)
