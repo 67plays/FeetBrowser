@@ -16,6 +16,14 @@ pub const MAX_STRING_OUT: usize = 32_000_000;
 pub const MAX_TIMERS: usize = 10_000;
 pub const MAX_DRAIN: usize = 1_000_000;
 
+/// The property-map key `Symbol.iterator` addresses. Symbols reach property
+/// slots by their `key` string, and the well-known iterator symbol pins this
+/// one because it is the key `interp::iterate` reads and the key every
+/// polyfill of the last decade has written. One key, one iteration protocol:
+/// `obj[Symbol.iterator] = f` and `obj["@@iterator"] = f` are the same slot,
+/// which is what keeps spread, `for...of` and `Array.from` from disagreeing.
+pub const SYMBOL_ITERATOR: &str = "@@iterator";
+
 #[derive(Debug, Clone)]
 pub enum JsError {
     /// An ordinary JS error (JSException-like).
@@ -143,6 +151,11 @@ pub enum JsValue {
     Date(Rc<RefCell<JsDate>>),
     Regex(Rc<RefCell<JsRegex>>),
     Error(Rc<RefCell<JsHostError>>),
+    /// A symbol: a primitive with identity and nothing else. `key` is the
+    /// string it addresses property slots by -- well-known symbols pin fixed
+    /// keys (`Symbol.iterator` -> `"@@iterator"`), fresh ones get a name no
+    /// source file can spell -- and `desc` is what `Symbol(desc)` shows.
+    Symbol(Rc<JsSymbol>),
     /// Not a value a program can ever hold: it is what sits in a property slot
     /// that was defined with `get`/`set`, and `js_get`/`js_set` unwrap it by
     /// running the accessor. Storing it inline like this is what lets objects,
@@ -174,6 +187,7 @@ impl std::fmt::Debug for JsValue {
             JsValue::Date(_) => write!(f, "Date"),
             JsValue::Regex(_) => write!(f, "RegExp"),
             JsValue::Error(_) => write!(f, "Error"),
+            JsValue::Symbol(s) => write!(f, "Symbol({})", s.desc),
             JsValue::Accessor(_) => write!(f, "accessor"),
             JsValue::Super(_) => write!(f, "super"),
             JsValue::Native(n) => write!(f, "function {}", n.name),
@@ -217,6 +231,7 @@ pub fn is_objectish(v: &JsValue) -> bool {
             | JsValue::Number(_)
             | JsValue::Str(_)
             | JsValue::Bool(_)
+            | JsValue::Symbol(_)
     )
 }
 
@@ -348,6 +363,11 @@ pub fn map_key(v: &JsValue) -> String {
         JsValue::Date(d) => format!("obj:{:p}", Rc::as_ptr(d)),
         JsValue::Regex(r) => format!("obj:{:p}", Rc::as_ptr(r)),
         JsValue::Error(e) => format!("obj:{:p}", Rc::as_ptr(e)),
+        // A symbol's `key` is its identity -- one key per symbol, forever --
+        // so it is what a Map keys by. The `sym:` prefix keeps it out of the
+        // string namespace, so `m.set(Symbol.for("k"), 1)` cannot be answered
+        // by `m.get("@@for:k")`.
+        JsValue::Symbol(s) => format!("sym:{}", s.key),
         JsValue::Accessor(a) => format!("obj:{:p}", Rc::as_ptr(a)),
         JsValue::Super(s) => format!("obj:{:p}", Rc::as_ptr(s)),
         JsValue::Native(n) => format!("obj:{:p}", Rc::as_ptr(n)),
@@ -414,6 +434,7 @@ pub fn same_ref(a: &JsValue, b: &JsValue) -> bool {
         (Date(x), Date(y)) => Rc::ptr_eq(x, y),
         (Regex(x), Regex(y)) => Rc::ptr_eq(x, y),
         (Error(x), Error(y)) => Rc::ptr_eq(x, y),
+        (Symbol(x), Symbol(y)) => Rc::ptr_eq(x, y),
         (Super(x), Super(y)) => Rc::ptr_eq(x, y),
         (Native(x), Native(y)) => Rc::ptr_eq(x, y),
         (Host(x), Host(y)) => x.is(y),
@@ -429,6 +450,13 @@ pub fn loose_eq(a: &JsValue, b: &JsValue) -> bool {
     }
     if let (JsValue::Str(x), JsValue::Str(y)) = (a, b) {
         return x == y;
+    }
+    // A symbol is a primitive, so `is_objectish` says no and the object arm
+    // below would never reach it -- but `s == s` is still true, and a symbol
+    // is never loosely equal to anything else (it does not coerce). Answer
+    // here rather than letting the numeric arm turn both sides into NaN.
+    if matches!(a, JsValue::Symbol(_)) || matches!(b, JsValue::Symbol(_)) {
+        return same_ref(a, b);
     }
     if is_numberish(a) || is_numberish(b) {
         let ca = to_number(a);
@@ -476,6 +504,7 @@ pub fn js_typeof(v: &JsValue) -> &'static str {
         JsValue::Bool(_) => "boolean",
         JsValue::Str(_) => "string",
         JsValue::Number(_) => "number",
+        JsValue::Symbol(_) => "symbol",
         JsValue::Function(_) => "function",
         JsValue::Class(_)
         | JsValue::Instance(_)
@@ -731,6 +760,22 @@ impl JSFunction {
             _ => {}
         }
     }
+}
+
+/// A symbol value. `key` is what property maps address the symbol by; the
+/// well-known symbols pin fixed keys (`Symbol.iterator` -> `"@@iterator"`),
+/// and a fresh `Symbol("x")` gets a key no source file can spell, so it can
+/// never collide with another symbol or with a string a script wrote.
+///
+/// Identity lives in the `Rc`: `same_ref` compares pointers, which is what
+/// makes `Symbol("a") !== Symbol("a")` true and `Symbol.for("a")` equal to
+/// itself. There is exactly one `Rc` per symbol -- held by the registry for
+/// `Symbol.for`, and by the well-known table for `Symbol.iterator` and its
+/// eleven siblings -- so a symbol fetched twice is the same value twice.
+#[derive(Debug)]
+pub struct JsSymbol {
+    pub key: String,
+    pub desc: String,
 }
 
 /// A JS Promise.

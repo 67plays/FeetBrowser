@@ -361,6 +361,12 @@ impl Interpreter {
                 let e = e.borrow();
                 format!("{}: {}", e.name, e.message)
             }
+            // A real engine throws on implicit string coercion of a symbol and
+            // only `String(sym)` gets you this. Throwing from `repr` is not
+            // available -- it is infallible and half the engine calls it -- so
+            // the description is what comes out, the same text `String(sym)`
+            // would give. It is not a property key: `index_name` reads `key`.
+            JsValue::Symbol(s) => format!("Symbol({})", s.desc),
             JsValue::Super(_) => "super".to_string(),
             JsValue::Native(n) => format!("function {}", n.name),
             JsValue::Callback(_) => "function".to_string(),
@@ -552,6 +558,13 @@ fn py_args(this: &Rc<Interpreter>, py: Python<'_>, args: &[JsValue]) -> PyResult
 pub fn index_name(this: &Interpreter, value: &JsValue) -> String {
     match value {
         JsValue::Str(s) => s.to_string(),
+        // The seam. A symbol addresses a property slot by its `key`, never by
+        // the text `repr` would give it, so `obj[Symbol.iterator] = f` writes
+        // the `"@@iterator"` slot -- the one and only slot `iterate` reads.
+        // Route this through `repr` instead and `obj[Symbol.iterator]` would
+        // land on `"Symbol(Symbol.iterator)"` and the protocol would fork in
+        // two, which is the bug `iterate` exists to prevent.
+        JsValue::Symbol(s) => s.key.clone(),
         _ => this.repr(value),
     }
 }
@@ -561,6 +574,33 @@ pub fn own_keys(_this: &Interpreter, value: &JsValue) -> Vec<String> {
         JsValue::Object(m) => m.borrow().keys().cloned().collect(),
         JsValue::Array(a) => (0..a.borrow().len()).map(|i| i.to_string()).collect(),
         _ => Vec::new(),
+    }
+}
+
+/// The three properties a symbol answers to. Everything else is `undefined`:
+/// a symbol has no prototype chain here and nothing to inherit one from.
+pub fn symbol_get(s: &Rc<JsSymbol>, name: &str) -> JsValue {
+    match name {
+        "description" => JsValue::str(s.desc.clone()),
+        "toString" => {
+            let desc = s.desc.clone();
+            JsValue::Callback(Rc::new(
+                move |_i: &Rc<Interpreter>, _args: Vec<JsValue>| -> EvResult {
+                    let out = JsValue::str(format!("Symbol({desc})"));
+                    Box::pin(async move { Ok(out) })
+                },
+            ))
+        }
+        "valueOf" => {
+            let s = s.clone();
+            JsValue::Callback(Rc::new(
+                move |_i: &Rc<Interpreter>, _args: Vec<JsValue>| -> EvResult {
+                    let out = JsValue::Symbol(s.clone());
+                    Box::pin(async move { Ok(out) })
+                },
+            ))
+        }
+        _ => JsValue::Undefined,
     }
 }
 
@@ -1277,7 +1317,46 @@ fn as_method(obj: &JsValue, name: &str, v: JsValue) -> JsValue {
     }
 }
 
+/// `arr[Symbol.iterator]`, and the same for a string, a Map and a Set.
+///
+/// `iterate` walks those four from the inside without ever asking them for an
+/// iterator, so until now they had no `"@@iterator"` slot to hand a script
+/// that wanted to step one by hand -- `arr[Symbol.iterator]()` was
+/// `undefined`, and a bundle that copies the iterator out before looping got
+/// nothing. This fills the slot, and fills it *by calling `iterate`*: the
+/// object handed back walks exactly what spread and `for...of` walk, because
+/// it is the same list. Wiring a second, hand-rolled cursor here is what
+/// would let `[...m]` and `m[Symbol.iterator]()` drift apart.
+///
+/// Only these four, and that is what makes it terminate: `iterate` answers
+/// them from their own contents before it ever reaches its `"@@iterator"`
+/// lookup, so nothing here can call back into itself.
+fn builtin_iterator(obj: &JsValue) -> Option<JsValue> {
+    if !matches!(
+        obj,
+        JsValue::Array(_) | JsValue::Str(_) | JsValue::Map(_) | JsValue::Set(_)
+    ) {
+        return None;
+    }
+    let owner = obj.clone();
+    Some(JsValue::Callback(Rc::new(
+        move |i: &Rc<Interpreter>, _args: Vec<JsValue>| -> EvResult {
+            let i = i.clone();
+            let owner = owner.clone();
+            Box::pin(async move {
+                let items = iterate(&i, &owner).await?.unwrap_or_default();
+                Ok(make_iterator(items))
+            })
+        },
+    )))
+}
+
 pub fn js_get(this: &Rc<Interpreter>, obj: &JsValue, name: &str) -> Result<JsValue, JsError> {
+    if name == SYMBOL_ITERATOR {
+        if let Some(f) = builtin_iterator(obj) {
+            return Ok(f);
+        }
+    }
     match obj {
         JsValue::Object(map) => {
             // Plain objects inherit too: `Object.setPrototypeOf(o, p)` and an
@@ -1295,6 +1374,7 @@ pub fn js_get(this: &Rc<Interpreter>, obj: &JsValue, name: &str) -> Result<JsVal
         JsValue::Array(arr) => Ok(as_method(obj, name, list_get(this, arr, name))),
         JsValue::Str(s) => Ok(as_method(obj, name, string_get(this, s, name))),
         JsValue::Number(n) => Ok(as_method(obj, name, number_get(this, *n, name))),
+        JsValue::Symbol(s) => Ok(symbol_get(s, name)),
         JsValue::Function(f) => function_get(this, f, name),
         JsValue::Promise(p) => promise_get(this, p, name),
         JsValue::Class(c) => {
@@ -3642,7 +3722,7 @@ pub fn make_iterator(items: Vec<JsValue>) -> JsValue {
     // that nothing in this engine ever collects.
     let weak = Rc::downgrade(&map);
     map.borrow_mut().insert(
-        "@@iterator".to_string(),
+        SYMBOL_ITERATOR.to_string(),
         JsValue::Callback(Rc::new(move |_i: &Rc<Interpreter>, _args: Vec<JsValue>| -> EvResult {
             let out = match weak.upgrade() {
                 Some(m) => JsValue::Object(m),
@@ -4004,7 +4084,12 @@ async fn eval_inner(
                     }
                     ObjectPair::Computed(key_expr, expr) => {
                         let k = eval(this, key_expr, env.clone()).await?;
-                        let key = this.repr(&k);
+                        // `index_name`, not `repr`: `{[Symbol.iterator]: f}`
+                        // has to reach the same slot `obj[Symbol.iterator] = f`
+                        // writes and `iterate` reads. `repr` would spell a
+                        // symbol out as `"Symbol(Symbol.iterator)"` and quietly
+                        // give the object literal a protocol of its own.
+                        let key = index_name(this, &k);
                         let v = eval(this, expr, env.clone()).await?;
                         out.borrow_mut().insert(key, v);
                     }
@@ -4014,7 +4099,7 @@ async fn eval_inner(
                     }
                     ObjectPair::ComputedAccessor { key_expr, kind, func } => {
                         let k = eval(this, key_expr, env.clone()).await?;
-                        let key = this.repr(&k);
+                        let key = index_name(this, &k);
                         let f = JsValue::Function(js_function_from(func, env.clone()));
                         set_accessor(&out, &key, kind, f);
                     }
@@ -4309,7 +4394,7 @@ pub fn iterate(
         }
         // A hand-written `[Symbol.iterator]() { return { next() {…} } }`, which
         // is how a bundle makes its own collection walkable.
-        let iter_fn = js_get(&this, &v, "@@iterator")?;
+        let iter_fn = js_get(&this, &v, SYMBOL_ITERATOR)?;
         if callable(&iter_fn) {
             let iter = call_value(&this, &iter_fn, vec![], v.clone()).await?;
             let mut out = Vec::new();
@@ -4589,8 +4674,14 @@ async fn eval_class(
         // A computed name is an expression evaluated once, as the class is
         // defined -- `[Symbol.iterator]` is the case that matters, and it has
         // to resolve to the same string the iteration protocol looks for.
+        // That is why this is `index_name` and not `repr`: a symbol names a
+        // slot by its `key`, and `Symbol.iterator`'s key is `"@@iterator"`,
+        // the one string `iterate` reads. Under `repr` the method would land
+        // on `"Symbol(Symbol.iterator)"` and the class would be silently
+        // un-iterable -- the comment above would still be true of the code
+        // and false of the engine.
         let member_name = match &m.key {
-            Some(k) => this.repr(&eval(this, k, env.clone()).await?),
+            Some(k) => index_name(this, &eval(this, k, env.clone()).await?),
             None => m.name.clone(),
         };
         if let Some(kind) = &m.accessor {
@@ -4624,7 +4715,7 @@ async fn eval_class(
             continue;
         }
         let key = match &f.key {
-            Some(k) => this.repr(&eval(this, k, env.clone()).await?),
+            Some(k) => index_name(this, &eval(this, k, env.clone()).await?),
             None => f.name.clone(),
         };
         let v = match &f.value {
@@ -4639,7 +4730,7 @@ async fn eval_class(
             continue;
         }
         let key = match &f.key {
-            Some(k) => this.repr(&eval(this, k, env.clone()).await?),
+            Some(k) => index_name(this, &eval(this, k, env.clone()).await?),
             None => f.name.clone(),
         };
         inst_fields.push((key, f.value.clone()));
@@ -4900,10 +4991,11 @@ fn ordered(left: &JsValue, right: &JsValue) -> bool {
 }
 
 fn eval_in(this: &Interpreter, key: &JsValue, obj: &JsValue) -> Result<bool, JsError> {
-    let name = match key {
-        JsValue::Str(s) => s.to_string(),
-        _ => this.repr(key),
-    };
+    // The same coercion a read or a write uses, so `Symbol.iterator in obj`
+    // asks about the slot `obj[Symbol.iterator]` actually occupies. This used
+    // to spell the rule out inline, which was harmless while it agreed with
+    // `index_name` and silently wrong the moment symbols stopped being strings.
+    let name = index_name(this, key);
     match obj {
         JsValue::Object(map) => Ok(map.borrow().contains_key(&name)),
         JsValue::Instance(inst) => {

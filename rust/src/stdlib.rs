@@ -1770,63 +1770,146 @@ fn date_get(_this: &Rc<Interpreter>, _obj: &JsValue, name: &str) -> Result<JsVal
 
 // -- Symbol ----------------------------------------------------------------
 
-// A symbol here is a string with a name no source file can spell. Real symbols
-// are a value type of their own, kept out of `Object.keys` and reported by
-// `typeof` as "symbol"; ours are strings, so they show up in a key listing and
-// `typeof` calls them strings. That is the whole of the compromise, and what it
-// buys is everything symbols are actually used for on a page: a property name
-// that will not collide, `Symbol.iterator` as a well-known key, and a `Symbol`
-// global that exists at all -- transpiled bundles test for it and take a much
-// worse path when it is missing, and Google's opens by handing it to a helper
-// that then calls it, so its absence took the whole script down.
+// A symbol is a value type of its own -- `JsValue::Symbol`, `typeof` "symbol",
+// compared by the identity of its `Rc` and by nothing else, so `Symbol("a")`
+// and `Symbol("a")` are two different values however alike they read. What a
+// property map addresses it by is its `key`, a name no source file can spell,
+// and `index_name` is where the two meet: `obj[sym]` writes `sym.key`.
 //
-// The well-known ones are spelled "@@iterator" and so on, which is the name
-// every polyfill of the last decade has used for the same reason.
+// The well-known ones pin their keys as "@@iterator" and so on, which is the
+// spelling every polyfill of the last decade has used, and -- the part that
+// matters here -- the key `interp::iterate` reads. That is deliberate and it
+// is load-bearing: `Symbol.iterator` and the literal string `"@@iterator"`
+// name the same slot, so a page that defines its iterator either way gets the
+// same answer out of spread, `for...of` and `Array.from`. One protocol, one
+// key, no way for the three to disagree.
+//
+// Identity has to survive repeated lookup, so neither the well-known table nor
+// the `Symbol.for` registry may mint a fresh symbol per access: both hand back
+// an `Rc` they are holding, which is what makes `Symbol.iterator ===
+// Symbol.iterator` and `Symbol.for("k") === Symbol.for("k")` true.
 thread_local! {
     static SYMBOL_SEQ: Cell<u64> = const { Cell::new(0) };
+    /// `Symbol.for`'s cross-page registry: description -> the one symbol.
+    static SYMBOL_REGISTRY: RefCell<BTreeMap<String, Rc<JsSymbol>>> =
+        const { RefCell::new(BTreeMap::new()) };
+    /// The well-known symbols, minted once so each keeps its identity.
+    static WELL_KNOWN: RefCell<BTreeMap<&'static str, Rc<JsSymbol>>> =
+        const { RefCell::new(BTreeMap::new()) };
+}
+
+/// The well-known symbols. `iterator` is the one with teeth; the rest exist
+/// because a transpiled bundle tests for them and takes a much worse path when
+/// they are missing, and Google's opens by handing `Symbol` to a helper that
+/// then calls it, so its absence took the whole script down.
+const WELL_KNOWN_NAMES: [&str; 12] = [
+    // `iterator` first because it is the one the engine itself reads.
+    "iterator",
+    "asyncIterator",
+    "hasInstance",
+    "toPrimitive",
+    "toStringTag",
+    "species",
+    "isConcatSpreadable",
+    "unscopables",
+    "match",
+    "replace",
+    "search",
+    "split",
+];
+
+/// `Symbol("desc")`: a brand-new symbol, equal to nothing but itself. The
+/// sequence number is what guarantees that -- two symbols with the same
+/// description still get different keys, and so different property slots.
+fn new_symbol(desc: String) -> JsValue {
+    let n = SYMBOL_SEQ.with(|c| {
+        c.set(c.get() + 1);
+        c.get()
+    });
+    JsValue::Symbol(Rc::new(JsSymbol {
+        key: format!("@@sym:{n}:{desc}"),
+        desc,
+    }))
 }
 
 fn symbol_call(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
     let this = this.clone();
     Box::pin(async move {
-        let n = SYMBOL_SEQ.with(|c| {
-            c.set(c.get() + 1);
-            c.get()
-        });
         let desc = match args.first() {
             Some(JsValue::Undefined) | None => String::new(),
             Some(v) => this.repr(v),
         };
-        Ok(JsValue::str(format!("@@sym:{n}:{desc}")))
+        Ok(new_symbol(desc))
     })
 }
 
-/// `Symbol.for` shares one symbol per key across the whole page, which for a
-/// string-backed symbol is just a name derived from the key.
+/// `Symbol.for` shares one symbol per key across the whole page: the registry
+/// holds the `Rc`, and every call for the same key hands back that same `Rc`,
+/// which is the whole of what "the same symbol" means here.
+///
+/// The key it addresses property slots by is `"@@for:<k>"`, not `<k>`. That
+/// prefix is not decoration -- without it `obj[Symbol.for("length")]` would
+/// write the plain `"length"` slot, and a registered symbol would be a way to
+/// clobber any string-named property a script has.
 fn symbol_for(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
     let this = this.clone();
     Box::pin(async move {
         let key = this.repr(&first(&args));
-        Ok(JsValue::str(format!("@@for:{key}")))
+        if let Some(s) = SYMBOL_REGISTRY.with(|r| r.borrow().get(&key).cloned()) {
+            return Ok(JsValue::Symbol(s));
+        }
+        let sym = Rc::new(JsSymbol {
+            key: format!("@@for:{key}"),
+            desc: key.clone(),
+        });
+        SYMBOL_REGISTRY.with(|r| r.borrow_mut().insert(key, sym.clone()));
+        Ok(JsValue::Symbol(sym))
     })
 }
 
-fn symbol_key_for(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
-    let this = this.clone();
+/// The registry read backwards: the key a symbol was registered under, or
+/// `undefined` for a symbol that never was. A non-symbol is a TypeError,
+/// because there is no answer to give for one.
+fn symbol_key_for(_this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
+    let arg = first(&args);
     Box::pin(async move {
-        let s = this.repr(&first(&args));
-        Ok(match s.strip_prefix("@@for:") {
-            Some(k) => JsValue::str(k.to_string()),
-            None => JsValue::Undefined,
-        })
+        match &arg {
+            JsValue::Symbol(s) => {
+                let registered = SYMBOL_REGISTRY
+                    .with(|r| r.borrow().get(&s.desc).map(|held| Rc::ptr_eq(held, s)))
+                    .unwrap_or(false);
+                if registered {
+                    Ok(JsValue::str(s.desc.clone()))
+                } else {
+                    Ok(JsValue::Undefined)
+                }
+            }
+            _ => Err(JsError::js("Symbol.keyFor requires a symbol argument")),
+        }
     })
+}
+
+/// One `Rc` per well-known name, minted on first ask and held forever.
+fn well_known(name: &str) -> Option<JsValue> {
+    let name: &'static str = WELL_KNOWN_NAMES.into_iter().find(|n| *n == name)?;
+    Some(JsValue::Symbol(WELL_KNOWN.with(|w| {
+        w.borrow_mut()
+            .entry(name)
+            .or_insert_with(|| {
+                Rc::new(JsSymbol {
+                    key: format!("@@{name}"),
+                    desc: format!("Symbol.{name}"),
+                })
+            })
+            .clone()
+    })))
 }
 
 fn symbol_get(_this: &Rc<Interpreter>, _obj: &JsValue, name: &str) -> Result<JsValue, JsError> {
+    if let Some(s) = well_known(name) {
+        return Ok(s);
+    }
     Ok(match name {
-        "iterator" | "asyncIterator" | "hasInstance" | "toPrimitive" | "toStringTag"
-        | "species" | "isConcatSpreadable" | "unscopables" | "match" | "replace"
-        | "search" | "split" => JsValue::str(format!("@@{name}")),
         "for" => native("for", symbol_for),
         "keyFor" => native("keyFor", symbol_key_for),
         _ => JsValue::Undefined,

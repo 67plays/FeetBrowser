@@ -662,6 +662,176 @@ def test_js_for_of_and_for_in():
     eq(g["sos"], 6, "for...of iterates array elements")
     eq(g["foic"], 2, "for...in counts own keys")
     eq(g["sos2"], 2, "for...of iterates a string")
+
+
+def test_js_symbol_is_a_value():
+    # Symbols used to be strings here with a name no source file could spell,
+    # which bought the property slot and nothing else: `typeof` said "string"
+    # and two `Symbol("a")`s were the same value. They are a value type now.
+    interp = Interpreter()
+    interp.run("""
+        var s = Symbol("tag");
+        var t = typeof s;
+        var sd = s.description;
+        var st = s.toString();
+        var a1 = Symbol("a");
+        var a2 = Symbol("a");
+        var distinct = a1 !== a2;
+        var selfEq = a1 === a1;
+        var looseSelf = a1 == a1;
+        var looseOther = a1 == a2;
+        var wellKnown = typeof Symbol.iterator;
+        var stable = Symbol.iterator === Symbol.iterator;
+        var toPrim = typeof Symbol.toPrimitive;
+        var s1 = Symbol.for("k");
+        var s2 = Symbol.for("k");
+        var registered = s1 === s2;
+        var unregistered = Symbol("k") !== Symbol.for("k");
+        var key = Symbol.keyFor(s1);
+        var kf = Symbol.keyFor(Symbol("other"));
+        var threw = false;
+        try { Symbol.keyFor("k"); } catch (e) { threw = true; }
+    """)
+    g = interp.globals
+    eq(g["t"], "symbol", "typeof a symbol")
+    eq(g["sd"], "tag", "a symbol carries its description")
+    eq(g["st"], "Symbol(tag)", "and prints it")
+    assert g["distinct"] is True, "two symbols with one description are two values"
+    assert g["selfEq"] is True, "a symbol is strictly equal to itself"
+    assert g["looseSelf"] is True, "and loosely equal to itself"
+    assert g["looseOther"] is False, "but to nothing else, however alike it reads"
+    eq(g["wellKnown"], "symbol", "a well-known symbol is a symbol too")
+    assert g["stable"] is True, "and the same one every time it is asked for"
+    eq(g["toPrim"], "symbol", "the rest of the well-known set exists as well")
+    assert g["registered"] is True, "Symbol.for shares one symbol per key"
+    assert g["unregistered"] is True, "and a fresh symbol is not that one"
+    eq(g["key"], "k", "Symbol.keyFor finds the registry key")
+    assert g["kf"] is UNDEFINED, "and gives nothing for an unregistered symbol"
+    assert g["threw"] is True, "Symbol.keyFor wants a symbol"
+
+
+def test_js_symbol_iterator_is_one_mechanism():
+    # The seam. `Symbol.iterator` is pinned to the property key "@@iterator",
+    # which is the key `iterate()` reads, so an object that spells its iterator
+    # with the symbol, an object that spells it with the literal string, and a
+    # generator are all the same thing to the engine. Three shapes by three
+    # consumers, and all nine have to agree: a silent disagreement between
+    # spread, `for...of` and `Array.from` is the exact bug `iterate()` ended,
+    # and giving symbols their own key space would have reopened it.
+    interp = Interpreter()
+    interp.run("""
+        function steps() {
+            var n = 0;
+            return { next: function () {
+                n += 1;
+                if (n <= 3) return { value: n * 10, done: false };
+                return { value: undefined, done: true };
+            } };
+        }
+        var viaSymbol = {};
+        viaSymbol[Symbol.iterator] = steps;
+        var viaString = {};
+        viaString["@@iterator"] = steps;
+        function* viaGenerator() { yield 10; yield 20; yield 30; }
+
+        function walk(x) { var out = []; for (var v of x) { out.push(v); } return out; }
+        var symLoop = walk(viaSymbol);
+        var symSpread = [...viaSymbol];
+        var symFrom = Array.from(viaSymbol);
+        var strLoop = walk(viaString);
+        var strSpread = [...viaString];
+        var strFrom = Array.from(viaString);
+        var genLoop = walk(viaGenerator());
+        var genSpread = [...viaGenerator()];
+        var genFrom = Array.from(viaGenerator());
+
+        // The two spellings are one slot, readable through either.
+        var crossRead = typeof viaSymbol["@@iterator"];
+        var crossWrite = typeof viaString[Symbol.iterator];
+        var inBoth = (Symbol.iterator in viaString) && ("@@iterator" in viaSymbol);
+
+        // A class member spelled the same way, which is how a bundle writes it.
+        class C {
+            *pairs() { yield 10; yield 20; yield 30; }
+            [Symbol.iterator]() { return this.pairs(); }
+        }
+        var inst = new C();
+        var clsLoop = walk(inst);
+        var clsSpread = [...inst];
+        var clsFrom = Array.from(inst);
+
+        // And the built-ins answer the protocol by hand with the same values
+        // they answer it with in a loop.
+        var arrByHand = [];
+        var it = [1, 2, 3][Symbol.iterator]();
+        var step = it.next();
+        while (!step.done) { arrByHand.push(step.value); step = it.next(); }
+        var arrSpread = [...[1, 2, 3]];
+        var mapByHand = [];
+        var mit = new Map([["a", 1], ["b", 2]])[Symbol.iterator]();
+        var mstep = mit.next();
+        while (!mstep.done) { mapByHand.push(mstep.value[1]); mstep = mit.next(); }
+        var strByHand = "ab"[Symbol.iterator]().next().value;
+        var genSelf = (function () { var g = viaGenerator(); return g[Symbol.iterator]() === g; })();
+    """)
+    g = interp.globals
+    want = [10, 20, 30]
+    for shape in ("sym", "str", "gen", "cls"):
+        for how, name in (("Loop", "for...of"), ("Spread", "spread"), ("From", "Array.from")):
+            eq(g[shape + how], want, f"{name} over the {shape} shape")
+    eq(g["crossRead"], "function", "a symbol-written iterator reads back as a string key")
+    eq(g["crossWrite"], "function", "and a string-written one reads back as the symbol")
+    assert g["inBoth"] is True, "`in` agrees with both spellings too"
+    eq(g["arrByHand"], [1, 2, 3], "an array hands out an iterator over its own values")
+    eq(g["arrSpread"], [1, 2, 3], "the same values spread gives")
+    eq(g["mapByHand"], [1, 2], "a Map hands out its entries")
+    eq(g["strByHand"], "a", "a string hands out its code points")
+    assert g["genSelf"] is True, "a generator is its own iterator"
+
+
+def test_js_symbol_keys_do_not_collide_with_strings():
+    # A symbol reaches a property slot by its key, never by the text it prints
+    # as. If it stringified into the slot instead, `obj[Symbol.for("length")]`
+    # would clobber `length`, and two `Symbol("x")`s would share one slot.
+    interp = Interpreter()
+    interp.run("""
+        var o = {};
+        o.length = "plain";
+        o[Symbol.for("length")] = "registered";
+        var bothKept = o.length + "/" + o[Symbol.for("length")];
+
+        var a = Symbol("x");
+        var b = Symbol("x");
+        var p = {};
+        p[a] = 1;
+        p[b] = 2;
+        var separate = p[a] + "," + p[b];
+        var notByText = p["Symbol(x)"];
+
+        var m = new Map();
+        m.set(a, "A");
+        m.set(b, "B");
+        var mapSize = m.size;
+        var mapA = m.get(a);
+        var byString = m.get("Symbol(x)");
+        var reg = new Map();
+        reg.set(Symbol.for("k"), 1);
+        var regHit = reg.get(Symbol.for("k"));
+
+        // A symbol still has a string form when one is asked for.
+        var printed = String(Symbol("shown"));
+    """)
+    g = interp.globals
+    eq(g["bothKept"], "plain/registered", "a registered symbol does not clobber its key's string")
+    eq(g["separate"], "1,2", "two symbols with one description are two slots")
+    assert g["notByText"] is UNDEFINED, "and neither is reachable by the text it prints as"
+    eq(g["mapSize"], 2, "a Map keys symbols by identity")
+    eq(g["mapA"], "A", "and hands each one back")
+    assert g["byString"] is UNDEFINED, "a string never finds a symbol's entry"
+    eq(g["regHit"], 1, "a registered symbol is one Map key, however often it is fetched")
+    eq(g["printed"], "Symbol(shown)", "String() still spells a symbol out")
+
+
 def test_js_modern_syntax():
     interp = Interpreter()
     interp.run("""
