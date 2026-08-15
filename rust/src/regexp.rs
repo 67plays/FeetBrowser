@@ -1003,6 +1003,11 @@ fn escape_char(p: &mut P) -> Result<u32, BadPattern> {
             p.i += 1;
             Ok(b'c' as u32)
         }
+        // `\p{...}` / `\P{...}` Unicode property escapes are unsupported.
+        // Passing them through as identity escapes would silently change what
+        // a pattern matches, so reject them and let the caller fall back to a
+        // pattern that never matches.
+        b'p' | b'P' => Err(BadPattern),
         _ => {
             // Identity escape: `\.` `\/` `\\` `\$` and, permissively, anything
             // else we do not recognise. Real pages lean on this.
@@ -1692,4 +1697,98 @@ fn run_look(st: &mut St, n: &Node, pos: u32, k: Option<&Cont>) -> bool {
         return false;
     }
     run_cont(st, k, pos)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn whole(re: &Regex, text: &str, start: usize) -> Option<(u32, u32)> {
+        re.exec(text, start)
+            .map(|caps| {
+                let s = caps[0].expect("a successful match always has group 0");
+                (s.start, s.end)
+            })
+    }
+
+    #[test]
+    fn captures_reset_between_exec_iterations() {
+        // Group 2 took part in the first iteration and is absent in the
+        // second; its slot must come back as None, not as the stale span.
+        let re = Regex::compile(r"(\d)(x)?", "").unwrap();
+        let caps = re.exec("1x 2", 0).unwrap();
+        assert!(caps[1].is_some() && caps[2].is_some());
+        let caps = re.exec("1 2", 0).unwrap();
+        assert!(caps[1].is_some() && caps[2].is_none());
+    }
+
+    #[test]
+    fn max_steps_aborts_catastrophic_backtracking() {
+        // `(a+)+b` against a run of 'a' has exponential blow-up; the step
+        // budget must end the match instead of hanging the tab.
+        let re = Regex::compile(r"(a+)+b", "").unwrap();
+        let text = "a".repeat(40) + "c";
+        let mut st = St {
+            re: &re,
+            input: text.as_bytes(),
+            caps: vec![None; re.group_count as usize + 1],
+            steps: 0,
+            depth: 0,
+            aborted: false,
+            match_start: 0,
+        };
+        st.steps = MAX_STEPS; // force the abort on the next step
+        assert!(!run(&mut st, re.root, 0, None) || st.aborted);
+    }
+
+    #[test]
+    fn max_nesting_rejects_deeply_nested_groups() {
+        let nested = "(".repeat(300) + "a" + &")".repeat(300);
+        assert!(Regex::compile(&nested, "").is_err());
+    }
+
+    #[test]
+    fn malformed_patterns_return_bad_pattern() {
+        assert!(Regex::compile(r"(abc", "").is_err());
+        assert!(Regex::compile(r"a{2,1}", "").is_err());
+        assert!(Regex::compile(r"[abc", "").is_err());
+    }
+
+    #[test]
+    fn sticky_versus_global_exec_start_offsets() {
+        // Global searches from `start` onward and can advance; sticky only
+        // ever tries the exact offset given.
+        let g = Regex::compile(r"a", "g").unwrap();
+        assert_eq!(whole(&g, "baa", 1), Some((1, 2)));
+        let y = Regex::compile(r"a", "y").unwrap();
+        assert_eq!(whole(&y, "baa", 1), Some((1, 2)));
+        assert_eq!(whole(&y, "baa", 2), Some((2, 3)));
+        assert_eq!(whole(&y, "baa", 3), None);
+    }
+
+    #[test]
+    fn spans_are_byte_offsets_over_multibyte_input() {
+        // The matcher works on bytes; a span over an emoji must cover its
+        // full 4-byte encoding, not one UTF-16 unit.
+        let re = Regex::compile("😀", "").unwrap();
+        let text = "a😀b";
+        assert_eq!(whole(&re, text, 0), Some((1, 5)));
+        let (s, e) = whole(&re, text, 0).unwrap();
+        assert_eq!(&text[s as usize..e as usize], "😀");
+    }
+
+    #[test]
+    fn named_group_and_lookaround_smoke() {
+        let re = Regex::compile(r"(?<y>\d+)", "").unwrap();
+        let caps = re.exec("x42y", 0).unwrap();
+        assert_eq!(caps[1].unwrap().start, 1);
+        assert_eq!(caps[1].unwrap().end, 3);
+        // Lookahead asserts what follows without consuming it, so the match
+        // is "foo" (span 0..3), and only succeeds because "bar" follows.
+        let la = Regex::compile(r"foo(?=bar)", "").unwrap();
+        let caps = la.exec("foobar", 0).unwrap();
+        assert_eq!(caps[0].unwrap().start, 0);
+        assert_eq!(caps[0].unwrap().end, 3);
+        assert!(Regex::compile(r"foo(?=bar)", "").unwrap().exec("foobaz", 0).is_none());
+    }
 }

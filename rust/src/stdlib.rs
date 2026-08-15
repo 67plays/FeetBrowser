@@ -455,8 +455,9 @@ fn float_prefix(text: &str) -> Option<&str> {
         i += 1;
     }
     // "Infinity" is a literal here, spelled in full but accepted in any case.
-    let rest = &text[i..];
-    if rest.len() >= 8 && rest[..8].eq_ignore_ascii_case("infinity") {
+    // `get` rather than a byte slice, so a multibyte character crossing the
+    // eighth-byte boundary cannot panic the string slicing.
+    if text.get(i..i + 8).map_or(false, |s| s.eq_ignore_ascii_case("infinity")) {
         return Some(&text[..i + 8]);
     }
     let mut digits = 0usize;
@@ -618,6 +619,15 @@ fn array_from(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvR
             // half, which is most of why anyone reaches for it on a string.
             JsValue::Str(s) => s.chars().map(|c| JsValue::str(c.to_string())).collect(),
             JsValue::Set(s) => s.borrow().store.borrow().values().cloned().collect(),
+            // A Map yields one `[key, value]` pair per entry, matching the
+            // spec's iterator protocol without depending on generators.
+            JsValue::Map(m) => m
+                .borrow()
+                .store
+                .borrow()
+                .iter()
+                .map(|(k, val)| JsValue::array(vec![JsValue::str(k.clone()), val.clone()]))
+                .collect(),
             JsValue::Undefined | JsValue::Null => vec![],
             other => {
                 // Array-like: honour `length` even when nothing is iterable.
@@ -636,6 +646,18 @@ fn array_from(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvR
             }
         };
         let f = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+        if !nullish(&f) && !is_js_function(&f) {
+            // The spec throws a TypeError when a mapping function is given
+            // but is not callable; silently ignoring it would hide a caller
+            // bug (`Array.from(x, 3)`).
+            return Err(JsError::Thrown(JsValue::Error(Rc::new(RefCell::new(
+                JsHostError {
+                    message: "Array.from: the mapping function is not callable"
+                        .to_string(),
+                    name: "TypeError".to_string(),
+                },
+            )))));
+        }
         if !is_js_function(&f) {
             return Ok(JsValue::array(items));
         }
@@ -1286,18 +1308,58 @@ fn parse_ms(text: &str) -> f64 {
         return f64::NAN;
     }
     let mut ms = days_from_civil(y, mo, d) * 86_400_000;
+    let mut i = 10usize;
     if b.len() >= 16 && (b[10] == b'T' || b[10] == b' ') && b[13] == b':' {
         let h = num(&text[11..13]).unwrap_or(0);
         let mi = num(&text[14..16]).unwrap_or(0);
         ms += h * 3_600_000 + mi * 60_000;
+        i = 16;
         if b.len() >= 19 && b[16] == b':' {
             ms += num(&text[17..19]).unwrap_or(0) * 1000;
+            i = 19;
             if b.len() >= 23 && b[19] == b'.' {
                 ms += num(&text[20..23]).unwrap_or(0);
+                i = 23;
             }
         }
     }
+    // An explicit numeric UTC offset `±HH:MM` is applied to the naive time;
+    // `Z` is UTC. Anything else after the fields is not something this
+    // parser recognises, and silently treating it as UTC would be a lie.
+    if i < b.len() {
+        match b[i] {
+            b'Z' => {
+                if i + 1 != b.len() {
+                    return f64::NAN;
+                }
+            }
+            b'+' | b'-' => {
+                if i + 6 != b.len() || b[i + 3] != b':' {
+                    return f64::NAN;
+                }
+                let oh = num(&text[i + 1..i + 3]).unwrap_or(0);
+                let om = num(&text[i + 4..i + 6]).unwrap_or(0);
+                let off = oh * 3_600_000 + om * 60_000;
+                ms += if b[i] == b'-' { off } else { -off };
+            }
+            _ => return f64::NAN,
+        }
+    }
     ms as f64
+}
+
+/// `days_from_civil` done in f64 so a huge but finite field cannot overflow
+/// i64; the caller clamps the result to JavaScript's ±8.64e15 ms range.
+fn days_from_civil_f64(y_in: f64, m: f64, d: f64) -> f64 {
+    let y = if m <= 2.0 { y_in - 1.0 } else { y_in };
+    let era = y.div_euclid(400.0);
+    let yoe = y - era * 400.0;
+    let mp = if m > 2.0 { m - 3.0 } else { m + 9.0 };
+    // Integer division, kept exact: with f64, `/` would turn 1532/5 into
+    // 306.4 instead of the 306 the civil-date arithmetic needs.
+    let doy = (153.0 * mp + 2.0).div_euclid(5.0) + d - 1.0;
+    let doe = yoe * 365.0 + yoe.div_euclid(4.0) - yoe.div_euclid(100.0) + doy;
+    era * 146_097.0 + doe - 719_468.0
 }
 
 /// The millisecond count a `new Date(...)` call describes. One argument is a
@@ -1320,18 +1382,28 @@ fn make_ms(this: &Rc<Interpreter>, args: &[JsValue]) -> f64 {
     if nums.iter().any(|n| !n.is_finite()) {
         return f64::NAN;
     }
-    let y = nums[0] as i64;
-    let mo = nums[1] as i64;
-    let d = nums.get(2).copied().unwrap_or(1.0) as i64;
-    let h = nums.get(3).copied().unwrap_or(0.0) as i64;
-    let mi = nums.get(4).copied().unwrap_or(0.0) as i64;
-    let s = nums.get(5).copied().unwrap_or(0.0) as i64;
-    let milli = nums.get(6).copied().unwrap_or(0.0) as i64;
+    let y = nums[0];
+    let mo = nums[1];
+    let d = nums.get(2).copied().unwrap_or(1.0);
+    let h = nums.get(3).copied().unwrap_or(0.0);
+    let mi = nums.get(4).copied().unwrap_or(0.0);
+    let s = nums.get(5).copied().unwrap_or(0.0);
+    let milli = nums.get(6).copied().unwrap_or(0.0);
     // Two-digit years mean the 1900s, a rule kept alive entirely by pages
     // written when that was the only way to spell a year.
-    let year = if (0..=99).contains(&y) { y + 1900 } else { y };
-    let days = days_from_civil(year + mo.div_euclid(12), mo.rem_euclid(12) + 1, d);
-    (days * 86_400_000 + h * 3_600_000 + mi * 60_000 + s * 1000 + milli) as f64
+    let year = if (0.0..=99.0).contains(&y) { y + 1900.0 } else { y };
+    // Carried fields and the epoch shift are done in f64: a huge but finite
+    // year must not overflow i64 on the way to a NaN.
+    let days = days_from_civil_f64(
+        year + mo.div_euclid(12.0),
+        mo.rem_euclid(12.0) + 1.0,
+        d,
+    );
+    let ms = days * 86_400_000.0 + h * 3_600_000.0 + mi * 60_000.0 + s * 1000.0 + milli;
+    if !ms.is_finite() || ms.abs() > 8_640_000_000_000_000.0 {
+        return f64::NAN;
+    }
+    ms
 }
 
 fn date_make(this: &Rc<Interpreter>, args: &[JsValue]) -> JsValue {
@@ -1367,8 +1439,11 @@ fn date_parse(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvR
 fn date_utc(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
     let this = this.clone();
     Box::pin(async move {
-        // A single argument to `Date.UTC` is a year, not a timestamp.
-        let ms = if args.len() == 1 {
+        // `Date.UTC()` with no arguments is NaN; a single argument is a year
+        // (with a default month), not a timestamp.
+        let ms = if args.is_empty() {
+            f64::NAN
+        } else if args.len() == 1 {
             let mut pair = args.clone();
             pair.push(JsValue::Number(0.0));
             make_ms(&this, &pair)

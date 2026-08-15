@@ -247,6 +247,12 @@ pub fn to_int32(v: &JsValue) -> i32 {
     }
 }
 
+/// Coerce to uint32 (ToUint32), used by Array.prototype.split limits.
+pub fn to_uint32(v: &JsValue) -> u32 {
+    let n = to_number(v) as u64 & 0xFFFF_FFFF;
+    n as u32
+}
+
 pub fn parse_number(text: &str) -> f64 {
     let text = if let Some(t) = text.strip_prefix('.') {
         format!("0{t}")

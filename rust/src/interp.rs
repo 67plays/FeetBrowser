@@ -867,7 +867,7 @@ pub fn string_split(
         let lim = if nullish(limit) {
             usize::MAX
         } else {
-            to_int32(limit).max(0) as usize
+            to_uint32(limit) as usize
         };
         return Ok(JsValue::array(regex_split(&r.re, text, lim)));
     }
@@ -2398,7 +2398,9 @@ pub struct Civil {
 /// so that the leap day lands at the end of a year rather than the middle.
 pub fn civil_from_days(z_in: i64) -> Civil {
     let z = z_in + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 }.div_euclid(146_097);
+    // div_euclid floors, so a negative day count lands in the era whose
+    // day-of-era range stays valid without a truncating-division offset.
+    let era = z.div_euclid(146_097);
     let doe = (z - era * 146_097) as u64; // day of era, 0..=146096
     let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // 0..=399
     let y = yoe as i64 + era * 400;
@@ -2419,7 +2421,7 @@ pub fn civil_from_days(z_in: i64) -> Civil {
 /// language says it should.
 pub fn days_from_civil(y_in: i64, m: i64, d: i64) -> i64 {
     let y = if m <= 2 { y_in - 1 } else { y_in };
-    let era = if y >= 0 { y } else { y - 399 }.div_euclid(400);
+    let era = y.div_euclid(400);
     let yoe = y - era * 400;
     let mp = if m > 2 { m - 3 } else { m + 9 };
     let doy = (153 * mp + 2) / 5 + d - 1;
@@ -2589,7 +2591,9 @@ pub fn regex_get(_this: &Rc<Interpreter>, r: &Rc<RefCell<JsRegex>>, name: &str) 
                 let r2 = r2.clone();
                 Box::pin(async move {
                     let text = i2.repr(&args.first().cloned().unwrap_or(JsValue::Undefined));
-                    let r = r2.borrow_mut();
+                    // A shared borrow: `last_index` is a `Cell`, and a replacement
+                    // callback may already hold a shared borrow of this same regex.
+                    let r = r2.borrow();
                     Ok(JsValue::Bool(regex_step(&r, &text).is_some()))
                 })
             }));
@@ -2600,7 +2604,7 @@ pub fn regex_get(_this: &Rc<Interpreter>, r: &Rc<RefCell<JsRegex>>, name: &str) 
                 let r2 = r2.clone();
                 Box::pin(async move {
                     let text = i2.repr(&args.first().cloned().unwrap_or(JsValue::Undefined));
-                    let r = r2.borrow_mut();
+                    let r = r2.borrow();
                     match regex_step(&r, &text) {
                         Some(caps) => Ok(match_array(&r.re, &text, &caps)),
                         None => Ok(JsValue::Null),
@@ -3349,6 +3353,26 @@ async fn super_call(
 }
 // -- evaluator: expressions -------------------------------------------------
 
+/// `{ get v() {}, set v(n) {} }` is one property, so a second half joins the
+/// accessor the first half left rather than replacing it.
+fn set_accessor(out: &Rc<RefCell<BTreeMap<String, JsValue>>>, key: &str,
+                kind: &str, f: JsValue) {
+    let existing = out.borrow().get(key).cloned();
+    let acc = match existing {
+        Some(JsValue::Accessor(a)) => a,
+        _ => {
+            let a = Rc::new(JsAccessor::default());
+            out.borrow_mut().insert(key.to_string(), JsValue::Accessor(a.clone()));
+            a
+        }
+    };
+    if kind == "get" {
+        *acc.get.borrow_mut() = Some(f);
+    } else {
+        *acc.set.borrow_mut() = Some(f);
+    }
+}
+
 pub fn eval(this: &Rc<Interpreter>, node: &Rc<Node>, env: Env) -> EvResult {
     let this = this.clone();
     let node = node.clone();
@@ -3423,24 +3447,13 @@ async fn eval_inner(
                     }
                     ObjectPair::Accessor { key, kind, func } => {
                         let f = JsValue::Function(js_function_from(func, env.clone()));
-                        // `{ get v() {}, set v(n) {} }` is one property, so the
-                        // second half joins the accessor the first half left
-                        // rather than replacing it.
-                        let existing = out.borrow().get(key).cloned();
-                        let acc = match existing {
-                            Some(JsValue::Accessor(a)) => a,
-                            _ => {
-                                let a = Rc::new(JsAccessor::default());
-                                out.borrow_mut()
-                                    .insert(key.clone(), JsValue::Accessor(a.clone()));
-                                a
-                            }
-                        };
-                        if kind == "get" {
-                            *acc.get.borrow_mut() = Some(f);
-                        } else {
-                            *acc.set.borrow_mut() = Some(f);
-                        }
+                        set_accessor(&out, key, kind, f);
+                    }
+                    ObjectPair::ComputedAccessor { key_expr, kind, func } => {
+                        let k = eval(this, key_expr, env.clone()).await?;
+                        let key = this.repr(&k);
+                        let f = JsValue::Function(js_function_from(func, env.clone()));
+                        set_accessor(&out, &key, kind, f);
                     }
                     ObjectPair::Spread(expr) => {
                         let v = eval(this, expr, env.clone()).await?;

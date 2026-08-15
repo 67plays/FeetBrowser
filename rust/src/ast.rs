@@ -105,6 +105,9 @@ pub enum ObjectPair {
     /// `"set"`; two pairs with the same name and different kinds describe one
     /// property with both halves, which is why they are not merged here.
     Accessor { key: String, kind: String, func: FuncNode },
+    /// `{ get [expr]() {...} }` / `{ set [expr](n) {...} }`. Same as
+    /// `Accessor`, but the key is only known once the object is built.
+    ComputedAccessor { key_expr: Rc<Node>, kind: String, func: FuncNode },
 }
 
 #[derive(Debug, Clone)]
