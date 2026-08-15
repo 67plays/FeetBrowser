@@ -428,21 +428,68 @@ fn parse_float_call(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) 
             None => String::new(),
         };
         let text = text.trim().to_string();
-        let re = regex::Regex::new(r"^[+-]?(?:\d+\.?\d*|\.\d+|[iI][nN][fF]i?n?i?t?y?)")
-            .unwrap();
-        match re.find(&text) {
-            Some(m) => {
-                let tok = m.as_str();
-                if tok.to_lowercase() == "infinity" {
-                    Ok(JsValue::Number(f64::INFINITY))
+        match float_prefix(&text) {
+            Some(tok) => {
+                if tok.trim_start_matches(['+', '-']).eq_ignore_ascii_case("infinity") {
+                    let sign = if tok.starts_with('-') { -1.0 } else { 1.0 };
+                    Ok(JsValue::Number(sign * f64::INFINITY))
                 } else {
-                    let v: f64 = tok.parse().unwrap_or(f64::NAN);
-                    Ok(JsValue::Number(v))
+                    Ok(JsValue::Number(tok.parse().unwrap_or(f64::NAN)))
                 }
             }
             None => Ok(JsValue::Number(f64::NAN)),
         }
     })
+}
+
+/// The longest prefix of `text` that reads as a decimal literal, which is what
+/// `parseFloat` is defined in terms of: it takes as much as it understands and
+/// ignores the rest, so `parseFloat("3.5px")` is 3.5 and `parseFloat("px")` is
+/// NaN. Written out by hand rather than pattern-matched, because the project
+/// takes no third-party crates and its own regexp engine has no business being
+/// dragged into number parsing.
+fn float_prefix(text: &str) -> Option<&str> {
+    let b = text.as_bytes();
+    let mut i = 0usize;
+    if i < b.len() && (b[i] == b'+' || b[i] == b'-') {
+        i += 1;
+    }
+    // "Infinity" is a literal here, spelled in full but accepted in any case.
+    let rest = &text[i..];
+    if rest.len() >= 8 && rest[..8].eq_ignore_ascii_case("infinity") {
+        return Some(&text[..i + 8]);
+    }
+    let mut digits = 0usize;
+    while i < b.len() && b[i].is_ascii_digit() {
+        i += 1;
+        digits += 1;
+    }
+    if i < b.len() && b[i] == b'.' {
+        i += 1;
+        while i < b.len() && b[i].is_ascii_digit() {
+            i += 1;
+            digits += 1;
+        }
+    }
+    if digits == 0 {
+        return None;
+    }
+    // An exponent only counts when it is complete: "1e" is the number 1
+    // followed by junk, not a malformed literal.
+    if i < b.len() && (b[i] == b'e' || b[i] == b'E') {
+        let mut j = i + 1;
+        if j < b.len() && (b[j] == b'+' || b[j] == b'-') {
+            j += 1;
+        }
+        let start = j;
+        while j < b.len() && b[j].is_ascii_digit() {
+            j += 1;
+        }
+        if j > start {
+            i = j;
+        }
+    }
+    Some(&text[..i])
 }
 
 // -- base64 ----------------------------------------------------------------
@@ -554,24 +601,72 @@ fn array_is_array(_this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -
     Box::pin(async move { Ok(JsValue::Bool(matches!(v, JsValue::Array(_)))) })
 }
 
+/// `Array.from(src)` and `Array.from(src, fn)`. Three shapes reach it in
+/// practice and all three have to work: something already iterable (an array,
+/// a string, a Set), the `arguments`-style array-like that only has a
+/// `length` and numeric keys, and the same again with a mapping function --
+/// `Array.from(nodeList, n => n.id)` is how half the DOM code in the wild
+/// turns a live collection into something it can `map` over.
 fn array_from(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
-    let _this = this.clone();
+    let this = this.clone();
     Box::pin(async move {
         let v = first(&args);
-        Ok(match v {
-            JsValue::Array(a) => JsValue::array(a.borrow().clone()),
-            JsValue::Str(s) => JsValue::array(
-                s.chars().map(|c| JsValue::str(c.to_string())).collect(),
-            ),
-            _ => JsValue::array(vec![]),
-        })
+        let items: Vec<JsValue> = match &v {
+            JsValue::Array(a) => a.borrow().clone(),
+            // By code point, not by byte or by UTF-16 unit: `Array.from` is
+            // the standard way to split a string without tearing an emoji in
+            // half, which is most of why anyone reaches for it on a string.
+            JsValue::Str(s) => s.chars().map(|c| JsValue::str(c.to_string())).collect(),
+            JsValue::Set(s) => s.borrow().store.borrow().values().cloned().collect(),
+            JsValue::Undefined | JsValue::Null => vec![],
+            other => {
+                // Array-like: honour `length` even when nothing is iterable.
+                let len = js_get(&this, other, "length")?;
+                let n = to_number(&len);
+                if n.is_nan() || n <= 0.0 {
+                    vec![]
+                } else {
+                    let n = n.min(MAX_ARRAY_LEN as f64) as usize;
+                    let mut out = Vec::with_capacity(n);
+                    for i in 0..n {
+                        out.push(js_get(&this, other, &i.to_string())?);
+                    }
+                    out
+                }
+            }
+        };
+        let f = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+        if !is_js_function(&f) {
+            return Ok(JsValue::array(items));
+        }
+        let mut out = Vec::with_capacity(items.len());
+        for (i, item) in items.into_iter().enumerate() {
+            out.push(
+                call_value(
+                    &this,
+                    &f,
+                    vec![item, JsValue::Number(i as f64)],
+                    JsValue::Undefined,
+                )
+                .await?,
+            );
+        }
+        Ok(JsValue::array(out))
     })
+}
+
+/// `Array.of(1, 2, 3)`. It exists because `Array(3)` means "three empty slots"
+/// rather than "the array [3]", and there has to be one spelling that does not
+/// change meaning when it is handed exactly one number.
+fn array_of(_this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
+    Box::pin(async move { Ok(JsValue::array(args)) })
 }
 
 fn array_get(_this: &Rc<Interpreter>, _obj: &JsValue, name: &str) -> Result<JsValue, JsError> {
     Ok(match name {
         "isArray" => native("isArray", array_is_array),
         "from" => native("from", array_from),
+        "of" => native("of", array_of),
         _ => JsValue::Undefined,
     })
 }
@@ -1169,95 +1264,88 @@ fn date_now(_this: &Rc<Interpreter>, _obj: &JsValue, _args: Vec<JsValue>) -> EvR
     })
 }
 
+/// ISO 8601, and only ISO 8601: `YYYY-MM-DD` with an optional
+/// `THH:MM:SS(.mmm)(Z)`. Every other spelling a date has ever been written in
+/// is implementation-defined, and guessing at them is how you end up parsing
+/// `03/04/2020` differently from the page that wrote it. Anything unrecognised
+/// is NaN, which is what an invalid date is.
 fn parse_ms(text: &str) -> f64 {
-    use chrono::{NaiveDate, NaiveDateTime};
-    if let Ok(dt) = NaiveDateTime::parse_from_str(text, "%Y-%m-%dT%H:%M:%S%.fZ") {
-        return dt.and_utc().timestamp() as f64 * 1000.0;
+    let b = text.as_bytes();
+    if b.len() < 10 {
+        return f64::NAN;
     }
-    if let Ok(dt) = NaiveDateTime::parse_from_str(text, "%Y-%m-%dT%H:%M:%SZ") {
-        return dt.and_utc().timestamp() as f64 * 1000.0;
+    let num = |s: &str| -> Option<i64> { s.parse::<i64>().ok() };
+    if b[4] != b'-' || b[7] != b'-' {
+        return f64::NAN;
     }
-    if let Ok(dt) = NaiveDateTime::parse_from_str(text, "%Y-%m-%dT%H:%M:%S") {
-        return dt.and_utc().timestamp() as f64 * 1000.0;
+    let (y, mo, d) = match (num(&text[0..4]), num(&text[5..7]), num(&text[8..10])) {
+        (Some(y), Some(mo), Some(d)) => (y, mo, d),
+        _ => return f64::NAN,
+    };
+    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) {
+        return f64::NAN;
     }
-    if let Ok(d) = NaiveDate::parse_from_str(text, "%Y-%m-%d") {
-        if let Some(dt) = d.and_hms_opt(0, 0, 0) {
-            return dt.and_utc().timestamp() as f64 * 1000.0;
+    let mut ms = days_from_civil(y, mo, d) * 86_400_000;
+    if b.len() >= 16 && (b[10] == b'T' || b[10] == b' ') && b[13] == b':' {
+        let h = num(&text[11..13]).unwrap_or(0);
+        let mi = num(&text[14..16]).unwrap_or(0);
+        ms += h * 3_600_000 + mi * 60_000;
+        if b.len() >= 19 && b[16] == b':' {
+            ms += num(&text[17..19]).unwrap_or(0) * 1000;
+            if b.len() >= 23 && b[19] == b'.' {
+                ms += num(&text[20..23]).unwrap_or(0);
+            }
         }
     }
-    if let Ok(dt) = NaiveDateTime::parse_from_str(text, "%a %b %d %Y %H:%M:%S") {
-        return dt.and_utc().timestamp() as f64 * 1000.0;
-    }
-    f64::NAN
+    ms as f64
 }
 
-fn make_ms(this: &Rc<Interpreter>, args: &[JsValue], utc: bool) -> f64 {
+/// The millisecond count a `new Date(...)` call describes. One argument is a
+/// timestamp or an ISO string; two or more are the calendar fields, and they
+/// are *carried* rather than validated -- month 12 is January of the next
+/// year, day 0 is the last day of the previous month, and code in the wild
+/// leans on both.
+fn make_ms(this: &Rc<Interpreter>, args: &[JsValue]) -> f64 {
     if args.is_empty() {
         return this.now.get() * 1000.0;
     }
     if args.len() == 1 {
-        match &args[0] {
-            JsValue::Number(n) => return *n,
-            v => return parse_ms(&this.repr(v)),
-        }
+        return match &args[0] {
+            JsValue::Str(s) => parse_ms(s),
+            JsValue::Date(d) => d.borrow().ms,
+            v => to_number(v),
+        };
     }
     let nums: Vec<f64> = args.iter().map(to_number).collect();
-    let y = nums[0] as i32;
-    let mo = nums[1] as u32;
-    let d = nums.get(2).copied().unwrap_or(1.0) as u32;
-    let h = nums.get(3).copied().unwrap_or(0.0) as u32;
-    let mi = nums.get(4).copied().unwrap_or(0.0) as u32;
-    let s = nums.get(5).copied().unwrap_or(0.0) as u32;
-    let ms = nums.get(6).copied().unwrap_or(0.0) as u32;
-    let year = if (0..=99).contains(&y) { y + 1900 } else { y };
-    use chrono::{NaiveDate, TimeZone, Utc};
-    if utc {
-        let dt = Utc
-            .with_ymd_and_hms(year, mo + 1, d, h, mi, s)
-            .earliest()
-            .and_then(|dt| dt.checked_add_signed(chrono::Duration::milliseconds(ms as i64)));
-        match dt {
-            Some(dt) => dt.timestamp_millis() as f64,
-            None => f64::NAN,
-        }
-    } else {
-        let dt = NaiveDate::from_ymd_opt(year, mo + 1, d)
-            .and_then(|nd| nd.and_hms_milli_opt(h, mi, s, ms));
-        match dt {
-            Some(dt) => dt.and_utc().timestamp() as f64 * 1000.0,
-            None => f64::NAN,
-        }
+    if nums.iter().any(|n| !n.is_finite()) {
+        return f64::NAN;
     }
+    let y = nums[0] as i64;
+    let mo = nums[1] as i64;
+    let d = nums.get(2).copied().unwrap_or(1.0) as i64;
+    let h = nums.get(3).copied().unwrap_or(0.0) as i64;
+    let mi = nums.get(4).copied().unwrap_or(0.0) as i64;
+    let s = nums.get(5).copied().unwrap_or(0.0) as i64;
+    let milli = nums.get(6).copied().unwrap_or(0.0) as i64;
+    // Two-digit years mean the 1900s, a rule kept alive entirely by pages
+    // written when that was the only way to spell a year.
+    let year = if (0..=99).contains(&y) { y + 1900 } else { y };
+    let days = days_from_civil(year + mo.div_euclid(12), mo.rem_euclid(12) + 1, d);
+    (days * 86_400_000 + h * 3_600_000 + mi * 60_000 + s * 1000 + milli) as f64
 }
 
-fn date_make(this: &Rc<Interpreter>, args: &[JsValue], utc: bool) -> JsValue {
-    let ms = make_ms(this, args, utc);
-    make_js_date(ms)
+fn date_make(this: &Rc<Interpreter>, args: &[JsValue]) -> JsValue {
+    make_js_date(make_ms(this, args))
 }
 
 fn make_js_date(ms: f64) -> JsValue {
-    use chrono::{TimeZone, Utc};
-    let local = if ms.is_finite() {
-        chrono::Local.timestamp_millis_opt(ms as i64).single()
-    } else {
-        None
-    };
-    let utc = if ms.is_finite() {
-        Utc.timestamp_millis_opt(ms as i64).single()
-    } else {
-        None
-    };
-    JsValue::Date(Rc::new(RefCell::new(JsDate {
-        ms,
-        local: local.map(|l| l.naive_local()),
-        utc: utc.map(|u| u.naive_utc().and_utc()),
-    })))
+    JsValue::Date(Rc::new(RefCell::new(JsDate { ms })))
 }
 
 fn date_call(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
     let this = this.clone();
     Box::pin(async move {
-        let d = date_make(&this, &args, false);
+        let d = date_make(&this, &args);
         Ok(d)
     })
 }
@@ -1273,10 +1361,20 @@ fn date_parse(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvR
     })
 }
 
+/// `Date.UTC(...)`. With local time defined as UTC it is the same arithmetic
+/// as the constructor's; it exists so that code which spells the intent out
+/// still gets an answer, and gets the same one.
 fn date_utc(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
     let this = this.clone();
     Box::pin(async move {
-        let ms = make_ms(&this, &args, true);
+        // A single argument to `Date.UTC` is a year, not a timestamp.
+        let ms = if args.len() == 1 {
+            let mut pair = args.clone();
+            pair.push(JsValue::Number(0.0));
+            make_ms(&this, &pair)
+        } else {
+            make_ms(&this, &args)
+        };
         Ok(JsValue::Number(ms))
     })
 }

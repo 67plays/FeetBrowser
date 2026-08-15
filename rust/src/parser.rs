@@ -47,6 +47,18 @@ impl Parser {
         self.peek_n(3).map_or(false, |t| t.kind == TokKind::Punct && t.text == "=>")
     }
 
+    /// Whether the token after next could begin a property name. This is how
+    /// `{ get v() {} }` is told apart from `{ get: 1 }` and `{ get }`: in the
+    /// accessor form a name follows `get`, in the others a punctuator does.
+    fn peek2_is_property_name(&self) -> bool {
+        self.peek2().map_or(false, |t| {
+            matches!(
+                t.kind,
+                TokKind::Ident | TokKind::Kw | TokKind::Str | TokKind::Number
+            )
+        })
+    }
+
     fn peek_is_punct(&self, text: &str) -> bool {
         self.peek().map_or(false, |t| t.kind == TokKind::Punct && t.text == text)
     }
@@ -157,10 +169,8 @@ impl Parser {
                 }
             } else if t.kind == TokKind::Ident && t.text == "async" && self.next_is_kw("function")
             {
-                self.pos += 1;
-                self.pos += 1;
-                let _name = self.expect_ident()?;
-                let f = self.function_rest(true)?;
+                self.pos += 2; // past `async` and `function`
+                let f = self.function_declaration(true)?;
                 return Ok(rc(FunctionDecl(f)));
             }
         }
@@ -456,6 +466,18 @@ impl Parser {
             async_,
             arrow: false,
         })
+    }
+
+    /// The `(params) { body }` half of a method in an object literal, once its
+    /// name has already been read. The name goes on the function so that
+    /// `({ f() {} }).f.name` and a stack trace both say `f`.
+    fn method_rest(&mut self, name: &str) -> Result<FuncNode, JsError> {
+        if !self.peek_is_punct("(") {
+            return self.syntax("expected '(' in method definition");
+        }
+        let mut f = self.function_rest(false)?;
+        f.name = name.to_string();
+        Ok(f)
     }
 
     fn param_list(&mut self) -> Result<(Vec<String>, BTreeMap<String, Rc<Node>>, Option<String>), JsError> {
@@ -760,9 +782,12 @@ impl Parser {
         let mut catch_param = None;
         let mut catch_block = None;
         if self.match_kw("catch") {
-            self.expect_punct("(")?;
-            catch_param = Some(self.expect_ident()?);
-            self.expect_punct(")")?;
+            // The binding is optional: `catch {}` is the form you write when
+            // the failure itself is the news and the error object is not.
+            if self.match_punct("(") {
+                catch_param = Some(self.expect_ident()?);
+                self.expect_punct(")")?;
+            }
             catch_block = Some(rc(Block(self.parse_stmts_until(Some("}"))?)));
         }
         let finally_block = if self.match_kw("finally") {
@@ -1195,9 +1220,41 @@ impl Parser {
                 self.expect_punct(",")?;
                 continue;
             }
+            // A computed key -- `{ [expr]: value }`. The brackets are the only
+            // thing that distinguishes it, and what is inside is an ordinary
+            // expression, so it cannot be folded into the name case below.
+            if self.match_punct("[") {
+                let key_expr = self.expression()?;
+                self.expect_punct("]")?;
+                self.expect_punct(":")?;
+                let val = self.expression()?;
+                out.push(ObjectPair::Computed(key_expr, val));
+                if self.match_punct("}") {
+                    break;
+                }
+                self.expect_punct(",")?;
+                continue;
+            }
+            // `get` and `set` are only accessor markers when a property name
+            // follows them. On their own they are perfectly good property
+            // names -- `{ get: 1 }` and `{ set }` both appear in real code --
+            // so peek past them before committing.
+            let accessor = match self.peek() {
+                Some(t)
+                    if t.kind == TokKind::Ident
+                        && (t.text == "get" || t.text == "set")
+                        && self.peek2_is_property_name() =>
+                {
+                    let kind = t.text.clone();
+                    self.pos += 1;
+                    Some(kind)
+                }
+                _ => None,
+            };
             let key = match self.peek() {
                 Some(t)
-                    if t.kind == TokKind::Ident || t.kind == TokKind::Str || t.kind == TokKind::Kw =>
+                    if t.kind == TokKind::Ident || t.kind == TokKind::Str || t.kind == TokKind::Kw
+                        || t.kind == TokKind::Number =>
                 {
                     let k = t.text.clone();
                     self.pos += 1;
@@ -1205,7 +1262,15 @@ impl Parser {
                 }
                 _ => return self.syntax("expected property name"),
             };
-            if self.match_punct(":") {
+            if let Some(kind) = accessor {
+                let func = self.method_rest(&key)?;
+                out.push(ObjectPair::Accessor { key, kind, func });
+            } else if self.peek_is_punct("(") {
+                // Method shorthand: `{ name() {...} }` is `{ name: function
+                // name() {...} }` in every way that matters here.
+                let func = self.method_rest(&key)?;
+                out.push(ObjectPair::Key(key, rc(FunctionExpr(func))));
+            } else if self.match_punct(":") {
                 let val = self.expression()?;
                 out.push(ObjectPair::Key(key, val));
             } else {
@@ -1299,6 +1364,18 @@ impl Parser {
                     }
                 }
             }
+            let mut is_async = false;
+            if let Some(t) = self.peek() {
+                // `async f() {}`, but not a method that happens to be *called*
+                // `async` -- which is legal, since `async` is never a keyword.
+                if t.kind == TokKind::Ident
+                    && t.text == "async"
+                    && self.peek2_is_property_name()
+                {
+                    self.pos += 1;
+                    is_async = true;
+                }
+            }
             if let Some(t) = self.peek() {
                 if t.kind == TokKind::Ident && (t.text == "get" || t.text == "set") {
                     if !self.peek2_is_punct("(") && !self.peek2_is_punct("=")
@@ -1315,7 +1392,17 @@ impl Parser {
                 return self.syntax("expected '(' in class method");
             }
             let (params, defaults, rest) = self.param_list()?;
-            let body = self.parse_stmts_until(Some("}"))?;
+            // `await` is only a keyword inside an async body, and a class body
+            // parses its methods here rather than through `function_rest`, so
+            // the depth has to be carried over the body by hand.
+            if is_async {
+                self.async_depth += 1;
+            }
+            let body = self.parse_stmts_until(Some("}"));
+            if is_async {
+                self.async_depth -= 1;
+            }
+            let body = body?;
             methods.push(ClassMethodNode {
                 name,
                 params,
@@ -1324,6 +1411,7 @@ impl Parser {
                 body,
                 is_static,
                 accessor,
+                is_async,
             });
         }
         Ok(methods)

@@ -7,6 +7,7 @@
 
 use crate::ast::*;
 use crate::parser;
+use crate::regexp::Span;
 use crate::value::*;
 use pyo3::conversion::IntoPyObjectExt;
 use pyo3::prelude::*;
@@ -340,6 +341,9 @@ impl Interpreter {
             JsValue::Class(c) => format!("class {}", c.borrow().name),
             JsValue::Promise(_) => "[object Object]".to_string(),
             JsValue::Object(_) => "[object Object]".to_string(),
+            // Only reachable if an accessor slot escaped `js_get`, which is a
+            // bug rather than a value a script can name; say something inert.
+            JsValue::Accessor(_) => "undefined".to_string(),
             JsValue::Instance(_) => "[object Object]".to_string(),
             JsValue::Map(_) => "[object Map]".to_string(),
             JsValue::Set(_) => "[object Set]".to_string(),
@@ -623,6 +627,232 @@ pub fn number_to_string_radix(this: &Interpreter, n: f64, radix: &JsValue) -> Re
     Ok(this.repr(&JsValue::Number(n)))
 }
 
+// -- regexp glue -----------------------------------------------------------
+//
+// `regexp.rs` speaks byte offsets and capture spans; JavaScript speaks arrays
+// with `index`/`input`/`groups` hanging off them, `$1` in replacement strings,
+// and a `lastIndex` that only moves for a global pattern. Everything that
+// translates between the two lives here.
+
+fn span_str<'a>(text: &'a str, sp: Span) -> &'a str {
+    &text[sp.start as usize..sp.end as usize]
+}
+
+/// The next code-point boundary after `pos`, so a zero-width match cannot
+/// make the scan stand still.
+fn advance_one(text: &str, pos: usize) -> usize {
+    let b = text.as_bytes();
+    let mut p = pos + 1;
+    while p < b.len() && b[p] & 0xC0 == 0x80 {
+        p += 1;
+    }
+    p
+}
+
+/// Every non-overlapping match at or after `start`, in order.
+fn regex_matches(re: &crate::regexp::Regex, text: &str, start: usize) -> Vec<Vec<Option<Span>>> {
+    let mut out = Vec::new();
+    let mut pos = start;
+    while pos <= text.len() {
+        let caps = match re.exec(text, pos) {
+            Some(c) => c,
+            None => break,
+        };
+        let whole = match caps[0] {
+            Some(sp) => sp,
+            None => break,
+        };
+        pos = if whole.end as usize > whole.start as usize {
+            whole.end as usize
+        } else {
+            advance_one(text, whole.start as usize)
+        };
+        out.push(caps);
+        if re.flags.sticky && pos > text.len() {
+            break;
+        }
+    }
+    out
+}
+
+/// The array `exec` and a non-global `match` hand back: element 0 is the whole
+/// match, element i the i-th group, plus `index`, `input`, and `groups` when
+/// the pattern named anything.
+fn match_array(re: &crate::regexp::Regex, text: &str, caps: &[Option<Span>]) -> JsValue {
+    let whole = caps[0].expect("a successful match always has group 0");
+    let mut items = vec![JsValue::str(span_str(text, whole))];
+    for c in caps.iter().skip(1) {
+        items.push(match c {
+            Some(sp) => JsValue::str(span_str(text, *sp)),
+            None => JsValue::Undefined,
+        });
+    }
+    let arr = Rc::new(JsArray::new(items));
+    {
+        let mut props = arr.props.borrow_mut();
+        props.insert(
+            "index".to_string(),
+            JsValue::Number(char_of_byte(text, whole.start as usize) as f64),
+        );
+        props.insert("input".to_string(), JsValue::str(text));
+        let groups = if re.has_named_groups() {
+            let map: BTreeMap<String, JsValue> = re
+                .group_names
+                .iter()
+                .enumerate()
+                .skip(1)
+                .filter(|(_, n)| !n.is_empty())
+                .map(|(i, n)| {
+                    let v = match caps.get(i).and_then(|c| *c) {
+                        Some(sp) => JsValue::str(span_str(text, sp)),
+                        None => JsValue::Undefined,
+                    };
+                    (n.clone(), v)
+                })
+                .collect();
+            JsValue::Object(Rc::new(RefCell::new(map)))
+        } else {
+            JsValue::Undefined
+        };
+        props.insert("groups".to_string(), groups);
+    }
+    JsValue::Array(arr)
+}
+
+/// One `exec`/`test` step. A global or sticky pattern resumes from, and then
+/// updates, `lastIndex` -- that stateful walk is what `while ((m = re.exec(s)))`
+/// loops are built on. Everything else always starts from the beginning and
+/// leaves `lastIndex` alone. Offsets in `lastIndex` are character indices, the
+/// same units the rest of this engine's string methods count in.
+fn regex_step(r: &JsRegex, text: &str) -> Option<Vec<Option<Span>>> {
+    let stateful = r.global_ || r.re.flags.sticky;
+    if !stateful {
+        return r.re.exec(text, 0);
+    }
+    let from = r.last_index.get();
+    let start = if from > 0.0 {
+        byte_of_char(text, from as i64)
+    } else {
+        0
+    };
+    if start > text.len() {
+        r.last_index.set(0.0);
+        return None;
+    }
+    match r.re.exec(text, start) {
+        Some(caps) => {
+            let end = caps[0].expect("a successful match always has group 0").end;
+            r.last_index.set(char_of_byte(text, end as usize) as f64);
+            Some(caps)
+        }
+        None => {
+            r.last_index.set(0.0);
+            None
+        }
+    }
+}
+
+/// The arguments a replacement *function* is handed: the whole match, then one
+/// per group, then the match offset and the subject.
+fn js_capture_args(text: &str, caps: &[Option<Span>]) -> Vec<JsValue> {
+    let whole = caps[0].expect("a successful match always has group 0");
+    let mut args = vec![JsValue::str(span_str(text, whole))];
+    for c in caps.iter().skip(1) {
+        args.push(match c {
+            Some(sp) => JsValue::str(span_str(text, *sp)),
+            None => JsValue::Undefined,
+        });
+    }
+    args.push(JsValue::Number(char_of_byte(text, whole.start as usize) as f64));
+    args.push(JsValue::str(text));
+    args
+}
+
+/// Expand `$&`, ``$` ``, `$'`, `$1`..`$99`, `$<name>` and `$$` in a
+/// replacement string. Anything else after a `$` is left alone, which is what
+/// every engine does and what pages that write `$foo` rely on.
+fn expand_replacement(
+    re: &crate::regexp::Regex,
+    text: &str,
+    caps: &[Option<Span>],
+    repl: &str,
+) -> String {
+    let whole = caps[0].expect("a successful match always has group 0");
+    let bytes = repl.as_bytes();
+    let mut out = String::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] != b'$' || i + 1 >= bytes.len() {
+            let d = repl[i..].chars().next().unwrap();
+            out.push(d);
+            i += d.len_utf8();
+            continue;
+        }
+        match bytes[i + 1] {
+            b'$' => {
+                out.push('$');
+                i += 2;
+            }
+            b'&' => {
+                out.push_str(span_str(text, whole));
+                i += 2;
+            }
+            b'`' => {
+                out.push_str(&text[..whole.start as usize]);
+                i += 2;
+            }
+            b'\'' => {
+                out.push_str(&text[whole.end as usize..]);
+                i += 2;
+            }
+            b'<' => {
+                let close = repl[i + 2..].find('>').map(|k| i + 2 + k);
+                match close {
+                    Some(close) => {
+                        let name = &repl[i + 2..close];
+                        if let Some(gi) = re.group_index(name) {
+                            if let Some(Some(sp)) = caps.get(gi as usize) {
+                                out.push_str(span_str(text, *sp));
+                            }
+                        }
+                        i = close + 1;
+                    }
+                    None => {
+                        out.push('$');
+                        i += 1;
+                    }
+                }
+            }
+            b'0'..=b'9' => {
+                // Two digits win over one when there is a group that high.
+                let mut n = (bytes[i + 1] - b'0') as usize;
+                let mut used = 2usize;
+                if i + 2 < bytes.len() && bytes[i + 2].is_ascii_digit() {
+                    let two = n * 10 + (bytes[i + 2] - b'0') as usize;
+                    if two >= 1 && two <= re.group_count as usize {
+                        n = two;
+                        used = 3;
+                    }
+                }
+                if n >= 1 && n <= re.group_count as usize {
+                    if let Some(Some(sp)) = caps.get(n) {
+                        out.push_str(span_str(text, *sp));
+                    }
+                    i += used;
+                } else {
+                    out.push('$');
+                    i += 1;
+                }
+            }
+            _ => {
+                out.push('$');
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
 pub fn string_split(
     this: &Interpreter,
     text: &str,
@@ -634,17 +864,12 @@ pub fn string_split(
     }
     if let JsValue::Regex(r) = sep {
         let r = r.borrow();
-        let maxsplit = if nullish(limit) {
-            0usize
+        let lim = if nullish(limit) {
+            usize::MAX
         } else {
             to_int32(limit).max(0) as usize
         };
-        let parts: Vec<String> = if maxsplit > 0 {
-            r.re.splitn(text, maxsplit + 1).map(|s| s.to_string()).collect()
-        } else {
-            r.re.split(text).map(|s| s.to_string()).collect()
-        };
-        return Ok(JsValue::array(parts.into_iter().map(JsValue::str).collect()));
+        return Ok(JsValue::array(regex_split(&r.re, text, lim)));
     }
     let s = this.repr(sep);
     let out: Vec<String> = if s.is_empty() {
@@ -659,6 +884,60 @@ pub fn string_split(
     Ok(JsValue::array(out.into_iter().map(JsValue::str).collect()))
 }
 
+/// `String.prototype.split` with a pattern separator. Follows the spec's scan:
+/// a separator that matches nothing at all, or matches empty where the last
+/// piece already ended, does not produce a piece -- otherwise `/x*/` would
+/// split every string into infinitely many empty ones. Capture groups from the
+/// separator land in the output, which is what makes `split(/(\d)/)` useful.
+fn regex_split(re: &crate::regexp::Regex, text: &str, limit: usize) -> Vec<JsValue> {
+    let mut out: Vec<JsValue> = Vec::new();
+    if limit == 0 {
+        return out;
+    }
+    if text.is_empty() {
+        // An empty subject splits into nothing when the separator matches it,
+        // and into one empty piece when it does not.
+        if re.exec(text, 0).is_none() {
+            out.push(JsValue::str(""));
+        }
+        return out;
+    }
+    let mut p = 0usize; // start of the piece being built
+    let mut pos = 0usize; // where the next search begins
+    while pos <= text.len() {
+        let caps = match re.exec(text, pos) {
+            Some(c) => c,
+            None => break,
+        };
+        let whole = caps[0].unwrap();
+        let (s, e) = (whole.start as usize, whole.end as usize);
+        if s >= text.len() {
+            break; // a zero-width match past the last character splits nothing
+        }
+        if e == p {
+            pos = advance_one(text, s);
+            continue;
+        }
+        out.push(JsValue::str(&text[p..s]));
+        if out.len() >= limit {
+            return out;
+        }
+        for c in caps.iter().skip(1) {
+            out.push(match c {
+                Some(sp) => JsValue::str(span_str(text, *sp)),
+                None => JsValue::Undefined,
+            });
+            if out.len() >= limit {
+                return out;
+            }
+        }
+        p = e;
+        pos = if e > s { e } else { advance_one(text, e) };
+    }
+    out.push(JsValue::str(&text[p..]));
+    out
+}
+
 pub fn string_match(
     _this: &Interpreter,
     text: &str,
@@ -667,29 +946,21 @@ pub fn string_match(
     if let JsValue::Regex(r) = regex {
         let r = r.borrow();
         if r.global_ {
-            let found: Vec<JsValue> = r
-                .re
-                .find_iter(text)
-                .map(|m| JsValue::str(m.as_str()))
+            // A global match reports only the matched text, one entry per
+            // match -- the capture groups are what `matchAll`/`exec` are for.
+            let found: Vec<JsValue> = regex_matches(&r.re, text, 0)
+                .iter()
+                .map(|caps| JsValue::str(span_str(text, caps[0].unwrap())))
                 .collect();
             if found.is_empty() {
                 return Ok(JsValue::Null);
             }
             return Ok(JsValue::array(found));
         }
-        if let Some(m) = r.re.find(text) {
-            let mut out = vec![JsValue::str(m.as_str())];
-            if let Some(caps) = r.re.captures(text) {
-                for i in 1..caps.len() {
-                    out.push(match caps.get(i) {
-                        Some(g) => JsValue::str(g.as_str()),
-                        None => JsValue::Undefined,
-                    });
-                }
-            }
-            return Ok(JsValue::array(out));
-        }
-        return Ok(JsValue::Null);
+        return match r.re.exec(text, 0) {
+            Some(caps) => Ok(match_array(&r.re, text, &caps)),
+            None => Ok(JsValue::Null),
+        };
     }
     Err(JsError::js("String.prototype.match: not a RegExp"))
 }
@@ -712,28 +983,27 @@ pub fn string_replace(
         };
         if let JsValue::Regex(r) = &pat {
             let r = r.borrow();
-            let count = if r.global_ || all { 0usize } else { 1usize };
-            if is_js_function(&repl) {
-                let mut out = String::new();
-                let mut last = 0usize;
-                let matches: Vec<regex::Match> = r.re.find_iter(&text).collect();
-                let iter = matches.iter().take(if count == 0 { matches.len() } else { 1 });
-                for m in iter {
-                    out.push_str(&text[last..m.start()]);
-                    let args = js_capture_args(&r, &text, *m)?;
+            let every = r.global_ || all;
+            let mut matches = regex_matches(&r.re, &text, 0);
+            if !every {
+                matches.truncate(1);
+            }
+            let mut out = String::new();
+            let mut last = 0usize;
+            for caps in &matches {
+                let whole = caps[0].unwrap();
+                out.push_str(&text[last..whole.start as usize]);
+                if is_js_function(&repl) {
+                    let args = js_capture_args(&text, caps);
                     let v = call_value(&this, &repl.clone(), args, JsValue::Undefined).await?;
                     out.push_str(&this.repr(&v));
-                    last = m.end();
+                } else {
+                    out.push_str(&expand_replacement(&r.re, &text, caps, &repl_text));
                 }
-                out.push_str(&text[last..]);
-                return Ok(JsValue::str(out));
+                last = whole.end as usize;
             }
-            let replaced = if count == 0 {
-                r.re.replace_all(&text, repl_text.as_str()).to_string()
-            } else {
-                r.re.replace(&text, repl_text.as_str()).to_string()
-            };
-            return Ok(JsValue::str(replaced));
+            out.push_str(&text[last..]);
+            return Ok(JsValue::str(out));
         }
         let pat_str = match &pat {
             JsValue::Str(s) => s.to_string(),
@@ -754,57 +1024,98 @@ pub fn string_replace(
     })
 }
 
-fn js_capture_args(
-    r: &JsRegex,
-    text: &str,
-    m: regex::Match<'_>,
-) -> Result<Vec<JsValue>, JsError> {
-    let mut args = vec![JsValue::str(m.as_str())];
-    if let Some(caps) = r.re.captures(text) {
-        for i in 1..caps.len() {
-            args.push(match caps.get(i) {
-                Some(g) => JsValue::str(g.as_str()),
-                None => JsValue::Undefined,
-            });
-        }
-    }
-    Ok(args)
-}
-
+/// A pattern we cannot parse becomes one that never matches. Throwing here
+/// would take the whole script down over a regex a page may never even use,
+/// and every browser that has tried the strict reading has quietly retreated
+/// from it.
 pub fn compile_regex(source: &str, flags: &str) -> JsRegex {
-    let global_ = flags.contains('g');
-    let ignore_case = flags.contains('i');
-    let multiline = flags.contains('m');
-    let mut pat = source.to_string();
-    if multiline {
-        pat = format!("(?m:{pat})");
-    }
-    if ignore_case {
-        pat = format!("(?i:{pat})");
-    }
-    let re = regex::Regex::new(&pat).unwrap_or_else(|_| regex::Regex::new(r"[^\s\S]").unwrap());
+    let re = crate::regexp::Regex::compile(source, flags)
+        .or_else(|_| crate::regexp::Regex::compile(r"[^\s\S]", ""))
+        .expect("the never-matching fallback pattern must compile");
     JsRegex {
         source: source.to_string(),
         flags: flags.to_string(),
-        global_,
-        ignore_case,
-        multiline,
+        global_: flags.contains('g'),
+        ignore_case: flags.contains('i'),
+        multiline: flags.contains('m'),
         last_index: Cell::new(0.0),
         re,
     }
 }
+
 // -- js_get / js_set -------------------------------------------------------
+
+/// Turn whatever was sitting in a property slot into the value a read of that
+/// property should produce. For nearly everything that is the value itself;
+/// for an accessor it means running the getter with `receiver` as `this`.
+///
+/// The getter runs through `drive_sync` because property reads are synchronous
+/// everywhere in this interpreter -- `js_get` is called from expression
+/// evaluation, from the DOM bridge and from the stdlib alike. A getter that
+/// actually suspends on an `await` is the one thing that cannot work here, and
+/// it reports the same "await is only valid in async functions" every other
+/// synchronous context does.
+pub fn read_slot(
+    this: &Rc<Interpreter>,
+    receiver: &JsValue,
+    slot: JsValue,
+) -> Result<JsValue, JsError> {
+    match slot {
+        JsValue::Accessor(a) => {
+            let getter = a.get.borrow().clone();
+            match getter {
+                Some(f) => drive_sync(this, call_value(this, &f, vec![], receiver.clone())),
+                None => Ok(JsValue::Undefined),
+            }
+        }
+        other => Ok(other),
+    }
+}
+
+/// If `slot` holds an accessor, run its setter and report that the write is
+/// done; otherwise report `false` so the caller stores the value the usual way.
+/// A getter-only property swallows the write, which is what non-strict code
+/// gets and what every page written before strict mode expects.
+fn write_slot(
+    this: &Rc<Interpreter>,
+    receiver: &JsValue,
+    slot: Option<JsValue>,
+    value: &JsValue,
+) -> Result<bool, JsError> {
+    match slot {
+        Some(JsValue::Accessor(a)) => {
+            let setter = a.set.borrow().clone();
+            if let Some(f) = setter {
+                drive_sync(
+                    this,
+                    call_value(this, &f, vec![value.clone()], receiver.clone()),
+                )?;
+            }
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
 
 pub fn js_get(this: &Rc<Interpreter>, obj: &JsValue, name: &str) -> Result<JsValue, JsError> {
     match obj {
-        JsValue::Object(map) => Ok(map.borrow().get(name).cloned().unwrap_or(JsValue::Undefined)),
+        JsValue::Object(map) => {
+            let slot = map.borrow().get(name).cloned().unwrap_or(JsValue::Undefined);
+            read_slot(this, obj, slot)
+        }
         JsValue::Array(arr) => Ok(list_get(this, arr, name)),
         JsValue::Str(s) => Ok(string_get(this, s, name)),
         JsValue::Number(n) => Ok(number_get(this, *n, name)),
         JsValue::Function(f) => function_get(this, f, name),
         JsValue::Promise(p) => promise_get(this, p, name),
-        JsValue::Class(c) => class_get(this, c, name),
-        JsValue::Instance(inst) => Ok(instance_get(inst, name)),
+        JsValue::Class(c) => {
+            let slot = class_get(this, c, name)?;
+            read_slot(this, obj, slot)
+        }
+        JsValue::Instance(inst) => {
+            let slot = instance_get(inst, name);
+            read_slot(this, obj, slot)
+        }
         JsValue::Map(m) => Ok(map_get(this, m, name)),
         JsValue::Set(s) => Ok(set_get(this, s, name)),
         JsValue::Date(d) => Ok(date_get(this, d, name)),
@@ -827,7 +1138,9 @@ pub fn js_get(this: &Rc<Interpreter>, obj: &JsValue, name: &str) -> Result<JsVal
             Ok(JsValue::Undefined)
         }
         JsValue::Host(h) => host_get(this, h, name),
-        JsValue::Undefined | JsValue::Null | JsValue::Bool(_) => Ok(JsValue::Undefined),
+        JsValue::Accessor(_) | JsValue::Undefined | JsValue::Null | JsValue::Bool(_) => {
+            Ok(JsValue::Undefined)
+        }
     }
 }
 
@@ -884,6 +1197,10 @@ pub fn js_set(
 ) -> Result<(), JsError> {
     match obj {
         JsValue::Object(map) => {
+            let slot = map.borrow().get(name).cloned();
+            if write_slot(this, obj, slot, value)? {
+                return Ok(());
+            }
             map.borrow_mut().insert(name.to_string(), value.clone());
             Ok(())
         }
@@ -895,6 +1212,13 @@ pub fn js_set(
             Ok(())
         }
         JsValue::Instance(inst) => {
+            // A setter declared on the class sits on the prototype, so the
+            // whole chain has to be consulted before deciding this is a plain
+            // own-property write.
+            let slot = Some(instance_get(inst, name)).filter(|v| matches!(v, JsValue::Accessor(_)));
+            if write_slot(this, obj, slot, value)? {
+                return Ok(());
+            }
             inst.borrow().props.borrow_mut().insert(name.to_string(), value.clone());
             Ok(())
         }
@@ -926,7 +1250,7 @@ pub fn js_set(
     }
 }
 
-fn array_set(arr: &Rc<RefCell<Vec<JsValue>>>, name: &str, value: &JsValue) -> Result<(), JsError> {
+fn array_set(arr: &Rc<JsArray>, name: &str, value: &JsValue) -> Result<(), JsError> {
     if name == "length" {
         let len = to_number(value).max(0.0) as usize;
         let mut a = arr.borrow_mut();
@@ -949,7 +1273,9 @@ fn array_set(arr: &Rc<RefCell<Vec<JsValue>>>, name: &str, value: &JsValue) -> Re
             }
             a[index as usize] = value.clone();
         }
+        return Ok(());
     }
+    arr.props.borrow_mut().insert(name.to_string(), value.clone());
     Ok(())
 }
 
@@ -1044,7 +1370,7 @@ fn char_of_byte(s: &str, byte_idx: usize) -> i64 {
 
 pub fn list_get(
     this: &Rc<Interpreter>,
-    arr: &Rc<RefCell<Vec<JsValue>>>,
+    arr: &Rc<JsArray>,
     name: &str,
 ) -> JsValue {
     if name == "length" {
@@ -1510,8 +1836,11 @@ pub fn list_get(
             let i = if index < 0 { n + index } else { index };
             return arr[i as usize].clone();
         }
+        return JsValue::Undefined;
     }
-    JsValue::Undefined
+    // Not a method and not an index: the expando properties, which in practice
+    // means `index`, `input` and `groups` on a regexp match result.
+    arr.props.borrow().get(name).cloned().unwrap_or(JsValue::Undefined)
 }
 
 fn flatten_array(_this: &Interpreter, values: &[JsValue], depth: i32) -> Vec<JsValue> {
@@ -2045,27 +2374,85 @@ pub fn set_get(this: &Rc<Interpreter>, s: &Rc<RefCell<JsSet>>, name: &str) -> Js
 }
 
 // -- date ------------------------------------------------------------------
+//
+// Civil-date arithmetic after Howard Hinnant's `civil_from_days`, which is
+// exact for every year a `f64` millisecond count can reach and needs no
+// tables. There is no timezone database here: local time *is* UTC and
+// `getTimezoneOffset` returns zero. A browser that renders a page's
+// timestamps an hour out is a nuisance; one that ships a copy of tzdata is a
+// different project. That choice is why `getFullYear` and `getUTCFullYear`
+// are the same function below, and why there are no setters -- a date is the
+// number it was built from and nothing else.
 
-fn date_repr(d: &JsDate) -> String {
-    match &d.local {
-        Some(dt) => format!(
-            "{} {:02} {:03} {} {}:{}:{} GMT+0000",
-            weekday_name(dt.weekday().num_days_from_monday()),
-            dt.day(),
-            month_name(dt.month()),
-            dt.year(),
-            dt.hour(),
-            dt.minute(),
-            dt.second()
-        ),
-        None => "Invalid Date".to_string(),
+/// A year/month/day triple. `m` is 1-12 and `d` is 1-31, as the algorithm
+/// produces them; the JavaScript-facing zero-based month is applied at the
+/// edge, in `date_get`.
+pub struct Civil {
+    pub y: i64,
+    pub m: u32,
+    pub d: u32,
+}
+
+/// The civil date `z` days after 1970-01-01. Days before the epoch are
+/// negative, and the shift by 719468 is what moves the era boundary to March
+/// so that the leap day lands at the end of a year rather than the middle.
+pub fn civil_from_days(z_in: i64) -> Civil {
+    let z = z_in + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 }.div_euclid(146_097);
+    let doe = (z - era * 146_097) as u64; // day of era, 0..=146096
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // 0..=399
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // day of year, March-based
+    let mp = (5 * doy + 2) / 153; // month, March = 0
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    Civil {
+        y: if m <= 2 { y + 1 } else { y },
+        m: m as u32,
+        d: d as u32,
     }
 }
 
-use chrono::{Datelike, Timelike};
+/// The inverse: days since the epoch for a civil date. `m` is 1-12 here, and
+/// values outside the usual ranges are carried rather than rejected, which is
+/// what makes `new Date(2020, 13, 1)` land in February 2021 the way the
+/// language says it should.
+pub fn days_from_civil(y_in: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y_in - 1 } else { y_in };
+    let era = if y >= 0 { y } else { y - 399 }.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = if m > 2 { m - 3 } else { m + 9 };
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe.div_euclid(4) - yoe.div_euclid(100) + doy;
+    era * 146_097 + doe - 719_468
+}
+
+pub struct DateParts {
+    pub civil: Civil,
+    pub hour: u32,
+    pub minute: u32,
+    pub second: u32,
+    pub milli: u32,
+    /// Day of the week, 0 = Sunday. The epoch was a Thursday, hence the +4.
+    pub dow: u32,
+}
+
+pub fn date_parts(ms: f64) -> DateParts {
+    let total = ms.floor() as i64;
+    let days = total.div_euclid(86_400_000);
+    let rem = (total - days * 86_400_000) as u64;
+    DateParts {
+        civil: civil_from_days(days),
+        hour: (rem / 3_600_000) as u32,
+        minute: ((rem / 60_000) % 60) as u32,
+        second: ((rem / 1000) % 60) as u32,
+        milli: (rem % 1000) as u32,
+        dow: (days + 4).rem_euclid(7) as u32,
+    }
+}
 
 fn weekday_name(d: u32) -> &'static str {
-    const N: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+    const N: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
     N[(d as usize) % 7]
 }
 
@@ -2073,96 +2460,101 @@ fn month_name(m: u32) -> &'static str {
     const N: [&str; 12] = [
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
     ];
-    N[(m as usize + 11) % 12]
+    N[((m as usize) + 11) % 12]
+}
+
+/// What `String(date)` and string concatenation produce. The `GMT+0000` is
+/// not a pretence: this engine really is in UTC.
+pub fn date_repr(d: &JsDate) -> String {
+    if !d.ms.is_finite() {
+        return "Invalid Date".to_string();
+    }
+    let p = date_parts(d.ms);
+    format!(
+        "{} {} {:02} {} {:02}:{:02}:{:02} GMT+0000",
+        weekday_name(p.dow),
+        month_name(p.civil.m),
+        p.civil.d,
+        p.civil.y,
+        p.hour,
+        p.minute,
+        p.second
+    )
+}
+
+fn date_iso(ms: f64) -> String {
+    if !ms.is_finite() {
+        return "Invalid Date".to_string();
+    }
+    let p = date_parts(ms);
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+        p.civil.y, p.civil.m, p.civil.d, p.hour, p.minute, p.second, p.milli
+    )
+}
+
+fn date_utc_string(ms: f64) -> String {
+    if !ms.is_finite() {
+        return "Invalid Date".to_string();
+    }
+    let p = date_parts(ms);
+    format!(
+        "{}, {:02} {} {} {:02}:{:02}:{:02} GMT",
+        weekday_name(p.dow),
+        p.civil.d,
+        month_name(p.civil.m),
+        p.civil.y,
+        p.hour,
+        p.minute,
+        p.second
+    )
 }
 
 pub fn date_get(_this: &Rc<Interpreter>, d: &Rc<RefCell<JsDate>>, name: &str) -> JsValue {
-    let d2 = d.clone();
-    let make = move |f: fn(&JsDate) -> Option<f64>| -> JsValue {
-        let d2 = d2.clone();
-        JsValue::Callback(Rc::new(move |_i: &Rc<Interpreter>, _args: Vec<JsValue>| -> EvResult {
-            let v = f(&d2.borrow()).unwrap_or(f64::NAN);
-            Box::pin(async move { Ok(JsValue::Number(v)) })
-        }))
+    // Every getter is the same shape: take the millisecond count, pull one
+    // field out of it, and hand back NaN untouched if the date is invalid.
+    let number = |f: fn(f64) -> f64| -> JsValue {
+        let d2 = d.clone();
+        JsValue::Callback(Rc::new(
+            move |_i: &Rc<Interpreter>, _args: Vec<JsValue>| -> EvResult {
+                let ms = d2.borrow().ms;
+                let v = if ms.is_finite() { f(ms) } else { f64::NAN };
+                Box::pin(async move { Ok(JsValue::Number(v)) })
+            },
+        ))
+    };
+    let text = |f: fn(f64) -> String| -> JsValue {
+        let d2 = d.clone();
+        JsValue::Callback(Rc::new(
+            move |_i: &Rc<Interpreter>, _args: Vec<JsValue>| -> EvResult {
+                let s = f(d2.borrow().ms);
+                Box::pin(async move { Ok(JsValue::str(s)) })
+            },
+        ))
     };
     match name {
-        "getTime" | "valueOf" => return make(|d| Some(d.ms)),
-        "getFullYear" => return make(|d| d.local.as_ref().map(|x| x.year() as f64)),
-        "getMonth" => return make(|d| d.local.as_ref().map(|x| (x.month() - 1) as f64)),
-        "getDate" => return make(|d| d.local.as_ref().map(|x| x.day() as f64)),
-        "getDay" => return make(|d| d.local.as_ref().map(|x| x.weekday().num_days_from_monday() as f64)),
-        "getHours" => return make(|d| d.local.as_ref().map(|x| x.hour() as f64)),
-        "getMinutes" => return make(|d| d.local.as_ref().map(|x| x.minute() as f64)),
-        "getSeconds" => return make(|d| d.local.as_ref().map(|x| x.second() as f64)),
-        "getMilliseconds" => return make(|d| Some((d.ms as i64).rem_euclid(1000) as f64)),
-        "getUTCFullYear" => return make(|d| d.utc.as_ref().map(|x| x.year() as f64)),
-        "getUTCMonth" => return make(|d| d.utc.as_ref().map(|x| (x.month() - 1) as f64)),
-        "getUTCDate" => return make(|d| d.utc.as_ref().map(|x| x.day() as f64)),
-        "getUTCDay" => return make(|d| d.utc.as_ref().map(|x| x.weekday().num_days_from_monday() as f64)),
-        "getUTCHours" => return make(|d| d.utc.as_ref().map(|x| x.hour() as f64)),
-        "getUTCMinutes" => return make(|d| d.utc.as_ref().map(|x| x.minute() as f64)),
-        "getUTCSeconds" => return make(|d| d.utc.as_ref().map(|x| x.second() as f64)),
-        "getUTCMilliseconds" => return make(|d| Some((d.ms as i64).rem_euclid(1000) as f64)),
-        _ => {}
-    }
-    let d2 = d.clone();
-    match name {
-        "toISOString" => {
-            return JsValue::Callback(Rc::new(move |_i: &Rc<Interpreter>, _args: Vec<JsValue>| -> EvResult {
-                let d = d2.borrow();
-                let s = match &d.utc {
-                    Some(u) => format!(
-                        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
-                        u.year(),
-                        u.month(),
-                        u.day(),
-                        u.hour(),
-                        u.minute(),
-                        u.second(),
-                        (d.ms as i64).rem_euclid(1000)
-                    ),
-                    None => "Invalid Date".to_string(),
-                };
-                Box::pin(async move { Ok(JsValue::str(s)) })
-            }));
-        }
-        "toUTCString" => {
-            return JsValue::Callback(Rc::new(move |_i: &Rc<Interpreter>, _args: Vec<JsValue>| -> EvResult {
-                let d = d2.borrow();
-                let s = match &d.utc {
-                    Some(u) => format!(
-                        "{} {:02} {} {} {}:{}:{} GMT",
-                        weekday_name(u.weekday().num_days_from_monday()),
-                        u.day(),
-                        month_name(u.month()),
-                        u.year(),
-                        u.hour(),
-                        u.minute(),
-                        u.second()
-                    ),
-                    None => "Invalid Date".to_string(),
-                };
-                Box::pin(async move { Ok(JsValue::str(s)) })
-            }));
-        }
-        "toLocaleString" | "toString" | "toDateString" | "toTimeString" => {
-            return JsValue::Callback(Rc::new(move |_i: &Rc<Interpreter>, _args: Vec<JsValue>| -> EvResult {
-                let d = d2.borrow();
-                let s = match &d.local {
-                    Some(x) => format!(
-                        "{} {:02} {} {} {}:{}:{} GMT+0000",
-                        weekday_name(x.weekday().num_days_from_monday()),
-                        x.day(),
-                        month_name(x.month()),
-                        x.year(),
-                        x.hour(),
-                        x.minute(),
-                        x.second()
-                    ),
-                    None => "Invalid Date".to_string(),
-                };
-                Box::pin(async move { Ok(JsValue::str(s)) })
-            }));
+        "getTime" | "valueOf" => number(|ms| ms),
+        // Local time is UTC, so each pair below is deliberately one function.
+        "getFullYear" | "getUTCFullYear" => number(|ms| date_parts(ms).civil.y as f64),
+        "getMonth" | "getUTCMonth" => number(|ms| (date_parts(ms).civil.m - 1) as f64),
+        "getDate" | "getUTCDate" => number(|ms| date_parts(ms).civil.d as f64),
+        "getDay" | "getUTCDay" => number(|ms| date_parts(ms).dow as f64),
+        "getHours" | "getUTCHours" => number(|ms| date_parts(ms).hour as f64),
+        "getMinutes" | "getUTCMinutes" => number(|ms| date_parts(ms).minute as f64),
+        "getSeconds" | "getUTCSeconds" => number(|ms| date_parts(ms).second as f64),
+        "getMilliseconds" | "getUTCMilliseconds" => number(|ms| date_parts(ms).milli as f64),
+        "getTimezoneOffset" => number(|_| 0.0),
+        "toISOString" | "toJSON" => text(date_iso),
+        "toUTCString" | "toGMTString" => text(date_utc_string),
+        "toString" | "toLocaleString" | "toDateString" | "toTimeString"
+        | "toLocaleDateString" | "toLocaleTimeString" => {
+            let d2 = d.clone();
+            JsValue::Callback(Rc::new(
+                move |_i: &Rc<Interpreter>, _args: Vec<JsValue>| -> EvResult {
+                    let s = date_repr(&d2.borrow());
+                    Box::pin(async move { Ok(JsValue::str(s)) })
+                },
+            ))
         }
         _ => JsValue::Undefined,
     }
@@ -2198,27 +2590,7 @@ pub fn regex_get(_this: &Rc<Interpreter>, r: &Rc<RefCell<JsRegex>>, name: &str) 
                 Box::pin(async move {
                     let text = i2.repr(&args.first().cloned().unwrap_or(JsValue::Undefined));
                     let r = r2.borrow_mut();
-                    let start = if r.global_ {
-                        r.last_index.get() as usize
-                    } else {
-                        0
-                    };
-                    let m = r.re.find(&text[start.min(text.len())..]);
-                    match m {
-                        Some(m) => {
-                            if r.global_ {
-                                let byte_end = start + m.end();
-                                r.last_index.set(char_of_byte(&text, byte_end) as f64);
-                            }
-                            Ok(JsValue::Bool(true))
-                        }
-                        None => {
-                            if r.global_ {
-                                r.last_index.set(0.0);
-                            }
-                            Ok(JsValue::Bool(false))
-                        }
-                    }
+                    Ok(JsValue::Bool(regex_step(&r, &text).is_some()))
                 })
             }));
         }
@@ -2229,35 +2601,9 @@ pub fn regex_get(_this: &Rc<Interpreter>, r: &Rc<RefCell<JsRegex>>, name: &str) 
                 Box::pin(async move {
                     let text = i2.repr(&args.first().cloned().unwrap_or(JsValue::Undefined));
                     let r = r2.borrow_mut();
-                    let start = if r.global_ {
-                        r.last_index.get() as usize
-                    } else {
-                        0
-                    };
-                    let m = r.re.find(&text[start.min(text.len())..]);
-                    match m {
-                        Some(m) => {
-                            if r.global_ {
-                                let byte_end = start + m.end();
-                                r.last_index.set(char_of_byte(&text, byte_end) as f64);
-                            }
-                            let mut out = vec![JsValue::str(m.as_str())];
-                            if let Some(caps) = r.re.captures(&text[start..]) {
-                                for i in 1..caps.len() {
-                                    out.push(match caps.get(i) {
-                                        Some(g) => JsValue::str(g.as_str()),
-                                        None => JsValue::Undefined,
-                                    });
-                                }
-                            }
-                            Ok(JsValue::array(out))
-                        }
-                        None => {
-                            if r.global_ {
-                                r.last_index.set(0.0);
-                            }
-                            Ok(JsValue::Null)
-                        }
+                    match regex_step(&r, &text) {
+                        Some(caps) => Ok(match_array(&r.re, &text, &caps)),
+                        None => Ok(JsValue::Null),
                     }
                 })
             }));
@@ -2725,6 +3071,19 @@ fn bind_args(
         if let Some(rest) = &fn_.rest {
             scope.set_var(rest, JsValue::array(args[fn_.params.len()..].to_vec()));
         }
+        // `arguments` is everything that was actually passed, however many
+        // parameters were declared -- which is the whole point of it, and why
+        // code written before rest parameters existed reaches for it. An array
+        // is not quite the spec's arguments object, but it indexes, it has a
+        // `length`, and it spreads and iterates, which is all any of that code
+        // ever asks of it.
+        //
+        // Arrow functions deliberately get none: theirs is the enclosing
+        // function's, and not defining it here is exactly how the scope chain
+        // hands them that one.
+        if !fn_.arrow {
+            scope.set_var("arguments", JsValue::array(args));
+        }
         Ok(())
     })
 }
@@ -2889,17 +3248,63 @@ fn class_construct_on_obj(
     Box::pin(async move {
         if let Some(ctor) = &c.borrow().ctor {
             construct_on(&this, &obj, ctor, args).await?;
-        } else if let Some(parent) = &c.borrow().parent {
-            match parent {
-                JsValue::Class(pc) => class_construct_on_obj(&this, pc, &obj, args).await?,
-                JsValue::Function(pf) => {
-                    construct_on(&this, &obj, pf, args).await?;
+        } else {
+            // No constructor of its own: the implicit one is `constructor(...a)
+            // { super(...a) }`, so the parent still has to run.
+            let parent = c.borrow().parent.clone();
+            if let Some(parent) = parent {
+                match &parent {
+                    JsValue::Class(pc) => class_construct_on_obj(&this, pc, &obj, args).await?,
+                    JsValue::Function(pf) => {
+                        construct_on(&this, &obj, pf, args).await?;
+                    }
+                    JsValue::Native(_) => native_super_on(&this, &obj, &parent, args).await?,
+                    _ => {}
                 }
-                _ => {}
             }
         }
         Ok(())
     })
+}
+
+/// Run a native constructor on behalf of a subclass instance. A native builds
+/// and returns its own value rather than filling in the object it was handed
+/// -- `Error` hands back a `JsValue::Error` -- so inheriting from one means
+/// running it and folding what it produced into the instance's own properties.
+/// That is what makes `new (class E extends Error {})('boom').message` the
+/// string `"boom"` rather than `undefined`.
+async fn native_super_on(
+    this: &Rc<Interpreter>,
+    obj: &JsValue,
+    parent: &JsValue,
+    args: Vec<JsValue>,
+) -> Result<(), JsError> {
+    let made = construct(this, parent, args).await?;
+    let inst = match obj {
+        JsValue::Instance(i) => i.clone(),
+        _ => return Ok(()),
+    };
+    let props = inst.borrow().props.clone();
+    match &made {
+        JsValue::Error(e) => {
+            let e = e.borrow();
+            let mut p = props.borrow_mut();
+            p.insert("message".to_string(), JsValue::str(e.message.clone()));
+            p.insert("name".to_string(), JsValue::str(e.name.clone()));
+            p.insert(
+                "stack".to_string(),
+                JsValue::str(format!("{}: {}", e.name, e.message)),
+            );
+        }
+        JsValue::Object(map) => {
+            let mut p = props.borrow_mut();
+            for (k, v) in map.borrow().iter() {
+                p.insert(k.clone(), v.clone());
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 async fn construct_on(
@@ -2930,8 +3335,14 @@ async fn super_call(
     args: Vec<JsValue>,
 ) -> Result<JsValue, JsError> {
     if !nullish(&sup.parent_ctor) {
-        if let JsValue::Function(f) = &sup.parent_ctor {
-            construct_on(this, &sup.this, f, args).await?;
+        match &sup.parent_ctor {
+            JsValue::Function(f) => {
+                construct_on(this, &sup.this, f, args).await?;
+            }
+            JsValue::Native(_) => {
+                native_super_on(this, &sup.this, &sup.parent_ctor, args).await?;
+            }
+            _ => {}
         }
     }
     Ok(sup.this.clone())
@@ -3003,6 +3414,33 @@ async fn eval_inner(
                     ObjectPair::Key(key, expr) => {
                         let v = eval(this, expr, env.clone()).await?;
                         out.borrow_mut().insert(key.clone(), v);
+                    }
+                    ObjectPair::Computed(key_expr, expr) => {
+                        let k = eval(this, key_expr, env.clone()).await?;
+                        let key = this.repr(&k);
+                        let v = eval(this, expr, env.clone()).await?;
+                        out.borrow_mut().insert(key, v);
+                    }
+                    ObjectPair::Accessor { key, kind, func } => {
+                        let f = JsValue::Function(js_function_from(func, env.clone()));
+                        // `{ get v() {}, set v(n) {} }` is one property, so the
+                        // second half joins the accessor the first half left
+                        // rather than replacing it.
+                        let existing = out.borrow().get(key).cloned();
+                        let acc = match existing {
+                            Some(JsValue::Accessor(a)) => a,
+                            _ => {
+                                let a = Rc::new(JsAccessor::default());
+                                out.borrow_mut()
+                                    .insert(key.clone(), JsValue::Accessor(a.clone()));
+                                a
+                            }
+                        };
+                        if kind == "get" {
+                            *acc.get.borrow_mut() = Some(f);
+                        } else {
+                            *acc.set.borrow_mut() = Some(f);
+                        }
                     }
                     ObjectPair::Spread(expr) => {
                         let v = eval(this, expr, env.clone()).await?;
@@ -3242,6 +3680,18 @@ async fn eval_call(
     call_value(this, &f, args, JsValue::Undefined).await
 }
 
+/// The accessor already living under `name` in `map`, or a fresh empty one put
+/// there. `get x()` and `set x()` are written as two members but describe a
+/// single property, and whichever is seen second has to find the first.
+fn accessor_slot(map: &mut BTreeMap<String, JsValue>, name: &str) -> Rc<JsAccessor> {
+    if let Some(JsValue::Accessor(a)) = map.get(name) {
+        return a.clone();
+    }
+    let a = Rc::new(JsAccessor::default());
+    map.insert(name.to_string(), JsValue::Accessor(a.clone()));
+    a
+}
+
 async fn eval_class(
     this: &Rc<Interpreter>,
     node: &ClassNode,
@@ -3250,7 +3700,16 @@ async fn eval_class(
     let mut parent: Option<JsValue> = None;
     if let Some(sc) = &node.superclass {
         let p = eval(this, sc, env.clone()).await?;
-        if !matches!(p, JsValue::Class(_) | JsValue::Function(_)) {
+        // Natives are constructors too. `class NotFound extends Error {}` is
+        // about as common as class syntax gets in page code, and refusing it
+        // because `Error` is not a `JsValue::Function` would fail scripts for
+        // a reason that has nothing to do with what they wrote.
+        let constructible = match &p {
+            JsValue::Class(_) | JsValue::Function(_) => true,
+            JsValue::Native(n) => n.ctor.is_some(),
+            _ => false,
+        };
+        if !constructible {
             return Err(JsError::js("Class extends value is not a constructor"));
         }
         parent = Some(p);
@@ -3264,6 +3723,15 @@ async fn eval_class(
         let proto = match p {
             JsValue::Class(c) => c.borrow().prototype.clone(),
             JsValue::Function(f) => JSFunction::prototype_obj(f),
+            // A native has no prototype object of its own to borrow, so the
+            // chain gets a fresh link standing in for one. It is not empty:
+            // it remembers which native it stands for, which is the only way
+            // `err instanceof Error` can later be answered by walking here.
+            JsValue::Native(_) => {
+                let mut m = BTreeMap::new();
+                m.insert(NATIVE_CTOR.to_string(), p.clone());
+                Rc::new(RefCell::new(m))
+            }
             _ => Rc::new(RefCell::new(BTreeMap::new())),
         };
         prototype
@@ -3278,6 +3746,7 @@ async fn eval_class(
                 .map(|f| JsValue::Function(f))
                 .unwrap_or(JsValue::Undefined),
             JsValue::Function(f) => JsValue::Function(f.clone()),
+            JsValue::Native(_) => p.clone(),
             _ => JsValue::Undefined,
         };
     }
@@ -3289,19 +3758,37 @@ async fn eval_class(
     let mut ctor_fn: Option<Rc<JSFunction>> = None;
     for m in &node.methods {
         let fn_ = Rc::new(JSFunction {
-            name: name.clone(),
+            // A method is named after itself, not after its class. Anything
+            // that reports a function's name -- `Class.prototype.f.name`, a
+            // thrown error, `console.log` of the method -- reads this.
+            name: m.name.clone(),
             params: m.params.clone(),
             defaults: m.defaults.clone(),
             rest: m.rest.clone(),
             body: m.body.clone(),
             body_expr: None,
             env: env.clone(),
-            async_: false,
+            async_: m.is_async,
             arrow: false,
             super_info: super_info.clone(),
             prototype: RefCell::new(None),
         });
-        if m.name == "constructor" && !m.is_static {
+        if let Some(kind) = &m.accessor {
+            // `get`/`set` members define one accessor property between them,
+            // on the prototype for an instance member and on the class itself
+            // for a static one.
+            let acc = if m.is_static {
+                accessor_slot(&mut statics, &m.name)
+            } else {
+                let mut proto = prototype.borrow_mut();
+                accessor_slot(&mut proto, &m.name)
+            };
+            if kind == "get" {
+                *acc.get.borrow_mut() = Some(JsValue::Function(fn_));
+            } else {
+                *acc.set.borrow_mut() = Some(JsValue::Function(fn_));
+            }
+        } else if m.name == "constructor" && !m.is_static {
             ctor_fn = Some(fn_);
         } else if m.is_static {
             statics.insert(m.name.clone(), JsValue::Function(fn_));
@@ -3588,6 +4075,33 @@ fn eval_in(this: &Interpreter, key: &JsValue, obj: &JsValue) -> Result<bool, JsE
     }
 }
 
+/// The slot a synthesised prototype link uses to name the native constructor
+/// it stands in for. It is deliberately not a name a script would ever write.
+pub const NATIVE_CTOR: &str = "__native_ctor__";
+
+/// Walk an instance's prototype chain looking for the stand-in link a
+/// `class X extends <native>` left behind. This is how `instanceof` answers
+/// for a native right-hand side, which has no prototype object to compare to.
+fn extends_native(
+    inst: &Rc<RefCell<crate::value::JsClassInstance>>,
+    ctor: &JsValue,
+) -> bool {
+    let mut p = Some(inst.borrow().proto.clone());
+    while let Some(pp) = p {
+        if let Some(n) = pp.borrow().get(NATIVE_CTOR) {
+            if same_ref(n, ctor) {
+                return true;
+            }
+        }
+        let next = pp.borrow().get("__proto__").cloned();
+        p = match next {
+            Some(JsValue::Object(m)) => Some(m),
+            _ => None,
+        };
+    }
+    false
+}
+
 fn eval_instanceof(
     this: &Interpreter,
     obj: &JsValue,
@@ -3597,6 +4111,15 @@ fn eval_instanceof(
         JsValue::Class(c) => c.borrow().prototype.clone(),
         JsValue::Function(f) => JSFunction::prototype_obj(f),
         _ => {
+            // A subclass of a native reports itself an instance of that native
+            // however deep the chain of `extends` runs, which is the whole
+            // point of writing `class NotFound extends Error` in the first
+            // place: the code that catches it says `e instanceof Error`.
+            if let JsValue::Instance(i) = obj {
+                if matches!(ctor, JsValue::Native(_)) && extends_native(i, ctor) {
+                    return Ok(true);
+                }
+            }
             let globals = this.globals.borrow();
             let builtins: &[(&str, &[&str])] = &[
                 ("Array", &["Array"]),
@@ -3607,6 +4130,7 @@ fn eval_instanceof(
                 ("Date", &["Date"]),
                 ("String", &["Str"]),
                 ("Number", &["Number"]),
+                ("Error", &["Error"]),
             ];
             for (gname, variants) in builtins {
                 if let Some(g) = globals.get(*gname) {
@@ -3627,6 +4151,7 @@ fn eval_instanceof(
                             ["Date"] => matches!(obj, JsValue::Date(_)),
                             ["Str"] => matches!(obj, JsValue::Str(_)),
                             ["Number"] => matches!(obj, JsValue::Number(_)),
+                            ["Error"] => matches!(obj, JsValue::Error(_)),
                             _ => false,
                         };
                         return Ok(ok);
