@@ -992,6 +992,53 @@ def test_a_tone_generator_makes_the_tone_it_claims_to():
 
 # -- the null device and graceful degradation ------------------------------
 
+def clock_lag(clock, started, base, window=0.25, gap=0.002):
+    """How far behind the wall a device clock is, measured so that the
+    measurement's own bad luck cannot inflate the answer.
+
+    A paced device advances its clock a block at a time -- ten milliseconds of
+    audio for the null device, one buffer for a real one -- from a thread that
+    is at the operating system's mercy. Both compute what they owe from
+    absolute elapsed time rather than by accumulating periods, so a stalled
+    thread catches the whole stall up in its next step. Read the clock during
+    the stall and it reads late; read it a moment later and it is level again.
+    A single reading therefore measures the scheduler as much as the clock,
+    and on a loaded CI runner it measures it badly: ninety milliseconds of
+    stall is an ordinary amount of bad luck there, which is more than the
+    tolerance below and is what used to fail this test on a machine whose
+    audio was keeping perfect time.
+
+    Sampling repeatedly and keeping the *smallest* lag removes exactly that
+    artefact and nothing else. Staleness can only make a reading look later,
+    never earlier, so the minimum over many readings is the one closest to the
+    truth -- and a clock that is genuinely losing time cannot hide beneath it,
+    because every one of its readings is late.
+
+    Returns `(lag, ahead)`: the smallest wall-minus-clock seen, and the
+    largest amount by which the clock ran ahead of the wall.
+    """
+    lag, ahead, end = None, 0.0, time.monotonic() + window
+    while True:
+        played = clock.now() - base
+        behind = (time.monotonic() - started) - played
+        lag = behind if lag is None else min(lag, behind)
+        ahead = max(ahead, -behind)
+        if time.monotonic() >= end:
+            return lag, ahead
+        time.sleep(gap)
+
+
+def clock_state(clock):
+    """What the clock has to say for itself, for a failure message. A clock
+    that lost time because the device never asked for samples and one that
+    lost it while filling in silence are different faults, and a bare pair of
+    numbers cannot tell them apart -- which matters most on a machine we
+    cannot log into to ask."""
+    return ("%d frames, %d silent, %d underruns, %.3f s"
+            % (clock.frames, clock.silent_frames, clock.underruns,
+               clock.now()))
+
+
 def test_the_null_device_keeps_real_time():
     """A machine with no sound card still has to play a video at the right
     speed. The paced null device is what makes that not a special case."""
@@ -1000,12 +1047,72 @@ def test_the_null_device_keeps_real_time():
     source = output.add_source(48000, channels=1)
     source.write([0.0] * 48000, fmt="float")
     started = time.monotonic()
+    base = output.clock.now()
     time.sleep(0.25)
-    elapsed = time.monotonic() - started
-    played = output.clock.now()
+    lag, ahead = clock_lag(output.clock, started, base)
+    played = output.clock.now() - base
+    state = clock_state(output.clock)
     output.close()
-    close(played, elapsed, 0.08, "the silent clock lost time")
+    close(lag, 0.0, 0.08, "the silent clock lost time (%s)" % state)
+    # It computes what it owes from elapsed time and discards it, so unlike a
+    # real device it has no buffer to run ahead into.
+    close(ahead, 0.0, 0.01, "the silent clock ran fast")
     assert played > 0.1, "the silent clock did not run at all"
+
+
+def test_the_lag_measurement_still_catches_a_clock_that_is_wrong():
+    """The negative control for `clock_lag`, which exists to stop a stalled
+    reader failing a healthy clock and must not have become a way for a sick
+    one to pass.
+
+    Taking the minimum only discards lag that accrues *during* the sampling
+    window; everything the clock lost before sampling began is in every
+    reading and survives the minimum. So a clock running slow for a quarter of
+    a second is caught however lucky the sampling gets, which is what these
+    two rates show -- one either side of the tolerance the real test uses.
+    """
+    class Crystal:
+        """A clock that runs at `factor` times real time and nothing else."""
+
+        def __init__(self, factor):
+            self.factor, self.started = factor, time.monotonic()
+
+        def now(self):
+            return (time.monotonic() - self.started) * self.factor
+
+    started = time.monotonic()
+    slow, fast = Crystal(0.5), Crystal(1.5)
+    time.sleep(0.25)
+    lag, ahead = clock_lag(slow, started, 0.0, window=0.05)
+    assert lag > 0.08, "a half-speed clock passed as real time: %.3f" % lag
+    assert ahead <= 0.0, "a slow clock cannot also be running fast"
+    lag, ahead = clock_lag(fast, started, 0.0, window=0.05)
+    assert ahead > 0.08, "a clock running fast went unnoticed: %.3f" % ahead
+    # And a clock that is genuinely keeping time passes, so the measurement is
+    # not simply refusing everything.
+    lag, ahead = clock_lag(Crystal(1.0), time.monotonic(), 0.0, window=0.05)
+    assert abs(lag) < 0.02 and ahead < 0.02, "%.4f / %.4f" % (lag, ahead)
+
+    class Blocky:
+        """Real time, but only visible in steps: what a device that updates
+        its clock a buffer at a time looks like from outside. This is the
+        artefact the sampling exists for -- read it at the wrong instant and
+        it is a whole step behind, which is more than the tolerance."""
+
+        def __init__(self, step):
+            self.step, self.started = step, time.monotonic()
+
+        def now(self):
+            return (int((time.monotonic() - self.started) / self.step)
+                    * self.step)
+
+    blocky = Blocky(0.1)
+    started = time.monotonic()
+    time.sleep(0.25)
+    worst = (time.monotonic() - started) - blocky.now()
+    lag, ahead = clock_lag(blocky, started, 0.0, window=0.15)
+    assert lag < 0.02, "sampling did not see past the steps: %.3f" % lag
+    assert worst >= 0.0 and lag <= worst, "%.3f / %.3f" % (lag, worst)
 
 
 def test_asking_for_no_device_is_answered_rather_than_refused():
@@ -1994,7 +2101,11 @@ def live_a_real_device_consumes_frames_in_real_time():
     callback has been measured at over 200 ms. Timing from before ``start()``
     charges all of that to the crystal and fails a device that is keeping
     perfect time; it is a start-up latency test wearing a rate test's name.
-    So: wait for the first frame, then measure a window inside the run."""
+    So: wait for the first frame, then measure a window inside the run, and
+    read the clock the way `clock_lag` does rather than once at the end -- a
+    device delivers a whole buffer at a time, so a single reading lands
+    somewhere inside a buffer's worth of quantisation and, on a runner that
+    stalls the reading thread, well outside it."""
     output = heel.open_output()
     assert not output.silent, "available() said yes and open_output said no"
     source = output.add_source(44100, channels=1, gain=0.2, name="live")
@@ -2008,15 +2119,24 @@ def live_a_real_device_consumes_frames_in_real_time():
     base = output.clock.now()
     before = output.clock.underruns
     time.sleep(0.25)
-    elapsed = time.monotonic() - started
+    lag, ahead = clock_lag(output.clock, started, base)
     played = output.clock.now() - base
     underruns = output.clock.underruns - before
     failure = output.device.failure
+    latency = output.device.latency
+    state = clock_state(output.clock)
     output.close()
     eq(failure, None, "the device thread recorded a failure")
-    close(played, elapsed, 0.06, "the device clock does not match the wall")
+    close(lag, 0.0, 0.06,
+          "the device clock does not match the wall (%s, %.3f s latency)"
+          % (state, latency))
+    # A real device takes a buffer before it plays it, so the clock is
+    # entitled to sit that far ahead of the wall and no further.
+    assert ahead <= latency + 0.05, \
+        "the clock ran %.3f s ahead of a device with %.3f s of latency" % (
+            ahead, latency)
     assert played > 0.15, "only %.3f s came out" % played
-    assert underruns <= 1, "%d underruns in a quarter second" % underruns
+    assert underruns <= 1, "%d underruns in half a second" % underruns
 
 
 def live_the_device_agrees_a_format_it_can_actually_use():
