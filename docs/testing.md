@@ -85,6 +85,16 @@ skips cleanly with no `gfortran`, and because that state is hard to find on
 purpose (all three CI platforms turned out to ship one) one of its tests
 forces it on a machine that has one.
 
+The other half of that story is not in this suite and cannot be: a machine
+with no gfortran is exactly what a packaged application runs on, and until
+the packaging started shipping a compiled decoder every downloaded copy of
+the browser refused H.264 while every developer's checkout played it. That
+is now checked where it can only be checked -- inside the built artifact, by
+`packaging/macos/verify.sh`, `packaging/linux/verify-in-container.sh` and
+`packaging/windows/verify-bundle.ps1`, each of which runs the bundle's own
+`--check-video` against these same fixtures with `PATH` cut back so no
+compiler and no stray runtime library can answer for it.
+
 The transport layer also has a Go port under `net/`, with its own tests.
 `test.sh` runs `go vet ./... && go test ./...` where a Go toolchain is
 installed and says so and moves on where there is not; CI always has one.

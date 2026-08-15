@@ -57,6 +57,7 @@ step() { printf '\n=== %s ===\n' "$1"; }
 step "build dependencies"
 dnf install -y -q \
   openssl-devel libffi-devel bzip2-devel xz-devel zlib-devel \
+  gcc-gfortran \
   dejavu-sans-fonts dejavu-serif-fonts dejavu-sans-mono-fonts \
   ca-certificates patchelf file findutils >/dev/null
 
@@ -149,6 +150,28 @@ cp "$SRC/toes/README.md" "$SITE/toes/README.md"
 rm -rf "$SITE"/*.dist-info
 
 cp "$SRC/packaging/linux/launcher.py" "$APPDIR/usr/lib/feetbrowser/launcher.py"
+
+# The H.264 decoder. feetbrowser/h264.py compiles fortran/ with gfortran the
+# first time a video plays, which is fine in a checkout and impossible in an
+# AppImage: the image is read-only and the user has no compiler. Left alone
+# the browser starts, renders, and says "[video: H.264: no gfortran on PATH]"
+# to anyone who opens a video -- a failure no developer ever sees, because
+# developers have gfortran.
+#
+# So it is compiled here and shipped inside the package, under a name that is
+# a hash of the sources it was built from; the sources ship beside the package
+# so the loader can recompute that hash and refuse a mismatch. This runs
+# before the private-library step on purpose: if gfortran's runtime could not
+# be linked in statically -- the flag that does it is GCC 10 and later -- what
+# is left is an ordinary NEEDED entry, which collect() will bundle and the
+# rpath pass will point at $ORIGIN, and either way nothing outside the image
+# is required.
+step "the H.264 decoder"
+(cd "$SRC" && tar cf - fortran) | (cd "$SITE" && tar xf -)
+H264=$(PYTHONPATH="$SITE" "$PY" -m feetbrowser.h264 --name)
+PYTHONPATH="$SITE" "$PY" -m feetbrowser.h264 --build "$SITE/feetbrowser/$H264"
+file "$SITE/feetbrowser/$H264"
+ldd "$SITE/feetbrowser/$H264"
 
 # -- 5. fonts ---------------------------------------------------------------
 #
@@ -268,6 +291,13 @@ step "self-test inside the AppDir"
 APPDIR="$APPDIR" "$APPDIR/AppRun" --version
 APPDIR="$APPDIR" "$APPDIR/AppRun" --screenshot \
   "file://$SRC/tests/fixtures/pixels.html" "$WORK/appdir-shot.png"
+# The decoder, asked of the bundle rather than of the container it was built
+# in: a stripped PATH so no gfortran can be found, one frame decoded, and the
+# result compared with the picture a reference decoder produced. verify-in-
+# container.sh asks the finished AppImage the same question on a machine with
+# no Python at all.
+APPDIR="$APPDIR" PATH=/usr/bin:/bin "$APPDIR/AppRun" --check-video \
+  "$SRC/tests/fixtures/h264/mb1.264" "$SRC/tests/fixtures/h264/mb1.i420.z"
 
 # -- 10. the AppImage -------------------------------------------------------
 #

@@ -35,8 +35,41 @@ FeetBrowser.app/Contents/
   Resources/lib/feetbrowser/     the browser
   Resources/lib/feetbrowser_engine/
                                  the Rust extension, universal2
+  Resources/lib/feetbrowser/_h264_<digest>.dylib
+                                 the H.264 decoder, compiled, universal2
+  Resources/lib/fortran/         the Fortran that decoder was built from
   Resources/lib/toes/            where discover_toes() looks
   Frameworks/Python.framework/   CPython 3.13, pruned
+```
+
+### Video
+
+`feetbrowser/h264.py` compiles `fortran/` with gfortran the first time a
+video plays. That is right for a checkout, where there is a compiler, and
+impossible here. Until this was fixed every shipped copy of the browser
+answered `[video: H.264: no gfortran on PATH]` to anyone who opened a video,
+which no developer ever saw, because developers run from a checkout.
+
+So the library is built at packaging time -- step 6 -- and ships inside the
+package. Both architectures: the arm64 half from the build machine's own
+gfortran, the x86_64 half from `FEETBROWSER_H264_X86_64`, which the workflow
+fills in from a job on `macos-15-intel`. gfortran is not a cross-compiler in
+any form Homebrew ships, so the alternative was shipping one architecture's
+video and not the other's.
+
+It is named after a hash of the sources it was built from, and those sources
+ship beside the package. The loader recomputes the hash: a library built from
+a different `fortran/`, or for a different ABI, is not preferred over the
+sources -- it is not found. `-static-libgfortran -static-libgcc
+-static-libquadmath` mean it needs nothing from the compiler installation,
+and build.sh checks that with `otool -L` rather than assuming it. It also
+deletes the `LC_RPATH` entries gfortran writes pointing at its own Cellar.
+
+To build one by hand:
+
+```
+python3 -m feetbrowser.h264 --name              # what it has to be called
+python3 -m feetbrowser.h264 --build path/to/it  # make one
 ```
 
 ### The launcher is a real executable, not a script
@@ -181,6 +214,16 @@ The launcher is compiled twice by hand -- `-mmacosx-version-min=10.13` for
 x86_64 and `11.0` for arm64, which is when the hardware arrived -- and
 `lipo`'d. CPython comes universal2 from python.org.
 
+The H.264 decoder is the one thing the build machine cannot produce both
+halves of. gfortran targets the machine it was installed on and Homebrew
+ships no cross-compiler, so the workflow builds the x86_64 slice in a
+separate job on `macos-15-intel`, uploads it, and `build.sh` takes it through
+`FEETBROWSER_H264_X86_64` and `lipo`s it with the arm64 half it built itself.
+Building it by hand needs the same: two machines, or one and a slice from
+somewhere. Everything else about it -- the flags, the name, the ABI check --
+is the same on both, because both go through
+`python3 -m feetbrowser.h264 --build`.
+
 `lipo -archs` proves a slice exists, not that it works, so
 `.github/workflows/package-macos.yml` mounts the image on an Intel runner
 and runs the app there.
@@ -261,6 +304,10 @@ Run either by hand against any bundle, including one copied off a mounted
   directory -- a build path left in a `.pyc` or a panic string is a leak,
   and the Rust build is given `--remap-path-prefix` for exactly this reason,
 * a missing icon, plist key, trust store, engine or launcher,
+* an app that cannot decode H.264. `verify.sh` runs the built app's own
+  `--check-video`, with `PATH` cut back to the system directories so no
+  gfortran and no Homebrew library can be reached, and compares the frame it
+  decodes with the picture in `tests/fixtures/h264/` byte for byte,
 * Tcl, Tk or `_tkinter`.
 
 Paths belonging to *upstream* CPython's own build machine are reported and

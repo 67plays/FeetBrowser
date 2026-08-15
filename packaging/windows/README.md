@@ -37,6 +37,18 @@ Three things in one directory:
    `.pyd` at the root of the wheel will bundle just as happily; what it
    insists on is that there is exactly one engine `.pyd` in there.
 
+4. **The H.264 decoder**: `feetbrowser\_h264_<digest>.dll`, compiled from
+   `fortran\` by gfortran at packaging time, with `fortran\` itself shipped
+   beside the package. `feetbrowser\h264.py` otherwise compiles those
+   sources on demand, which is right for a checkout and impossible on a
+   user's machine -- and the failure was silent to everyone who had a
+   compiler, which is everyone who develops the browser. The DLL is named
+   after a hash of the sources it was built from and the loader recomputes
+   it, so a stale one is not preferred over the sources, it is not found.
+   `-static-libgfortran -static-libgcc` mean it does not drag MinGW's
+   runtime DLLs along with it; the verification job proves that by running
+   with `PATH` cut back to the system directories.
+
 Plus `FeetBrowser.exe`, which is the subject of most of this document.
 
 Nothing is frozen. There is no PyInstaller, no cx_Freeze, no py2exe and no
@@ -276,8 +288,10 @@ reviewable: change a number, re-run, and the diff is explained.
 
 ## Building it
 
-On Windows, with Rust and a Python whose minor version matches the pinned one
-(3.13):
+On Windows, with Rust, a gfortran (MSYS2's, Strawberry Perl's, or
+`choco install mingw` -- `build.ps1` looks for all three and takes
+`FEETBROWSER_GFORTRAN` over any of them) and a Python whose minor version
+matches the pinned one (3.13):
 
 ```powershell
 python -m pip install maturin
@@ -345,7 +359,12 @@ The checks are:
    have to have run;
 7. `--screenshot` writes to a path with a space and an accent in it;
 8. launching it the way Explorer does (no redirected handles, just a URL),
-   producing a real `HWND` within a minute.
+   producing a real `HWND` within a minute;
+9. `--check-video` finds the prebuilt H.264 decoder, loads it, decodes
+   `mb1.264` and compares the result with the picture a reference decoder
+   produced, byte for byte. The two fixtures travel with this script in the
+   `verify-script` artifact, because the job that runs it has no checkout to
+   take them from.
 
 In CI all of this happens twice, on a runner that never checks the repository
 out: once from `C:\Program Files\FeetBrowser`, and once from a directory

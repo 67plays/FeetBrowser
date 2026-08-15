@@ -15,6 +15,8 @@
 #   * a file anywhere in the bundle containing a path under /Users, which is
 #     how a build machine's home directory ends up shipped to strangers,
 #   * a missing icon, plist key, trust store, engine or interpreter,
+#   * an app that cannot decode H.264 -- asked of the app itself, with a
+#     stripped PATH, because that failure is invisible from a checkout,
 #   * Tcl, Tk or _tkinter, which this project does not use and must not ship.
 set -euo pipefail
 
@@ -85,6 +87,40 @@ for key in CFBundleIdentifier CFBundleName CFBundleExecutable \
           2>/dev/null || true)
   if [ -n "$value" ]; then note "ok  $key = $value"; else bad "Info.plist has no $key"; fi
 done
+
+echo
+echo "== video"
+# The regression this exists for is invisible from a checkout. h264.py falls
+# back to compiling fortran/ with gfortran, which every developer has and no
+# user does, so a bundle that shipped no decoder passes every other check
+# here, starts, renders, and only admits it when somebody opens a video --
+# by which time it is a download. So the app is asked, in the app.
+decoder=$(find "$contents/Resources/lib/feetbrowser" -name '_h264_*' -type f | head -1)
+if [ -n "$decoder" ]; then note "ok  ${decoder#"$app"/}"; else bad "no prebuilt H.264 decoder in the bundle"; fi
+if [ -d "$contents/Resources/lib/fortran" ]; then
+  note "ok  Resources/lib/fortran (the sources the decoder's name is a hash of)"
+else
+  bad "missing Resources/lib/fortran"
+fi
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+vector="$here/../../tests/fixtures/h264/mb1.264"
+truth="$here/../../tests/fixtures/h264/mb1.i420.z"
+args=()
+if [ -f "$vector" ] && [ -f "$truth" ]; then
+  args=("$vector" "$truth")
+else
+  note "no test vectors beside this script; checking the decoder loads, not what it decodes"
+fi
+# PATH cut back to the system directories: if the bundle could only decode
+# because this machine has a gfortran or a Homebrew libgfortran, that is the
+# bug, and it must not be able to reach either.
+if out=$(env PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+             "$contents/MacOS/FeetBrowser" --check-video "${args[@]+"${args[@]}"}" 2>&1); then
+  printf '  %s\n' "$out"
+else
+  bad "--check-video failed inside the app:"
+  printf '   %s\n' "$out"
+fi
 
 echo
 echo "== no toolkit"

@@ -23,15 +23,73 @@ defaults:
     shell: bash
 
 jobs:
+  # The x86_64 half of the H.264 decoder, built on an Intel Mac because
+  # nothing else can build it. gfortran is a real cross-compiler in principle
+  # and Homebrew's is not one in practice: `brew install gcc` on Apple silicon
+  # produces a gfortran that targets aarch64-apple-darwin and nothing else,
+  # and Fortran has no equivalent of clang's -arch flag to reach for. So the
+  # slice is made where its architecture is, and handed to the build job,
+  # which lipos it together with the arm64 half. The digest in the filename is
+  # what stops the two coming from different sources: see prebuilt_name().
+  fortran:
+    runs-on: macos-15-intel
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: gfortran
+        run: brew install gcc
+
+      - name: Build the x86_64 decoder
+        run: |
+          name=$(python3 -m feetbrowser.h264 --name)
+          mkdir -p slice
+          # The same floor build.sh gives the x86_64 half of everything else.
+          MACOSX_DEPLOYMENT_TARGET=10.13 \
+            python3 -m feetbrowser.h264 --build "slice/$name"
+          file "slice/$name"
+          lipo -archs "slice/$name"
+          otool -L "slice/$name"
+
+      # Decoding a frame with it, here, on the machine that can run it. The
+      # build job cannot do this -- it is arm64 -- and by the time the intel
+      # job sees the finished app it is too late to be cheap.
+      - name: Decode with it
+        run: |
+          cp slice/*.dylib feetbrowser/
+          env PATH=/usr/bin:/bin:/usr/sbin:/sbin python3 -m feetbrowser \
+            --check-video tests/fixtures/h264/mb1.264 tests/fixtures/h264/mb1.i420.z
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: h264-x86_64
+          path: slice/*.dylib
+          if-no-files-found: error
+
   # Built on the Apple Silicon runner, which is what `macos-latest` is now.
   # The host architecture does not decide what comes out: both halves of the
   # extension are cross-compiled and lipo'd, and the CPython in the bundle is
   # python.org's universal2 build.
   build:
+    needs: fortran
     runs-on: macos-latest
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+
+      - name: gfortran, for the arm64 half of the decoder
+        run: brew install gcc
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: h264-x86_64
+          path: h264-x86_64
+
+      # build.sh takes the slice it cannot build from here. The name carries
+      # the digest of the sources it was built from, and build.sh refuses it
+      # if that is not the name it is looking for.
+      - name: Point build.sh at the x86_64 slice
+        run: echo "FEETBROWSER_H264_X86_64=$PWD/$(echo h264-x86_64/*.dylib)" >> "$GITHUB_ENV"
 
       # The CPython .pkg is pinned by version and by SHA-256 in build.sh, so
       # a cache hit is the same bytes the hash check would have accepted.

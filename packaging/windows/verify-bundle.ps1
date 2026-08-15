@@ -22,6 +22,7 @@
       6  https works, OpenSSL and the Windows certificate store included
       7  a page fetched over a socket renders to the right pixels
       8  launching it the way Explorer does opens a real window
+      9  it can decode H.264, on a machine with no gfortran
 
 .PARAMETER Root
     The unpacked bundle -- the directory with FeetBrowser.exe in it.
@@ -32,12 +33,21 @@
 .PARAMETER SkipNetwork
     Skip the checks that leave the machine (6, and the live render in 7).
     The local-fixture render still runs.
+
+.PARAMETER H264Vector
+.PARAMETER H264Truth
+    An H.264 stream and the I420 picture a reference decoder produced from
+    it. They travel beside this script -- the CI job that runs it has no
+    checkout to take them from. Without them check 9 still proves the
+    decoder loads; with them it proves what it decodes.
 #>
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][string]$Root,
     [string]$Evidence,
-    [switch]$SkipNetwork
+    [switch]$SkipNetwork,
+    [string]$H264Vector = (Join-Path $PSScriptRoot 'h264\mb1.264'),
+    [string]$H264Truth  = (Join-Path $PSScriptRoot 'h264\mb1.i420.z')
 )
 
 Set-StrictMode -Version Latest
@@ -181,6 +191,33 @@ Check "--version" {
         throw "said '$($r.Out.Trim())', expected 'FeetBrowser $version'"
     }
     Write-Host "   $($r.Out.Trim())"
+}
+
+# ---------------------------------------------------------------------------
+# The check this file was extended for. feetbrowser\h264.py falls back to
+# compiling fortran\ with gfortran, which every developer has and no user
+# does, so a bundle that shipped no decoder passes every other check here,
+# installs, starts, renders, and only admits it to whoever opens a video --
+# by which time it is a download. PATH is already cut back to the system
+# directories in CI, so nothing on this machine can supply a compiler or a
+# MinGW runtime DLL: what answers is what shipped.
+# ---------------------------------------------------------------------------
+Check "it can decode H.264" {
+    $lib = @(Get-ChildItem -Path (Join-Path $Root 'feetbrowser') -File -Filter '_h264_*.dll')
+    if ($lib.Count -ne 1) { throw "expected one prebuilt H.264 decoder in feetbrowser\, found $($lib.Count)" }
+    if (-not (Test-Path (Join-Path $Root 'fortran'))) {
+        throw "no fortran\ beside the package; h264.py cannot match the decoder against its sources"
+    }
+    $checkArgs = @('--check-video')
+    if ((Test-Path $H264Vector) -and (Test-Path $H264Truth)) {
+        $checkArgs += @($H264Vector, $H264Truth)
+    } else {
+        Write-Host "   no test vector beside this script: checking that the decoder loads, not what it decodes"
+    }
+    $r = Invoke-Exe $Exe $checkArgs 120
+    Assert-ExitZero $r '--check-video'
+    Write-Host ("   " + ($r.Out.Trim() -replace "`r?`n", "`n   "))
+    Write-Host "   $($lib[0].Name), $([int]($lib[0].Length / 1KB)) KB"
 }
 
 Check "--help" {

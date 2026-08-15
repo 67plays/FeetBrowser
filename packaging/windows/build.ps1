@@ -197,6 +197,56 @@ Get-ChildItem -Path $package -Recurse -Force -File |
 New-Item -ItemType Directory -Force -Path (Join-Path $stage 'toes') | Out-Null
 Copy-Item (Join-Path $RepoRoot 'toes\README.md') (Join-Path $stage 'toes') -Force
 
+# ---------------------------------------------------------------------------
+# The H.264 decoder.
+#
+# feetbrowser\h264.py compiles fortran\ with gfortran the first time a video
+# plays. That works from a checkout, where a developer has a compiler; it
+# cannot work here, where the user has neither gfortran nor any reason to.
+# Left alone the bundle installs, starts, renders, and tells anyone who opens
+# a video "[video: H.264: no gfortran on PATH]" -- which no developer ever
+# sees, because developers run from a checkout.
+#
+# So it is compiled now, into the package, under a name that is a hash of the
+# sources it was built from; fortran\ ships beside the package so the loader
+# can recompute that hash and refuse anything that does not match. The
+# compiler is a build-machine tool exactly like cargo: nothing it produced is
+# a third-party library, the .dll is our own Fortran, and -static-libgfortran
+# and friends mean it does not drag MinGW's runtime DLLs along behind it.
+# verify-bundle.ps1 is where that last claim is checked, on a machine whose
+# PATH has been cut back to Windows itself.
+# ---------------------------------------------------------------------------
+Step "the H.264 decoder"
+Copy-Item -Recurse -Force -Path (Join-Path $RepoRoot 'fortran') -Destination $stage
+$stagedPython = Join-Path $stage 'python.exe'
+if (-not (Test-Path $stagedPython)) { Fail "no python.exe in the embeddable package" }
+# The gfortrans that exist on a Windows build machine, in the order worth
+# trying. The GitHub runner image has Strawberry Perl's MinGW; a developer is
+# more likely to have MSYS2. FEETBROWSER_GFORTRAN wins over both.
+$gfortran = $null
+foreach ($candidate in @(
+        $env:FEETBROWSER_GFORTRAN,
+        'gfortran',
+        'C:\msys64\mingw64\bin\gfortran.exe',
+        'C:\Strawberry\c\bin\gfortran.exe',
+        'C:\ProgramData\mingw64\mingw64\bin\gfortran.exe',
+        'C:\ProgramData\chocolatey\bin\gfortran.exe')) {
+    if (-not $candidate) { continue }
+    $found = Get-Command $candidate -ErrorAction SilentlyContinue
+    if ($found) { $gfortran = $found.Source; break }
+}
+if (-not $gfortran) {
+    Fail ("no gfortran found. Install MinGW-w64 (choco install mingw) or point`n" +
+          "      FEETBROWSER_GFORTRAN at one. A bundle without it ships a browser`n" +
+          "      that cannot play video, and says so only to the user.")
+}
+Write-Host "    gfortran: $gfortran"
+$h264 = (& $stagedPython -m feetbrowser.h264 --name) | Select-Object -Last 1
+if ($LASTEXITCODE -ne 0 -or -not $h264) { Fail "could not ask h264.py for the library name" }
+& $stagedPython -m feetbrowser.h264 --build (Join-Path $package $h264) --fc $gfortran
+if ($LASTEXITCODE -ne 0) { Fail "gfortran could not build the decoder" }
+Write-Host ("    {0}, {1:N0} KB" -f $h264, ((Get-Item (Join-Path $package $h264)).Length / 1KB))
+
 foreach ($doc in @('LICENSE', 'README.md')) {
     $src = Join-Path $RepoRoot $doc
     if (Test-Path $src) { Copy-Item $src $stage -Force }

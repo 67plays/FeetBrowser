@@ -33,7 +33,10 @@ exact download and the one workload to tick.
 optional in the real sense: the H.264 decoder in `fortran/` is compiled on
 demand and cached, and a machine without a Fortran compiler gets a browser
 that reports H.264 as a codec it does not have. Nothing else in the tree
-depends on it, and the test suite passes either way.
+depends on it, and the test suite passes either way. It is not optional for
+*packaging*, though: the `.app`, the AppImage and the Windows bundle each
+compile the decoder at build time and ship it, because a user has no
+compiler and a bundle without it is a browser that cannot play video.
 
 The GNU toolchain is a real alternative rather than a dead end, which is worth
 saying because the opposite is usually assumed: official CPython is built with
