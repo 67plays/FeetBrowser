@@ -85,10 +85,6 @@ skips cleanly with no `gfortran`, and because that state is hard to find on
 purpose (all three CI platforms turned out to ship one) one of its tests
 forces it on a machine that has one.
 
-The transport layer also has a Go port under `net/`, with its own tests.
-`test.sh` runs `go vet ./... && go test ./...` where a Go toolchain is
-installed and says so and moves on where there is not; CI always has one.
-
 Nothing here needs a display or a GUI toolkit: the renderer draws into its own
 framebuffer, so the whole suite runs headless. `test_render.py` does need at
 least one system font, which every platform we support ships.
@@ -175,5 +171,4 @@ drawing a page with a photograph on it.
 The Linux jobs build the Rust engine and run `test_js.py` once against it;
 the macOS and Windows lines do the same. The Rust engine's own tests are
 covered by the `rust` job, which never crosses into Python, so running them
-once says as much as running them on all eight interpreters would, the same
-reason the Go toolchain has a job of its own.
+once says as much as running them on all eight interpreters would.

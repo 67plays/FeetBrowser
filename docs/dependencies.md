@@ -27,9 +27,9 @@ will need, but they describe finished work rather than open questions.
 
 The build side is heavier than the run side, and that is where most of the
 cost actually is: Rust with five crates, `maturin` and a virtualenv to install
-the extension into, `pyflakes` for lint, a Go toolchain for a package the
-browser does not call, and `gfortran` for the H.264 decoder. The last of
-those is the only compiler here that is genuinely optional at runtime; see
+the extension into, `pyflakes` for lint, and `gfortran` for the H.264 decoder.
+The last of those is the only compiler here that is genuinely optional at
+runtime; see
 [Fortran](#fortran) below.
 
 ## The Rust crates
@@ -431,49 +431,6 @@ file: Fortran arrives with no crates to audit.
 runner; the macOS and Windows runners already have one, so nothing to
 install there, and no runtime dependency on any of them.
 
-## Go
-
-`go.mod` is three lines with no `require` block, and `net/net.go` imports 24
-standard-library packages and nothing else, so the Go code has zero
-dependencies of its own. What it has is a **Go toolchain** on the build side:
-`test.sh:70-78` runs `go vet` and `go test` where one is on `PATH`, and
-`.github/workflows/ci.yml:225-241` installs Go 1.22 and runs build, vet and
-test.
-
-`net/net.go` is 1,091 lines and its own header calls it a port of
-`feetbrowser/net.py`. It is a near-complete one-to-one port down to the
-tunables (`MAX_REDIRECTS = 10`, `CACHE_MAX_SIZE = 1000`, the same 64 MB body
-cap and the same timeouts), with a hand-rolled HTTP/1.1 client on raw sockets,
-TLS with SNI, chunked decoding, gzip and deflate, a DNS cache, a keep-alive
-pool and a `Cache-Control`-aware response cache. `net/net_test.go` is 421 more
-lines and 19 test functions, and they are good tests.
-
-**Nothing uses it.** Greps for `go run`, `go build`, `cgo`, `net.go`, a
-subprocess call or a ctypes load turn up only the CI job and the `test.sh`
-block that run its own tests. The only shared libraries the browser loads are
-the assembled span kernel and `libX11.so.6`. All three consumers of the
-transport layer (`browser.py`, `toehub.py`, `toes.py`) import the Python
-`net.py`. No documentation mentions it. It has one real feature gap already:
-`RequestImpersonated` (`net.go:372`) is a one-line stub that returns a plain
-request, which is the opposite of what the method is for.
-
-It also drifts. Two commits created it, the second being a correction because
-it had already fallen out of step with `net.py` within a day, and 49 commits
-have landed since without touching it.
-
-The CI job is honest about what it is; its own comment says the port arrived
-with tests and nothing that ran them, and that the job is the only thing
-standing between the package and rot. Since `ci.yml` declares no `needs:`
-relationships, every job independently fails the workflow, so a Go compile
-error does turn the run red. Whether it is a *required* status check is a
-branch-protection setting that does not live in the repository, so that part
-is not something this file can answer.
-
-**Verdict: optional, and currently dead weight.** The decision to make is
-whether a Go transport has a job in a Python browser (a subprocess, or a
-cdylib over ctypes), and to wire it in, or to delete it. Keeping it as it
-stands costs a toolchain in CI and guarantees continued drift.
-
 ## Suggested order
 
 1. Turn the silent regex fallback at `interp.rs:785` into a thrown
@@ -491,10 +448,9 @@ stands costs a toolchain in CI and guarantees continued drift.
    of scope.~~ Done.
 7. `regex`. The largest item at 1,050-1,500 lines and one to two weeks, and the
    largest correctness win in the list.
-8. Decide about Go: wire it in or delete it.
-9. Reassess `pyo3` once it is the only entry left in `Cargo.toml`.
-10. Keep `pyflakes`, and write down why a development tool is not part of the
-    stack the project claims to own.
+8. Reassess `pyo3` once it is the only entry left in `Cargo.toml`.
+9. Keep `pyflakes`, and write down why a development tool is not part of the
+   stack the project claims to own.
 
 Steps 1 through 4 remove **42 of the 57 crates** and need no architectural
 change at all.

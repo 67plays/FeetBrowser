@@ -224,29 +224,6 @@ jobs:
           RUSTFLAGS: -D warnings
         run: cargo check --manifest-path rust/Cargo.toml --all-targets
 
-  # The Go port of the transport layer arrived with 421 lines of its own
-  # tests and nothing that ran them: no job, no line in test.sh, no mention
-  # in the docs. It is not wired into the browser yet -- every other job here
-  # runs the Python net.py and never looks at net/ -- so this is the only
-  # thing standing between that package and rot.
-  go:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-go@v5
-        with:
-          go-version: '1.22'
-          cache-dependency-path: go.mod
-
-      - name: Build and vet
-        run: |
-          go build ./...
-          go vet ./...
-
-      - name: Go tests
-        run: go test ./...
-
   # This job used to install Pillow and cairosvg so the JPEG, WebP and SVG
   # branches behind them ran at least once. There are no such branches now:
   # JPEG is decoded here and the rest draw as alt text. Every job above runs

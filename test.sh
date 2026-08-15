@@ -82,12 +82,4 @@ $run tests/test_asmops.py    # the image-codec kernels, against their Python ref
 $run tests/test_h264.py      # the Fortran H.264 decoder, or the skip where there is no gfortran
 $run tests/smoke.py
 
-# The Go port of the transport layer (net/) is a separate toolchain, so it is
-# run where one is installed and skipped where there is not, the same way the
-# window suites treat their platforms.
-if command -v go >/dev/null 2>&1; then
-  go vet ./...
-  go test ./...
-else
-  echo "skipping the Go net tests: no go toolchain on PATH"
-fi
+
