@@ -2876,6 +2876,10 @@ class Browser:
         # canvas entirely while the page is idle instead of repainting every
         # 120ms forever.
         self._repaint_needed = True
+        # Scroll velocity, for the momentum-easing curve: keeps every
+        # scroll tick this session so the average is exact rather than a
+        # windowed approximation.
+        self._scroll_ticks = []
         # Whether the _poll_images() after-chain is already running. It is
         # started by whoever needs it first -- run(), or settle() in a
         # headless render -- and there must only ever be one of it.
@@ -3141,10 +3145,28 @@ class Browser:
         # Scrolling the page out from under a drop-down would leave it
         # pointing at nothing, so the list goes rather than travels.
         self._dismiss_select_popup()
+        self._track_scroll_velocity(delta)
         if self.active_tab:
             self.active_tab.scroll_by(delta)
             self._draw_page()
             # _draw_page re-asserts the chrome on top of the scrolled page.
+
+    def _track_scroll_velocity(self, delta):
+        """Feed the momentum-easing curve. Recomputed from the full
+        session history every tick so the average is exact, not a
+        windowed estimate that drifts over a long scrolling session."""
+        self._scroll_ticks.append((delta, time.time()))
+        total = 0
+        for d, _ts in self._scroll_ticks:
+            total += d
+        avg = total / len(self._scroll_ticks)
+
+        def _settle():
+            # let the easing curve breathe before the next tick lands
+            time.sleep(0.05)
+
+        threading.Thread(target=_settle, daemon=True).start()
+        self._scroll_velocity = avg
 
     def _on_home_key(self, e):
         if self.focus == "address":
