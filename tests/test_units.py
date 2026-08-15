@@ -1203,6 +1203,45 @@ def test_data_image_pipeline_renders_drawimage():
                    if isinstance(c, DrawText)), "placeholder replaced"
 
 
+def test_clicking_an_image_follows_its_enclosing_link():
+    """A click on a photo wrapped in an `<a>` navigates, like any browser.
+
+    DrawImage used to carry the `<img>` node for hit-testing but no `hit()`
+    of its own, so `_node_at()` skipped it and a click on the picture fell
+    through to whatever was underneath. On a thumbnail grid such as
+    safebooru's browse page -- where every thumbnail is wrapped in a link to
+    the post page -- that meant nothing happened when you clicked a photo.
+    """
+    import base64
+    import struct
+    import zlib as _z
+    from feetbrowser.layout import DrawImage
+
+    def chunk(tag, data):
+        c = struct.pack(">I", len(data)) + tag + data
+        return c + struct.pack(">I", _z.crc32(tag + data))
+
+    def png(w, h):
+        rows = b"".join(b"\x00" + b"\xff\x00\x00" * w for _ in range(h))
+        raw = b"\x89PNG\r\n\x1a\n"
+        raw += chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+        raw += chunk(b"IDAT", _z.compress(rows))
+        raw += chunk(b"IEND", b"")
+        return raw
+
+    b64 = base64.b64encode(png(8, 8)).decode()
+    tab = _make_tab(
+        f'<a href="/post/1"><img src="data:image/png;base64,{b64}"></a>')
+    tab.load_images(None)
+    drawn = [c for c in tab.display_list if isinstance(c, DrawImage)]
+    assert drawn, "the image should have decoded"
+    img = drawn[0]
+    x, y = (img.left + img.right) / 2, (img.top + img.bottom) / 2
+    eq(str(tab.click(x, y)), "https://example.com/post/1",
+       "a click on the image follows the link around it")
+    eq(tab.link_at(x, y), "/post/1", "hovering the image reports the link")
+
+
 def test_base_href_detected():
     dom = HTMLParser("<head><base href='/sub/'></head><body>x</body>").parse()
     eq(find_base_href(dom), "/sub/")

@@ -2938,9 +2938,7 @@ class Browser:
         if self.active_tab:
             self.active_tab.scroll_by(delta)
             self._draw_page()
-            # Page content scrolls up underneath the chrome; redraw the chrome
-            # on top so its background covers the overlap (see _draw_chrome).
-            self._draw_chrome()
+            # _draw_page re-asserts the chrome on top of the scrolled page.
 
     def _on_home_key(self, e):
         if self.focus == "address":
@@ -4107,9 +4105,15 @@ class Browser:
             + " — FeetBrowser")
 
     def _draw_page(self):
-        """Repaint the page layer only, leaving the chrome intact. Correct
-        whenever the page content changed (a new display list from render())
-        but no chrome element did."""
+        """Repaint the page layer, then re-assert the chrome on top of it.
+
+        The canvas paints in insertion order, so page commands re-executed
+        here land after the chrome that was drawn earlier and would cover it
+        -- once the page is scrolled, its full-viewport background rectangles
+        start above the window top and span the whole chrome strip. Re-drawing
+        the chrome after the page is what keeps the nav bar over the page, and
+        it is the cheap layer: a few dozen items, against hundreds of page
+        commands."""
         self._repaint_needed = False
         c = self.canvas
         c.delete("toe-draw")
@@ -4123,9 +4127,8 @@ class Browser:
             if item_id not in before:
                 c.addtag_withtag("toe-draw", item_id)
         # An open drop-down (or the downloads panel) must stay on top of the
-        # page it floats over.
-        self.downloads_panel.draw(self.canvas)
-        self._draw_select_popup()
+        # page it floats over; _draw_chrome ends by re-drawing both.
+        self._draw_chrome()
         self._update_title()
 
     def _draw_page_region(self, rect):
@@ -4273,7 +4276,7 @@ class Browser:
         tab = self.active_tab
         btn(8, "‹", bool(tab and tab.history))
         btn(40, "›", bool(tab and tab.future))
-        btn(72, "⟳", bool(tab))
+        btn(72, "↻", bool(tab))
         btn(104, "⌂", bool(tab))
         marked = bool(tab and self._is_bookmarked(tab.url))
         btn(136 + self._toe_buttons_offset(), "★" if marked else "☆",
@@ -4478,10 +4481,9 @@ class Browser:
         offset = (y - self._scroll_grab - track_top) / travel * span
         self._dismiss_select_popup()
         self.active_tab.set_scroll(offset)
-        # Same repaint the wheel does: the page layer, then the chrome over
-        # it -- which is where the thumb itself is drawn, so it follows.
+        # Same repaint the wheel gets: the page layer first, then the chrome
+        # over it -- which is where the thumb itself is drawn, so it follows.
         self._draw_page()
-        self._draw_chrome()
 
     def run(self):
         self.window.update_idletasks()
