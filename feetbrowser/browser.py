@@ -38,6 +38,7 @@ from .selection import Index as SelectionIndex, Selection, \
 from . import shoes as shoes
 from . import downloads as downloads
 from . import media
+from . import arch
 from .jsdom import JSDocument, JSLocation, _JSStaticProps, _JSComputedStyle
 from .jsengine import Interpreter, JSException, UNDEFINED
 from . import toes as toes
@@ -313,6 +314,11 @@ class Tab:
         # Separate from image_cache because a player is not a picture: it owns
         # a decode thread and has to be closed when the page goes away.
         self.video_players = []
+        # The arch.AudioPlayer behind each of those, when the file had sound
+        # we could decode. Held separately because a video can outlive its
+        # soundtrack -- attaching is allowed to decline -- and because these
+        # are what has to let go of the sound card when the tab dies.
+        self.audio_players = []
         self._video_queue = []
         self._video_nodes = {}
         self._video_results = deque()
@@ -1436,6 +1442,11 @@ class Tab:
             # Show frame zero straight away. A paused <video> displaying its
             # own first frame is what a browser does, and it is also the
             # cheapest proof that the file really decoded.
+            # Sound, if the file has any. `attach_audio` is what makes the
+            # pictures follow the soundtrack rather than the wall clock, and
+            # it declines -- leaving the video exactly as it was -- when
+            # there is no audio track or no device that can be heard.
+            self._attach_video_audio(key, node, data, player)
             player.first_frame()
             node.video_player = player
             self.video_players.append(player)
@@ -1443,6 +1454,33 @@ class Tab:
                 player.play()
                 if self.browser is not None:
                     self.browser._ensure_video_tick()
+
+    def _attach_video_audio(self, key, node, data, player):
+        """Give a freshly built `VideoPlayer` its soundtrack, if it has one.
+
+        Silence is never a failure here. A file with no audio track, and a
+        machine with no sound card, are both videos that play exactly as
+        they did before this method existed; the only thing worth saying out
+        loud is a track the container names and we cannot decode, which is a
+        page the user can see is missing something.
+        """
+        try:
+            audio = arch.AudioPlayer(
+                data=data, loop="loop" in node.attributes)
+        except Exception as exc:  # noqa: BLE001 - a page must not die
+            self._add_error(f"AUDIO {key}: {exc}")
+            return None
+        info = audio.info
+        if not audio.playable and info is not None and info.codec:
+            self._add_error(f"AUDIO {key}: {audio.error or info.reason}")
+        if "muted" in node.attributes:
+            audio.muted = True
+        if not player.attach_audio(audio):
+            audio.close()
+            return None
+        node.audio_player = audio
+        self.audio_players.append(audio)
+        return audio
 
     def pending_videos(self):
         return bool(self._video_queue)
@@ -1466,7 +1504,10 @@ class Tab:
         nobody is watching is a leak with a picture on it."""
         for player in self.video_players:
             player.close()
+        for audio in self.audio_players:
+            audio.close()
         self.video_players = []
+        self.audio_players = []
         self._video_queue = []
         self._video_nodes = {}
 
