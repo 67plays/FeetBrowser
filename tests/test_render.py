@@ -1338,6 +1338,79 @@ def test_settle_waits_for_images_a_finished_document_asked_for():
         shutil.rmtree(work, ignore_errors=True)
 
 
+def test_script_created_images_are_fetched_and_painted():
+    """A `<script>` that builds `<img>` elements must have them fetched like
+    anything else in the document.
+
+    20plays.com (and plenty of other pages) build their banner strip by
+    creating `<img>` elements in JavaScript after the document has already
+    been scanned for images. Those used to render as "[img]": the DOM bridges
+    dropped `img.src = ...` writes, and nothing re-scanned the tree for images
+    a script added. This drives both halves through a loopback server.
+    """
+    import http.server
+    import struct
+    import threading
+    import zlib as _z
+
+    def chunk(tag, data):
+        c = struct.pack(">I", len(data)) + tag + data
+        return c + struct.pack(">I", _z.crc32(tag + data))
+
+    pixels = b"".join(b"\x00" + b"\xff\x00\x00" * 8 for _ in range(8))
+    png_bytes = b"\x89PNG\r\n\x1a\n"
+    png_bytes += chunk(b"IHDR", struct.pack(">IIBBBBB", 8, 8, 8, 2, 0, 0, 0))
+    png_bytes += chunk(b"IDAT", _z.compress(pixels))
+    png_bytes += chunk(b"IEND", b"")
+
+    script = (
+        'var files = ["a.png", "b.png", "c.png"];'
+        'for (var i = 0; i < files.length; i++) {'
+        '  var img = document.createElement("img");'
+        '  img.src = "/" + files[i];'
+        '  document.getElementById("wrap").appendChild(img);'
+        '}')
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path.endswith(".png"):
+                body, ctype = png_bytes, "image/png"
+            else:
+                body = (b'<!doctype html><div id="wrap"></div><script>'
+                        + script.encode() + b'</script>')
+                ctype = "text/html"
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        from feetbrowser.browser import Browser
+        from feetbrowser.layout import DrawImage
+
+        browser = Browser()
+        browser.window.geometry("900x700")
+        browser.canvas.resize(900, 700)
+        browser._apply_resize()
+        browser.new_tab("http://127.0.0.1:%d/" % server.server_address[1])
+        assert browser.settle(20.0), "script-created images should arrive"
+        tab = browser.tabs[0]
+        drawn = [c for c in tab.display_list if isinstance(c, DrawImage)]
+        assert len(drawn) == 3, \
+            f"wanted 3 JS-created images drawn, found {len(drawn)}"
+        assert not [c for c in tab.display_list
+                    if "[img" in getattr(c, "text", "")], \
+            "no [img] placeholder may remain"
+    finally:
+        server.shutdown()
+
+
 def test_browse_page_thumbnails_with_query_urls_render():
     """safebooru's post list: absolute JPEG `<img>` URLs with a query
     string, wrapped in flex cells.
@@ -1445,8 +1518,6 @@ def test_a_scrolled_page_never_paints_over_the_chrome():
             "the chrome strip shows page content instead of chrome"
     finally:
         shutil.rmtree(work, ignore_errors=True)
-
-
 # -- the scrollbar, dragged ------------------------------------------------
 #
 # The bar is painted onto the same canvas as everything else and is not a

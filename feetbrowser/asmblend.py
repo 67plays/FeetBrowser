@@ -39,29 +39,38 @@ def _find_cc():
     return None
 
 
-def _build_library():
-    """Compile spanblend.S to a shared object, cached by source hash."""
+def load_assembly(asm_path):
+    """Compile one ``.S`` file to a cached shared object and load it.
+
+    Available only where it can mean anything -- Linux on x86-64 with a C
+    compiler on the PATH. The ``.so`` is keyed by a hash of the source so a
+    given source builds at most once per machine. Returns the
+    ``ctypes.CDLL``, or ``None`` when this host cannot produce one. Other
+    kernel modules (``asmops``) build through this so the cache and the
+    host checks live in one place.
+    """
     if not _supports_asm():
         return None
     cc = _find_cc()
     if cc is None:
         return None
-    with open(_ASM, "rb") as fh:
+    with open(asm_path, "rb") as fh:
         digest = hashlib.sha256(fh.read()).hexdigest()[:16]
-    out = os.path.join(tempfile.gettempdir(), f"feetbrowser_spanblend_{digest}.so")
+    stem = os.path.splitext(os.path.basename(asm_path))[0]
+    out = os.path.join(tempfile.gettempdir(),
+                       f"feetbrowser_{stem}_{digest}.so")
     if not os.path.exists(out):
         tmp = out + ".tmp"
-        subprocess.run([cc, "-shared", "-fPIC", "-o", tmp, _ASM],
+        subprocess.run([cc, "-shared", "-fPIC", "-o", tmp, asm_path],
                        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         os.replace(tmp, out)
-    return out
+    return ctypes.CDLL(out)
 
 
 _lib = None
 if os.path.exists(_ASM):
-    _path = _build_library()
-    if _path is not None:
-        _lib = ctypes.CDLL(_path)
+    _lib = load_assembly(_ASM)
+    if _lib is not None:
         _lib.translate.restype = None
         _lib.translate.argtypes = [ctypes.POINTER(ctypes.c_ubyte)] * 3 \
             + [ctypes.c_size_t]
@@ -71,6 +80,12 @@ if os.path.exists(_ASM):
         _lib.fill_span.restype = None
         _lib.fill_span.argtypes = [ctypes.POINTER(ctypes.c_ubyte),
                                    ctypes.c_ubyte, ctypes.c_size_t]
+        _lib.blit_cov.restype = None
+        _lib.blit_cov.argtypes = [ctypes.POINTER(ctypes.c_ubyte)] * 2 \
+            + [ctypes.c_size_t, ctypes.c_ubyte, ctypes.c_ubyte, ctypes.c_ubyte]
+        _lib.blend_rgba.restype = None
+        _lib.blend_rgba.argtypes = [ctypes.POINTER(ctypes.c_ubyte)] * 2 \
+            + [ctypes.c_size_t]
 
 
 def _as_dst(buf, n):
@@ -111,9 +126,51 @@ def fill_span(dst, value, n):
         dst[i] = value
 
 
+def blit_cov(dst, cov, n, r, g, b):
+    """Composite an n-pixel coverage run in a solid colour into an RGB dst."""
+    if _lib is not None:
+        return _lib.blit_cov(_as_dst(dst, n * 3), _as_src(cov, n), n, r, g, b)
+    for i in range(n):
+        a = cov[i]
+        if a == 0:
+            continue
+        j = i * 3
+        if a >= 255:
+            dst[j] = r
+            dst[j + 1] = g
+            dst[j + 2] = b
+        else:
+            inv = 255 - a
+            dst[j] = (r * a + dst[j] * inv) >> 8
+            dst[j + 1] = (g * a + dst[j + 1] * inv) >> 8
+            dst[j + 2] = (b * a + dst[j + 2] * inv) >> 8
+
+
+def blend_rgba(dst, src, n):
+    """Blend an n-pixel RGBA run over an RGB dst: (srcc*a + dst*(255-a)) >> 8."""
+    if _lib is not None:
+        return _lib.blend_rgba(_as_dst(dst, n * 3), _as_src(src, n * 4), n)
+    for i in range(n):
+        a = src[i * 4 + 3]
+        if a == 0:
+            continue
+        j = i * 3
+        s = i * 4
+        if a >= 255:
+            dst[j] = src[s]
+            dst[j + 1] = src[s + 1]
+            dst[j + 2] = src[s + 2]
+        else:
+            inv = 255 - a
+            dst[j] = (src[s] * a + dst[j] * inv) >> 8
+            dst[j + 1] = (src[s + 1] * a + dst[j + 1] * inv) >> 8
+            dst[j + 2] = (src[s + 2] * a + dst[j + 2] * inv) >> 8
+
+
 def using_assembly():
     """True when the raw assembly kernels are active, not the fallback."""
     return _lib is not None
 
 
-__all__ = ["translate", "blend_rgb", "fill_span", "using_assembly"]
+__all__ = ["translate", "blend_rgb", "fill_span", "blit_cov", "blend_rgba",
+           "using_assembly"]

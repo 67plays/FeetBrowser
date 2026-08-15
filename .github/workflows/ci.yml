@@ -92,6 +92,9 @@ jobs:
       - name: Assembly span kernels
         run: $PY tests/test_asmblend.py
 
+      - name: Assembly image-codec kernels
+        run: $PY tests/test_asmops.py
+
       # The check this whole file was rebuilt for. A page with text, a PNG,
       # a GIF, a background and a border is fetched from a local server and
       # rendered, and then the pixels are counted: an image that stops

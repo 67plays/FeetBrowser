@@ -983,6 +983,53 @@ def test_js_window_environment_and_mutation():
     eq(g["iw"], 1000, "innerWidth matches browser WIDTH")
 
 
+def test_js_img_src_and_anchor_href_are_stored_as_attributes():
+    """`img.src = ...` and `a.href = ...` land in the attribute dictionary,
+    where js_get reads them from and layout looks images up by.
+
+    Script-created banners are built exactly this way -- createElement('img'),
+    set .src, appendChild -- and a write that went nowhere left every one of
+    them a bare <img> that rendered as "[img]". The fetch half of the fix (a
+    JS-created image actually loading) is covered in test_render.
+    """
+    import base64
+    import struct
+    import zlib as _z
+
+    def chunk(tag, data):
+        c = struct.pack(">I", len(data)) + tag + data
+        return c + struct.pack(">I", _z.crc32(tag + data))
+
+    def png(w, h):
+        rows = b"".join(b"\x00" + b"\xff\x00\x00" * w for _ in range(h))
+        raw = b"\x89PNG\r\n\x1a\n"
+        raw += chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+        raw += chunk(b"IDAT", _z.compress(rows))
+        raw += chunk(b"IEND", b"")
+        return raw
+
+    src = "data:image/png;base64," + base64.b64encode(png(2, 2)).decode()
+    tab = _make_tab(
+        '<div id="a"></div>'
+        '<script>'
+        'var img = document.createElement("img");'
+        'img.src = "' + src + '";'
+        'var a = document.createElement("a");'
+        'a.href = "/banners/ipv6.gif";'
+        'a.appendChild(img);'
+        'document.getElementById("a").appendChild(a);'
+        'window.__src = img.getAttribute("src");'
+        'window.__href = a.getAttribute("href");'
+        '</script>')
+    eq(tab.js_logs, [], "no js errors")
+    g = tab._js_interp.globals
+    eq(g["__src"], src, "img.src stored as an attribute")
+    eq(g["__href"], "/banners/ipv6.gif", "a.href stored as an attribute")
+    imgs = [n for n in tree_to_list(tab.nodes, [])
+            if isinstance(n, Element) and n.tag == "img"]
+    eq(imgs[0].attributes.get("src"), src, "DOM node carries the img src")
+
+
 def test_js_document_fragment():
     tab = _make_tab(
         '<div id="a"></div>'
