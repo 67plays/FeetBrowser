@@ -7,13 +7,14 @@ C     place and each edge sees the results of the edges before it, which
 C     is not an implementation shortcut -- it is what 8.7 specifies, and
 C     filtering into a copy would give different pixels.
 C
-C     Intra pictures make the boundary strength trivial.  8.7.2.1 gives
-C     bS = 4 when either side is intra and the edge is a macroblock edge,
-C     and bS = 3 when either side is intra otherwise; in an I picture
-C     every macroblock is intra, so the strength is 4 on the outside of a
-C     macroblock and 3 inside it, with no motion vectors or coefficient
-C     counts to consult.  When P slices arrive this is the routine that
-C     grows a real bS derivation.
+C     The boundary strength is where inter prediction shows up in this
+C     file.  In an I picture it is trivial -- 4 on the outside of a
+C     macroblock, 3 inside it, because every macroblock is intra.  In a P
+C     picture the strength varies along a single edge, so each edge is
+C     filtered as four groups of four lines rather than as sixteen lines
+C     with one strength, and each group asks about the two 4x4 blocks it
+C     separates: their coefficients, the pictures they predicted from,
+C     and how far apart their vectors are.
 
       SUBROUTINE H2DBLK
       IMPLICIT NONE
@@ -143,12 +144,56 @@ C     Where the area is not flat it falls back to two samples.
       RETURN
       END
 
+C     8.7.2.1, for a frame-coded P or I picture with one reference list.
+C     A and NB are the macroblocks on the q and p sides; MBEDG says the
+C     edge between them is a macroblock edge; the four block coordinates
+C     name the 4x4 block on each side, in raster order within its own
+C     macroblock.
+C
+C     MRPI and not MREF: two slices of one picture can reach the same
+C     reference picture through different indices, and 8.7.2.1 asks
+C     whether the pictures are the same, not whether the numbers are.
+      SUBROUTINE H2BS(A, NB, MBEDG, PBX, PBY, QBX, QBY, BS)
+      IMPLICIT NONE
+      INCLUDE 'h264com.inc'
+      INTEGER A, NB, MBEDG, PBX, PBY, QBX, QBY, BS
+      INTEGER PI, QI, PB, QB, PQ, QQ
+      BS = 0
+      IF (MINT(NB + 1) .NE. 0 .OR. MINT(A + 1) .NE. 0) THEN
+         BS = 3
+         IF (MBEDG .NE. 0) BS = 4
+         RETURN
+      END IF
+C     With the 8x8 transform every 4x4 block of an 8x8 carries that
+C     block's count, so this one test covers both transform sizes.
+      PB = ZORD(PBX, PBY) + 1
+      QB = ZORD(QBX, QBY) + 1
+      IF (MNZ(PB, NB + 1) .GT. 0 .OR. MNZ(QB, A + 1) .GT. 0) THEN
+         BS = 2
+         RETURN
+      END IF
+      PI = 1 + PBX + 4 * PBY
+      QI = 1 + QBX + 4 * QBY
+      PQ = 1 + PBX / 2 + 2 * (PBY / 2)
+      QQ = 1 + QBX / 2 + 2 * (QBY / 2)
+      IF (MRPI(PQ, NB + 1) .NE. MRPI(QQ, A + 1)) THEN
+         BS = 1
+         RETURN
+      END IF
+C     One full luma sample of disagreement, which is four quarter-sample
+C     units, is where a seam becomes visible.
+      IF (ABS(MMVX(PI, NB + 1) - MMVX(QI, A + 1)) .GE. 4) BS = 1
+      IF (ABS(MMVY(PI, NB + 1) - MMVY(QI, A + 1)) .GE. 4) BS = 1
+      RETURN
+      END
+
 C     All the edges of one macroblock.
       SUBROUTINE H2DBMB(A)
       IMPLICIT NONE
       INCLUDE 'h264com.inc'
       INTEGER A
       INTEGER MX, MY, E, BS, NB, X, Y, IA, IB, LEFT, TOP, SC, T8
+      INTEGER G, ME, PBX, PBY, LE
       MX = MOD(A, MBW)
       MY = A / MBW
       IF (MDBI(A + 1) .EQ. 1) RETURN
@@ -174,71 +219,99 @@ C     or the slice asked for its own edges to be left alone.
 C     Vertical edges, left to right.  With an 8x8 transform the two
 C     edges at four and twelve are inside a transform block and are not
 C     filtered at all.
-      DO 10 E = 0, 3
-         IF (T8 .NE. 0 .AND. MOD(E, 2) .NE. 0) GOTO 10
+      DO 15 E = 0, 3
+         IF (T8 .NE. 0 .AND. MOD(E, 2) .NE. 0) GOTO 15
          IF (E .EQ. 0) THEN
-            IF (LEFT .EQ. 0) GOTO 10
+            IF (LEFT .EQ. 0) GOTO 15
             NB = A - 1
-            BS = 4
+            ME = 1
+            PBX = 3
          ELSE
             NB = A
-            BS = 3
+            ME = 0
+            PBX = E - 1
          END IF
          CALL H2QPI(A, NB, 0, IA, IB)
          X = MX * 16 + E * 4
-         CALL H2EDG(PY, (MY * 16) * MXW + X + 1, 1, MXW, 16,
-     +              BS, IA, IB, 0)
-   10 CONTINUE
-      DO 20 E = 0, 1
+         DO 10 G = 0, 3
+            CALL H2BS(A, NB, ME, PBX, G, E, G, BS)
+            IF (BS .EQ. 0) GOTO 10
+            CALL H2EDG(PY, (MY * 16 + 4 * G) * MXW + X + 1, 1, MXW, 4,
+     +                 BS, IA, IB, 0)
+   10    CONTINUE
+   15 CONTINUE
+C     Chroma reuses the luma strengths: a chroma edge is a luma edge seen
+C     at half the resolution, so two chroma lines share one luma group.
+      DO 25 E = 0, 1
+         LE = 2 * E
          IF (E .EQ. 0) THEN
-            IF (LEFT .EQ. 0) GOTO 20
+            IF (LEFT .EQ. 0) GOTO 25
             NB = A - 1
-            BS = 4
+            ME = 1
+            PBX = 3
          ELSE
             NB = A
-            BS = 3
+            ME = 0
+            PBX = LE - 1
          END IF
          X = MX * 8 + E * 4
-         CALL H2QPI(A, NB, 1, IA, IB)
-         CALL H2EDG(PU, (MY * 8) * SC + X + 1, 1, SC, 8,
-     +              BS, IA, IB, 1)
-         CALL H2QPI(A, NB, 2, IA, IB)
-         CALL H2EDG(PV, (MY * 8) * SC + X + 1, 1, SC, 8,
-     +              BS, IA, IB, 1)
-   20 CONTINUE
+         DO 20 G = 0, 3
+            CALL H2BS(A, NB, ME, PBX, G, LE, G, BS)
+            IF (BS .EQ. 0) GOTO 20
+            CALL H2QPI(A, NB, 1, IA, IB)
+            CALL H2EDG(PU, (MY * 8 + 2 * G) * SC + X + 1, 1, SC, 2,
+     +                 BS, IA, IB, 1)
+            CALL H2QPI(A, NB, 2, IA, IB)
+            CALL H2EDG(PV, (MY * 8 + 2 * G) * SC + X + 1, 1, SC, 2,
+     +                 BS, IA, IB, 1)
+   20    CONTINUE
+   25 CONTINUE
 
 C     Horizontal edges, top to bottom.
-      DO 30 E = 0, 3
-         IF (T8 .NE. 0 .AND. MOD(E, 2) .NE. 0) GOTO 30
+      DO 35 E = 0, 3
+         IF (T8 .NE. 0 .AND. MOD(E, 2) .NE. 0) GOTO 35
          IF (E .EQ. 0) THEN
-            IF (TOP .EQ. 0) GOTO 30
+            IF (TOP .EQ. 0) GOTO 35
             NB = A - MBW
-            BS = 4
+            ME = 1
+            PBY = 3
          ELSE
             NB = A
-            BS = 3
+            ME = 0
+            PBY = E - 1
          END IF
          CALL H2QPI(A, NB, 0, IA, IB)
          Y = MY * 16 + E * 4
-         CALL H2EDG(PY, Y * MXW + MX * 16 + 1, MXW, 1, 16,
-     +              BS, IA, IB, 0)
-   30 CONTINUE
-      DO 40 E = 0, 1
+         DO 30 G = 0, 3
+            CALL H2BS(A, NB, ME, G, PBY, G, E, BS)
+            IF (BS .EQ. 0) GOTO 30
+            CALL H2EDG(PY, Y * MXW + MX * 16 + 4 * G + 1, MXW, 1, 4,
+     +                 BS, IA, IB, 0)
+   30    CONTINUE
+   35 CONTINUE
+      DO 45 E = 0, 1
+         LE = 2 * E
          IF (E .EQ. 0) THEN
-            IF (TOP .EQ. 0) GOTO 40
+            IF (TOP .EQ. 0) GOTO 45
             NB = A - MBW
-            BS = 4
+            ME = 1
+            PBY = 3
          ELSE
             NB = A
-            BS = 3
+            ME = 0
+            PBY = LE - 1
          END IF
          Y = MY * 8 + E * 4
-         CALL H2QPI(A, NB, 1, IA, IB)
-         CALL H2EDG(PU, Y * SC + MX * 8 + 1, SC, 1, 8,
-     +              BS, IA, IB, 1)
-         CALL H2QPI(A, NB, 2, IA, IB)
-         CALL H2EDG(PV, Y * SC + MX * 8 + 1, SC, 1, 8,
-     +              BS, IA, IB, 1)
-   40 CONTINUE
+         DO 40 G = 0, 3
+            CALL H2BS(A, NB, ME, G, PBY, G, LE, BS)
+            IF (BS .EQ. 0) GOTO 40
+            CALL H2QPI(A, NB, 1, IA, IB)
+            CALL H2EDG(PU, Y * SC + MX * 8 + 2 * G + 1, SC, 1, 2,
+     +                 BS, IA, IB, 1)
+            CALL H2QPI(A, NB, 2, IA, IB)
+            CALL H2EDG(PV, Y * SC + MX * 8 + 2 * G + 1, SC, 1, 2,
+     +                 BS, IA, IB, 1)
+   40    CONTINUE
+   45 CONTINUE
       RETURN
       END

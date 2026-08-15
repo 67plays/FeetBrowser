@@ -83,7 +83,7 @@ C     8-bit by definition and say nothing.
             DUMMY = H2SE()
    20    CONTINUE
       END IF
-      DUMMY = H2UE()
+      NUMREF = H2UE()
       DUMMY = H2U1()
       MBW = H2UE() + 1
       MBH = H2UE() + 1
@@ -114,6 +114,19 @@ C     to display the picture rather than how to decode it.
       END IF
       IF (FRMBO .EQ. 0) THEN
          ST = -4
+         RETURN
+      END IF
+C     MaxFrameNum and MaxPicOrderCntLsb, 7-1 and 7-2.  Both are wrapping
+C     moduli rather than sizes, and both are needed by 8.2.1 and 8.2.4.1
+C     on every picture, so they are computed once here.
+      MXFNUM = ISHFT(1, L2FNUM)
+      MXPOCL = ISHFT(1, L2POC)
+      IF (NUMREF .GT. MXREF) THEN
+C     More reference frames than we keep slots for.  Decoding it anyway
+C     would mean predicting from whichever picture had not been evicted
+C     yet, which produces a picture that is wrong in a way that looks
+C     right; MXREF in h264com.inc says what raising this costs.
+         ST = -8
          RETURN
       END IF
       MBH = MBH * (2 - FRMBO)
@@ -169,9 +182,9 @@ C     The picture parameter set.
       ECMODE = H2U1()
       BFPOC = H2U1()
       NSG = H2UE()
+      NRDEF = H2UE() + 1
       DUMMY = H2UE()
-      DUMMY = H2UE()
-      DUMMY = H2U1()
+      WPRED = H2U1()
       DUMMY = H2UN(2)
       PIQP = H2SE() + 26
       DUMMY = H2SE()
@@ -220,6 +233,10 @@ C     the lists reaches back into the sequence-level ones.
       END IF
       IF (PIQP .LT. 0 .OR. PIQP .GT. 51) THEN
          ST = -14
+         RETURN
+      END IF
+      IF (NRDEF .LT. 1 .OR. NRDEF .GT. 32) THEN
+         ST = -15
          RETURN
       END IF
       PPSOK = 1
@@ -430,15 +447,17 @@ C     picture-level matrices at all sends most of them by omission.
       RETURN
       END
 
-C     7.3.3, the slice header, for I slices.  A P or B slice is rejected
-C     here rather than deeper in, because the fields this routine skips
-C     (reference list modification, prediction weights) are exactly the
-C     fields a P slice has and an I slice does not.
+C     7.3.3, the slice header, for I and P slices.
+C
+C     A B, SP or SI slice is rejected as soon as slice_type is known,
+C     because everything after that point in the header is read
+C     conditionally on the slice type and a header parsed under the wrong
+C     assumption does not fail, it succeeds with the wrong numbers.
       SUBROUTINE H2SHDR(NALT, NALR, ST)
       IMPLICIT NONE
       INCLUDE 'h264com.inc'
       INTEGER NALT, NALR, ST
-      INTEGER DUMMY, OP, N, H2U1, H2UN, H2UE, H2SE
+      INTEGER DUMMY, H2U1, H2UN, H2UE, H2SE
       EXTERNAL H2U1, H2UN, H2UE, H2SE
 
       ST = 0
@@ -448,18 +467,27 @@ C     fields a P slice has and an I slice does not.
       END IF
       IDRF = 0
       IF (NALT .EQ. 5) IDRF = 1
+      NALRI = NALR
       SLFMB = H2UE()
       SLTYPE = H2UE()
+C     A slice_type of 5 or more says every slice of this picture has the
+C     same type; the type itself is the low five.
       IF (SLTYPE .GE. 5) SLTYPE = SLTYPE - 5
+      IF (SLTYPE .NE. 0 .AND. SLTYPE .NE. 2) THEN
+         ST = -43
+         RETURN
+      END IF
       DUMMY = H2UE()
       IF (SEPCP .NE. 0) DUMMY = H2UN(2)
-      DUMMY = H2UN(L2FNUM)
+      FRNUM = H2UN(L2FNUM)
 C     frame_mbs_only_flag is 1 or the SPS was already rejected, so there
 C     is no field_pic_flag to read here.
       IF (IDRF .NE. 0) DUMMY = H2UE()
+      POCLSB = 0
+      POCBOT = 0
       IF (POCTYP .EQ. 0) THEN
-         DUMMY = H2UN(L2POC)
-         IF (BFPOC .NE. 0) DUMMY = H2SE()
+         POCLSB = H2UN(L2POC)
+         IF (BFPOC .NE. 0) POCBOT = H2SE()
       ELSE IF (POCTYP .EQ. 1) THEN
 C     delta_pic_order_always_zero_flag lives in the SPS and we did not
 C     keep it, because pic_order_cnt_type 1 does not reach a browser:
@@ -469,30 +497,39 @@ C     0 or 2. Refusing is honest; guessing the field's presence is not.
          RETURN
       END IF
       IF (RPCP .NE. 0) DUMMY = H2UE()
-      IF (SLTYPE .NE. 2) THEN
-         ST = -43
-         RETURN
-      END IF
-      IF (NALR .NE. 0) THEN
-         IF (IDRF .NE. 0) THEN
-            DUMMY = H2U1()
-            DUMMY = H2U1()
+
+      NREF0 = 0
+      NRMOP = 0
+      IF (SLTYPE .EQ. 0) THEN
+         NREF0 = NRDEF
+         IF (H2U1() .NE. 0) NREF0 = H2UE() + 1
+         CALL H2RPLM(ST)
+         IF (ST .NE. 0) RETURN
+         IF (WPRED .NE. 0) THEN
+            CALL H2PWT(ST)
+            IF (ST .NE. 0) RETURN
          ELSE
-            IF (H2U1() .NE. 0) THEN
-               N = 0
-   10          OP = H2UE()
-               N = N + 1
-               IF (OP .EQ. 0 .OR. N .GT. 64 .OR. BITERR .NE. 0)
-     +            GOTO 20
-                  IF (OP .EQ. 1 .OR. OP .EQ. 3) DUMMY = H2UE()
-                  IF (OP .EQ. 2) DUMMY = H2UE()
-                  IF (OP .EQ. 3 .OR. OP .EQ. 6) DUMMY = H2UE()
-                  IF (OP .EQ. 4) DUMMY = H2UE()
-                  GOTO 10
-   20       CONTINUE
-            END IF
+            CALL H2DWT
          END IF
       END IF
+
+      CALL H2DRPM(NALR, ST)
+      IF (ST .NE. 0) RETURN
+
+      CBIDC = 0
+      CMODEL = 0
+      IF (ECMODE .NE. 0 .AND. SLTYPE .NE. 2) THEN
+         CBIDC = H2UE()
+         IF (CBIDC .GT. 2) THEN
+            ST = -48
+            RETURN
+         END IF
+C     9.3.1.1: an I slice has one initialisation table and a P slice
+C     picks between three.  Column 0 holds the first and columns 1 to 3
+C     the others, so the column is the idc plus one.
+         CMODEL = 1 + CBIDC
+      END IF
+
       SLQPY = PIQP + H2SE()
       DBIDC = 0
       ALPHOF = 0
@@ -521,5 +558,154 @@ C     0 or 2. Refusing is honest; guessing the field's presence is not.
          ST = -47
          RETURN
       END IF
+      IF (SLTYPE .EQ. 0 .AND. (NREF0 .LT. 1 .OR. NREF0 .GT. 32)) THEN
+         ST = -49
+         RETURN
+      END IF
       RETURN
+      END
+
+C     7.3.3.1, ref_pic_list_modification.  The commands are recorded and
+C     not obeyed: 8.2.4.3 runs them against a list that does not exist
+C     until the whole header has been read.
+      SUBROUTINE H2RPLM(ST)
+      IMPLICIT NONE
+      INCLUDE 'h264com.inc'
+      INTEGER ST, IDC, N, H2U1, H2UE
+      EXTERNAL H2U1, H2UE
+      ST = 0
+      NRMOP = 0
+      IF (H2U1() .EQ. 0) RETURN
+      N = 0
+   10 IDC = H2UE()
+      IF (IDC .EQ. 3 .OR. BITERR .NE. 0) RETURN
+      IF (IDC .EQ. 2) THEN
+C     A long-term picture, which we never mark and therefore never have.
+         ST = -50
+         RETURN
+      END IF
+      IF (IDC .GT. 3) THEN
+         ST = -50
+         RETURN
+      END IF
+      N = N + 1
+      IF (N .GT. 64) THEN
+         ST = -50
+         RETURN
+      END IF
+      RMOP(N) = IDC
+      RMVAL(N) = H2UE() + 1
+      NRMOP = N
+      GOTO 10
+      END
+
+C     Table 8-2's default weights: a scale of one and no offset, which is
+C     what a slice without a prediction weight table means and what every
+C     reference index the table skips means.
+      SUBROUTINE H2DWT
+      IMPLICIT NONE
+      INCLUDE 'h264com.inc'
+      INTEGER I
+      LOGWL = 0
+      LOGWC = 0
+      DO 10 I = 0, 31
+         WPL(I) = 1
+         WOL(I) = 0
+         WPCB(I) = 1
+         WOCB(I) = 0
+         WPCR(I) = 1
+         WOCR(I) = 0
+   10 CONTINUE
+      RETURN
+      END
+
+C     7.3.3.2, pred_weight_table.  x264 turns weighted P prediction on at
+C     every preset above ultrafast, so this is the common case and not an
+C     exotic one; a decoder that ignored the table would fade every frame
+C     of a stream that used it.
+      SUBROUTINE H2PWT(ST)
+      IMPLICIT NONE
+      INCLUDE 'h264com.inc'
+      INTEGER ST, I, H2U1, H2UE, H2SE
+      EXTERNAL H2U1, H2UE, H2SE
+      ST = 0
+      LOGWL = H2UE()
+      LOGWC = H2UE()
+      IF (LOGWL .GT. 7 .OR. LOGWC .GT. 7) THEN
+         ST = -50
+         RETURN
+      END IF
+      DO 10 I = 0, 31
+         WPL(I) = ISHFT(1, LOGWL)
+         WOL(I) = 0
+         WPCB(I) = ISHFT(1, LOGWC)
+         WOCB(I) = 0
+         WPCR(I) = ISHFT(1, LOGWC)
+         WOCR(I) = 0
+   10 CONTINUE
+      DO 20 I = 0, NREF0 - 1
+         IF (I .GT. 31 .OR. BITERR .NE. 0) THEN
+            ST = -50
+            RETURN
+         END IF
+         IF (H2U1() .NE. 0) THEN
+            WPL(I) = H2SE()
+            WOL(I) = H2SE()
+         END IF
+         IF (H2U1() .NE. 0) THEN
+            WPCB(I) = H2SE()
+            WOCB(I) = H2SE()
+            WPCR(I) = H2SE()
+            WOCR(I) = H2SE()
+         END IF
+   20 CONTINUE
+      RETURN
+      END
+
+C     7.3.3.3, dec_ref_pic_marking.  Long-term references are refused
+C     here by name.  They are not rare because they are hard; they are
+C     rare because no encoder aimed at streaming emits them, and
+C     supporting them would mean a second ordering rule in 8.2.4.1, a
+C     second numbering in 8.2.4.2 and four more marking operations, for
+C     content that does not exist on the web.
+      SUBROUTINE H2DRPM(NALR, ST)
+      IMPLICIT NONE
+      INCLUDE 'h264com.inc'
+      INTEGER NALR, ST, OP, N, DUMMY, H2U1, H2UE
+      EXTERNAL H2U1, H2UE
+      ST = 0
+      ADAPTF = 0
+      NAMOP = 0
+      IF (NALR .EQ. 0) RETURN
+      IF (IDRF .NE. 0) THEN
+         DUMMY = H2U1()
+         IF (H2U1() .NE. 0) THEN
+            ST = -50
+            RETURN
+         END IF
+         RETURN
+      END IF
+      ADAPTF = H2U1()
+      IF (ADAPTF .EQ. 0) RETURN
+      N = 0
+   10 OP = H2UE()
+      IF (OP .EQ. 0 .OR. BITERR .NE. 0) RETURN
+      IF (OP .EQ. 2 .OR. OP .EQ. 3 .OR. OP .EQ. 4 .OR. OP .EQ. 6) THEN
+         ST = -50
+         RETURN
+      END IF
+      IF (OP .GT. 6) THEN
+         ST = -50
+         RETURN
+      END IF
+      N = N + 1
+      IF (N .GT. 64) THEN
+         ST = -50
+         RETURN
+      END IF
+      AMOP(N) = OP
+      AMV(N) = 0
+      IF (OP .EQ. 1) AMV(N) = H2UE() + 1
+      NAMOP = N
+      GOTO 10
       END

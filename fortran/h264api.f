@@ -1,6 +1,29 @@
 C     The outside of the decoder: Annex B framing, and the handful of
 C     C-callable entry points that feetbrowser/h264.py loads with ctypes.
 C
+C     What decodes today: I and P slices, CABAC, 4:2:0 8-bit, progressive,
+C     Baseline, Main and High profile.  Every intra prediction mode, both
+C     transform sizes, scaling matrices, quarter-sample motion
+C     compensation, weighted prediction, up to four reference frames, and
+C     the deblocking filter.
+C
+C     Refused, each by its own status code so that a report says which:
+C     * B, SP and SI slices                                     -43
+C     * CAVLC                                                   -31
+C     * interlace                                                -4
+C     * chroma other than 4:2:0, or more than 8 bits             -3
+C     * slice groups                                            -13
+C     * pic_order_cnt_type 1                                    -42
+C     * long-term references, and the four marking operations
+C       and the one reordering operation that name them         -50
+C     * more reference frames than MXREF                         -8
+C
+C     H2DECD keeps its state across calls, because a P slice predicts
+C     from the picture the previous call decoded.  Calling h264_reset
+C     between two frames of one stream does not slow the decoder down, it
+C     breaks it; the caller resets when the stream changes and not
+C     otherwise.
+C
 C     Everything crossing the boundary is an INTEGER or a byte array
 C     passed by reference.  Nothing is returned by value, nothing is a
 C     struct, and no memory is allocated on this side and freed on the
@@ -100,7 +123,7 @@ C     misreads it.
       SUBROUTINE H2VERS(V) BIND(C, NAME='h264_version')
       IMPLICIT NONE
       INTEGER V
-      V = 2
+      V = 3
       RETURN
       END
 
@@ -118,6 +141,8 @@ C     Throw away all decoder state, including the parameter sets.
       OUTH = 0
       SLID = 0
       BITERR = 0
+      CALL H2DCLR
+      CALL H2PCLR
       RETURN
       END
 
@@ -180,15 +205,21 @@ C     byte is never zero and this trim can never eat real payload.
       IF (NT .EQ. 7 .OR. NT .EQ. 8 .OR. NT .EQ. 1 .OR. NT .EQ. 5) THEN
          CALL H2LOAD(BUF, S + 1, E, ST)
          IF (ST .NE. 0) RETURN
-C     Trim the trailing bits for every NAL we are going to read, not just
-C     for slices.  The picture parameter set ends in an optional block
-C     guarded by more_rbsp_data(), and without the trim that predicate
-C     mistakes the rbsp_stop_one_bit for payload: a Baseline or Main PPS,
-C     which has no such block, then reads a transform_size_8x8 flag off
-C     the end of itself and fails.  A High PPS happens to have the fields
-C     the predicate promised, which is why this went unnoticed for as
-C     long as every test stream was High.
-         CALL H2TRIM
+C     Parameter sets get their trailing bits trimmed; slices must not.
+C     The picture parameter set ends in an optional block guarded by
+C     more_rbsp_data(), and without the trim that predicate mistakes the
+C     rbsp_stop_one_bit for payload: a Baseline or Main PPS, which has no
+C     such block, then reads a transform_size_8x8 flag off the end of
+C     itself and fails.
+C
+C     A CABAC slice is the opposite case.  9.3.4.6 flushes the encoder by
+C     writing the low bits of codILow and then a one, and that one is the
+C     rbsp_stop_one_bit -- the stop bit is the last bit of the arithmetic
+C     codeword, not framing after it.  Trimming it away feeds the
+C     decoder a zero where the encoder wrote a one, and the final
+C     end_of_slice_flag reads as "more data" on the slices where the
+C     bit happened to matter.
+         IF (NT .EQ. 7 .OR. NT .EQ. 8) CALL H2TRIM
       END IF
 
       IF (NT .EQ. 7) THEN
@@ -209,12 +240,28 @@ C     long as every test stream was High.
          SLID = SLID + 1
          CALL H2SHDR(NT, NR, ST)
          IF (ST .NE. 0) RETURN
+         IF (SLID .EQ. 1) THEN
+C     8.2.1 once per picture, not once per slice: every slice of a
+C     picture carries the same frame number and order count, and the
+C     count's carried-forward high bits would be advanced twice by a
+C     second slice that recomputed them.
+            CALL H2CPOC
+            CURID = NXTID
+            NXTID = NXTID + 1
+         END IF
          CALL H2WSCL
          IF (ECMODE .EQ. 0) THEN
-C     CAVLC.  Phase 1 decodes CABAC only; saying so here is better than
-C     decoding the slice header and then producing a grey picture.
+C     CAVLC.  This decoder reads CABAC only; saying so here is better
+C     than decoding the slice header and then producing a grey picture.
             ST = -31
             RETURN
+         END IF
+         RL0N = 0
+         IF (SLTYPE .EQ. 0) THEN
+C     8.2.4, per slice and not per picture: two P slices of one picture
+C     may reorder the same set of references differently.
+            CALL H2RLST(ST)
+            IF (ST .NE. 0) RETURN
          END IF
          CALL H2ALGN
          CALL H2CINI(SLQPY)
@@ -231,6 +278,10 @@ C     decoding the slice header and then producing a grey picture.
          RETURN
       END IF
       CALL H2DBLK
+C     8.2.5 after the filter, because the picture later pictures predict
+C     from is the filtered one.
+      CALL H2MARK(ST)
+      IF (ST .NE. 0) RETURN
       ST = 0
       RETURN
       END

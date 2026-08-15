@@ -15,16 +15,25 @@ Fortran does it at 120 million. The rest of the codec followed the
 entropy layer across the boundary because splitting a decoder in half at
 the macroblock level would mean marshalling every coefficient.
 
-What decodes today: I-frame-only streams, CABAC-coded, 4:2:0 8-bit,
-Baseline, Main and High profile. Every intra prediction mode, both
-transform sizes, scaling matrices, the deblocking filter. Not P slices,
-not B slices, not CAVLC, not interlace -- see the module docstring in
+What decodes today: I and P slices, CABAC-coded, 4:2:0 8-bit, Baseline,
+Main and High profile. Every intra prediction mode, both transform sizes,
+scaling matrices, quarter-sample motion compensation with weighted
+prediction, up to four reference frames, the deblocking filter. Not B
+slices, not CAVLC, not interlace -- see the module docstring in
 ``fortran/h264api.f`` for the status codes each of those produces.
 
 The library holds one decoder's worth of state in COMMON blocks, which
 is to say a single global one. ``_LOCK`` is what stops two ``<video>``
 elements from interleaving their macroblocks; it is not an optimisation
 to remove later, it is load-bearing.
+
+P slices made that state persistent, which makes it sharper still: a
+frame is now decoded against the pictures the previous calls left behind,
+so a second ``Decoder`` touching the library does not merely slow the
+first one down, it invalidates it. ``_owner`` tracks whose pictures are
+in the buffer, and a decoder that finds it is not the owner replays its
+own stream from the last IDR before decoding. In the ordinary case of one
+video playing there is no replay and no copy.
 """
 
 import ctypes
@@ -43,18 +52,23 @@ _FORTRAN = os.path.join(os.path.dirname(_HERE), "fortran")
 # only COMMON blocks and an INCLUDE -- but a fixed order keeps the cache key
 # stable across filesystems that list a directory in their own order.
 _SOURCES = ("h264ctx.f", "h264tab.f", "h264bits.f", "h264ps.f", "h264mb.f",
-            "h264pred.f", "h264rec.f", "h264dbl.f", "h264api.f")
+            "h264pred.f", "h264rec.f", "h264mc.f", "h264dpb.f", "h264dbl.f",
+            "h264api.f")
 _INCLUDES = ("h264com.inc",)
 
 # The version H2VERS reports. A library left in the cache by an older
 # checkout has the old entry points and the old meanings, and calling it
 # would be worse than not having one.
-_ABI = 2
+_ABI = 3
 
 _LOCK = threading.Lock()
 _lib = None
 _load_error = None
 _loaded = False
+
+# Which Decoder's pictures are in the library's decoded picture buffer.
+# Guarded by _LOCK, like the buffer itself.
+_owner = None
 
 
 class H264Error(Exception):
@@ -253,9 +267,10 @@ def parameter_sets_from_avcc(avcc):
 # -- the decoder -------------------------------------------------------------
 
 # What the Fortran returns. The numbers are grouped by the routine that
-# produces them so that a bug report says where to look: -1..-7 the sequence
-# parameter set, -11..-14 the picture parameter set, -20..-22 the slice data,
-# -30..-33 the framing, -41..-47 the slice header.
+# produces them so that a bug report says where to look: -1..-8 the sequence
+# parameter set, -11..-15 the picture parameter set, -20..-22 the slice data,
+# -30..-33 the framing, -41..-50 the slice header, -51..-54 the decoded
+# picture buffer and inter prediction.
 _STATUS = {
     -1: "the SPS has more than 255 poc reference frames",
     -2: "the SPS ran off the end of its own NAL unit",
@@ -264,10 +279,12 @@ _STATUS = {
     -5: "the SPS gives the picture no size",
     -6: "the picture is larger than this decoder's fixed buffers",
     -7: "the SPS crops the picture away to nothing",
+    -8: "the stream asks for more reference frames than this decoder keeps",
     -11: "a PPS arrived before any SPS",
     -12: "the PPS ran off the end of its own NAL unit",
     -13: "slice groups (FMO), which no browser stream uses",
     -14: "the PPS gives an impossible pic_init_qp",
+    -15: "the PPS gives an impossible default reference list length",
     -20: "the slice claims more macroblocks than the picture has",
     -21: "the arithmetic decoder lost sync with the stream",
     -22: "a macroblock ran off the end of the slice",
@@ -277,11 +294,18 @@ _STATUS = {
     -33: "the NAL unit is larger than the decoder's buffer",
     -41: "a slice arrived before its SPS and PPS",
     -42: "pic_order_cnt_type 1, which no browser stream uses",
-    -43: "a P or B slice -- this decoder does I frames only",
+    -43: "a B, SP or SI slice -- this decoder does I and P slices",
     -44: "the slice header ran off the end of its own NAL unit",
     -45: "the slice header gives an impossible quantiser",
     -46: "the slice starts past the end of the picture",
     -47: "an unknown deblocking filter mode",
+    -48: "an unknown cabac_init_idc",
+    -49: "the slice gives an impossible reference list length",
+    -50: "long-term references, which this decoder does not implement",
+    -51: "a P slice with no reference picture to predict from",
+    -52: "the slice reorders in a picture that is not in the buffer",
+    -53: "the decoded picture buffer has no free slot",
+    -54: "a partition points at a reference index with no picture behind it",
 }
 
 
@@ -289,14 +313,102 @@ def _explain(status):
     return _STATUS.get(status, "decoder status %d" % status)
 
 
+def _nal_types(data):
+    """The nal_unit_type of every NAL unit in some Annex B bytes.
+
+    Only the header byte after each start code is read, which is all that
+    is needed to spot an IDR; the payload is the Fortran's business.
+    """
+    out = []
+    pos = data.find(b"\x00\x00\x01")
+    while pos >= 0 and pos + 3 < len(data):
+        out.append(data[pos + 3] & 0x1F)
+        pos = data.find(b"\x00\x00\x01", pos + 3)
+    return out
+
+
+def _unescape(chunk):
+    """7.4.1.1 in the small: drop the emulation prevention bytes.
+
+    Only ever called on the first few bytes of a slice, where an inserted
+    0x03 is vanishingly unlikely -- but "unlikely" is how a decoder reads a
+    field one bit out of place on somebody else's file.
+    """
+    out = bytearray()
+    zeros = 0
+    for byte in chunk:
+        if zeros >= 2 and byte == 3:
+            zeros = 0
+            continue
+        out.append(byte)
+        zeros = zeros + 1 if byte == 0 else 0
+    return bytes(out)
+
+
+def _ue(bits, pos):
+    """ue(v) at bit `pos`, returning the value and the bit after it."""
+    zeros = 0
+    while pos < len(bits) * 8 and not (bits[pos // 8] >> (7 - pos % 8)) & 1:
+        zeros += 1
+        pos += 1
+        if zeros > 31:
+            raise ValueError("exp-Golomb code with no end")
+    pos += 1
+    value = (1 << zeros) - 1
+    for _ in range(zeros):
+        if pos >= len(bits) * 8:
+            raise ValueError("exp-Golomb code past the end")
+        value += ((bits[pos // 8] >> (7 - pos % 8)) & 1) << (zeros - 1)
+        zeros -= 1
+        pos += 1
+    return value, pos
+
+
+def slice_types(data):
+    """Which kinds of slice some Annex B bytes contain, as a set of the
+    slice_type values of 7.4.3 reduced modulo 5: 0 P, 1 B, 2 I, 3 SP, 4 SI.
+
+    This exists so that a container can refuse a file it cannot finish
+    before it puts a poster frame on screen. slice_type is the second
+    exp-Golomb field of the slice header, so reading it costs a couple of
+    bytes per NAL and no arithmetic decoding at all -- which is the point:
+    trial-decoding cannot tell you that frame 400 is a B frame, and a video
+    that stops a quarter of the way through is worse than one that never
+    started. Malformed headers are simply not reported; the Fortran is the
+    thing that gets to have opinions about those.
+    """
+    found = set()
+    pos = data.find(b"\x00\x00\x01")
+    while pos >= 0:
+        nxt = data.find(b"\x00\x00\x01", pos + 3)
+        if pos + 3 < len(data) and (data[pos + 3] & 0x1F) in (1, 2, 5):
+            end = len(data) if nxt < 0 else nxt
+            head = _unescape(data[pos + 4:min(end, pos + 4 + 16)])
+            try:
+                _first_mb, at = _ue(head, 0)
+                kind, _at = _ue(head, at)
+            except (ValueError, IndexError):
+                kind = None
+            if kind is not None and kind < 10:
+                found.add(kind % 5)
+        pos = nxt
+    return found
+
+
 class Decoder:
     """One H.264 stream, decoded a frame at a time.
 
     Every instance shares the library's single set of COMMON blocks, so
-    every call takes ``_LOCK`` and re-feeds the parameter sets. That is the
-    price of a decoder whose state is static storage, and it is paid here
-    rather than in the caller: two ``<video>`` elements on one page must
-    not be able to corrupt each other, however slowly they play.
+    every call takes ``_LOCK``. That is the price of a decoder whose state
+    is static storage, and it is paid here rather than in the caller: two
+    ``<video>`` elements on one page must not be able to corrupt each
+    other, however slowly they play.
+
+    ``_since_idr`` is what makes sharing safe now that frames depend on the
+    frames before them. It holds the access units decoded since the last
+    IDR, and is replayed when another decoder has been at the library in
+    between. An IDR clears it, so it is bounded by the stream's keyframe
+    interval rather than by its length.
     """
 
     def __init__(self, extradata=b""):
@@ -306,6 +418,7 @@ class Decoder:
         self._lib = lib
         self._length_size = 0
         self._headers = b""
+        self._since_idr = []
         if extradata and extradata[:1] == b"\x01":
             self._headers, self._length_size = parameter_sets_from_avcc(
                 extradata)
@@ -315,8 +428,58 @@ class Decoder:
             self._headers = extradata
 
     def reset(self):
-        """Forget everything but the parameter sets, which come from the
-        container and not from the stream."""
+        """Forget every decoded picture. The parameter sets come from the
+        container rather than from the stream and are kept."""
+        global _owner
+        with _LOCK:
+            self._since_idr = []
+            if _owner is self:
+                self._lib.h264_reset()
+                _owner = None
+
+    def _framed(self, packet):
+        if self._length_size:
+            return self._headers + annexb_from_avcc(packet, self._length_size)
+        if packet[:3] == b"\x00\x00\x01" or packet[:4] == _START:
+            return self._headers + bytes(packet)
+        raise H264Error("this packet is neither Annex B nor a known "
+                        "MP4 sample")
+
+    def _feed(self, data):
+        """One access unit through the Fortran. _LOCK is already held."""
+        lib = self._lib
+        buf = (ctypes.c_char * len(data)).from_buffer_copy(data)
+        size = ctypes.c_int(len(data))
+        status = ctypes.c_int(0)
+        lib.h264_decode(buf, ctypes.byref(size), ctypes.byref(status))
+        if status.value != 0:
+            raise H264Error(_explain(status.value))
+
+    def _decode(self, packet):
+        """Decode one access unit, leaving the picture in the library.
+
+        Returns nothing; the caller reads the picture out in whichever
+        colour space it wants while still holding the lock.
+        """
+        global _owner
+        data = self._framed(packet)
+        if 5 in _nal_types(data):
+            self._since_idr = []
+        if _owner is not self:
+            self._lib.h264_reset()
+            _owner = None
+            for earlier in self._since_idr:
+                self._feed(earlier)
+            _owner = self
+        try:
+            self._feed(data)
+        except H264Error:
+            # The library now holds a half-decoded picture that no longer
+            # matches this decoder's history. Disown it so that the next
+            # call rebuilds the buffer instead of predicting from wreckage.
+            _owner = None
+            raise
+        self._since_idr.append(data)
 
     def decode(self, packet):
         """One access unit in, ``(width, height, rgba)`` out.
@@ -324,24 +487,12 @@ class Decoder:
         ``packet`` is Annex B bytes, or an MP4 sample when the ``avcC`` this
         decoder was built with said how long its length prefixes are.
         """
-        if self._length_size:
-            data = self._headers + annexb_from_avcc(packet, self._length_size)
-        elif packet[:3] == b"\x00\x00\x01" or packet[:4] == _START:
-            data = self._headers + bytes(packet)
-        else:
-            raise H264Error("this packet is neither Annex B nor a known "
-                            "MP4 sample")
         lib = self._lib
         with _LOCK:
-            lib.h264_reset()
-            buf = (ctypes.c_char * len(data)).from_buffer_copy(data)
-            size = ctypes.c_int(len(data))
-            status = ctypes.c_int(0)
-            lib.h264_decode(buf, ctypes.byref(size), ctypes.byref(status))
-            if status.value != 0:
-                raise H264Error(_explain(status.value))
+            self._decode(packet)
             width = ctypes.c_int(0)
             height = ctypes.c_int(0)
+            status = ctypes.c_int(0)
             lib.h264_dims(ctypes.byref(width), ctypes.byref(height))
             if width.value < 1 or height.value < 1:
                 raise H264Error("the decoder produced no picture")
@@ -361,21 +512,12 @@ class Decoder:
         against a reference decoder's RGB output would be a disagreement
         about colour, not about decoding.
         """
-        if self._length_size:
-            data = self._headers + annexb_from_avcc(packet, self._length_size)
-        else:
-            data = self._headers + bytes(packet)
         lib = self._lib
         with _LOCK:
-            lib.h264_reset()
-            buf = (ctypes.c_char * len(data)).from_buffer_copy(data)
-            size = ctypes.c_int(len(data))
-            status = ctypes.c_int(0)
-            lib.h264_decode(buf, ctypes.byref(size), ctypes.byref(status))
-            if status.value != 0:
-                raise H264Error(_explain(status.value))
+            self._decode(packet)
             width = ctypes.c_int(0)
             height = ctypes.c_int(0)
+            status = ctypes.c_int(0)
             lib.h264_dims(ctypes.byref(width), ctypes.byref(height))
             need = width.value * height.value * 3 // 2
             if need < 6:
@@ -402,7 +544,7 @@ def probe(extradata=b""):
 
 
 __all__ = ["Decoder", "H264Error", "available", "unavailable_reason", "probe",
-           "annexb_from_avcc", "parameter_sets_from_avcc"]
+           "annexb_from_avcc", "parameter_sets_from_avcc", "slice_types"]
 
 if __name__ == "__main__":                      # pragma: no cover
     # Decode a .264 or .mp4 named on the command line and say what came out.

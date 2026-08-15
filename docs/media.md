@@ -5,9 +5,9 @@ real file, and presents them through the existing rasteriser against a real
 clock, with play, pause and a scrubber. Motion JPEG plays (in AVI, in
 QuickTime, and as a bare stream of JPEGs), as do uncompressed and RLE AVI and
 QuickTime's `raw ` and `png `. H.264 plays as far as its decoder goes, which
-is every frame of an I-frame-only stream and nothing else yet; see
-[H.264, in Fortran](#h264-in-fortran). Everything else is identified by name
-and refused in public. There is no audio at all.
+is every frame of a stream of I and P slices -- an ordinary web MP4 -- and
+not one with B slices; see [H.264, in Fortran](#h264-in-fortran). Everything
+else is identified by name and refused in public. There is no audio at all.
 
 Read this before adding a codec. The point of writing it down is that the
 hard parts here are not the codec; they are the seams the codec plugs into,
@@ -197,20 +197,51 @@ Navigating away or closing a tab stops the decode threads.
 
 The sections above say twice that H.264 is a multi-month project. They were
 written before anyone started it, and they were right about the size; what
-they got wrong was that the size is a reason not to begin. Phase one is in
-`fortran/`, wrapped by `feetbrowser/h264.py`, and it decodes I frames to the
-exact pixels a reference decoder produces.
+they got wrong was that the size is a reason not to begin. It is in
+`fortran/`, wrapped by `feetbrowser/h264.py`, and it decodes I and P slices
+to the exact pixels a reference decoder produces.
 
 **Exactly what it does.** Annex B and AVCC framing with emulation-prevention
 removal; SPS and PPS including the High-profile block and both scaling-matrix
-fall-back rules; I-slice headers; CABAC, which is the whole of clause 9.3:
-context initialisation from the (m, n) tables, decode-decision,
+fall-back rules; I- and P-slice headers, including the reference list
+modification and weighted prediction tables; CABAC, which is the whole of
+clause 9.3: context initialisation from the (m, n) tables, decode-decision,
 decode-bypass, decode-terminate and renormalisation; I macroblocks in all of
 Intra_4x4, Intra_8x8, Intra_16x16 and the four chroma modes; residual
 decoding with the 4x4 and 8x8 integer inverse transforms and the chroma DC
 Hadamard; the deblocking filter; and the colour conversion out to RGBA. There
 is no CAVLC. A `-coder 0` stream is refused by name rather than decoded
 wrongly, which is the same contract every other unplayable file here gets.
+
+**And what inter prediction added.** A decoded picture buffer; picture order
+count (8.2.1) for types 0 and 2; reference picture list initialisation and
+reordering (8.2.4); sliding-window and MMCO reference marking (8.2.5); the
+median motion vector predictor with the 16x8 and 8x16 directional cases
+(8.4.1.3) and P_Skip (8.4.1.1); the six-tap quarter-sample luma interpolator
+(8.4.2.2.1) and the eighth-sample bilinear chroma one (8.4.2.2.2), both
+clamping at the picture edge; weighted prediction (8.4.2.3); the four P
+macroblock types with their sub-macroblock partitions; the CABAC contexts for
+`mb_skip_flag`, `ref_idx_l0`, `mvd_l0` and `sub_mb_type`; and a boundary
+strength derivation (8.7.2.1) that now compares motion vectors and reference
+*pictures* rather than reference indices, which is not the same thing the
+moment two slices order their lists differently.
+
+**Four reference frames, not sixteen.** The buffer is dimensioned `MXREF =
+4`, and a stream whose SPS asks for more is refused rather than decoded
+wrongly. The level limit is 16, but there is no allocator here -- the planes
+are `COMMON` and are sized at compile time for 1920x1088 -- so the cap is a
+real trade of memory against reach. Sixteen reference frames is 50 MB of
+static storage carried by every process whether it plays a video or not, and
+nothing on the web needs it: x264's default is three, its `--preset slow` is
+four, and the hardware encoders in phones and cameras use one or two. Four
+covers all of those, and the failure mode for the rest is a named refusal
+rather than a wrong picture. Raising it is one number.
+
+The reference planes are `INTEGER*1` even though the working picture is
+`INTEGER`. A reference sample is a byte and is only ever read back through
+one masking accessor, so a reference frame costs 3.1 MB against the working
+picture's 12.5, and all four of them together cost what the one picture the
+decoder is building costs.
 
 **Why Fortran.** Because the hot loop of a CABAC decoder is a handful of
 integer comparisons, table lookups and shifts in a dependent chain, and that
@@ -222,7 +253,7 @@ the only compiled language in this tree that arrives with no crates, no
 package manager and no lock file, which is the standing constraint here.
 
 **How it is built and loaded.** `h264.py` finds a `gfortran`, compiles the
-nine sources into a shared library in the temporary directory under a name
+eleven sources into a shared library in the temporary directory under a name
 keyed on a hash of those sources, and loads it with `ctypes`. The hash is
 what makes the cache safe: edit a `.f` file and the next run builds a
 different library rather than loading the old one. Nothing about this is
@@ -239,20 +270,29 @@ decoder in the process no matter how many `Decoder` objects Python holds. The
 bearing rather than defensive: the browser decodes video on a worker thread
 per element.
 
-**What it is not.** No P slices, no B slices, no motion compensation, no
-reference picture list, no weighted prediction, no interlaced coding in any
-of its forms. Those are not stubbed or half-written; the slice header parser
-sees a slice type it does not handle and refuses the stream.
+**What it is not.** No B slices, no CAVLC, no SP or SI slices, no interlaced
+coding in any of its forms, no long-term reference pictures, and no picture
+order count type 1. Those are not stubbed or half-written: the parser sees
+what it does not handle and refuses the stream by name.
 
-A web MP4 is P frames from its second frame onward, so this does not play
-one, and the interesting part is *how* it does not. Frame zero of such a file
-decodes perfectly (it is an IDR), so trial-decoding it would say yes to a
-file that then shows one picture and holds it for the rest of the clip, with
-nothing anywhere reporting an error. So `_H264` reads the container's sync
-flags first and refuses any track that has a frame which is not a sync
-sample, before it decodes anything. The element then draws the same sized box
-and sentence it drew before this decoder existed, which is the honest answer
-until inter prediction lands.
+Refusing has to happen before the poster goes up rather than in the middle of
+playback, and for B slices that is harder than it sounds. Trial-decoding
+frame zero cannot see frame four hundred, and an encoder may introduce a B
+slice anywhere. So `_H264` reads `slice_type` out of every sample's slice
+header first -- two exp-Golomb fields per NAL, no arithmetic decoding, so it
+costs nothing -- and refuses the whole file if any of them is a kind it
+cannot finish. Then it trial-decodes the first keyframe for everything a
+header cannot tell you, and throws the result away so that frame zero is
+decoded once, by whoever asks for frame zero.
+
+The other thing inter prediction changed above the decoder: there is one
+decoder in the process, and a P frame is a difference against pictures that
+decoder is still holding, so two `<video>` elements decoding alternately
+would each be predicting from the other's pictures. `Decoder` keeps the
+access units it has fed since its last IDR and replays them when it finds
+another instance has been at the library in between. The history is bounded
+by the stream's keyframe interval rather than by its length, and
+`test_two_decoders_interleaved_do_not_corrupt_each_other` is the proof.
 
 ## What is not supported
 
@@ -261,17 +301,17 @@ Bluntly, because a foundation that overstates itself is worse than none:
 - **No audio.** Not decoded, not parsed, not mixed, not synchronised. AVI
   audio streams are skipped. This is not a small omission: A/V sync is its
   own engineering problem, and nothing here is designed around it yet.
-- **No inter-frame codec.** H.264 decodes I frames only; there is no VP8,
-  VP9, AV1 or MPEG-4 ASP at all. A file carrying one is named in the
-  placeholder, not guessed at. This is still the big one: an ordinary web
-  MP4 is one I frame and then P frames, so it is refused, and YouTube and
-  essentially every video on a modern site does not play.
+- **No B slices in H.264, and no other inter-frame codec.** I and P slices
+  decode; a stream with B slices is refused by name before anything is
+  drawn, and there is no VP8, VP9, AV1 or MPEG-4 ASP at all. B frames are
+  the common case in a well-compressed web MP4, so plenty of real files
+  still do not play -- but the ordinary I-then-P encode now does, which is
+  what the `<video>` element on most pages that roll their own is.
 - **No CAVLC.** The other half of H.264's entropy coding. Baseline profile
   and anything encoded with `-coder 0` is refused by name.
 - **WebM is probe-only.** Geometry and duration, no pixels. An MP4 is
   demuxed but only plays if its codec is `jpeg`, `mjpa`, `raw `, `png `, or
-  H.264 with every frame a sync sample, which in practice means a
-  QuickTime file or a deliberately all-intra encode rather than a web MP4.
+  H.264 without B slices.
 - **No streaming.** The whole file is fetched into memory before the first
   frame. No range requests, no progressive start, no HLS or DASH. An MJPEG
   camera stream over HTTP, which never ends, therefore cannot be played even
@@ -339,13 +379,14 @@ agree, and a reorder buffer belongs in `VideoTrack.frame()`.
    on the list by a wide margin and should be planned on its own. Nothing in
    the project outputs a sample today (there is no CoreAudio, ALSA or
    WASAPI binding anywhere in it), so this starts from zero.
-7. **P slices in the H.264 decoder.** This is now the shortest route to a
-   web video playing, because everything before it is done: the entropy
-   coder, the transforms, the deblocking filter and the whole container
-   path already work and are held to pixel-exactness. What is left is a
-   reference picture, motion vector prediction, quarter-pel interpolation
-   and the P macroblock types. B slices and CAVLC come after, and each is
-   its own piece of work.
+7. **B slices in the H.264 decoder.** P slices are done, so this is now the
+   shortest route to the rest of the web's video: a second reference list,
+   bi-prediction with its own rounding, direct modes (spatial and temporal,
+   and 8.4.1.2 is the fiddliest derivation in the standard), and the
+   decode-order-versus-presentation-order problem, which is the one part
+   that is not confined to `fortran/` -- `VideoTrack.frame()` assumes the
+   two orders agree and would need a reorder buffer. CAVLC is separate work
+   again, and is what Baseline files need.
 
 ## Tests
 
@@ -388,9 +429,19 @@ size a single wrong sample is never a rounding difference; it is a bug in a
 prediction mode or a scan order that happens to be small today. The vectors
 between them cover 16x16 through 1280x720, Baseline-shaped, Main and High,
 QP 1 to 51, deblocking on and off, the 8x8 transform, picture-level scaling
-matrices, multiple slices per picture and frame cropping on both axes. The
-fixtures are committed so the suite runs offline and on a machine with no
-encoder; the script that generated them is not part of the build.
+matrices, multiple slices per picture and frame cropping on both axes.
+
+Six of them are inter-coded, and for those *every frame* is compared, not the
+first: a wrong motion vector predictor shows up in one macroblock and then
+spreads by prediction, so a decoder that is checked only on its IDR is not
+checked at all. They cover a plain I-then-P sequence, runs of P_Skip over a
+still background, sub-8x8 partitions with the 8x8 transform, four reference
+frames, a picture that pans off its own edges so the interpolator has to
+clamp, and weighted prediction across a fade. `make_inter_vectors.sh` beside
+them is the offline tool that made them and says what each encoder option is
+for; it is not run by `test.sh` and ffmpeg is not a dependency of anything.
+The fixtures are committed so the suite runs offline and on a machine with no
+encoder.
 
 The whole suite skips cleanly where there is no `gfortran`, and one test
 forces that state on a machine that has one: it takes the loaded library
