@@ -174,22 +174,53 @@ def _compile(fc, out, attempts=_LOCAL_ATTEMPTS):
         # and packaging/macos/verify.sh rejects it, correctly.
         base += ["-Wl,-install_name,@loader_path/" + os.path.basename(out)]
     sources = [os.path.join(_FORTRAN, name) for name in _SOURCES]
-    last = None
+    failures = []
     for extra in attempts:
         try:
             subprocess.run([fc] + base + list(extra) + sources, check=True,
                            stdout=subprocess.DEVNULL,
                            stderr=subprocess.PIPE)
         except subprocess.CalledProcessError as exc:
-            last = exc
+            noise = (exc.stderr or b"").decode("utf8", "replace").strip()
+            failures.append((list(extra), noise))
             continue
         except OSError as exc:
             raise H264Error("could not run %s: %s" % (fc, exc))
         os.replace(tmp, out)
         return
-    detail = (last.stderr or b"").decode("utf8", "replace").strip() if last else ""
-    raise H264Error("gfortran could not build the decoder: %s"
-                    % (detail.splitlines()[-1] if detail else "no output"))
+    raise H264Error("gfortran could not build the decoder.\n%s"
+                    % _why(fc, failures))
+
+
+# How many lines of a failed compile are worth keeping. A missing static
+# runtime says so on the first line and an undefined symbol on the last, so
+# both ends are kept and only the middle of a long one is dropped.
+_KEEP = 12
+
+
+def _why(fc, failures):
+    """Every attempt and what it said, laid out to be read in a CI log.
+
+    Reporting only the last line of the last attempt is how "ld returned 1
+    exit status" comes to be the whole of a build failure -- which is the
+    exit status and not the reason, and names neither the flag that was
+    tried nor the symbol that was missing.
+    """
+    report = ["%s tried %d flag set%s and none of them worked:"
+              % (fc, len(failures), "" if len(failures) == 1 else "s")]
+    for extra, noise in failures:
+        report.append("  with %s:" % (" ".join(extra) if extra
+                                      else "no extra flags"))
+        lines = [line for line in noise.splitlines() if line.strip()]
+        if not lines:
+            report.append("    (it said nothing at all)")
+            continue
+        if len(lines) > _KEEP:
+            head, tail = lines[:_KEEP // 2], lines[-(_KEEP // 2):]
+            lines = head + ["    ... %d lines omitted ..."
+                            % (len(lines) - _KEEP)] + tail
+        report.extend("    " + line for line in lines)
+    return "\n".join(report)
 
 
 def prebuilt_name():
