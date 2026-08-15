@@ -631,7 +631,7 @@ def test_toolbar_glyphs_have_real_widths():
     """
     from feetbrowser.layout import get_font
     font = get_font(11, "bold", "roman", "Helvetica")
-    for glyph in "‹›⟳⌂★☆←→":
+    for glyph in "‹›↻⌂★☆←→":
         assert font.measure(glyph) > 0.5, (glyph, font.measure(glyph))
 
 

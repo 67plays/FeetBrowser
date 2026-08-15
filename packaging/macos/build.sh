@@ -436,9 +436,33 @@ ditto "$app" "$dmgroot/FeetBrowser.app"
 # The customary drag-to-install gesture: the app on one side, a link to
 # /Applications on the other.
 ln -s /Applications "$dmgroot/Applications"
+# The app is unsigned on purpose, so the first launch is refused and the way
+# past it is buried in System Settings. Nothing else on this image says so,
+# and a user who drags the app across and double-clicks it has been told by
+# macOS that it may be malicious and by us nothing at all. The Windows
+# bundle ships README-FIRST.txt for the same reason; this is its counterpart,
+# and the name is what makes it get read while the warning is on screen.
+cp "$here/OPEN-ME-FIRST.txt" "$dmgroot/OPEN ME FIRST.txt"
 dmg="$dist/FeetBrowser-$version.dmg"
 hdiutil create -volname "FeetBrowser $version" -srcfolder "$dmgroot" \
   -fs HFS+ -format UDZO -ov "$dmg" >/dev/null
+
+# Mount what was just written and look at it, because every check up to here
+# examined the staging directory rather than the file people download. The
+# instructions especially: an unsigned app whose disk image forgot to say how
+# to open it is an app most people cannot open at all, and that failure is
+# invisible to anyone who has already allowed it on their own machine.
+check="$work/dmgcheck"
+mkdir -p "$check"
+hdiutil attach "$dmg" -mountpoint "$check" -nobrowse -readonly -quiet
+missing=""
+for item in "FeetBrowser.app" "Applications" "OPEN ME FIRST.txt"; do
+  [ -e "$check/$item" ] || missing="$missing $item"
+done
+hdiutil detach "$check" -quiet
+rmdir "$check" 2>/dev/null || true
+[ -z "$missing" ] || { echo "the disk image is missing:$missing" >&2; exit 1; }
+echo "  image carries the app, the Applications link and the instructions"
 
 say "done"
 echo "$app"
