@@ -1,0 +1,76 @@
+FeetBrowser for macOS
+=====================
+
+Drag FeetBrowser.app onto the Applications folder beside it, then read the
+next paragraph before you double-click it, because the first launch will be
+refused and the way round it is not where you would look.
+
+The first launch is blocked. This is expected.
+---------------------------------------------
+
+Double-clicking gives you:
+
+    "FeetBrowser" cannot be opened because Apple cannot check it for
+    malicious software.
+
+FeetBrowser is not signed with an Apple Developer ID and is not notarised.
+That is a deliberate choice, not a mistake or a sign that something is
+wrong with your download -- signing requires a paid Apple developer
+membership, and this is a free project that would rather tell you the truth
+than charge for it.
+
+Gatekeeper is doing its job. It cannot tell "nobody paid Apple" apart from
+"this is dangerous", so it says the scarier of the two.
+
+How to open it anyway
+---------------------
+
+1. Double-click FeetBrowser and let it be refused. Click Done.
+
+2. Open System Settings, go to Privacy & Security, and scroll to the
+   bottom. FeetBrowser is named there, with an "Open Anyway" button next
+   to it.
+
+3. Click Open Anyway, confirm, and enter your password.
+
+That is it. macOS remembers your decision for this one application, and
+every launch after this is an ordinary double-click.
+
+If you have used a Mac for a while you may remember right-clicking an app
+and choosing Open. That shortcut was removed in macOS 15 Sequoia, so on any
+recent Mac it will not work for the first launch. Use System Settings.
+
+If you prefer the Terminal, this is the same decision in one line:
+
+    xattr -d com.apple.quarantine /Applications/FeetBrowser.app
+
+Please do not turn Gatekeeper off entirely (spctl --master-disable). That
+switches the check off for everything you will ever download, to solve a
+problem with one file. FeetBrowser is not worth that, and neither is any
+other app.
+
+What you can check instead of a signature
+-----------------------------------------
+
+A signature would tell you who built this. Without one, here is what you
+can verify yourself:
+
+* Every build is made in public, by GitHub Actions, from the source in the
+  repository. The log for the run that produced this file is public and
+  shows every command.
+
+* The app is self-contained and talks to nothing on your machine outside
+  itself. To see that for yourself:
+
+      codesign -dv /Applications/FeetBrowser.app
+      otool -L /Applications/FeetBrowser.app/Contents/MacOS/FeetBrowser
+
+  The second lists the system libraries it loads -- everything else it
+  needs lives inside the bundle.
+
+* Nothing is installed outside the app. There is no background service, no
+  login item and no system extension. Uninstalling is dragging
+  FeetBrowser.app to the Trash.
+
+The project, the source and the build scripts:
+https://github.com/JuiceyDew/FeetBrowser

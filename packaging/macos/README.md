@@ -188,8 +188,13 @@ and runs the app there.
 ## Gatekeeper
 
 **The disk image is not signed with an Apple Developer ID and is not
-notarised, because there is no certificate to sign it with.** On a Mac that
-downloaded it from the internet, double-clicking `FeetBrowser.app` shows
+notarised. That is a decision, not an oversight** -- see the end of this
+section for what signing would cost and why the answer is no. Shipping
+unsigned means every user meets Gatekeeper once, so the instructions below
+are part of the product and need to be right.
+
+On a Mac that downloaded the image from the internet, double-clicking
+`FeetBrowser.app` shows
 
 > "FeetBrowser" cannot be opened because Apple cannot check it for malicious
 > software.
@@ -197,17 +202,25 @@ downloaded it from the internet, double-clicking `FeetBrowser.app` shows
 This is Gatekeeper doing its job, and there are two honest ways round it,
 both of which apply to this one app and leave the rest of the system alone:
 
-1. **Right-click the app and choose Open**, then click Open in the dialog
-   that appears. macOS records consent for that specific application and
-   subsequent launches are normal. (On Ventura and later, first-launch
-   consent may instead be given in System Settings > Privacy & Security,
-   where the blocked app appears with an "Open Anyway" button.)
+1. **System Settings > Privacy & Security.** Try to open the app, let it be
+   refused, then open Privacy & Security and scroll to the bottom: the
+   blocked app is named there with an **Open Anyway** button. Click it,
+   confirm, and authenticate. macOS records consent for that one
+   application and later launches are normal.
 2. **Remove the quarantine attribute**, which is the same decision made from
    a terminal:
 
    ```
    xattr -d com.apple.quarantine /Applications/FeetBrowser.app
    ```
+
+Control-clicking the app and choosing **Open** is the instruction most of
+the internet still gives, and it stopped working in macOS 15 Sequoia:
+Apple removed that contextual-menu override precisely because malicious
+installers were talking people through it. It still works for later
+launches, but never for the first one, which is the only launch that
+needs it. Assume it does not work, and the System Settings route is the
+one to document to anyone on Sequoia or newer.
 
 Do **not** disable Gatekeeper globally (`spctl --master-disable`). It turns
 the check off for everything you will ever download, to solve a problem with
@@ -218,7 +231,9 @@ the attribute is attached by the browser or mail client that downloaded the
 file, not by the build -- so `build.sh` output runs on the machine that made
 it with no ceremony.
 
-Making the warning go away properly would need, and this is the whole list:
+Making the warning go away properly would need, and this is the whole list
+-- recorded so the decision can be revisited by someone who knows what they
+would be taking on, not because it is planned:
 an Apple Developer Program membership (99 USD a year), a Developer ID
 Application certificate to `codesign --options runtime --sign "Developer ID
 Application: ..."` every Mach-O in the bundle with, a Developer ID Installer

@@ -402,7 +402,9 @@ so Windows may also want it unblocked via Properties → Unblock before it will
 extract cleanly. `README-FIRST.txt` in the bundle tells users all of this in
 plain language, and tells them what to check instead of a signature.
 
-What signing would actually take, if the project ever wants it:
+Unsigned is the chosen way to ship this, not a stage on the way to signing.
+What signing would take is recorded here so the decision can be revisited by
+someone who knows what they would be taking on:
 
 * An OV or EV code-signing certificate from a CA — a few hundred dollars a
   year, and issued only to a verified legal entity, which a pseudonymous
@@ -420,9 +422,9 @@ What signing would actually take, if the project ever wants it:
   hardware token) but requires an organisation that has existed for three
   years or more.
 
-Until one of those happens, an unsigned build that says so is the honest
-artifact. A build that claimed to be signed, or that told users to disable
-SmartScreen, would be worse than the warning.
+An unsigned build that says so is the honest artifact. A build that claimed
+to be signed, or that told users to disable SmartScreen, would be worse than
+the warning.
 
 
 ## Reproducing a build
