@@ -1871,6 +1871,31 @@ def test_at_layer_rules_are_not_thrown_away():
        "layers and @supports come through, keyframes do not")
 
 
+def test_skipped_at_rule_blocks_end_where_they_should():
+    """Finding the `}` that closes a block is a brace count, not a search for
+    the next one, and the count has to survive braces that are not structure.
+    The scan hops between braces with `find` rather than reading every
+    character, so these are the cases where hopping could land wrong."""
+    def colors(css):
+        return sorted(b["color"] for _s, b in CSSParser(css).parse()
+                      if "color" in b)
+
+    eq(colors("@keyframes spin { from { color: pink } } p { color: red }"),
+       ["red"], "a nested block does not end the outer one early")
+    eq(colors("@font-face { src: url(a) } p { color: red }"),
+       ["red"], "a flat skipped block ends at its own brace")
+    eq(colors("@keyframes k { a { content: '}' } } p { color: red }"),
+       ["red"], "a brace inside a string still counts, as it always did")
+    eq(colors("@keyframes k { from { color: pink }"),
+       [], "an unterminated block swallows the rest rather than raising")
+    eq(colors("@keyframes k {} p { color: red }"),
+       ["red"], "an empty block is not an unterminated one")
+    eq(colors("@layer a { @layer b { p { color: red } } } q { color: blue }"),
+       ["blue", "red"], "layers nest and both halves survive")
+    eq(colors("@keyframes k { a { b: c } } } } p { color: red }"),
+       ["red"], "stray closers do not lose the rules after them")
+
+
 def test_viewport_and_font_relative_units():
     from feetbrowser.layout import parse_px
     from feetbrowser.cssparser import set_viewport, get_viewport
@@ -2531,13 +2556,15 @@ def test_nth_child_expression_forms():
        ["red", "black", "red", "black", "red"], "odd is 1, 3, 5")
     eq([li.style["font-weight"] for li in lis],
        ["normal", "bold", "normal", "bold", "normal"], "even is 2 and 4")
-    # `-n+2` should be the first two children. It is the first one, because
-    # the step count has always had to be at least 1, which drops the n=0
-    # term of every an+b expression. Kept as it is: the pages the renderer is
-    # checked against are pixel-identical with this behaviour and would not be
-    # without it. Recorded here so the next person finds it deliberately.
+    # `-n+2` is the first two children: n counts from zero, so the terms are
+    # 2 and 1. This used to be the first child alone, because the step count
+    # was required to be at least 1 and that drops the n=0 term of every an+b
+    # expression -- `2n+1` skipped the first child instead of selecting it and
+    # `n+3` started at the fourth. `odd` and `even` are spelled out separately
+    # and were always right, which is most of what pages use and is why it
+    # survived. Selectors 4 6.6.5 is explicit that n is non-negative.
     eq([li.style["font-style"] for li in lis][:3],
-       ["italic", "normal", "normal"], "-n+2 drops its n=0 term")
+       ["italic", "italic", "normal"], "-n+2 is the first two children")
     eq(lis[2].style["white-space"], "pre", "a bare number is that child")
     eq(lis[3].style["text-align"], "right", "spaces around the number are fine")
     eq([li.style["font-family"] for li in lis].count("serif"), 0,
