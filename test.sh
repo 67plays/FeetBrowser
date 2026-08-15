@@ -78,8 +78,8 @@ $run tests/test_shoes.py
 $run tests/test_e2e.py     # a fixture page in, its pixels back out
 $run tests/test_nav.py
 $run tests/test_toes.py
-$run tests/test_asmblend.py  # raw assembly on Linux/x86-64, Python elsewhere
-$run tests/test_asmops.py    # the image-codec kernels, against their Python references
+$run tests/test_asmx11.py    # raw assembly on Linux/x86-64, Python elsewhere
+$run tests/test_asmselect.py # the selection nearest-boundary kernel
 $run tests/test_h264.py      # the Fortran H.264 decoder, or the skip where there is no gfortran
 $run tests/test_aac.py       # the Fortran AAC decoder, against FFmpeg's samples
 $run tests/test_pcm.py       # uncompressed sound, against the waveform it was made from

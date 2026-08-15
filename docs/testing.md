@@ -35,7 +35,8 @@ tests/
   test_nav.py       click-to-navigate, history, view-source
   download_cases.py downloads, against a local server (run from test_nav.py)
   test_toes.py      toe engine + ToeHub tests (install/uninstall/toggle)
-  test_asmblend.py  the assembly span kernels against their Python references
+  test_asmx11.py  the assembly pixel-packing kernels against their Python references
+  test_asmselect.py the assembly selection nearest-boundary kernel against its Python reference
   test_h264.py      the Fortran H.264 decoder, sample-exact against fixtures
   test_aac.py       the Fortran AAC decoder, against FFmpeg's own samples
   smoke.py          end-to-end pipeline over a real socket
