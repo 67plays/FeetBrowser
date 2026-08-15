@@ -1,4 +1,4 @@
-"""Video containers and video codecs, decoded to raw RGBA.
+"""Media containers and codecs, decoded to raw RGBA and raw PCM.
 
 This is the bytes half of video: it turns a file into a sequence of frames
 with times on them. It knows nothing about clocks, threads, layout or the
@@ -13,7 +13,21 @@ What is actually decoded to pixels:
   AVI (RIFF) with `MJPG`     Motion JPEG: every frame is a whole JPEG
   MOV/MP4 with `jpeg`/`mjpa` the same codec in QuickTime's container
   MOV/MP4 with `raw `/`png ` uncompressed and PNG-per-frame QuickTime video
+  MOV/MP4/AVI with `avc1`    H.264, I, P and B slices, by the Fortran
+                             decoder in `fortran/`; a stream with SP or SI
+                             slices is refused before anything is drawn
   a bare `.mjpeg` stream      JPEGs end to end with no container at all
+
+And what is decoded to sound:
+
+  MOV/MP4 with `mp4a`        AAC-LC, by the Fortran decoder in `fortran/`,
+                             handed back as interleaved 32-bit floats
+
+That is one codec in two containers, and it is deliberately the whole list.
+`probe_audio` walks everything else far enough to say what it is -- the
+sample rate, the channel count, the duration and a name -- and then declines,
+for the same reason the video side declines VP9: "48 kHz stereo Opus, no
+decoder" is a useful sentence and silence is not.
 
 Motion JPEG is the one that makes this a video player rather than a
 demonstration. It is here because the expensive half of it was already
@@ -23,11 +37,17 @@ a frame costs a couple of percent of one frame's worth of time. The codec
 below is the cheap half -- work out where each JPEG starts and ends, hand it
 over, and put the pixels where the compositor expects them.
 
-Everything else in this module *reads* the file and refuses honestly: an MP4
-carrying H.264, or a WebM carrying VP9, is walked far enough to report its
-dimensions, duration and codec name, and then declines, because saying
-"1280x720, H.264, 4.0s, no decoder" is useful and pretending to play it is
-not. See docs/media.md.
+Everything else in this module *reads* the file and refuses honestly: a WebM
+carrying VP9, or an H.264 stream with SP slices, is walked far enough to
+report its dimensions, duration and codec name, and then declines, because
+saying "1280x720, VP9, 4.0s, no decoder" is useful and pretending to play it
+is not. See docs/media.md.
+
+B frames also make decode order and presentation order two different
+orders, and the container is where they are put back together: `ctts` says
+how far each sample's presentation time sits from its decode time, and
+`VideoTrack` indexes everything by the order a viewer sees while decoding
+in the order the file is written.
 
 Three rules the parsers hold to, because the file came from a stranger:
 
@@ -41,7 +61,10 @@ Three rules the parsers hold to, because the file came from a stranger:
 The frame model is `VideoFrame`: an index, a presentation time in seconds, a
 duration, and `rgba` -- 4 bytes per pixel, the same buffer shape
 `canvas.PhotoImage` and `raster.Surface.blit_rgba` already consume, so a
-decoded frame goes to the screen without a conversion step.
+decoded frame goes to the screen without a conversion step. `AudioFrame` is
+the same idea one channel layout over: an index, a time, a duration, and
+`samples` -- interleaved 32-bit floats, which is what a mixer wants and what
+the decoder already has.
 """
 
 import struct
@@ -51,8 +74,9 @@ from . import imagecodec
 from .imagecodec import MAX_PIXELS
 
 __all__ = ["MediaError", "VideoFrame", "VideoTrack", "MediaInfo",
-           "open_video", "probe", "sniff", "MAX_FRAMES", "MAX_CHUNKS",
-           "MJPEG_DEFAULT_FPS"]
+           "AudioFrame", "AudioTrack", "AudioInfo",
+           "open_video", "probe", "open_audio", "probe_audio", "sniff",
+           "MAX_FRAMES", "MAX_CHUNKS", "MJPEG_DEFAULT_FPS"]
 
 
 class MediaError(Exception):
@@ -191,6 +215,77 @@ class MediaInfo:
         return ("<MediaInfo %s/%s %dx%d %.3fs %d frames %s>"
                 % (self.container, self.codec or "?", self.width, self.height,
                    self.duration, self.frame_count,
+                   "ok" if self.supported else "unsupported"))
+
+
+class AudioFrame:
+    """One decoded block of sound and the instant it belongs at.
+
+    `samples` is interleaved 32-bit floats in the machine's own byte order --
+    one float per sample per channel, channels adjacent -- because that is
+    what the decoder produces and what a mixer consumes, and a conversion in
+    between would cost a copy per frame for nothing.
+
+    An AAC frame is 1024 samples per channel, so at 44.1 kHz this is about
+    23 milliseconds of sound; `sample_count` is that number, not the length
+    of the buffer, which is the distinction every audio bug is made of.
+    """
+
+    __slots__ = ("index", "pts", "duration", "sample_rate", "channels",
+                 "samples")
+
+    def __init__(self, index, pts, duration, sample_rate, channels, samples):
+        self.index = index
+        self.pts = pts
+        self.duration = duration
+        self.sample_rate = sample_rate
+        self.channels = channels
+        self.samples = samples
+
+    @property
+    def end(self):
+        return self.pts + self.duration
+
+    @property
+    def sample_count(self):
+        """Samples per channel: four bytes a float, `channels` of them."""
+        if self.channels <= 0:
+            return 0
+        return len(self.samples) // 4 // self.channels
+
+    def __repr__(self):
+        return ("<AudioFrame %d %dch %dHz %d samples @%.3fs+%.3f>"
+                % (self.index, self.channels, self.sample_rate,
+                   self.sample_count, self.pts, self.duration))
+
+
+class AudioInfo:
+    """What a file's sound says about itself, whether or not we decode it.
+
+    The audio half of `MediaInfo`, and separate from it on purpose: a file
+    can have a video track we play and an audio track we only name, and one
+    object carrying both would have to have a `supported` that means two
+    things at once.
+    """
+
+    __slots__ = ("container", "codec", "sample_rate", "channels", "duration",
+                 "frame_count", "supported", "reason")
+
+    def __init__(self, container, codec="", sample_rate=0, channels=0,
+                 duration=0.0, frame_count=0, supported=False, reason=""):
+        self.container = container
+        self.codec = codec
+        self.sample_rate = sample_rate
+        self.channels = channels
+        self.duration = duration
+        self.frame_count = frame_count
+        self.supported = supported
+        self.reason = reason
+
+    def __repr__(self):
+        return ("<AudioInfo %s/%s %dHz %dch %.3fs %d frames %s>"
+                % (self.container, self.codec or "?", self.sample_rate,
+                   self.channels, self.duration, self.frame_count,
                    "ok" if self.supported else "unsupported"))
 
 
@@ -618,40 +713,51 @@ class _Mjpeg(_Codec):
 class _H264(_Codec):
     """H.264/AVC, decoded by the Fortran decoder in ``fortran/``.
 
-    Phase one of that decoder is I frames only, so the useful question is
-    not "is this H.264" but "does this particular stream decode", and the
-    only honest way to answer it is to decode a frame. That is what the
-    constructor does: it takes the first keyframe, runs it, and refuses
-    the whole file with the decoder's own reason if it does not come out.
-    Opening a file that plays for two frames and then stops would be worse
-    than refusing it -- the poster and a sentence beats a frozen picture.
+    The decoder does I, P and B slices, so the useful question is not "is
+    this H.264" but "does this particular stream decode", and part of the
+    answer can only be had by decoding. The constructor takes the first
+    keyframe, runs it, and refuses the whole file with the decoder's own
+    reason if it does not come out. Opening a file that plays for two
+    frames and then stops would be worse than refusing it -- the poster and
+    a sentence beats a frozen picture.
 
-    Which is also why the sync flags are read before anything is decoded.
-    Every ordinary web MP4 starts with an I frame and continues with P
-    frames, so trial-decoding frame zero would say yes to a file that then
-    freezes on frame one. A track whose every sample is a sync sample is
-    the shape this decoder can finish, and it is the shape an all-intra
-    encode has; anything else is refused up front and named.
+    Trial-decoding frame zero cannot see frame four hundred, though, and
+    the things this decoder still cannot do -- SP and SI slices -- are a
+    per-slice property that an encoder is free to introduce anywhere. So
+    every sample's slice_type is read first. That costs two exp-Golomb
+    fields per NAL, needs no arithmetic decoding, and is the only way to
+    know before the poster goes up that the file finishes.
 
-    Stateless between frames, because there is nothing yet that is not a
-    keyframe. When inter prediction arrives this class grows a reference
-    picture and `reset()` starts meaning something.
+    Stateful, and it means something: P and B frames are differences
+    against other pictures, so `reset()` drops the decoder's reference
+    pictures and `VideoTrack.frame()` replays from the keyframe. B frames
+    also arrive out of presentation order, which is the container's problem
+    rather than this class's: everything here is in decode order and
+    `VideoTrack` puts the pictures back in the order they are shown.
     """
 
     def __init__(self, width, height, extradata, data, samples):
         _check_size(width, height)
         self.width = width
         self.height = height
-        inter = sum(1 for _o, _l, keyframe in samples if not keyframe)
-        if inter:
-            raise MediaError(
-                "H.264: %d of this track's %d frames are inter-coded, and "
-                "the decoder does I frames only"
-                % (inter, len(samples)))
         try:
             self._decoder = h264.Decoder(extradata)
+        except h264.H264Error as exc:
+            raise MediaError("H.264: %s" % exc)
+        kinds = h264.slice_types(_annexb_track(data, samples, extradata))
+        refused = [name for kind, name in ((3, "SP"), (4, "SI"))
+                   if kind in kinds]
+        if refused:
+            raise MediaError(
+                "H.264: this track has %s slices, and the decoder does I, P "
+                "and B slices" % " and ".join(refused))
+        try:
             got_width, got_height, _rgba = self._decoder.decode(
                 _first_keyframe(data, samples))
+            # The trial decode has left an IDR in the reference list; drop
+            # it so that frame zero is decoded once, from a clean decoder,
+            # by whoever asks for frame zero.
+            self._decoder.reset()
         except h264.H264Error as exc:
             raise MediaError("H.264: %s" % exc)
         # The container and the sequence parameter set can disagree about
@@ -665,7 +771,7 @@ class _H264(_Codec):
                                              width, height))
 
     def reset(self):
-        pass
+        self._decoder.reset()
 
     def decode(self, packet, keyframe):
         if not packet:
@@ -675,6 +781,57 @@ class _H264(_Codec):
         except h264.H264Error as exc:
             raise MediaError("H.264 frame: %s" % exc)
         return rgba
+
+
+def _aac_module():
+    """The AAC decoder, imported at the moment it is needed.
+
+    Lazy, and for the same reason `probe()` has to keep working on a machine
+    with no gfortran: a decoder that will not import is a codec we do not
+    have, which is a sentence to show a user, not a reason for
+    `import mediacodec` to fail and take the whole media stack with it.
+    """
+    try:
+        from . import aac
+    except Exception as exc:        # not just ImportError: a broken build
+        raise MediaError("AAC: no decoder (%s)" % exc)
+    return aac
+
+
+class _Aac:
+    """AAC, decoded by the Fortran decoder in ``fortran/``.
+
+    Stateful, and unavoidably so: every AAC frame is coded independently in
+    the sense that matters for a container -- there is no keyframe flag and
+    no reference frame -- but the last step of decoding one is an inverse
+    MDCT whose output is overlapped and added with the *previous* frame's.
+    So a decoder handed frame N with nothing before it produces the right
+    number of samples and the wrong sound for the first half of them, which
+    is why `AudioTrack.frame()` replays from frame zero rather than seeking.
+    """
+
+    def __init__(self, asc):
+        aac = _aac_module()
+        self._aac = aac
+        try:
+            self._decoder = aac.Decoder(asc)
+        except aac.AacError as exc:
+            raise MediaError(_aac_reason(exc))
+        self.sample_rate = self._decoder.sample_rate
+        self.channels = self._decoder.channels
+        self.frame_length = self._decoder.frame_length
+
+    def reset(self):
+        self._decoder.reset()
+
+    def decode(self, packet):
+        """(samples per channel, channels, interleaved float32 bytes)."""
+        if not packet:
+            return 0, self.channels, b""
+        try:
+            return self._decoder.decode(packet)
+        except self._aac.AacError as exc:
+            raise MediaError(_aac_reason(exc))
 
 
 # The fourccs that mean H.264. `avc1` and `avc3` are the MP4 spellings and
@@ -709,6 +866,38 @@ KNOWN_UNDECODABLE = {
     "cvid": "Cinepak: no decoder",
     "msvc": "Microsoft Video 1: no decoder",
     "CRAM": "Microsoft Video 1: no decoder",
+}
+
+
+# The MPEG-4 objectTypeIndication values that mean AAC. 0x40 is "MPEG-4
+# Audio", which is what every modern muxer writes and is the one that then
+# needs its AudioSpecificConfig read to find out *which* MPEG-4 audio; the
+# other three are the MPEG-2 AAC profiles, which older files use and which
+# decode the same way once the config is in hand.
+AAC_OBJECT_TYPES = (0x40, 0x66, 0x67, 0x68)
+
+# ...and the two that mean MP3 hiding inside an `mp4a` sample entry, which is
+# legal, rare, and exactly the case where trusting the fourcc alone would
+# hand an AAC decoder something that is not AAC.
+MP3_OBJECT_TYPES = (0x69, 0x6B)
+
+# Audio fourccs we can name but not decode, in the same spirit as the video
+# table above: the point of naming them is that a page can say "AC-3" rather
+# than "unknown", and that the next contributor can see where a decoder goes.
+KNOWN_UNDECODABLE_AUDIO = {
+    "ac-3": "Dolby Digital (AC-3): no decoder",
+    "ec-3": "Dolby Digital Plus (E-AC-3): no decoder",
+    ".mp3": "MP3: no decoder",
+    "mp3 ": "MP3: no decoder",
+    "sowt": "16-bit PCM: no decoder",
+    "twos": "16-bit PCM: no decoder",
+    "lpcm": "uncompressed PCM: no decoder",
+    "raw ": "8-bit PCM: no decoder",
+    "alac": "Apple Lossless: no decoder",
+    "Opus": "Opus: no decoder",
+    "opus": "Opus: no decoder",
+    "fLaC": "FLAC: no decoder",
+    "samr": "AMR narrowband: no decoder",
 }
 
 
@@ -898,13 +1087,30 @@ class VideoTrack:
     """
 
     def __init__(self, data, info, packets, codec, frame_rate, keyframes,
-                 times=None):
+                 times=None, order=None):
         self._data = data
         self.info = info
         self._packets = packets            # (offset, length, keyframe)
         self._codec = codec
         self.frame_rate = frame_rate
         self._keyframes = keyframes
+        # Every index this class takes or returns is a position in
+        # presentation order -- the order a viewer sees. `_packets` is in
+        # decode order, which for a stream with B frames is a different
+        # order, and `_order[p]` is the packet shown p-th. None means the
+        # two orders are the same, which is every stream without B frames
+        # and so is worth not paying for.
+        self._order = list(order) if order else None
+        self._shown_at = None
+        if self._order is not None:
+            self._shown_at = [0] * len(self._order)
+            for position, packet in enumerate(self._order):
+                self._shown_at[packet] = position
+        # Pictures decoded but not yet asked for, by presentation position.
+        # A B stream produces them out of order and this is where they wait;
+        # it holds the reorder delay and nothing more, because everything
+        # already shown is dropped on the way out of `_picture`.
+        self._pending = {}
         # Per-frame presentation times, when the container carries them.
         # AVI does not -- it has one rate for the whole stream -- but an MP4's
         # `stts` is a list of durations and is allowed to vary, so a track
@@ -952,26 +1158,44 @@ class VideoTrack:
             index = lo - 1
         return max(0, min(index, max(0, self.frame_count - 1)))
 
+    def _decode_index(self, index):
+        """Where the frame shown at `index` sits in decode order."""
+        if self._order is None:
+            return index
+        return self._order[index]
+
     def packet(self, index):
         if not 0 <= index < len(self._packets):
             raise MediaError("frame %d out of range (0..%d)"
                              % (index, len(self._packets) - 1))
-        offset, length, _key = self._packets[index]
+        return self._sample(self._decode_index(index))
+
+    def _sample(self, decode_index):
+        offset, length, _key = self._packets[decode_index]
         if length > MAX_FRAME_BYTES:
-            raise MediaError("frame %d is %d bytes" % (index, length))
+            raise MediaError("frame %d is %d bytes" % (decode_index, length))
         end = offset + length
         if end > len(self._data):
-            raise MediaError("frame %d runs past the end of the file" % index)
+            raise MediaError("frame %d runs past the end of the file"
+                             % decode_index)
         return self._data[offset:end]
 
     def is_keyframe(self, index):
         if not 0 <= index < len(self._packets):
             return False
-        return self._packets[index][2]
+        return self._packets[self._decode_index(index)][2]
 
     def keyframe_before(self, index):
+        """The latest frame at or before `index` that can be decoded cold.
+
+        In presentation order, like every other index here. That is the
+        right space for it even with B frames in the file: an IDR opens its
+        group of pictures in both orders at once, so no frame shown after
+        one is coded before it, and landing on it and playing forward loses
+        nothing that was going to be shown.
+        """
         for i in range(min(index, len(self._packets) - 1), -1, -1):
-            if self._packets[i][2]:
+            if self.is_keyframe(i):
                 return i
         return 0
 
@@ -983,17 +1207,8 @@ class VideoTrack:
         index."""
         if not 0 <= index < len(self._packets):
             raise MediaError("frame %d out of range" % index)
-        start = index
-        if index != self._cursor + 1:
-            start = self.keyframe_before(index)
-            self._codec.reset()
-            self._cursor = start - 1
-        rgba = None
-        for i in range(start, index + 1):
-            decoded = self._codec.decode(self.packet(i), self._packets[i][2])
-            if decoded is not None:
-                rgba = decoded
-            self._cursor = i
+        rgba = self._picture(index) if self._order is not None \
+            else self._in_order(index)
         if rgba is None:
             # A run of drop frames with nothing before them. Show black
             # rather than nothing at all.
@@ -1001,6 +1216,157 @@ class VideoTrack:
         return VideoFrame(index, self.frame_time(index),
                           self.frame_duration(index),
                           self.width, self.height, rgba)
+
+    def _in_order(self, index):
+        """Decode frame `index` when decode order is presentation order."""
+        start = index
+        if index != self._cursor + 1:
+            start = self.keyframe_before(index)
+            self._codec.reset()
+            self._cursor = start - 1
+        rgba = None
+        for i in range(start, index + 1):
+            decoded = self._codec.decode(self._sample(i), self._packets[i][2])
+            if decoded is not None:
+                rgba = decoded
+            self._cursor = i
+        return rgba
+
+    def _picture(self, index):
+        """The same, for a stream whose two orders differ.
+
+        A B frame is coded after the frame it predicts forwards from, so
+        asking for the frame shown fourth can mean decoding the sixth, and
+        the fifth and sixth then come out of the buffer for free. Playing a
+        B stream straight through therefore still costs one packet per
+        frame; what it does not do is replay from the keyframe at every
+        second frame, which is what happens if you decode in presentation
+        order and pretend nothing is out of place.
+
+        A seek backwards past what is still buffered resets and replays
+        from the keyframe, exactly as `_in_order` does. That is the case
+        worth being careful about: after a seek the decoder holds reference
+        pictures from the old position, and a B frame decoded against those
+        is a plausible picture rather than an error, so the reset has to
+        happen on the way in and not be noticed later.
+        """
+        if index in self._pending:
+            return self._pending[index]
+        target = self._order[index]
+        if target <= self._cursor:
+            start = self._decode_index(self.keyframe_before(index))
+            self._codec.reset()
+            self._pending.clear()
+            self._cursor = start - 1
+        for i in range(self._cursor + 1, target + 1):
+            decoded = self._codec.decode(self._sample(i), self._packets[i][2])
+            self._cursor = i
+            if decoded is not None:
+                self._pending[self._shown_at[i]] = decoded
+        rgba = self._pending.get(index)
+        for shown in [p for p in self._pending if p < index]:
+            del self._pending[shown]
+        return rgba
+
+    def reset(self):
+        self._codec.reset()
+        self._cursor = -1
+        self._pending = {}
+
+
+class AudioTrack:
+    """A decodable audio stream: frame count, timing, and `frame(i)`.
+
+    The same shape as `VideoTrack`, deliberately, because the thing above
+    them -- a scheduler holding a clock -- wants to ask both tracks the same
+    questions. A "frame" here is one coded AAC frame: 1024 samples per
+    channel, about 23 milliseconds, not one sample.
+    """
+
+    def __init__(self, data, info, packets, codec, times=None, asc=b""):
+        self._data = data
+        self.info = info
+        self._packets = packets            # (offset, length, keyframe)
+        self._codec = codec
+        # `stts` for a sound track is normally one run of equal deltas, but
+        # it is allowed to vary and a final short frame is common, so the
+        # real per-sample times are carried rather than divided out of a
+        # rate that would then be wrong at the end of every file.
+        self._times = list(times) if times else None
+        self._cursor = -1                  # last index handed to the codec
+        self.asc = asc                     # AudioSpecificConfig, verbatim
+        self.sample_rate = info.sample_rate
+        self.channels = info.channels
+        self.sample_count = info.frame_count
+        self.duration = info.duration
+        self.codec_name = info.codec
+        self.container = info.container
+
+    def frame_time(self, index):
+        if self._times is not None and 0 <= index < len(self._times):
+            return self._times[index][0]
+        return 0.0
+
+    def frame_duration(self, index):
+        if self._times is not None and 0 <= index < len(self._times):
+            return self._times[index][1]
+        return 0.0
+
+    def index_at(self, seconds):
+        """The coded frame that is playing at `seconds`."""
+        if not self._times:
+            return 0
+        lo, hi = 0, len(self._times)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if self._times[mid][0] <= seconds:
+                lo = mid + 1
+            else:
+                hi = mid
+        return max(0, min(lo - 1, max(0, self.sample_count - 1)))
+
+    def packet(self, index):
+        if not 0 <= index < len(self._packets):
+            raise MediaError("audio frame %d out of range (0..%d)"
+                             % (index, len(self._packets) - 1))
+        offset, length, _key = self._packets[index]
+        if length > MAX_FRAME_BYTES:
+            raise MediaError("audio frame %d is %d bytes" % (index, length))
+        end = offset + length
+        if end > len(self._data):
+            raise MediaError("audio frame %d runs past the end of the file"
+                             % index)
+        return self._data[offset:end]
+
+    def frame(self, index):
+        """Decode coded frame `index`, replaying from the start when it is
+        not the one that comes next.
+
+        There is no keyframe to replay from -- AAC has no such concept, every
+        frame carries a whole spectrum -- but the decoder still carries the
+        previous frame's second MDCT half, so an out-of-order request has to
+        start from frame zero. The first frame after a `reset()` is the
+        priming frame: it is decoded against silence and comes out
+        attenuated, which is correct and is what every AAC decoder does.
+        """
+        if not 0 <= index < len(self._packets):
+            raise MediaError("audio frame %d out of range" % index)
+        start = index
+        if index != self._cursor + 1:
+            start = 0
+            self._codec.reset()
+            self._cursor = -1
+        if index - start >= MAX_FRAMES:
+            raise MediaError("replaying %d audio frames is too many"
+                             % (index - start))
+        channels = self.channels
+        samples = b""
+        for i in range(start, index + 1):
+            _count, channels, samples = self._codec.decode(self.packet(i))
+            self._cursor = i
+        return AudioFrame(index, self.frame_time(index),
+                          self.frame_duration(index), self.sample_rate,
+                          channels or self.channels, samples)
 
     def reset(self):
         self._codec.reset()
@@ -1093,6 +1459,52 @@ def _open_avi(data):
                       [i for i, p in enumerate(ours) if p[2]])
 
 
+# WAVEFORMATEX format tags, which is how an AVI names an audio codec: a
+# 16-bit number rather than a fourcc. Only the ones worth naming are here --
+# 0x00FF and the two 0x16xx are the three spellings of AAC that muxers
+# actually wrote, and the last two cover the files most likely to turn up.
+WAVE_FORMAT_NAMES = {
+    0x0001: "PCM",
+    0x0002: "ADPCM",
+    0x0055: "MP3",
+    0x00FF: "AAC",
+    0x1600: "AAC",
+    0x1601: "AAC",
+    0x2000: "AC-3",
+}
+
+
+def _probe_avi_audio(data):
+    """What an AVI's sound is, said honestly and then declined.
+
+    AVI audio is not demuxed here. The chunks are interleaved with the video
+    on a schedule the `strf` describes rather than a sample table, and
+    getting that wrong produces sound that drifts out of sync over minutes
+    rather than sound that is obviously broken -- so the choice is to read
+    the format header, say what the stream is, and stop.
+    """
+    _micros, streams, _packets, _flags, _base = _parse_avi(data)
+    stream = None
+    for candidate in streams:
+        if candidate.kind == "auds":
+            stream = candidate
+            break
+    if stream is None:
+        return AudioInfo("AVI", reason="this AVI has no audio stream")
+    info = AudioInfo("AVI")
+    if len(stream.format) >= 14:
+        header = _Reader(stream.format)
+        tag = header.u16le()
+        info.codec = WAVE_FORMAT_NAMES.get(tag, "0x%04X" % tag)
+        info.channels = header.u16le()
+        info.sample_rate = header.u32le()
+    if stream.rate and stream.scale and stream.length:
+        info.duration = stream.length * stream.scale / stream.rate
+    info.reason = ("%s in AVI: audio is demuxed out of MP4 and MOV only"
+                   % (info.codec or "the audio stream"))
+    return info
+
+
 def _h264_reason(exc):
     """Whatever went wrong, said with the codec's name in front of it.
 
@@ -1105,6 +1517,46 @@ def _h264_reason(exc):
     """
     text = str(exc)
     return text if text.startswith("H.264") else "H.264: %s" % text
+
+
+def _aac_reason(exc):
+    """The same rule for sound: name the codec exactly once.
+
+    Three things raise on the way to an AAC track and only one of them --
+    the decoder -- knows it is AAC. The other two are the descriptor reader
+    and the sample-table reader, which are told nothing about the codec they
+    are reading for and should not be.
+    """
+    text = str(exc)
+    return text if text.startswith("AAC") else "AAC: %s" % text
+
+
+def _annexb_track(data, samples, extradata):
+    """Every sample of an H.264 track as one run of Annex B bytes.
+
+    Only ever handed to `h264.slice_types`, which reads two fields out of
+    each slice header, so this deliberately does not care about access unit
+    boundaries. A sample that points outside the file is skipped rather
+    than complained about: `_first_keyframe` is the check for that, and it
+    gives a better sentence.
+    """
+    length_size = 0
+    if extradata[:1] == b"\x01" and len(extradata) > 4:
+        length_size = (extradata[4] & 3) + 1
+    out = []
+    for offset, length, _keyframe in samples:
+        if offset < 0 or length <= 0 or offset + length > len(data):
+            continue
+        if length > MAX_FRAME_BYTES:
+            continue
+        sample = data[offset:offset + length]
+        if length_size:
+            try:
+                sample = h264.annexb_from_avcc(sample, length_size)
+            except h264.H264Error:
+                continue
+        out.append(sample)
+    return b"".join(out)
 
 
 def _first_keyframe(data, samples):
@@ -1188,14 +1640,22 @@ class _Mp4Track:
         self.width = 0              # stsd, in pixels -- what is stored
         self.height = 0
         self.depth = 24
+        self.channels = 0           # stsd, sound tracks only
+        self.sample_rate = 0.0      # stsd, in hertz
+        self.sample_size = 0        # stsd, bits per PCM sample
+        self.object_type = 0        # esds objectTypeIndication
         self.codec = ""
         self.stts = []              # (sample count, duration in ticks)
+        self.ctts = []              # (sample count, composition offset)
         self.sync = None            # 1-based sample numbers, or None for all
         self.stsc = []              # (first chunk, samples per chunk)
-        self.sample_size = 0        # non-zero when every sample is that size
+        # `constant_size` is stsz's own field and is not `sample_size` above:
+        # one is a number of bytes in the file and the other a number of bits
+        # in a loudspeaker, and a sound track sets both.
+        self.constant_size = 0      # non-zero when every sample is that size
         self.sizes = []
         self.chunks = []            # chunk offsets into the file
-        self.extradata = b""        # avcC and the like, verbatim
+        self.extradata = b""        # avcC, an AudioSpecificConfig, verbatim
 
 
 def _parse_mp4(data):
@@ -1272,6 +1732,23 @@ def _parse_stbl(stbl, track):
                 count = box.u32be()
                 delta = box.u32be()
                 track.stts.append((count, delta))
+        elif kind == "ctts":
+            # The composition offsets: how far each sample's presentation
+            # time sits from its decode time. A file without B frames has no
+            # `ctts` at all, which is why the rest of this reader could
+            # ignore it for as long as it did. Version 0 declares the offsets
+            # unsigned and version 1 signed; muxers wrote negative offsets
+            # into version 0 boxes for years before version 1 existed, and a
+            # 2^32-ish "duration" is unmistakably one of those, so read
+            # anything past the top of the signed range as negative rather
+            # than believing it.
+            box.skip(4)
+            for _ in range(_table_count(box, 8)):
+                count = box.u32be()
+                offset = box.u32be()
+                if offset >= 0x80000000:
+                    offset -= 0x100000000
+                track.ctts.append((count, offset))
         elif kind == "stss":
             box.skip(4)
             sync = set()
@@ -1290,10 +1767,10 @@ def _parse_stbl(stbl, track):
             # stsz is the one table whose count is not the first field, so it
             # cannot go through _table_count -- a constant sample size means
             # there is no per-sample list to bound against at all.
-            track.sample_size = box.u32be()
+            track.constant_size = box.u32be()
             declared = box.u32be()
-            if track.sample_size:
-                track.sizes = [track.sample_size] * min(declared, MAX_FRAMES)
+            if track.constant_size:
+                track.sizes = [track.constant_size] * min(declared, MAX_FRAMES)
             else:
                 room = box.remaining() // 4
                 for _ in range(min(declared, room, MAX_FRAMES)):
@@ -1347,13 +1824,144 @@ def _parse_stsd(stsd, track):
             # sample carries no SPS or PPS of its own in MP4, they live in
             # this box, and without it the samples are undecodable.
             _parse_sample_extensions(entry, track)
+        elif track.handler == "soun" and body >= _AUDIO_ENTRY_BYTES:
+            # A sound entry that will not read must not take the file's
+            # picture with it: `probe()` walks every track in the file, and a
+            # stranger's malformed `esds` is no reason to refuse to describe
+            # a video track that parsed perfectly.
+            try:
+                _parse_audio_sample_entry(entry, track)
+            except MediaError:
+                pass
         stsd.skip(body)
 
 
-def _parse_sample_extensions(entry, track):
-    for kind, box in _boxes(entry, 1):
+# 6 reserved + 2 data reference index, then version, revision and vendor,
+# then the four 16-bit fields and the 16.16 sample rate: the smallest
+# AudioSampleEntry the spec allows.
+_AUDIO_ENTRY_BYTES = 28
+
+
+def _parse_audio_sample_entry(entry, track):
+    """An AudioSampleEntry, in either of QuickTime's three versions.
+
+    Version 0 is the ISO one and the only one an MP4 muxer writes. Versions 1
+    and 2 are QuickTime's, and they matter here for one reason each: version
+    1 appends sixteen bytes before the child boxes, so a parser that does not
+    know about it looks for `esds` sixteen bytes early and finds nothing; and
+    version 2 carries the sample rate as a float64, which is the only way the
+    format can express the rates a 16.16 fixed-point field cannot.
+    """
+    entry.skip(8)                            # reserved, data reference index
+    version = entry.u16be()
+    entry.skip(6)                            # revision, vendor
+    track.channels = entry.u16be()
+    track.sample_size = entry.u16be()
+    entry.skip(4)                            # compression id, packet size
+    rate = entry.u16be()                     # 16.16 fixed point
+    fraction = entry.u16be()
+    track.sample_rate = rate + fraction / 65536.0
+    if version == 1:
+        # samples per packet, bytes per packet, bytes per frame, bytes per
+        # sample -- all four are about uncompressed audio and none of them
+        # tell us anything an AAC track has not already said.
+        entry.skip(16)
+    elif version == 2:
+        entry.skip(4)                        # size of the struct that follows
+        track.sample_rate = struct.unpack(">d", entry.take(8))[0]
+        track.channels = entry.u32be()
+        entry.skip(20)                       # constant bits/bytes per packet
+    _parse_sample_extensions(entry, track)
+
+
+# MPEG-4 descriptor tags, ISO/IEC 14496-1. Only the three on the path from
+# the `esds` box down to the AudioSpecificConfig are named, because the rest
+# are skipped by length like any other descriptor.
+_TAG_ES = 0x03
+_TAG_DECODER_CONFIG = 0x04
+_TAG_DECODER_SPECIFIC = 0x05
+
+
+def _descriptors(reader):
+    """Yield (tag, body reader) for one level of an MPEG-4 descriptor chain.
+
+    The length is the awkward part: one to four bytes, seven bits of payload
+    each, with the top bit meaning "another byte follows". Four is the limit
+    the standard sets and the limit enforced here, because the encoding
+    itself has no end -- a run of 0x80 bytes is a valid prefix of a length
+    forever, and a reader that keeps taking them is a reader a file can hang.
+    """
+    seen = 0
+    while reader.remaining() >= 2:
+        seen += 1
+        if seen > MAX_CHUNKS:
+            raise MediaError("MPEG-4 descriptor chain does not terminate")
+        tag = reader.u8()
+        size = 0
+        for _ in range(4):
+            byte = reader.u8()
+            size = (size << 7) | (byte & 0x7F)
+            if not byte & 0x80:
+                break
+        # A length longer than what is left is a truncated file, not a reason
+        # to read the descriptor after it: clamp and carry on, the same way
+        # the RIFF and box walkers do with a short tail.
+        size = min(size, reader.remaining())
+        start = reader.pos
+        yield tag, _Reader(reader.data, start, start + size)
+        # The header is already consumed, so this advances even for a
+        # zero-length descriptor and the walk cannot stand still.
+        reader.pos = start + size
+
+
+def _parse_esds(box, track):
+    """`esds` -> ES_Descriptor -> DecoderConfigDescriptor -> the config.
+
+    The AudioSpecificConfig at the bottom is what an AAC decoder is
+    configured from -- sample rate, channel configuration, object type -- and
+    an MP4's audio samples carry none of it, exactly as an H.264 sample
+    carries no SPS. So it is stored verbatim in the same field `avcC` uses:
+    the two are the same kind of thing, a codec's private setup blob, and
+    neither is interpreted here.
+    """
+    box.skip(4)                              # full box version and flags
+    for tag, es in _descriptors(box):
+        if tag != _TAG_ES:
+            continue
+        es.skip(2)                           # ES_ID
+        flags = es.u8()
+        if flags & 0x80:
+            es.skip(2)                       # dependsOn_ES_ID
+        if flags & 0x40:
+            es.skip(es.u8())                 # URL, as a Pascal string
+        if flags & 0x20:
+            es.skip(2)                       # OCR_ES_ID
+        for config_tag, config in _descriptors(es):
+            if config_tag != _TAG_DECODER_CONFIG:
+                continue
+            track.object_type = config.u8()
+            config.skip(12)                  # stream type, buffer, bitrates
+            for specific_tag, specific in _descriptors(config):
+                if specific_tag == _TAG_DECODER_SPECIFIC:
+                    track.extradata = bytes(
+                        specific.data[specific.pos:specific.end])
+                    return
+            return
+        return
+
+
+def _parse_sample_extensions(entry, track, depth=1):
+    for kind, box in _boxes(entry, depth):
         if kind == "avcC" and not track.extradata:
             track.extradata = bytes(box.data[box.pos:box.end])
+        elif kind == "esds" and not track.extradata:
+            _parse_esds(box, track)
+        elif kind == "wave" and depth < MAX_DEPTH:
+            # QuickTime does not put `esds` beside the sample entry's other
+            # children; it wraps it, and whatever else the codec brought,
+            # in a `wave` box. Files written by iTunes and by every version
+            # of QuickTime Player look like this, so both layouts are read.
+            _parse_sample_extensions(box, track, depth + 1)
 
 
 def _mp4_samples(track):
@@ -1400,7 +2008,12 @@ def _mp4_samples(track):
 
 
 def _mp4_times(track, count):
-    """Per-sample (pts, duration) in seconds, from `stts`."""
+    """Per-sample (pts, duration) in seconds, from `stts`.
+
+    In decode order, and equal to the presentation times only for a track
+    with no `ctts`. `_mp4_order` below is what turns these into the order
+    and the times a viewer sees.
+    """
     timescale = track.timescale or 600
     times = []
     ticks = 0
@@ -1417,6 +2030,61 @@ def _mp4_times(track, count):
         times.append((ticks / timescale, tail))
         ticks += tail * timescale
     return times
+
+
+def _mp4_order(track, times, count):
+    """Presentation order and presentation times, from `ctts`.
+
+    Returns `(order, times)` where `order[p]` is the decode-order sample
+    shown p-th, or `(None, times)` when the file says the two orders are
+    the same -- which is every file without B frames, and is why nothing
+    here existed until there was a decoder that could produce them.
+
+    A sample's composition time is its decode time plus its `ctts` offset,
+    and presentation order is those times sorted. The sort is stable, so
+    two samples that claim the same instant stay in decode order rather
+    than swapping on a detail of the sort; a file that does that is broken
+    either way and this at least makes it decode.
+
+    Durations are recomputed as the gap to the next frame shown rather than
+    carried across from `stts`, because `stts` durations are decode-order
+    gaps and a B frame's is not how long it is on screen. The last frame
+    keeps its `stts` duration -- there is no next frame to measure against
+    and its own is the only number anybody has.
+    """
+    if not track.ctts or count <= 0:
+        return None, times
+    timescale = track.timescale or 600
+    offsets = []
+    for run, offset in track.ctts:
+        if len(offsets) >= count:
+            break
+        offsets.extend([offset] * min(run, count - len(offsets)))
+    # A short `ctts` means the rest of the samples have no offset, which is
+    # what a muxer that stopped writing B frames partway leaves behind.
+    offsets.extend([0] * (count - len(offsets)))
+    composed = [times[i][0] + offsets[i] / timescale for i in range(count)]
+    order = sorted(range(count), key=lambda i: composed[i])
+    if order == list(range(count)):
+        # A `ctts` that shifts every sample by the same amount, which is how
+        # some muxers spell "the first frame starts at zero". It reorders
+        # nothing, so say so and let the caller keep the simple path.
+        return None, times
+    # Composition times need not start at zero -- a positive offset on every
+    # sample is one way of spelling "there is nothing before this" -- and the
+    # rest of the browser takes the first frame to be at t=0, so the whole
+    # timeline slides back to meet it. Edit lists, which are the proper way
+    # to say the same thing, are not read here either.
+    base = composed[order[0]]
+    shown = []
+    for p, i in enumerate(order):
+        pts = composed[i] - base
+        if p + 1 < count:
+            duration = composed[order[p + 1]] - composed[i]
+        else:
+            duration = times[i][1]
+        shown.append((pts, max(0.0, duration)))
+    return order, shown
 
 
 class _QuickTimeRaw(_Codec):
@@ -1537,6 +2205,7 @@ def _open_mp4(data, container="MP4"):
         raise _Unsupported(info)
     info.frame_count = len(samples)
     times = _mp4_times(video, len(samples))
+    order, times = _mp4_order(video, times, len(samples))
     if duration <= 0 and times:
         duration = times[-1][0] + times[-1][1]
         info.duration = duration
@@ -1562,13 +2231,109 @@ def _open_mp4(data, container="MP4"):
         raise _Unsupported(info)
     _check_size(width, height)
     info.supported = True
-    return VideoTrack(data, info, samples, decoder, frame_rate,
-                      [i for i, s in enumerate(samples) if s[2]], times=times)
+    keyframes = [i for i, s in enumerate(samples) if s[2]]
+    if order is not None:
+        shown_at = [0] * len(order)
+        for position, packet in enumerate(order):
+            shown_at[packet] = position
+        keyframes = sorted(shown_at[i] for i in keyframes)
+    return VideoTrack(data, info, samples, decoder, frame_rate, keyframes,
+                      times=times, order=order)
 
 
 def _probe_mp4(data, container="MP4"):
     try:
         return _open_mp4(data, container).info
+    except _Unsupported as exc:
+        return exc.info
+
+
+def _audio_reason(codec, object_type):
+    """What to say about a sound track we are not going to decode.
+
+    One sentence, naming the codec, in the same spirit as the video table:
+    an `mp4a` entry is a family rather than a codec, so the descriptor's
+    objectTypeIndication is what actually decides, and an MP3 in an `mp4a`
+    box has to be called MP3 rather than AAC.
+    """
+    if codec == "mp4a":
+        if object_type in MP3_OBJECT_TYPES:
+            return "MP3: no decoder"
+        if object_type and object_type not in AAC_OBJECT_TYPES:
+            return ("no decoder for MPEG-4 audio object type 0x%02X"
+                    % object_type)
+    return KNOWN_UNDECODABLE_AUDIO.get(
+        codec, "no decoder for %s" % (codec or "this file's audio codec"))
+
+
+def _open_mp4_audio(data, container="MP4"):
+    """An `AudioTrack` over an MP4/MOV, or `_Unsupported` carrying what we
+    learned about it -- the same bargain `_open_mp4` makes for pictures, and
+    for the same reason: the numbers in the "no decoder" message are the
+    numbers a player that had one would have used."""
+    movie_duration, tracks = _parse_mp4(data)
+    audio = None
+    for track in tracks:
+        if track.handler == "soun":
+            audio = track
+            break
+    if audio is None:
+        info = AudioInfo(container, reason="%s has no audio track" % container)
+        raise _Unsupported(info)
+
+    codec = audio.codec or ""
+    duration = movie_duration
+    if audio.timescale and audio.duration_ticks:
+        duration = audio.duration_ticks / audio.timescale
+    info = AudioInfo(container, codec, int(round(audio.sample_rate)),
+                     audio.channels, duration, 0)
+    try:
+        samples = _mp4_samples(audio)
+    except MediaError as exc:
+        info.reason = _audio_reason(codec, audio.object_type)
+        if codec == "mp4a" and audio.object_type in AAC_OBJECT_TYPES:
+            info.reason = _aac_reason(exc)
+        raise _Unsupported(info)
+    info.frame_count = len(samples)
+    times = _mp4_times(audio, len(samples))
+    if duration <= 0 and times:
+        duration = times[-1][0] + times[-1][1]
+        info.duration = duration
+
+    if codec != "mp4a" or audio.object_type not in AAC_OBJECT_TYPES:
+        info.reason = _audio_reason(codec, audio.object_type)
+        raise _Unsupported(info)
+    if not audio.extradata:
+        info.reason = ("AAC: this track carries no AudioSpecificConfig, and "
+                       "an AAC decoder cannot be configured without one")
+        raise _Unsupported(info)
+    try:
+        aac = _aac_module()
+        if not aac.available():
+            raise MediaError(aac.unavailable_reason() or "no decoder")
+        why = aac.probe(audio.extradata)
+        if why:
+            raise MediaError(why)
+        decoder = _Aac(audio.extradata)
+    except MediaError as exc:
+        info.reason = _aac_reason(exc)
+        raise _Unsupported(info)
+    # The AudioSpecificConfig is what made the samples, so where it and the
+    # sample entry disagree -- which is what HE-AAC does, coding at half the
+    # rate the track declares -- the config wins, and `info` is corrected
+    # rather than left saying something the frames will contradict.
+    if decoder.sample_rate > 0:
+        info.sample_rate = decoder.sample_rate
+    if decoder.channels > 0:
+        info.channels = decoder.channels
+    info.supported = True
+    return AudioTrack(data, info, samples, decoder, times=times,
+                      asc=audio.extradata)
+
+
+def _probe_mp4_audio(data, container="MP4"):
+    try:
+        return _open_mp4_audio(data, container).info
     except _Unsupported as exc:
         return exc.info
 
@@ -1653,6 +2418,12 @@ def _ebml_walk(reader, info, timing, depth=0):
             codec = body.take(body.remaining()).decode("latin-1").strip("\0")
             if codec.startswith("V_"):
                 info.codec = codec
+            elif codec.startswith("A_"):
+                # The audio track's name, kept in `timing` rather than on
+                # `info`: `info` is a MediaInfo with one `codec` field, and
+                # a file has both kinds of track. `_probe_webm_audio` reads
+                # it back out; `probe()` never looks and so cannot change.
+                timing.setdefault("audio", codec)
         elif element == _EBML_PIXEL_WIDTH:
             info.width = _ebml_uint(body)
         elif element == _EBML_PIXEL_HEIGHT:
@@ -1687,6 +2458,40 @@ def _probe_webm(data):
     short = {"V_VP8": "VP80", "V_VP9": "VP90"}.get(codec, codec)
     info.reason = KNOWN_UNDECODABLE.get(
         short, "no decoder for %s" % (codec or "this WebM's video codec"))
+    return info
+
+
+# What Matroska's CodecIDs are called in a sentence a person reads.
+_WEBM_AUDIO_NAMES = {
+    "A_AAC": "AAC",
+    "A_OPUS": "Opus",
+    "A_VORBIS": "Vorbis",
+    "A_MPEG/L3": "MP3",
+    "A_AC3": "AC-3",
+    "A_FLAC": "FLAC",
+}
+
+
+def _probe_webm_audio(data):
+    """The same walk as `_probe_webm`, read for its sound instead.
+
+    Nothing is demuxed: a Matroska block is inside a cluster inside a
+    lacing scheme, none of which this parser reads. What it can do is give
+    the codec a name and the file a duration, which is the whole of what an
+    honest refusal needs.
+    """
+    scratch = MediaInfo("WebM")
+    timing = {"scale": 1000000, "ticks": 0.0}
+    _ebml_walk(_Reader(data), scratch, timing)
+    codec = timing.get("audio", "")
+    info = AudioInfo("WebM", _WEBM_AUDIO_NAMES.get(codec, codec))
+    info.duration = ((timing["ticks"] or 0.0)
+                     * (timing["scale"] or 1000000) / 1e9)
+    if not codec:
+        info.reason = "this WebM has no audio track"
+    else:
+        info.reason = ("%s in WebM: audio is demuxed out of MP4 and MOV only"
+                       % info.codec)
     return info
 
 
@@ -1796,3 +2601,38 @@ def open_video(data):
     if kind in ("MP4", "MOV"):
         return _open_mp4(data, kind)
     raise _Unsupported(probe(data))
+
+
+def probe_audio(data):
+    """What the file's sound is, whether or not we can play it.
+
+    The audio half of `probe()`, with the same bargain: never raises for a
+    file we merely lack a codec for -- including a file with no audio track
+    at all, which comes back as an AudioInfo saying so -- and still raises
+    `MediaError` for bytes that are not a container we know, or for one that
+    is malformed.
+    """
+    kind = sniff(data)
+    if kind in ("MP4", "MOV"):
+        return _probe_mp4_audio(data, kind)
+    if kind == "AVI":
+        return _probe_avi_audio(data)
+    if kind == "WebM":
+        return _probe_webm_audio(data)
+    if kind == "MJPEG":
+        return AudioInfo("MJPEG",
+                         reason="a bare MJPEG stream is pictures and nothing "
+                                "else: there is no audio in it")
+    raise MediaError("not a media container we recognise")
+
+
+def open_audio(data):
+    """An `AudioTrack` for a file whose sound we can actually decode.
+
+    Raises `MediaError` otherwise -- including for a perfectly good MP4 with
+    an AC-3 track in it, whose `probe_audio()` result is still worth showing.
+    """
+    kind = sniff(data)
+    if kind in ("MP4", "MOV"):
+        return _open_mp4_audio(data, kind)
+    raise _Unsupported(probe_audio(data))

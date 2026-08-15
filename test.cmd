@@ -74,6 +74,9 @@ rem one that skips everywhere else.
 %RUN% tests\test_cocoa.py || exit /b 1
 %RUN% tests\test_x11.py || exit /b 1
 %RUN% tests\test_win32.py || exit /b 1
+rem The audio stack. The waveOut backend is the one that only runs here; the
+rem live half needs a real output device and skips when there is not one.
+%RUN% tests\test_audio.py || exit /b 1
 %RUN% tests\test_units.py || exit /b 1
 %RUN% tests\test_js.py || exit /b 1
 %RUN% tests\test_shoes.py || exit /b 1
@@ -87,6 +90,8 @@ rem No assembler here, so this checks the pure-Python fallback.
 rem The Fortran H.264 decoder. Windows has no gfortran unless someone put one
 rem there, so this usually checks that the browser survives not having one.
 %RUN% tests\test_h264.py || exit /b 1
+rem The Fortran AAC decoder, and the same arrangement about gfortran.
+%RUN% tests\test_aac.py || exit /b 1
 %RUN% tests\smoke.py || exit /b 1
 
 rem The Go port of the transport layer (net/) is a separate toolchain, so it is

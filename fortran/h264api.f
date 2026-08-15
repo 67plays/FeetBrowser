@@ -1,6 +1,40 @@
 C     The outside of the decoder: Annex B framing, and the handful of
 C     C-callable entry points that feetbrowser/h264.py loads with ctypes.
 C
+C     What decodes today: I, P and B slices, both entropy coders (CABAC
+C     and CAVLC), 4:2:0 8-bit, progressive, Baseline, Main and High
+C     profile.  Every intra prediction mode, both transform sizes,
+C     scaling matrices, quarter-sample motion compensation, explicit and
+C     implicit weighted prediction, bi-prediction, both direct modes, up
+C     to four reference frames, and the deblocking filter.
+C
+C     Refused, each by its own status code so that a report says which:
+C     * SP and SI slices                                        -43
+C     * interlace                                                -4
+C     * chroma other than 4:2:0, or more than 8 bits             -3
+C     * slice groups                                            -13
+C     * pic_order_cnt_type 1                                    -42
+C     * long-term references, and the four marking operations
+C       and the one reordering operation that name them         -50
+C     * more reference frames than MXREF                         -8
+C     * lossless coding, qpprime_y_zero_transform_bypass_flag     -9
+C     * temporal direct prediction with
+C       direct_8x8_inference_flag clear                         -55
+C     * a B slice coded with CAVLC, which no real stream is      -56
+C
+C     H2DECD keeps its state across calls, because an inter slice
+C     predicts from the pictures the previous calls decoded.  Calling
+C     h264_reset between two frames of one stream does not slow the
+C     decoder down, it breaks it; the caller resets when the stream
+C     changes and not otherwise.
+C
+C     Pictures come out in decode order, which is not the order they are
+C     shown in once a stream has B slices in it.  h264_poc reports the
+C     picture order count of the last picture decoded and that is the
+C     whole of this side's involvement: putting the frames back in order
+C     needs the container's composition offsets and belongs where they
+C     are, in feetbrowser/mediacodec.py.
+C
 C     Everything crossing the boundary is an INTEGER or a byte array
 C     passed by reference.  Nothing is returned by value, nothing is a
 C     struct, and no memory is allocated on this side and freed on the
@@ -100,7 +134,7 @@ C     misreads it.
       SUBROUTINE H2VERS(V) BIND(C, NAME='h264_version')
       IMPLICIT NONE
       INTEGER V
-      V = 2
+      V = 4
       RETURN
       END
 
@@ -118,6 +152,8 @@ C     Throw away all decoder state, including the parameter sets.
       OUTH = 0
       SLID = 0
       BITERR = 0
+      CALL H2DCLR
+      CALL H2PCLR
       RETURN
       END
 
@@ -133,6 +169,18 @@ C     not been one.
          W = OUTW
          H = OUTH
       END IF
+      RETURN
+      END
+
+C     The picture order count of the last picture decoded.  Decode order
+C     and presentation order are the same thing only until a stream uses
+C     B pictures; a caller that wants frames in the order a viewer sees
+C     them has to sort by this.  Meaningless before the first picture.
+      SUBROUTINE H2GPOC(P) BIND(C, NAME='h264_poc')
+      IMPLICIT NONE
+      INCLUDE 'h264com.inc'
+      INTEGER P
+      P = CURPOC
       RETURN
       END
 
@@ -180,15 +228,39 @@ C     byte is never zero and this trim can never eat real payload.
       IF (NT .EQ. 7 .OR. NT .EQ. 8 .OR. NT .EQ. 1 .OR. NT .EQ. 5) THEN
          CALL H2LOAD(BUF, S + 1, E, ST)
          IF (ST .NE. 0) RETURN
-C     Trim the trailing bits for every NAL we are going to read, not just
-C     for slices.  The picture parameter set ends in an optional block
-C     guarded by more_rbsp_data(), and without the trim that predicate
-C     mistakes the rbsp_stop_one_bit for payload: a Baseline or Main PPS,
-C     which has no such block, then reads a transform_size_8x8 flag off
-C     the end of itself and fails.  A High PPS happens to have the fields
-C     the predicate promised, which is why this went unnoticed for as
-C     long as every test stream was High.
-         CALL H2TRIM
+C     Three cases, and they do not agree.
+C
+C     Parameter sets must be trimmed.  The picture parameter set ends in
+C     an optional block guarded by more_rbsp_data(), and without the trim
+C     that predicate mistakes the rbsp_stop_one_bit for payload: a
+C     Baseline or Main PPS, which has no such block, then reads a
+C     transform_size_8x8 flag off the end of itself and fails.
+C
+C     A CABAC slice must not be trimmed.  9.3.4.6 flushes the encoder by
+C     writing the low bits of codILow and then a one, and that one is the
+C     rbsp_stop_one_bit -- the stop bit is the last bit of the arithmetic
+C     codeword, not framing after it.  Trimming it away feeds the
+C     decoder a zero where the encoder wrote a one, and the final
+C     end_of_slice_flag reads as "more data" on the slices where the
+C     bit happened to matter.
+C
+C     A CAVLC slice must be trimmed, and for the parameter sets' reason
+C     rather than against the CABAC one.  It has no end_of_slice_flag;
+C     7.3.4 runs its macroblock loop on more_rbsp_data(), so an untrimmed
+C     slice sees the stop bit as one more macroblock.  Its stop bit is
+C     ordinary framing -- rbsp_slice_trailing_bits, appended after the
+C     last codeword -- so nothing is lost by removing it.
+C
+C     ECMODE is the previous PPS's, and this NAL's slice header has not
+C     been read yet.  That is sound only because H2PPSP keeps one
+C     parameter set and H2SHDR ignores pic_parameter_set_id, so there is
+C     exactly one entropy_coding_mode_flag in play; a decoder that kept
+C     several would have to trim after the header instead.
+         IF (NT .EQ. 7 .OR. NT .EQ. 8) THEN
+            CALL H2TRIM
+         ELSE IF (PPSOK .NE. 0 .AND. ECMODE .EQ. 0) THEN
+            CALL H2TRIM
+         END IF
       END IF
 
       IF (NT .EQ. 7) THEN
@@ -209,16 +281,41 @@ C     long as every test stream was High.
          SLID = SLID + 1
          CALL H2SHDR(NT, NR, ST)
          IF (ST .NE. 0) RETURN
-         CALL H2WSCL
-         IF (ECMODE .EQ. 0) THEN
-C     CAVLC.  Phase 1 decodes CABAC only; saying so here is better than
-C     decoding the slice header and then producing a grey picture.
-            ST = -31
-            RETURN
+         IF (SLID .EQ. 1) THEN
+C     8.2.1 once per picture, not once per slice: every slice of a
+C     picture carries the same frame number and order count, and the
+C     count's carried-forward high bits would be advanced twice by a
+C     second slice that recomputed them.
+            CALL H2CPOC
+            CURID = NXTID
+            NXTID = NXTID + 1
          END IF
-         CALL H2ALGN
-         CALL H2CINI(SLQPY)
-         CALL H2SLIC(ST)
+         CALL H2WSCL
+         RL0N = 0
+         RL1N = 0
+         COLSL = 0
+         IF (SLTYPE .EQ. 0) THEN
+C     8.2.4, per slice and not per picture: two P slices of one picture
+C     may reorder the same set of references differently.
+            CALL H2RLST(ST)
+            IF (ST .NE. 0) RETURN
+         ELSE IF (SLTYPE .EQ. 1) THEN
+C     8.2.4.2.3 and 8.2.4.2.4.  A B slice's two lists are built from the
+C     same references sorted by picture order count rather than by frame
+C     number, which is the whole reason a B slice needs a correct POC and
+C     a P slice can limp along with a wrong one.
+            CALL H2BLST(ST)
+            IF (ST .NE. 0) RETURN
+         END IF
+         IF (ECMODE .EQ. 0) THEN
+C     CAVLC reads on from wherever the slice header stopped: no
+C     cabac_alignment_one_bit, no arithmetic decoder to initialise.
+            CALL H2CSLC(ST)
+         ELSE
+            CALL H2ALGN
+            CALL H2CINI(SLQPY)
+            CALL H2SLIC(ST)
+         END IF
          IF (ST .NE. 0) RETURN
       END IF
 
@@ -231,6 +328,10 @@ C     decoding the slice header and then producing a grey picture.
          RETURN
       END IF
       CALL H2DBLK
+C     8.2.5 after the filter, because the picture later pictures predict
+C     from is the filtered one.
+      CALL H2MARK(ST)
+      IF (ST .NE. 0) RETURN
       ST = 0
       RETURN
       END

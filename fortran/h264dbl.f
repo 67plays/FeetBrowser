@@ -7,13 +7,14 @@ C     place and each edge sees the results of the edges before it, which
 C     is not an implementation shortcut -- it is what 8.7 specifies, and
 C     filtering into a copy would give different pixels.
 C
-C     Intra pictures make the boundary strength trivial.  8.7.2.1 gives
-C     bS = 4 when either side is intra and the edge is a macroblock edge,
-C     and bS = 3 when either side is intra otherwise; in an I picture
-C     every macroblock is intra, so the strength is 4 on the outside of a
-C     macroblock and 3 inside it, with no motion vectors or coefficient
-C     counts to consult.  When P slices arrive this is the routine that
-C     grows a real bS derivation.
+C     The boundary strength is where inter prediction shows up in this
+C     file.  In an I picture it is trivial -- 4 on the outside of a
+C     macroblock, 3 inside it, because every macroblock is intra.  In a P
+C     picture the strength varies along a single edge, so each edge is
+C     filtered as four groups of four lines rather than as sixteen lines
+C     with one strength, and each group asks about the two 4x4 blocks it
+C     separates: their coefficients, the pictures they predicted from,
+C     and how far apart their vectors are.
 
       SUBROUTINE H2DBLK
       IMPLICIT NONE
@@ -143,12 +144,160 @@ C     Where the area is not flat it falls back to two samples.
       RETURN
       END
 
+C     Does the transform block containing 4x4 block (BX, BY) of
+C     macroblock A hold any non-zero coefficients?
+C
+C     MNZ is per 4x4 block because CAVLC needs it that way -- each 4x4's
+C     TotalCoeff is the next block's nC -- so when the 8x8 transform is
+C     in use the four counts of an 8x8 are four different numbers and the
+C     question has to be asked of all four.  Under CABAC an 8x8 is one
+C     coded block and all four slots hold its count, so the loop finds
+C     the same answer it would have found from any one of them.
+      INTEGER FUNCTION H2NZQ(A, BX, BY)
+      IMPLICIT NONE
+      INCLUDE 'h264com.inc'
+      INTEGER A, BX, BY, I, K
+      H2NZQ = 0
+      IF (MT8(A + 1) .EQ. 0) THEN
+         IF (MNZ(ZORD(BX, BY) + 1, A + 1) .GT. 0) H2NZQ = 1
+         RETURN
+      END IF
+      K = 4 * (BX / 2 + 2 * (BY / 2))
+      DO 10 I = 1, 4
+         IF (MNZ(K + I, A + 1) .GT. 0) H2NZQ = 1
+   10 CONTINUE
+      RETURN
+      END
+
+C     One full luma sample of disagreement, which is four quarter-sample
+C     units, is where a seam becomes visible.
+      INTEGER FUNCTION H2MVNE(AX, AY, BX, BY)
+      IMPLICIT NONE
+      INTEGER AX, AY, BX, BY
+      H2MVNE = 0
+      IF (ABS(AX - BX) .GE. 4) H2MVNE = 1
+      IF (ABS(AY - BY) .GE. 4) H2MVNE = 1
+      RETURN
+      END
+
+C     8.7.2.1, for a frame-coded picture.  A and NB are the macroblocks
+C     on the q and p sides; MBEDG says the edge between them is a
+C     macroblock edge; the four block coordinates name the 4x4 block on
+C     each side, in raster order within its own macroblock.
+C
+C     MRPI and not MREF: two slices of one picture can reach the same
+C     reference picture through different indices, and 8.7.2.1 asks
+C     whether the pictures are the same, not whether the numbers are.
+C     In a B slice that is not a nicety.  The same picture sits at
+C     different indices in the two lists of one slice, so an edge
+C     between a list-0 partition and a list-1 partition of the very same
+C     picture would be filtered on every macroblock of every B frame if
+C     indices were compared -- and every one of those edges is smooth.
+C
+C     Two vectors on each side is where 8.7.2.1 stops being a comparison
+C     and becomes a matching problem.  The two predictions are a set and
+C     not a pair: which of them the encoder called list 0 says nothing
+C     about the picture.  When the two sides used two different pictures
+C     the matching is forced, and each vector is compared with the one
+C     that points at the same picture.  When both sides used the same
+C     picture twice there are two matchings, and the edge is smooth if
+C     either of them agrees -- which is the standard's rule, and it is
+C     the right one: a block predicted from a picture twice with two
+C     vectors is the average of both, and swapping them changes nothing.
+      SUBROUTINE H2BS(A, NB, MBEDG, PBX, PBY, QBX, QBY, BS)
+      IMPLICIT NONE
+      INCLUDE 'h264com.inc'
+      INTEGER A, NB, MBEDG, PBX, PBY, QBX, QBY, BS
+      INTEGER PI, QI, PQ, QQ, L, NPR, NQR, J1, J2, D1, D2
+      INTEGER PR(2), QR(2), PMX(2), PMY(2), QMX(2), QMY(2)
+      INTEGER H2MVNE, H2NZQ
+      EXTERNAL H2MVNE, H2NZQ
+      BS = 0
+      IF (MINT(NB + 1) .NE. 0 .OR. MINT(A + 1) .NE. 0) THEN
+         BS = 3
+         IF (MBEDG .NE. 0) BS = 4
+         RETURN
+      END IF
+C     8.7.2.1 asks about the transform block containing the 4x4, which
+C     is the 4x4 itself unless the 8x8 transform is in use.  H2NZQ and
+C     not MNZ read directly: under CABAC all four slots of an 8x8 carry
+C     that block's count and either would answer, but CAVLC keeps a
+C     separate TotalCoeff per 4x4 because the next block's nC comes from
+C     it, and there one slot is not the block.
+      IF (H2NZQ(NB, PBX, PBY) .NE. 0 .OR. H2NZQ(A, QBX, QBY) .NE. 0)
+     +   THEN
+         BS = 2
+         RETURN
+      END IF
+      PI = 1 + PBX + 4 * PBY
+      QI = 1 + QBX + 4 * QBY
+      PQ = 1 + PBX / 2 + 2 * (PBY / 2)
+      QQ = 1 + QBX / 2 + 2 * (QBY / 2)
+      NPR = 0
+      NQR = 0
+      DO 10 L = 1, 2
+         IF (MREF(PQ, L, NB + 1) .GE. 0) THEN
+            NPR = NPR + 1
+            PR(NPR) = MRPI(PQ, L, NB + 1)
+            PMX(NPR) = MMVX(PI, L, NB + 1)
+            PMY(NPR) = MMVY(PI, L, NB + 1)
+         END IF
+         IF (MREF(QQ, L, A + 1) .GE. 0) THEN
+            NQR = NQR + 1
+            QR(NQR) = MRPI(QQ, L, A + 1)
+            QMX(NQR) = MMVX(QI, L, A + 1)
+            QMY(NQR) = MMVY(QI, L, A + 1)
+         END IF
+   10 CONTINUE
+      IF (NPR .NE. NQR) THEN
+         BS = 1
+         RETURN
+      END IF
+      IF (NPR .EQ. 0) RETURN
+      IF (NPR .EQ. 1) THEN
+         IF (PR(1) .NE. QR(1)) THEN
+            BS = 1
+         ELSE IF (H2MVNE(PMX(1), PMY(1), QMX(1), QMY(1)) .NE. 0) THEN
+            BS = 1
+         END IF
+         RETURN
+      END IF
+      IF (PR(1) .EQ. PR(2)) THEN
+         IF (QR(1) .NE. PR(1) .OR. QR(2) .NE. PR(1)) THEN
+            BS = 1
+            RETURN
+         END IF
+         D1 = 0
+         IF (H2MVNE(PMX(1), PMY(1), QMX(1), QMY(1)) .NE. 0) D1 = 1
+         IF (H2MVNE(PMX(2), PMY(2), QMX(2), QMY(2)) .NE. 0) D1 = 1
+         D2 = 0
+         IF (H2MVNE(PMX(1), PMY(1), QMX(2), QMY(2)) .NE. 0) D2 = 1
+         IF (H2MVNE(PMX(2), PMY(2), QMX(1), QMY(1)) .NE. 0) D2 = 1
+         IF (D1 .NE. 0 .AND. D2 .NE. 0) BS = 1
+         RETURN
+      END IF
+      IF (PR(1) .EQ. QR(1) .AND. PR(2) .EQ. QR(2)) THEN
+         J1 = 1
+         J2 = 2
+      ELSE IF (PR(1) .EQ. QR(2) .AND. PR(2) .EQ. QR(1)) THEN
+         J1 = 2
+         J2 = 1
+      ELSE
+         BS = 1
+         RETURN
+      END IF
+      IF (H2MVNE(PMX(1), PMY(1), QMX(J1), QMY(J1)) .NE. 0) BS = 1
+      IF (H2MVNE(PMX(2), PMY(2), QMX(J2), QMY(J2)) .NE. 0) BS = 1
+      RETURN
+      END
+
 C     All the edges of one macroblock.
       SUBROUTINE H2DBMB(A)
       IMPLICIT NONE
       INCLUDE 'h264com.inc'
       INTEGER A
       INTEGER MX, MY, E, BS, NB, X, Y, IA, IB, LEFT, TOP, SC, T8
+      INTEGER G, ME, PBX, PBY, LE
       MX = MOD(A, MBW)
       MY = A / MBW
       IF (MDBI(A + 1) .EQ. 1) RETURN
@@ -174,71 +323,99 @@ C     or the slice asked for its own edges to be left alone.
 C     Vertical edges, left to right.  With an 8x8 transform the two
 C     edges at four and twelve are inside a transform block and are not
 C     filtered at all.
-      DO 10 E = 0, 3
-         IF (T8 .NE. 0 .AND. MOD(E, 2) .NE. 0) GOTO 10
+      DO 15 E = 0, 3
+         IF (T8 .NE. 0 .AND. MOD(E, 2) .NE. 0) GOTO 15
          IF (E .EQ. 0) THEN
-            IF (LEFT .EQ. 0) GOTO 10
+            IF (LEFT .EQ. 0) GOTO 15
             NB = A - 1
-            BS = 4
+            ME = 1
+            PBX = 3
          ELSE
             NB = A
-            BS = 3
+            ME = 0
+            PBX = E - 1
          END IF
          CALL H2QPI(A, NB, 0, IA, IB)
          X = MX * 16 + E * 4
-         CALL H2EDG(PY, (MY * 16) * MXW + X + 1, 1, MXW, 16,
-     +              BS, IA, IB, 0)
-   10 CONTINUE
-      DO 20 E = 0, 1
+         DO 10 G = 0, 3
+            CALL H2BS(A, NB, ME, PBX, G, E, G, BS)
+            IF (BS .EQ. 0) GOTO 10
+            CALL H2EDG(PY, (MY * 16 + 4 * G) * MXW + X + 1, 1, MXW, 4,
+     +                 BS, IA, IB, 0)
+   10    CONTINUE
+   15 CONTINUE
+C     Chroma reuses the luma strengths: a chroma edge is a luma edge seen
+C     at half the resolution, so two chroma lines share one luma group.
+      DO 25 E = 0, 1
+         LE = 2 * E
          IF (E .EQ. 0) THEN
-            IF (LEFT .EQ. 0) GOTO 20
+            IF (LEFT .EQ. 0) GOTO 25
             NB = A - 1
-            BS = 4
+            ME = 1
+            PBX = 3
          ELSE
             NB = A
-            BS = 3
+            ME = 0
+            PBX = LE - 1
          END IF
          X = MX * 8 + E * 4
-         CALL H2QPI(A, NB, 1, IA, IB)
-         CALL H2EDG(PU, (MY * 8) * SC + X + 1, 1, SC, 8,
-     +              BS, IA, IB, 1)
-         CALL H2QPI(A, NB, 2, IA, IB)
-         CALL H2EDG(PV, (MY * 8) * SC + X + 1, 1, SC, 8,
-     +              BS, IA, IB, 1)
-   20 CONTINUE
+         DO 20 G = 0, 3
+            CALL H2BS(A, NB, ME, PBX, G, LE, G, BS)
+            IF (BS .EQ. 0) GOTO 20
+            CALL H2QPI(A, NB, 1, IA, IB)
+            CALL H2EDG(PU, (MY * 8 + 2 * G) * SC + X + 1, 1, SC, 2,
+     +                 BS, IA, IB, 1)
+            CALL H2QPI(A, NB, 2, IA, IB)
+            CALL H2EDG(PV, (MY * 8 + 2 * G) * SC + X + 1, 1, SC, 2,
+     +                 BS, IA, IB, 1)
+   20    CONTINUE
+   25 CONTINUE
 
 C     Horizontal edges, top to bottom.
-      DO 30 E = 0, 3
-         IF (T8 .NE. 0 .AND. MOD(E, 2) .NE. 0) GOTO 30
+      DO 35 E = 0, 3
+         IF (T8 .NE. 0 .AND. MOD(E, 2) .NE. 0) GOTO 35
          IF (E .EQ. 0) THEN
-            IF (TOP .EQ. 0) GOTO 30
+            IF (TOP .EQ. 0) GOTO 35
             NB = A - MBW
-            BS = 4
+            ME = 1
+            PBY = 3
          ELSE
             NB = A
-            BS = 3
+            ME = 0
+            PBY = E - 1
          END IF
          CALL H2QPI(A, NB, 0, IA, IB)
          Y = MY * 16 + E * 4
-         CALL H2EDG(PY, Y * MXW + MX * 16 + 1, MXW, 1, 16,
-     +              BS, IA, IB, 0)
-   30 CONTINUE
-      DO 40 E = 0, 1
+         DO 30 G = 0, 3
+            CALL H2BS(A, NB, ME, G, PBY, G, E, BS)
+            IF (BS .EQ. 0) GOTO 30
+            CALL H2EDG(PY, Y * MXW + MX * 16 + 4 * G + 1, MXW, 1, 4,
+     +                 BS, IA, IB, 0)
+   30    CONTINUE
+   35 CONTINUE
+      DO 45 E = 0, 1
+         LE = 2 * E
          IF (E .EQ. 0) THEN
-            IF (TOP .EQ. 0) GOTO 40
+            IF (TOP .EQ. 0) GOTO 45
             NB = A - MBW
-            BS = 4
+            ME = 1
+            PBY = 3
          ELSE
             NB = A
-            BS = 3
+            ME = 0
+            PBY = LE - 1
          END IF
          Y = MY * 8 + E * 4
-         CALL H2QPI(A, NB, 1, IA, IB)
-         CALL H2EDG(PU, Y * SC + MX * 8 + 1, SC, 1, 8,
-     +              BS, IA, IB, 1)
-         CALL H2QPI(A, NB, 2, IA, IB)
-         CALL H2EDG(PV, Y * SC + MX * 8 + 1, SC, 1, 8,
-     +              BS, IA, IB, 1)
-   40 CONTINUE
+         DO 40 G = 0, 3
+            CALL H2BS(A, NB, ME, G, PBY, G, LE, BS)
+            IF (BS .EQ. 0) GOTO 40
+            CALL H2QPI(A, NB, 1, IA, IB)
+            CALL H2EDG(PU, Y * SC + MX * 8 + 2 * G + 1, SC, 1, 2,
+     +                 BS, IA, IB, 1)
+            CALL H2QPI(A, NB, 2, IA, IB)
+            CALL H2EDG(PV, Y * SC + MX * 8 + 2 * G + 1, SC, 1, 2,
+     +                 BS, IA, IB, 1)
+   40    CONTINUE
+   45 CONTINUE
       RETURN
       END

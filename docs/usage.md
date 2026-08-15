@@ -99,6 +99,20 @@ To render a page without opening a window:
 This runs the whole browser (chrome, tabs, toolbar, page, scrollbar), waits
 for images to load, and writes a PNG.
 
+To ask a copy of the browser whether it can play video:
+
+```bash
+./run.sh --check-video
+./run.sh --check-video tests/fixtures/h264/mb1.264 tests/fixtures/h264/mb1.i420.z
+```
+
+The first prints whether the H.264 decoder loaded and, if it did not, why.
+The second decodes a frame and compares it with the picture a reference
+decoder produced. It is mostly there for the packaging, which runs it inside
+the `.app`, the AppImage and the Windows bundle -- that is the one place the
+answer cannot be taken on trust, because a build that ships no decoder looks
+perfect until somebody opens a video.
+
 ## Environment variables
 
 The browser reads two variables of its own, and neither of them has to be set

@@ -57,6 +57,7 @@ step() { printf '\n=== %s ===\n' "$1"; }
 step "build dependencies"
 dnf install -y -q \
   openssl-devel libffi-devel bzip2-devel xz-devel zlib-devel \
+  gcc-gfortran \
   dejavu-sans-fonts dejavu-serif-fonts dejavu-sans-mono-fonts \
   ca-certificates patchelf file findutils >/dev/null
 
@@ -149,6 +150,40 @@ cp "$SRC/toes/README.md" "$SITE/toes/README.md"
 rm -rf "$SITE"/*.dist-info
 
 cp "$SRC/packaging/linux/launcher.py" "$APPDIR/usr/lib/feetbrowser/launcher.py"
+
+# The two Fortran decoders. feetbrowser/h264.py and feetbrowser/aac.py compile
+# fortran/ with gfortran the first time a video or a soundtrack plays, which
+# is fine in a checkout and impossible in an AppImage: the image is read-only
+# and the user has no compiler. Left alone the browser starts, renders, and
+# says "[video: H.264: no gfortran on PATH]" to anyone who opens a video -- a
+# failure no developer ever sees, because developers have gfortran.
+#
+# Both of them, because shipping only the video half produces an AppImage
+# that plays pictures in silence, which reads as a broken player rather than
+# as a missing decoder.
+#
+# So they are compiled here and shipped inside the package, each under a name
+# that is a hash of the sources it was built from; the sources ship beside the
+# package so the loader can recompute those hashes and refuse a mismatch. This
+# runs before the private-library step on purpose: if gfortran's runtime could
+# not be linked in statically -- manylinux_2_28's libgfortran.a is not built
+# -fPIC and cannot go into a shared object at all -- what is left is an
+# ordinary NEEDED entry, which collect() will bundle and the rpath pass will
+# point at $ORIGIN, and either way nothing outside the image is required.
+step "the Fortran decoders"
+(cd "$SRC" && tar cf - fortran) | (cd "$SITE" && tar xf -)
+H264=$(PYTHONPATH="$SITE" "$PY" -m feetbrowser.h264 --name)
+PYTHONPATH="$SITE" "$PY" -m feetbrowser.h264 --build "$SITE/feetbrowser/$H264"
+AAC=$(PYTHONPATH="$SITE" "$PY" -m feetbrowser.aac --name)
+PYTHONPATH="$SITE" "$PY" -m feetbrowser.aac --build "$SITE/feetbrowser/$AAC"
+for lib in "$H264" "$AAC"; do
+  file "$SITE/feetbrowser/$lib"
+  # What it still needs, printed here and dealt with by collect() below. A
+  # NEEDED libgfortran.so.5 in this list is expected on manylinux and is not
+  # a failure; anything left unresolved after the rpath pass would be, and
+  # the self-test at step 9 is what would catch it.
+  ldd "$SITE/feetbrowser/$lib"
+done
 
 # -- 5. fonts ---------------------------------------------------------------
 #
@@ -268,6 +303,15 @@ step "self-test inside the AppDir"
 APPDIR="$APPDIR" "$APPDIR/AppRun" --version
 APPDIR="$APPDIR" "$APPDIR/AppRun" --screenshot \
   "file://$SRC/tests/fixtures/pixels.html" "$WORK/appdir-shot.png"
+# The decoders, asked of the bundle rather than of the container they were
+# built in: a stripped PATH so no gfortran can be found, one frame and one
+# soundtrack decoded, and both results compared with what a reference decoder
+# produced. verify-in-container.sh asks the finished AppImage the same
+# questions on a machine with no Python at all.
+APPDIR="$APPDIR" PATH=/usr/bin:/bin "$APPDIR/AppRun" --check-video \
+  "$SRC/tests/fixtures/h264/mb1.264" "$SRC/tests/fixtures/h264/mb1.i420.z"
+APPDIR="$APPDIR" PATH=/usr/bin:/bin "$APPDIR/AppRun" --check-audio \
+  "$SRC/tests/fixtures/aac/lowrate.aac" "$SRC/tests/fixtures/aac/lowrate.f32.z"
 
 # -- 10. the AppImage -------------------------------------------------------
 #

@@ -74,6 +74,14 @@ jobs:
           $PY tests/test_x11.py
           $PY tests/test_win32.py
 
+      # The audio stack. Its pure half -- ring, resampler, mixer, clock --
+      # is nearly all of it and runs everywhere; the live half needs an
+      # output device that actually consumes samples, which no runner has,
+      # so it skips and says so. What this checks on a runner is that a
+      # machine with no sound card ends up silent-but-working.
+      - name: Audio tests
+        run: $PY tests/test_audio.py
+
       - name: Unit tests
         run: $PY tests/test_units.py
 
@@ -104,6 +112,15 @@ jobs:
       # library away itself and asserts the browser still works without it.
       - name: H.264 decoder
         run: $PY tests/test_h264.py
+
+      # The Fortran AAC-LC decoder, against PCM from the same reference
+      # decoder. Three compilers on three operating systems is worth more
+      # here than it is for H.264: AAC is not a bit-exact standard, so what
+      # is being checked across the three is that the transform lands inside
+      # the same tolerance wherever it is built, not just on the machine the
+      # vectors were measured on.
+      - name: AAC decoder
+        run: $PY tests/test_aac.py
 
       # The check this whole file was rebuilt for. A page with text, a PNG,
       # a GIF, a background and a border is fetched from a local server and

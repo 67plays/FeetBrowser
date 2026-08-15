@@ -5,9 +5,23 @@ real file, and presents them through the existing rasteriser against a real
 clock, with play, pause and a scrubber. Motion JPEG plays (in AVI, in
 QuickTime, and as a bare stream of JPEGs), as do uncompressed and RLE AVI and
 QuickTime's `raw ` and `png `. H.264 plays as far as its decoder goes, which
-is every frame of an I-frame-only stream and nothing else yet; see
-[H.264, in Fortran](#h264-in-fortran). Everything else is identified by name
-and refused in public. There is no audio at all.
+is every frame of a stream of I, P and B slices -- an ordinary
+well-compressed web MP4 -- and not one with SP or SI slices, nor a B slice
+coded with CAVLC; see [H.264, in Fortran](#h264-in-fortran). Everything else
+is identified by name and refused in public.
+
+Audio has both halves and the join between them. The AAC-LC track of an
+ordinary web MP4 comes out as PCM samples in memory, exactly as a reference
+decoder produces them -- see [AAC, in Fortran](#aac-in-fortran) -- there is a
+platform output device on all three platforms, a lock-free ring, a polyphase
+resampler, a mixer with per-source gain and a master volume, and a monotonic
+audio clock, see [Audio output](#audio-output); and `feetbrowser/arch.py`
+pumps one into the other and hangs the pictures off the result, see
+[Sound and pictures together](#sound-and-pictures-together). An MP4 with an
+AAC-LC track plays with sound, and its frames are scheduled against the
+sound rather than against the wall clock. Every other container's audio is
+still named and refused: there is no MP3, no Vorbis and no Opus, and AVI's
+audio is not demuxed at all.
 
 Read this before adding a codec. The point of writing it down is that the
 hard parts here are not the codec; they are the seams the codec plugs into,
@@ -97,6 +111,22 @@ browser. Everything in it is a pure function of a `bytes` object.
   `reset()`. When `frame(i)` is not the sequential next one it rewinds to
   `keyframe_before(i)` and replays. Sequential playback costs one decode per
   frame; a seek costs the distance back to the keyframe.
+- `probe_audio(data)` and `open_audio(data)` are the same pair for sound,
+  returning an `AudioInfo` (container, codec, sample rate, channels,
+  duration, coded frame count, `supported`, `reason`) and an `AudioTrack`.
+  Deliberately a separate pair rather than more fields on `MediaInfo`: a
+  file can have a video track we play and an audio track we can only name,
+  and one answer for both would have to be wrong about one of them. A file
+  with no sound at all comes back as an `AudioInfo` saying so rather than as
+  an error.
+- `AudioTrack` is the shape of `VideoTrack`, because the thing above them --
+  a scheduler holding a clock -- wants to ask both the same questions.
+  `frame(i)` returns an `AudioFrame` (index, pts, duration, sample rate,
+  channels, and interleaved float32 bytes); one "frame" is one coded AAC
+  frame, 1024 samples per channel, about 23 milliseconds. There is no
+  keyframe in AAC -- every frame carries a whole spectrum but its first half
+  is the previous frame's transform tail -- so an out-of-order `frame(i)`
+  replays from the start of the track rather than from a sync sample.
 
 Every read goes through a `_Reader` that bounds-checks, and every walk is
 capped: `MAX_FRAMES`, `MAX_CHUNKS`, `MAX_FRAME_BYTES`, `MAX_DEPTH`, plus
@@ -197,20 +227,85 @@ Navigating away or closing a tab stops the decode threads.
 
 The sections above say twice that H.264 is a multi-month project. They were
 written before anyone started it, and they were right about the size; what
-they got wrong was that the size is a reason not to begin. Phase one is in
-`fortran/`, wrapped by `feetbrowser/h264.py`, and it decodes I frames to the
-exact pixels a reference decoder produces.
+they got wrong was that the size is a reason not to begin. It is in
+`fortran/`, wrapped by `feetbrowser/h264.py`, and it decodes I, P and B
+slices to the exact pixels a reference decoder produces.
 
 **Exactly what it does.** Annex B and AVCC framing with emulation-prevention
 removal; SPS and PPS including the High-profile block and both scaling-matrix
-fall-back rules; I-slice headers; CABAC, which is the whole of clause 9.3:
-context initialisation from the (m, n) tables, decode-decision,
-decode-bypass, decode-terminate and renormalisation; I macroblocks in all of
-Intra_4x4, Intra_8x8, Intra_16x16 and the four chroma modes; residual
-decoding with the 4x4 and 8x8 integer inverse transforms and the chroma DC
-Hadamard; the deblocking filter; and the colour conversion out to RGBA. There
-is no CAVLC. A `-coder 0` stream is refused by name rather than decoded
-wrongly, which is the same contract every other unplayable file here gets.
+fall-back rules; I-, P- and B-slice headers, including the reference list
+modification and weighted prediction tables; CABAC, which is the whole of
+clause 9.3: context initialisation from the (m, n) tables, decode-decision,
+decode-bypass, decode-terminate and renormalisation; CAVLC, which is the
+whole of clause 9.2: all five `coeff_token` tables with the `nC` derivation
+that picks between them, the `level_prefix`/`level_suffix` escalation and
+both of its escapes, `total_zeros` and `run_before`, and the macroblock and
+slice syntax that goes with them -- `mb_skip_run`, the two columns of Table
+9-4, and a residual loop terminated by `more_rbsp_data()` rather than an
+`end_of_slice_flag`; I macroblocks in all of Intra_4x4, Intra_8x8,
+Intra_16x16 and the four chroma modes; residual decoding with the 4x4 and 8x8
+integer inverse transforms and the chroma DC Hadamard; the deblocking filter;
+and the colour conversion out to RGBA.
+
+**And what inter prediction added.** A decoded picture buffer; picture order
+count (8.2.1) for types 0 and 2; reference picture list initialisation and
+reordering (8.2.4); sliding-window and MMCO reference marking (8.2.5); the
+median motion vector predictor with the 16x8 and 8x16 directional cases
+(8.4.1.3) and P_Skip (8.4.1.1); the six-tap quarter-sample luma interpolator
+(8.4.2.2.1) and the eighth-sample bilinear chroma one (8.4.2.2.2), both
+clamping at the picture edge; weighted prediction (8.4.2.3); the four P
+macroblock types with their sub-macroblock partitions; the CABAC contexts for
+`mb_skip_flag`, `ref_idx_l0`, `mvd_l0` and `sub_mb_type`; and a boundary
+strength derivation (8.7.2.1) that now compares motion vectors and reference
+*pictures* rather than reference indices, which is not the same thing the
+moment two slices order their lists differently.
+
+**And what B slices added.** Reference list 1 and the B initialisation
+(8.2.4.2.3), with modification applied to both lists; the B macroblock and
+sub-macroblock types including B_Skip and B_Direct_16x16; bi-prediction with
+its own rounding (8.4.2.3.1) and weighted bi-prediction in both the explicit
+and the implicit mode (8.4.2.3.2), whose weights come from where the picture
+sits between its two references and appear nowhere in the bitstream; both
+direct modes -- spatial (8.4.1.2.2) and temporal (8.4.1.2.3), with the
+colocated picture and its motion field saved per reference frame; the CABAC
+contexts for the B forms of `mb_skip_flag`, `mb_type` and `sub_mb_type` and
+for `ref_idx_l1` and `mvd_l1`; and a boundary strength derivation that now
+compares two lists of motion against two, which is a matching problem rather
+than a pairwise comparison when both sides predict twice from the same
+picture.
+
+Storing the colocated motion field is what B slices cost in memory: 5.5 MB
+of `COMMON`, on top of doubling the current picture's motion field to hold
+two lists. That is the price of temporal direct, which reads the motion of
+the picture at reference index 0 of list 1 as it was when *that* picture was
+decoded, and there is nowhere else to keep it.
+
+Decode order stops being presentation order here, and that half of the
+problem is deliberately not in `fortran/`: the decoder hands pictures over
+in the order they are coded and reports each one's picture order count, and
+`VideoTrack` sorts them into the order they are shown using the container's
+`ctts` composition offsets. A reorder buffer holds the handful of pictures
+that have been decoded but not yet shown, so playing an IBBP file straight
+through still costs one packet per frame; a seek backwards past that buffer
+resets and replays from the keyframe, and `bframes.mp4` in the fixtures is
+the test that both paths produce the same bytes as playing straight through.
+
+**Four reference frames, not sixteen.** The buffer is dimensioned `MXREF =
+4`, and a stream whose SPS asks for more is refused rather than decoded
+wrongly. The level limit is 16, but there is no allocator here -- the planes
+are `COMMON` and are sized at compile time for 1920x1088 -- so the cap is a
+real trade of memory against reach. Sixteen reference frames is 50 MB of
+static storage carried by every process whether it plays a video or not, and
+nothing on the web needs it: x264's default is three, its `--preset slow` is
+four, and the hardware encoders in phones and cameras use one or two. Four
+covers all of those, and the failure mode for the rest is a named refusal
+rather than a wrong picture. Raising it is one number.
+
+The reference planes are `INTEGER*1` even though the working picture is
+`INTEGER`. A reference sample is a byte and is only ever read back through
+one masking accessor, so a reference frame costs 3.1 MB against the working
+picture's 12.5, and all four of them together cost what the one picture the
+decoder is building costs.
 
 **Why Fortran.** Because the hot loop of a CABAC decoder is a handful of
 integer comparisons, table lookups and shifts in a dependent chain, and that
@@ -221,11 +316,20 @@ enough that the language stopped being the interesting variable. It is also
 the only compiled language in this tree that arrives with no crates, no
 package manager and no lock file, which is the standing constraint here.
 
-**How it is built and loaded.** `h264.py` finds a `gfortran`, compiles the
-nine sources into a shared library in the temporary directory under a name
-keyed on a hash of those sources, and loads it with `ctypes`. The hash is
-what makes the cache safe: edit a `.f` file and the next run builds a
-different library rather than loading the old one. Nothing about this is
+**How it is built and loaded.** In a packaged application the library is
+already there: the packaging compiled it on the build machine and put it
+inside the package as `_h264_<digest>.dll`/`.dylib`/`.so`, with `fortran/`
+shipped beside the package. `h264.py` prefers it, and the digest is the whole
+check -- it is a hash of the shipped sources and the ABI number, recomputed at
+load, so a library built from a different decoder is not loaded in error, it
+is not found. The `h264_version` check still runs on it.
+
+Failing that -- which is to say, from a checkout -- `h264.py` finds a
+`gfortran`, compiles the eleven sources into a shared library in the
+temporary directory under a name keyed on a hash of those sources *and of the
+compiler*, and loads it with `ctypes`. The hash is what makes the cache safe:
+edit a `.f` file, or build with a different gfortran, and the next run builds
+a different library rather than loading the old one. Nothing about this is
 required. No compiler, a compiler that fails, or a library that reports the
 wrong ABI version all end in `h264.available()` returning false, and a file
 carrying H.264 is then named and refused exactly as it was before any of this
@@ -233,52 +337,462 @@ existed. `run.sh` and `run.cmd` warm the cache at startup so the first
 `<video>` on a page does not stall for the build, and both ignore whether it
 worked.
 
+`python3 -m feetbrowser --check-video [stream.264 [truth.i420.z]]` asks a
+build whether it can decode, and with the fixtures from
+`tests/fixtures/h264/` makes it prove it. It exists because the answer used
+to be "no" in every shipped copy of the browser and "yes" on every machine
+that could have noticed. The packaging scripts run it inside the artifact
+they just built, with `PATH` cut back to the system directories.
+
 The decoder's state lives in `COMMON` blocks, which is to say there is one
 decoder in the process no matter how many `Decoder` objects Python holds. The
 `threading.Lock` in `h264.py` is what keeps that honest, and it is load-
 bearing rather than defensive: the browser decodes video on a worker thread
 per element.
 
-**What it is not.** No P slices, no B slices, no motion compensation, no
-reference picture list, no weighted prediction, no interlaced coding in any
-of its forms. Those are not stubbed or half-written; the slice header parser
-sees a slice type it does not handle and refuses the stream.
+**What it is not.** No SP or SI slices, no interlaced coding in any of its
+forms, no long-term reference pictures, no picture order count type 1, and no
+lossless coding -- `qpprime_y_zero_transform_bypass_flag`, which is what
+x264's `--qp 0` turns on, and where a macroblock's residual is added to the
+prediction without ever going through a transform. A B slice coded with CAVLC
+is refused too: the two features were built for
+different halves of the syntax, the combination does not occur in a real
+stream, and reading it would produce a plausible picture rather than an error.
+Temporal direct prediction is refused when `direct_8x8_inference_flag` is
+clear, which is a corner x264 never produces and which there is therefore no
+way to test bit-exactly here; spatial direct works either way. Those are not
+stubbed or half-written: the parser sees what it does not handle and refuses
+the stream by name.
 
-A web MP4 is P frames from its second frame onward, so this does not play
-one, and the interesting part is *how* it does not. Frame zero of such a file
-decodes perfectly (it is an IDR), so trial-decoding it would say yes to a
-file that then shows one picture and holds it for the rest of the clip, with
-nothing anywhere reporting an error. So `_H264` reads the container's sync
-flags first and refuses any track that has a frame which is not a sync
-sample, before it decodes anything. The element then draws the same sized box
-and sentence it drew before this decoder existed, which is the honest answer
-until inter prediction lands.
+Refusing has to happen before the poster goes up rather than in the middle of
+playback, and for a per-slice property that is harder than it sounds.
+Trial-decoding frame zero cannot see frame four hundred, and an encoder may
+introduce an SP slice anywhere. So `_H264` reads `slice_type` out of every
+sample's slice header first -- two exp-Golomb fields per NAL, no arithmetic
+decoding, so it
+costs nothing -- and refuses the whole file if any of them is a kind it
+cannot finish. Then it trial-decodes the first keyframe for everything a
+header cannot tell you, and throws the result away so that frame zero is
+decoded once, by whoever asks for frame zero.
+
+The other thing inter prediction changed above the decoder: there is one
+decoder in the process, and a P frame is a difference against pictures that
+decoder is still holding, so two `<video>` elements decoding alternately
+would each be predicting from the other's pictures. `Decoder` keeps the
+access units it has fed since its last IDR and replays them when it finds
+another instance has been at the library in between. The history is bounded
+by the stream's keyframe interval rather than by its length, and
+`test_two_decoders_interleaved_do_not_corrupt_each_other` is the proof.
+
+## Audio output
+
+Everything downstream of "here are some PCM samples". Named `heel`, because
+it is the part of a foot that makes a noise, and because LICENSE condition 3
+says so.
+
+Nothing here decodes anything. A `Source` is a rate, a channel count and a
+stream of samples; where they came from is not this code's business. That
+line is deliberate -- it is what let the output stack be written, measured
+and finished while no audio codec exists.
+
+### The pieces
+
+- `feetbrowser/heel.py`: the pure engine, and nearly all of it.
+  - `Ring` is a single-producer, single-consumer byte ring over one
+    preallocated ctypes buffer, with no lock in it. Two monotonically
+    increasing byte counters; the producer alone writes one and the consumer
+    alone writes the other, so a stale read of the other side's counter is
+    always stale in the safe direction. The counters are Python integers and
+    do not wrap.
+  - `Resampler` is polyphase windowed-sinc: upsample by L, low-pass at the
+    lower of the two Nyquist frequencies, decimate by M, with the filter
+    decomposed into L branches so that no multiplication by a stuffed zero
+    is ever performed. 64 taps, Kaiser window at beta 9, each branch
+    normalised to unity gain. State carries across calls, so
+    `process(a) + process(b)` is sample-for-sample `process(a + b)` -- which
+    is what makes it usable against a decoder handing over whatever a packet
+    happened to contain. Rate pairs that do not reduce to a small ratio are
+    approximated by continued fractions.
+  - `Mixer` and `Source`: several sounds at once, summed in floating point,
+    per-source `gain`, one master `volume`, clamped exactly once at the end.
+    Resampling and channel mapping happen on the *writing* side, because the
+    decoder thread has a packet's worth of slack and the mixer thread has two
+    milliseconds.
+  - `AudioClock` is frames the device has actually consumed. `now()` returns
+    seconds and is duck-compatible with `media.Clock`, so a `Scheduler` takes
+    one with no adapter. **Video follows audio, never the reverse**: a
+    dropped picture costs one frame nobody sees, and a gap in sound is a
+    click everybody hears.
+
+    There are two clocks here and picking the wrong one is the mistake
+    waiting to be made. `AudioClock.now()` is the *device's* timeline: how
+    much the hardware has swallowed since the stream started. It is the right
+    thing to measure underruns against and the wrong thing to hang a picture
+    on, because it does not know when a particular stream started, does not
+    move backwards over a seek, and counts frames that are still in a buffer
+    somewhere rather than in the air. `Source.position()` is the *stream's*
+    timeline and is the one `<video>` wants: it takes off the ring's backlog
+    and the device's own reported latency, so it is seconds of that source
+    the listener has actually heard. On the machine this was written on, over
+    Bluetooth, the two differ by 171 ms -- about four frames of video, which
+    is well past the point where a viewer sees lips out of step.
+  - `open_output()` is the entry point and never raises. On a machine with
+    no sound card it returns an `Output` over a `NullDevice` that consumes
+    in real time and throws the samples away, with `silent` true and
+    `reason` set to a sentence fit to show a user. That is not a test stub:
+    a browser on a headless box still has to play a video at the right
+    speed. `available()` and `unavailable_reason()` follow `h264.py` --
+    probed once, and the answer remembered, so a container with no
+    `/dev/snd` is not asked about it once per packet.
+- `feetbrowser/coreaudio.py`, `alsa.py`, `winmm.py`: one per platform,
+  ctypes against the system library, the same shape as `cocoa.py`, `x11.py`
+  and `win32.py`. Each knows how to take bytes out of a ring and nothing
+  else at all.
+
+### Rules for the realtime side
+
+On macOS the device callback runs on a CoreAudio thread with a deadline of a
+couple of milliseconds. Six rules, and every one of them is about *not*
+doing something: the callback never blocks on a lock, never waits for data
+(an empty ring is silence and a counter, not an error path), never raises
+(the body is wrapped and the failure stashed for the main thread), allocates
+nothing that can grow (the payload moves by `memmove` between two buffers
+that existed before the stream started), does no work that belongs to
+somebody else (no mixing, gain, conversion or resampling on that thread),
+and nothing is freed while the device is running. They are written out in
+full at the top of `heel.py`.
+
+The GIL is the thing that cannot be designed away: calling a Python function
+at all means taking it, CoreAudio's deadline is about 2 ms and CPython's
+switch interval is 5. So the callback is made as short as it can be and the
+ring is 4096 frames -- 85 ms -- deep, which is how late the mixer thread is
+allowed to be. A design where the callback does real work in Python clicks
+whenever the browser lays out a page, and no amount of making the callback
+faster recovers it.
+
+Linux and Windows do not need most of that and get it anyway. Neither ALSA
+nor `waveOut` requires a callback on a foreign thread: both are driven from
+an ordinary Python thread that blocks on the device and pulls from the same
+ring, using the same `read_into`, with the same short-read handling.
+
+### Platforms
+
+| | binding | driven by | notes |
+|---|---|---|---|
+| macOS | AudioToolbox / CoreAudio | an `AURenderCallback` on CoreAudio's realtime thread | takes the hardware's own rate rather than asking it to convert |
+| Linux | `libasound.so.2` | a thread of ours blocking in `snd_pcm_writei` | opens `default`, so PulseAudio or PipeWire is what it actually reaches; `FEETBROWSER_ALSA_DEVICE` overrides |
+| Windows | `winmm.dll` (`waveOut`) | a thread of ours, woken by `CALLBACK_EVENT` | 16-bit samples; see below |
+
+`waveOut` rather than WASAPI, and the reason is ctypes rather than taste.
+WASAPI is COM and only COM, so through ctypes every call is a hand-counted
+vtable slot -- and a mis-numbered slot is not an exception, it is an access
+violation on a machine nobody working on this has, in a subsystem whose
+failure mode is already "silence, and you cannot tell why". `waveOut` is a
+flat C API of eight functions, is implemented over WASAPI shared mode by the
+OS on Windows 10 and 11, and costs exclusive mode and some latency. A
+browser tab has no business taking a device exclusively, and the latency is
+a fixed offset, which is the one kind of error a sync loop does not mind.
+The interface a backend has to satisfy is three methods -- `start(ring,
+clock)`, `stop()`, `close()` -- and seven attributes, so replacing this file
+with a WASAPI one later changes nothing above it.
+
+### Measured
+
+Resampler, against an analytically generated tone, measured with an
+exact-bin DFT (the frequency chosen so that a whole number of cycles fits
+the analysis window; a tone between two bins leaks into every other bin and
+gives you a number in the sixties however good the filter is):
+
+| | 93.8 Hz | 1 kHz | 5 kHz | 10 kHz | 15 kHz | 19 kHz |
+|---|---|---|---|---|---|---|
+| 44.1 -> 48 kHz, SNR | 123.9 dB | 110.2 | 108.3 | 105.4 | 106.2 | 99.1 |
+| 44.1 -> 48 kHz, worst spur | -125.3 dBc | -110.0 | -108.2 | -105.2 | -105.9 | -99.8 |
+
+48 -> 44.1 kHz is 107.6 dB at 915 Hz, 105.7 at 9.2 kHz and 99.7 at 17.5 kHz,
+worst spur -101 to -110 dBc. Passband gain is flat to within 0.0001 dB
+across the band, and DC through 44.1 -> 48 comes back as 1.0 to within
+2e-16.
+
+That is what 64 taps buys, and the number was chosen by measuring rather
+than by taste: at 19 kHz, 32 taps gives 44.7 dB and 16 taps gives 17.2 dB
+with a whole decibel of level error. There is a test that measures exactly
+that and fails if the shipped filter ever stops beating a short one. Cost is
+about 9% of one core for 64 taps of mono at 48 kHz on this laptop, which is
+affordable in pure Python only because the inner loop is
+`sum(map(mul, coeffs, history[a:b]))` and runs in C.
+
+Verified audible on macOS by wrapping the render callback with a spy that
+reads the bytes back out of CoreAudio's own buffer *after* the memmove and
+analyses them: 2.496 s consumed at 48 kHz with zero underruns and zero
+invented silence, a 440 Hz sine at the amplitude asked for to within 0.02%,
+mono correctly duplicated to both channels, and no discontinuity across any
+of 39 buffer seams.
+
+### Testing sound without a sound card
+
+`tests/test_audio.py`, split the way `tests/test_x11.py` is. The pure half
+is the ring (wraparound, underrun, overrun, partial frames, and a real
+two-thread producer/consumer test that checks every byte of a known
+sequence), the filter design, the resampler, the formats, the mixer, the
+clock, and the whole pipeline end to end against a device that keeps what it
+consumed so the mixed bytes can be measured. It runs everywhere, including
+in a container with no sound. The live half opens the real backend, plays
+two hundred milliseconds of something quiet and checks the device consumed
+it in the time it should have; where there is no device it prints why and
+skips. `FEETBROWSER_AUDIO=null` forces the silent path, which is how CI and
+a bug report ask for it.
+
+### Not tested
+
+The ALSA and `waveOut` backends have never been run. Their pure helpers are
+tested everywhere, including the structure sizes `waveOut` depends on, but
+no Linux or Windows machine was available while they were written, and CI
+runners have no sound device to exercise the live half on either. Read them
+as carefully-written and unproven. The CoreAudio backend is the one that has
+actually made a noise.
+## Sound and pictures together
+
+`feetbrowser/arch.py`, the *arch*, because it carries the load between the
+heel and the toes. `mediacodec.py` says what frame 37 sounds like and
+`heel.py` says how samples reach a speaker; this is the only module in the
+tree that knows both, and it exists so that neither has to know the other.
+
+`AudioPlayer` is `media.VideoPlayer` in the other medium, deliberately down
+to the shape of the calls -- `play`, `pause`, `seek`, `position`, `pump`,
+`close`, `gain`, `muted` -- including the `threaded=False` plus `pump()`
+bargain, because the two are driven by one `<video>` element and an element
+that has to remember which half wants which spelling will get it wrong. A
+worker decodes ahead until the source has about half a second queued and
+then stops; a `<video>` in a background tab is not holding seconds of PCM.
+
+Three things in it are less obvious than they look.
+
+- **The position is the source's, not the device's.** See the warning under
+  [Audio output](#audio-output): `AudioClock.now()` is the device timeline
+  and `Source.position()` is the stream timeline. Only the second can have a
+  picture scheduled against it.
+- **A seek throws sound away and nothing else may.** `seek()` is
+  `Source.restart(t)`, which drops the queue and starts a new timeline --
+  right for a scrubber, wrong for a loop or a change of playback rate, where
+  the sound already decoded is still the sound that should be heard next.
+  Those push a boundary onto a `deque` instead, in `Source.position()`
+  coordinates, saying "when the playhead reaches here, media time is *that*
+  and runs at *this* rate from then on"; the boundary is popped as the
+  playhead crosses it.
+- **A frame whose channel count disagrees with the source's is not
+  written.** The source interleaves at a fixed channel count, so a stereo
+  frame written to a mono source is not quiet or wrong-eared, it is noise
+  for the rest of the file. Such a frame is counted in `channel_errors` and
+  its *duration* is written as silence, so everything after it still lands
+  in the right place.
+
+The sync needed no change to `Scheduler` at all. `Scheduler.position()` is
+`offset + (clock.now() - origin)`, so `media._AudioClock`, whose `now()` is
+the audio player's position, makes both terms cancel and the pictures land
+wherever the sound is. `VideoPlayer.attach_audio(player)` installs it and
+routes `play`, `pause` and `seek` to both sides -- the sound first, because
+`Scheduler.seek()` re-origins itself against the clock and a clock seeked
+afterwards leaves every picture out by exactly the size of the seek.
+
+`attach_audio` declines, leaving the video exactly as it was, when there is
+no audio track or the output is the null fallback. A video whose clock is a
+device nobody can hear is a video with a new way to stop, and a headless run
+must play its pictures the way it always did.
+
+`browser.py` builds an `AudioPlayer` alongside the `VideoPlayer` for every
+`<video>` whose file has sound, hands it the element's own `loop` and
+`muted`, and offers it to the video. Silence is never a failure there: a
+file with no audio track and a machine with no sound card both give a video
+that plays as it did before. The only thing said out loud is a track the
+container names and we have no decoder for. Every player on a page shares
+one `heel.Output`, opened the first time something actually has sound to
+play, because `Mixer` exists precisely so the second sound does not have to
+ask the sound card for a second exclusive stream and lose.
+
+## AAC, in Fortran
+
+The audio half of an ordinary web MP4, decoded to PCM. It is in
+`fortran/inst*.f`, wrapped by `feetbrowser/aac.py`, and it is called the
+*instep* -- the top of the foot, over the arch that carries the weight. It
+shares nothing with the H.264 decoder next door but the build machinery: `IP*` routines and `/IP*/`
+COMMON blocks against H.264's `H2*` and `/H2*/`, because Fortran has one
+global namespace and two decoders in one process have to stay out of each
+other's way.
+
+**Exactly what it does.** ADTS framing and MP4's `AudioSpecificConfig` out
+of an `esds` box, including the backward-compatible SBR sync word *and the
+flag inside it*, and the `program_config_element` that an implicit channel
+configuration needs;
+`raw_data_block` with its SCE, CPE, LFE, CCE, DSE, PCE and FIL elements;
+`ics_info`, section data, the three scalefactor difference chains, pulse
+data, TNS and spectral data; all eleven spectral Huffman codebooks and
+codebook 11's escape sequence; inverse quantisation; mid/side and intensity
+stereo; perceptual noise substitution; temporal noise shaping; all four
+window sequences (ONLY_LONG, LONG_START, EIGHT_SHORT with grouping, and
+LONG_STOP) in both the sine and KBD window shapes; the inverse MDCT; and
+windowed overlap-add out to float samples in [-1, 1]. Mono and stereo.
+
+**The transform.** An AAC frame is 1024 inverse-MDCT outputs per channel or
+eight interleaved 128-point ones, forty-three times a second, and the
+definition of the transform is an O(N^2) sum that costs about a thousand
+times what it needs to. So the long transform is a DCT-IV done as a
+512-point complex FFT with the -pi(l + 1/8)/M twiddle on both sides and the
+standard's fold applied to the result, and the short one is the same thing
+at 64 points. The O(N^2) definition is written out as well, in `IPIMDS`, and
+nothing calls it to decode anything: it is there so that
+`test_the_fast_imdct_computes_the_transform_it_claims_to` can hold the fast
+path to the formula it claims to compute rather than to itself. They agree
+to 3.4e-13 relative at 1024 points.
+
+Measured on this machine, one core: 0.49 seconds of 44.1 kHz stereo decodes
+in 1.0 millisecond, which is about 500x realtime, or 20 microseconds per
+frame per channel against the 23 milliseconds a frame plays for. That is the
+number that matters, because what will consume this is a mixer on a
+deadline.
+
+**Ground truth.** `tests/fixtures/aac` holds fourteen ADTS streams and,
+beside each, the exact float samples FFmpeg 7.1 decoded it to,
+zlib-compressed. They cover a pure tone, broadband noise, a stereo file the
+encoder really does code in mid/side, a transient that forces all four
+window sequences, 32 kbit/s stereo under bit starvation, 320 kbit/s where
+the quantised coefficients run into the thousands and codebook 11's escape
+reaches eight leading ones, all eight scalefactor band layouts the standard
+defines (8, 16, 24, 32, 44.1, 48, 64 and 96 kHz), and one stream from a
+different encoder entirely, for temporal noise shaping. Between them they
+exercise every one of the eleven codebooks.
+
+Those last two groups are there because of what was missing. Four of the
+eight band tables had no vector at all, and the TNS filter could be deleted
+outright without changing one sample of anything: FFmpeg's encoder set
+`tns_data_present` in two channel-frames out of 203 and signalled no filters
+in both. Coverage a threshold cannot see is coverage that is not there, so
+`test_the_tools_and_the_layouts_are_all_actually_reached` now asserts it
+directly, and the TNS vector comes from Apple's AudioToolbox encoder --
+which is macOS-only, and so the one vector `make_aac_vectors.sh` cannot
+regenerate everywhere. Nothing at test time needs any encoder.
+
+AAC is not a bit-exact specification -- the standard defines the transform
+in real arithmetic -- so the comparison is numerical, and the numbers are:
+worst case across all fourteen vectors, a maximum absolute sample error of
+3.6e-07, an RMS error of 3.4e-08 and an SNR of 137.9 dB. FFmpeg's own
+float32 output quantises at 6e-08 near full scale, so that is a handful of
+ulps and not a disagreement about decoding. The test asserts 1e-06, 1e-07
+and 130 dB. For scale, with the tools deleted one at a time: no TNS is
+29 dB, and a noise seed one bit out is 2e-04 in the first frame of a tone.
+
+A threshold at the end of a pipeline can hide a bug in the middle of it, so
+the stages that can be compared exactly are. Every frame of every vector is
+consumed to the bit -- the number of bits read equals the number the ADTS
+header promised, which no wrong codeword length in any codebook can leave
+true. Dequantisation is recomputed in Python from the decoder's own
+quantised values and scalefactors and agrees to the last bit. The windows
+are checked against their closed forms and against Princen-Bradley.
+
+**Noise substitution is a deliberate copy.** A PNS band carries an energy
+and no coefficients: the decoder is told to put noise of that loudness
+there, and *which* noise is left to the decoder. There is no correct answer,
+which means there is also no way to compare a PNS band against a reference
+decoder unless both draw the same numbers. So `IPRAND` reproduces FFmpeg's
+generator and its seed exactly, and this is the one place in the project
+where the implementation was chosen to match another program rather than a
+standard. Without it these vectors would agree everywhere except in the
+bands that happen to be noise-substituted, which is most bands of a quiet
+tone, and the SNR would fall from 138 dB to about 72 -- which is what it
+did, for a day, before the seed was right.
+
+**Why Fortran.** The same reason as H.264, and the licence's condition 6,
+but the shape of the code is different: this is floating-point kernels over
+contiguous arrays -- an FFT butterfly, a windowed overlap-add, a Levinson
+step-up -- which is the workload Fortran compilers have been aimed at for
+fifty years, and it benchmarks within a small factor of C without any of it
+being written cleverly.
+
+**How it is built and loaded.** Exactly as `h264.py` does it: find a
+gfortran, compile the five sources into a shared library named after a hash
+of them, load it with `ctypes`, check the ABI integer, and remember the
+failure if any of that does not happen. No compiler means
+`aac.available()` is false and an AAC track is named and refused in public,
+which is the same contract every other unplayable file gets.
+
+The state is in COMMON, so there is one decoder in the process. Audio makes
+that sharper than video did: there is no keyframe in AAC and every frame's
+first half is the previous frame's windowed transform tail, so a decoder
+cannot start clean anywhere. Rather than replaying the stream the way
+`h264.Decoder` replays access units, each `aac.Decoder` saves its own 2048
+doubles of overlap out of the library and puts them back when it finds
+another instance has been at it in between. Two `<audio>` elements are then
+slow and correct rather than fast and clicking.
+
+**What it is not.** No SBR, so no HE-AAC; no Parametric Stereo; no Main
+profile prediction; no LTP; no SSR gain control; no coupling channels; no
+LFE; nothing above two channels; no 960-sample frames. None of those is
+stubbed or half-written -- each is recognised and refused with a status code
+and a sentence of its own, because a decoder that silently ignores SBR
+produces something that sounds like a bad phone line and a decoder that
+ignores PS produces mono.
+
+Refusing SBR is a decision about the *tool*, though, and not about the
+signalling, and conflating the two cost us most of the web's AAC for a
+while. An `AudioSpecificConfig` may append an 11-bit sync word (`0x2B7`)
+and an object type of 5 to say "SBR is described below", and what follows
+that object type is `sbrPresentFlag`, which is allowed to say no. FFmpeg's
+MP4 muxer writes the whole extension into every file it encodes straight
+into MP4 -- `121056e500` -- whether or not the encoder used the tool, and
+writes the bare `1210` for the identical coded frames when it remuxes from
+ADTS instead. Refusing on the object type alone therefore turned down
+ordinary AAC-LC that we decode perfectly, and the two configurations are
+committed as a pair of fixtures (`sbr_signalled.mp4`, `sbr_absent.mp4`)
+whose samples are asserted to be identical, because the config parse is
+allowed to permit a decode and not to change one. With the flag set, the
+stream really is HE-AAC and is refused as before.
+
+Two smaller gaps worth naming. Pulse data is implemented and is not covered
+by any fixture, because FFmpeg's encoder never emits it. And the decoder
+refuses more than two channels rather than downmixing, so a 5.1 soundtrack
+is silent rather than folded.
 
 ## What is not supported
 
 Bluntly, because a foundation that overstates itself is worse than none:
 
-- **No audio.** Not decoded, not parsed, not mixed, not synchronised. AVI
-  audio streams are skipped. This is not a small omission: A/V sync is its
-  own engineering problem, and nothing here is designed around it yet.
-- **No inter-frame codec.** H.264 decodes I frames only; there is no VP8,
-  VP9, AV1 or MPEG-4 ASP at all. A file carrying one is named in the
-  placeholder, not guessed at. This is still the big one: an ordinary web
-  MP4 is one I frame and then P frames, so it is refused, and YouTube and
-  essentially every video on a modern site does not play.
-- **No CAVLC.** The other half of H.264's entropy coding. Baseline profile
-  and anything encoded with `-coder 0` is refused by name.
+- **MP4 is the only container with sound in it.** An MP4 with an AAC-LC
+  track plays, in sync -- see [Sound and pictures
+  together](#sound-and-pictures-together). Nothing else does. AVI and WebM
+  audio streams are named by `probe_audio` and not decoded: WebM for want
+  of a Vorbis or Opus decoder, AVI for want of a demuxer that reaches its
+  audio. MP3 is absent entirely. The `<audio>` element is not implemented
+  at all, so sound arrives only alongside a picture.
+- **No user-facing volume or mute.** `VideoPlayer.set_volume()` and
+  `AudioPlayer.muted` exist and are tested; nothing in the GUI calls them,
+  and `volume` and `muted` are not scriptable from JavaScript yet.
+- **AAC-LC only.** HE-AAC (SBR), HE-AAC v2 (Parametric Stereo), Main
+  profile, LTP, SSR, coupling channels, LFE, more than two channels and
+  960-sample frames are each refused by name with a status code of their
+  own. SBR is the one worth knowing about: a low-bitrate web stream is
+  often HE-AAC, and it is refused rather than played at half its bandwidth.
+  What is *not* refused, and is worth knowing about for the opposite
+  reason, is an AAC-LC config that merely carries SBR's signalling with
+  the flag clear -- see below.
+- **No inter-frame codec other than H.264.** I, P and B slices decode, under
+  either entropy coder, which is what an ordinary well-compressed web MP4 is;
+  but there is no VP8, VP9, AV1 or MPEG-4 ASP at all. A stream with SP or SI
+  slices is refused by name before anything is drawn, as is one whose SPS
+  uses picture order count type 1 or asks for more than four reference
+  frames, and so is the one combination the two halves of the entropy layer
+  do not meet in: a B slice coded with CAVLC.
 - **WebM is probe-only.** Geometry and duration, no pixels. An MP4 is
   demuxed but only plays if its codec is `jpeg`, `mjpa`, `raw `, `png `, or
-  H.264 with every frame a sync sample, which in practice means a
-  QuickTime file or a deliberately all-intra encode rather than a web MP4.
+  H.264 without SP or SI slices.
 - **No streaming.** The whole file is fetched into memory before the first
   frame. No range requests, no progressive start, no HLS or DASH. An MJPEG
   camera stream over HTTP, which never ends, therefore cannot be played even
   though its frames are the format that does.
-- **Controls are play/pause and a scrubber.** No volume: there is nothing
-  to make quieter. No fullscreen, no poster frame, no playback rate, no
-  buffered ranges, no keyboard focus or shortcuts, no captions.
+- **Controls are play/pause and a scrubber.** Still no volume slider, but
+  the reason has changed: there is now something to make quieter
+  (`Output.volume`, and a per-source `gain` under it), and what is missing
+  is the widget and the mute state, not the machinery. No fullscreen, no
+  poster frame, no playback rate, no buffered ranges, no keyboard focus or
+  shortcuts, no captions.
 - **No JavaScript media API.** No `HTMLMediaElement` on the DOM bridge:
   `play()`, `pause()`, `currentTime`, `timeupdate` and friends do not exist.
   `autoplay`, `muted` and `preload` are ignored; `loop` is honoured.
@@ -307,14 +821,18 @@ line changes: the scheduler, the drop logic, the resync, the layout box and
 the paint path are all codec-agnostic today, and the RLE8 path exists
 specifically to prove that an inter-frame codec needs no new machinery.
 
-Two things a real codec will want that are not there yet. First, output that
-is not RGBA: every real video codec produces planar YUV, and converting in
-Python per frame will dominate the decode. The colour conversion belongs in
-Rust next to the rasteriser, and `_Codec.decode` should be allowed to return
-a plane triple that the player converts once. Second, an inter-frame codec
-with B-frames needs decode order and presentation order to differ; `VideoFrame`
-carries a pts already, but `VideoTrack` currently assumes the two orders
-agree, and a reorder buffer belongs in `VideoTrack.frame()`.
+One thing a real codec will want that is not there yet: output that is not
+RGBA. Every real video codec produces planar YUV, and converting in Python
+per frame will dominate the decode. The colour conversion belongs in Rust
+next to the rasteriser, and `_Codec.decode` should be allowed to return a
+plane triple that the player converts once.
+
+The other thing on this list used to be reordering, and it is now done. A
+codec whose decode order is not its presentation order needs nothing new:
+`VideoTrack` indexes everything by presentation order, reads `ctts` to find
+out what that order is, and keeps a reorder buffer. A `_Codec` still sees
+packets in decode order and returns one picture per packet, which is what
+every codec wants to be handed.
 
 ## Ordered next steps
 
@@ -334,18 +852,23 @@ agree, and a reorder buffer belongs in `VideoTrack.frame()`.
    last byte arrives. Worth doing now rather than later, because MJPEG over
    HTTP is a format we can already decode and cannot currently play at all:
    the stream never ends, so waiting for the last byte waits forever.
-6. **Audio.** A decoder, a resampler, a platform output device on three
-   platforms, and A/V sync against the same clock. This is the largest item
-   on the list by a wide margin and should be planned on its own. Nothing in
-   the project outputs a sample today (there is no CoreAudio, ALSA or
-   WASAPI binding anywhere in it), so this starts from zero.
-7. **P slices in the H.264 decoder.** This is now the shortest route to a
-   web video playing, because everything before it is done: the entropy
-   coder, the transforms, the deblocking filter and the whole container
-   path already work and are held to pixel-exactness. What is left is a
-   reference picture, motion vector prediction, quarter-pel interpolation
-   and the P macroblock types. B slices and CAVLC come after, and each is
-   its own piece of work.
+6. **More than one container with sound in it, and then SBR.** The join is
+   done -- see [Sound and pictures together](#sound-and-pictures-together)
+   -- but only MP4 and MOV reach it, because `open_audio()` only demuxes
+   those. WebM's audio is identified and refused for want of a Vorbis or
+   Opus decoder, which is a codec-sized job; AVI's is refused for want of a
+   demuxer, which is not, and is the cheaper of the two. There is also no
+   fixture in the tree with a video track and an audio track in one file,
+   so the end-to-end path is proved a half at a time; a muxer in
+   `tests/media_fixtures.py` that writes both traks would close that. After
+   those, SBR, so that low-bitrate HE-AAC streams play at all.
+7. **Per-decoder H.264 state.** Both entropy coders and all three slice types
+   are done, so what is left in `fortran/` is not a feature but the shape of
+   the thing: the decoder's state is `COMMON`, which is to say there is one
+   decoder in the process, and two `<video>` elements share it by replaying
+   their history at each other. That is correct and it is quadratic. Picture
+   order count type 1 and long-term reference pictures are smaller items in
+   the same file and are refused by name today.
 
 ## Tests
 
@@ -386,14 +909,69 @@ decodes each and compares every sample: not a PSNR, not a tolerance, every
 byte. A single wrong luma sample fails the suite, because in a codec this
 size a single wrong sample is never a rounding difference; it is a bug in a
 prediction mode or a scan order that happens to be small today. The vectors
-between them cover 16x16 through 1280x720, Baseline-shaped, Main and High,
-QP 1 to 51, deblocking on and off, the 8x8 transform, picture-level scaling
-matrices, multiple slices per picture and frame cropping on both axes. The
-fixtures are committed so the suite runs offline and on a machine with no
-encoder; the script that generated them is not part of the build.
+between them cover 16x16 through 1280x720, Baseline, Main and High, both
+entropy coders, QP 1 to 51, deblocking on and off, the 8x8 transform,
+picture-level scaling matrices, multiple slices per picture and frame
+cropping on both axes.
 
-The whole suite skips cleanly where there is no `gfortran`, and one test
-forces that state on a machine that has one: it takes the loaded library
-away and asserts that `probe()`, `MediaInfo` and `open_video()` behave the
-way they did before the decoder existed. That test is the reason the
+Eighteen of them run to several frames, and for those *every frame* is
+compared, not the first: a wrong motion vector predictor shows up in one
+macroblock and then spreads by prediction, so a decoder that is checked only
+on its IDR is not checked at all. The six P vectors cover a plain I-then-P
+sequence, runs of P_Skip over a still background, sub-8x8 partitions with the
+8x8 transform, four reference frames, a picture that pans off its own edges so
+the interpolator has to clamp, and weighted prediction across a fade. The six
+CAVLC vectors cover that same ground in the other entropy coder, plus the two
+ends of the quantiser range that only CAVLC cares about: QP 44, where almost
+every block is empty and the `nC` derivation is all that is left, and QP 3 on
+noise, where the levels are long enough to run `suffixLength` up to its limit
+and reach the `level_prefix` >= 15 escape. The six B vectors cover plain IBBP,
+a B pyramid where B pictures are themselves references, spatial direct and
+temporal direct on identical content so the two vectors differ only in the
+derivation, implicit weighted bi-prediction across a fade, and long runs of
+B_Skip. Those are compared after sorting the decoded pictures by the picture
+order count the decoder reports, and the sorted order has to be the one FFmpeg
+wrote: a decoder that got the counts wrong fails even if every sample it
+produced was right.
+
+`bframes.mp4` is the same IBBP content in a container, and is where `ctts` and
+the reorder buffer are tested rather than the decoder. It is encoded straight
+to MP4 rather than muxed from the `.264`, because FFmpeg's raw H.264 demuxer
+hands its muxer pts == dts and `-c copy` therefore writes a file with no
+`ctts` at all -- a file that lies about its own order would make the test pass
+for the wrong reason.
+
+`make_inter_vectors.sh` beside them is the offline tool that made all of this
+and says what each encoder option is for; it is not run by `test.sh` and
+ffmpeg is not a dependency of anything. The fixtures are committed so the
+suite runs offline and on a machine with no encoder.
+
+`tests/test_aac.py` is the same arrangement for audio, with one difference
+that matters. H.264 is bit-exact and is compared byte for byte; AAC is not,
+so the PCM comparison is numerical and the threshold is the measured error
+with a small margin rather than a round number chosen to pass -- 1e-06
+maximum absolute error against a worst measured 3.6e-07, and a 130 dB floor
+against a worst measured 137.9 dB. Because a threshold at the end can hide a
+bug in the middle, the stages that can be compared exactly are compared
+exactly and not through the samples: every frame is consumed to the bit, the
+dequantiser is recomputed in Python coefficient by coefficient and agrees to
+the last bit, the fast IMDCT is held against the standard's summation
+written out in the test, and the windows against their closed forms. There
+are also tests that the fixtures still exercise what they were chosen for --
+mid/side, intensity, noise substitution, all four window sequences, temporal
+noise shaping and all eight scalefactor band layouts -- so that a
+regenerated vector cannot quietly stop proving anything.
+`tests/fixtures/aac/make_aac_vectors.sh` is the offline tool that made them,
+and like its H.264 counterpart it is not run by `test.sh`.
+
+The whole suite skips cleanly where there is no `gfortran`, and one test in
+each of the two Fortran suites forces that state on a machine that has one:
+it takes the loaded library away and asserts that `probe()`, `probe_audio()`,
+`MediaInfo`, `AudioInfo`, `open_video()` and `open_audio()` behave the way
+they did before the decoders existed. Those tests are the reason the
 degradation path is a claim rather than a hope.
+
+Audio has its own suite, `tests/test_audio.py`, and its own version of that
+last idea: `FEETBROWSER_AUDIO=null` forces a machine with a working sound
+card to behave like one without. See
+[Testing sound without a sound card](#testing-sound-without-a-sound-card).

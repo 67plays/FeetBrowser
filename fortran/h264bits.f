@@ -193,8 +193,13 @@ C     floors.
       Q = QP
       IF (Q .LT. 0) Q = 0
       IF (Q .GT. 51) Q = 51
+C     CMODEL is the column the slice header chose: 0 for an I slice, and
+C     1 + cabac_init_idc for a P one.  It is read from COMMON rather than
+C     passed because I_PCM restarts the engine from inside the macroblock
+C     layer, and a second parameter to thread through that would be a
+C     second place to get it wrong.
       DO 10 I = 0, 1023
-         PRE = SHIFTA(CTXM(I) * Q, 4) + CTXN(I)
+         PRE = SHIFTA(CTXM(I,CMODEL) * Q, 4) + CTXN(I,CMODEL)
          IF (PRE .LT. 1) PRE = 1
          IF (PRE .GT. 126) PRE = 126
          IF (PRE .LE. 63) THEN
