@@ -1109,10 +1109,21 @@ def test_the_lag_measurement_still_catches_a_clock_that_is_wrong():
     blocky = Blocky(0.1)
     started = time.monotonic()
     time.sleep(0.25)
-    worst = (time.monotonic() - started) - blocky.now()
+    # What one reading of this clock can be worth, measured rather than
+    # assumed: a window longer than a step contains an instant just before
+    # the next one lands, and a reading there is nearly a whole step behind.
+    # Which reading that is cannot be arranged in advance -- so take them all
+    # and keep the worst, which a stalled reader can only make worse.
+    single, end = [], time.monotonic() + 0.15
+    while True:
+        single.append((time.monotonic() - started) - blocky.now())
+        if time.monotonic() >= end:
+            break
+        time.sleep(0.002)
+    assert max(single) > 0.05, \
+        "the artefact this exists for never appeared: %.3f" % max(single)
     lag, ahead = clock_lag(blocky, started, 0.0, window=0.15)
     assert lag < 0.02, "sampling did not see past the steps: %.3f" % lag
-    assert worst >= 0.0 and lag <= worst, "%.3f / %.3f" % (lag, worst)
 
 
 def test_asking_for_no_device_is_answered_rather_than_refused():
