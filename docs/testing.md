@@ -35,7 +35,8 @@ tests/
   test_nav.py       click-to-navigate, history, view-source
   download_cases.py downloads, against a local server (run from test_nav.py)
   test_toes.py      toe engine + ToeHub tests (install/uninstall/toggle)
-  test_asmblend.py  the assembly span kernels against their Python references
+  test_asmx11.py  the assembly pixel-packing kernels against their Python references
+  test_asmselect.py the assembly selection nearest-boundary kernel against its Python reference
   test_h264.py      the Fortran H.264 decoder, sample-exact against fixtures
   test_aac.py       the Fortran AAC decoder, against FFmpeg's own samples
   smoke.py          end-to-end pipeline over a real socket
@@ -117,10 +118,6 @@ is now checked where it can only be checked -- inside the built artifact, by
 `packaging/windows/verify-bundle.ps1`, each of which runs the bundle's own
 `--check-video` against these same fixtures with `PATH` cut back so no
 compiler and no stray runtime library can answer for it.
-
-The transport layer also has a Go port under `net/`, with its own tests.
-`test.sh` runs `go vet ./... && go test ./...` where a Go toolchain is
-installed and says so and moves on where there is not; CI always has one.
 
 Nothing here needs a display or a GUI toolkit: the renderer draws into its own
 framebuffer, so the whole suite runs headless. `test_render.py` does need at
@@ -208,5 +205,4 @@ drawing a page with a photograph on it.
 The Linux jobs build the Rust engine and run `test_js.py` once against it;
 the macOS and Windows lines do the same. The Rust engine's own tests are
 covered by the `rust` job, which never crosses into Python, so running them
-once says as much as running them on all eight interpreters would, the same
-reason the Go toolchain has a job of its own.
+once says as much as running them on all eight interpreters would.

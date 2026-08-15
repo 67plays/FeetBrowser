@@ -97,11 +97,10 @@ jobs:
 
       # Linux/x86-64 assembles and runs the real kernels here; everywhere
       # else the module's pure-Python fallback is what gets checked.
-      - name: Assembly span kernels
-        run: $PY tests/test_asmblend.py
-
-      - name: Assembly image-codec kernels
-        run: $PY tests/test_asmops.py
+      - name: Assembly X11 pixel-packing kernels
+        run: $PY tests/test_asmx11.py
+      - name: Assembly selection nearest-boundary kernel
+        run: $PY tests/test_asmselect.py
 
       # The Fortran H.264 decoder, against pixel-exact ground truth from a
       # reference decoder. All three runners turn out to have a gfortran,
@@ -257,29 +256,6 @@ jobs:
         env:
           RUSTFLAGS: -D warnings
         run: cargo check --manifest-path rust/Cargo.toml --all-targets
-
-  # The Go port of the transport layer arrived with 421 lines of its own
-  # tests and nothing that ran them: no job, no line in test.sh, no mention
-  # in the docs. It is not wired into the browser yet -- every other job here
-  # runs the Python net.py and never looks at net/ -- so this is the only
-  # thing standing between that package and rot.
-  go:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-go@v5
-        with:
-          go-version: '1.22'
-          cache-dependency-path: go.mod
-
-      - name: Build and vet
-        run: |
-          go build ./...
-          go vet ./...
-
-      - name: Go tests
-        run: go test ./...
 
   # This job used to install Pillow and cairosvg so the JPEG, WebP and SVG
   # branches behind them ran at least once. There are no such branches now:

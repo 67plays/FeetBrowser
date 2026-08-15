@@ -34,6 +34,7 @@ import ctypes.util
 import os
 import time
 
+from . import asmx11
 from .window import (QUIET, STATE_ALT, STATE_CONTROL, STATE_SHIFT, Event,
                      Window, key_sequences)
 
@@ -494,24 +495,18 @@ def _pack_generic(pixels, width, height, stride, fmt, line):
     """The slow path: any TrueColor layout at all, a pixel at a time.
 
     Depth 15 and 16 are what this is for, and on anything made this century
-    nothing reaches it. Written for correctness rather than speed accordingly
-    -- a window on such a server works, and feels like it is working hard.
+    nothing reaches it. The packing loop itself is a raw-assembly kernel on
+    Linux/x86-64 (``asmx11``) and a byte-identical Python loop elsewhere;
+    either way a window on such a server works, and feels like it is working
+    hard.
     """
     pixel_bytes = (fmt.bits_per_pixel + 7) // 8
-    red = channel_table(fmt.red_mask)
-    green = channel_table(fmt.green_mask)
-    blue = channel_table(fmt.blue_mask)
-    order = "little" if fmt.byte_order == LSB_FIRST else "big"
     out = bytearray(line * height)
-    for row in range(height):
-        src = row * stride
-        dst = row * line
-        for _column in range(width):
-            value = (red[pixels[src]] | green[pixels[src + 1]]
-                     | blue[pixels[src + 2]])
-            out[dst:dst + pixel_bytes] = value.to_bytes(pixel_bytes, order)
-            src += 3
-            dst += pixel_bytes
+    asmx11.pack_rows(pixels, out, width, height, stride, line,
+                     channel_table(fmt.red_mask),
+                     channel_table(fmt.green_mask),
+                     channel_table(fmt.blue_mask),
+                     pixel_bytes, fmt.byte_order != LSB_FIRST)
     return out
 
 

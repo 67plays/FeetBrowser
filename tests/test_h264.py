@@ -17,7 +17,7 @@ the standard says nothing about anybody's colour matrix, so a mismatch
 there would be a disagreement about display rather than about decoding.
 
 The whole suite skips where there is no gfortran. That is the same
-arrangement as the assembly kernels in test_asmblend.py: a machine without
+arrangement as the assembly kernels in test_asmx11.py: a machine without
 the toolchain still has a browser, it just has a browser that says "no
 decoder" for H.264, and the tests have to prove that path works too.
 """
