@@ -15,8 +15,8 @@
 #   * a file anywhere in the bundle containing a path under /Users, which is
 #     how a build machine's home directory ends up shipped to strangers,
 #   * a missing icon, plist key, trust store, engine or interpreter,
-#   * an app that cannot decode H.264 -- asked of the app itself, with a
-#     stripped PATH, because that failure is invisible from a checkout,
+#   * an app that cannot decode H.264 or AAC -- asked of the app itself, with
+#     a stripped PATH, because both failures are invisible from a checkout,
 #   * Tcl, Tk or _tkinter, which this project does not use and must not ship.
 set -euo pipefail
 
@@ -89,38 +89,56 @@ for key in CFBundleIdentifier CFBundleName CFBundleExecutable \
 done
 
 echo
-echo "== video"
-# The regression this exists for is invisible from a checkout. h264.py falls
-# back to compiling fortran/ with gfortran, which every developer has and no
-# user does, so a bundle that shipped no decoder passes every other check
-# here, starts, renders, and only admits it when somebody opens a video --
-# by which time it is a download. So the app is asked, in the app.
-decoder=$(find "$contents/Resources/lib/feetbrowser" -name '_h264_*' -type f | head -1)
-if [ -n "$decoder" ]; then note "ok  ${decoder#"$app"/}"; else bad "no prebuilt H.264 decoder in the bundle"; fi
+echo "== video and sound"
+# The regression this exists for is invisible from a checkout. h264.py and
+# aac.py fall back to compiling fortran/ with gfortran, which every developer
+# has and no user does, so a bundle that shipped no decoder passes every
+# other check here, starts, renders, and only admits it when somebody opens a
+# video -- by which time it is a download. So the app is asked, in the app.
+#
+# Both decoders, separately. They are two libraries built from two sets of
+# sources, and a bundle that carries one of them is the failure that reads as
+# "the video player is broken" rather than as "this app cannot decode AAC":
+# pictures, and silence.
 if [ -d "$contents/Resources/lib/fortran" ]; then
-  note "ok  Resources/lib/fortran (the sources the decoder's name is a hash of)"
+  note "ok  Resources/lib/fortran (the sources the decoders' names are a hash of)"
 else
   bad "missing Resources/lib/fortran"
 fi
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-vector="$here/../../tests/fixtures/h264/mb1.264"
-truth="$here/../../tests/fixtures/h264/mb1.i420.z"
-args=()
-if [ -f "$vector" ] && [ -f "$truth" ]; then
-  args=("$vector" "$truth")
-else
-  note "no test vectors beside this script; checking the decoder loads, not what it decodes"
-fi
-# PATH cut back to the system directories: if the bundle could only decode
-# because this machine has a gfortran or a Homebrew libgfortran, that is the
-# bug, and it must not be able to reach either.
-if out=$(env PATH=/usr/bin:/bin:/usr/sbin:/sbin \
-             "$contents/MacOS/FeetBrowser" --check-video "${args[@]+"${args[@]}"}" 2>&1); then
-  printf '  %s\n' "$out"
-else
-  bad "--check-video failed inside the app:"
-  printf '   %s\n' "$out"
-fi
+# what it is called, which prebuilt to look for, and the fixtures that prove
+# what it decodes rather than merely that it loaded.
+check_decoder() {
+  local what="$1" glob="$2" flag="$3" vector="$4" truth="$5" found args out
+  found=$(find "$contents/Resources/lib/feetbrowser" -name "$glob" -type f | head -1)
+  if [ -n "$found" ]; then
+    note "ok  ${found#"$app"/}"
+  else
+    bad "no prebuilt $what decoder in the bundle"
+  fi
+  args=()
+  if [ -f "$vector" ] && [ -f "$truth" ]; then
+    args=("$vector" "$truth")
+  else
+    note "no $what test vectors beside this script; checking the decoder loads, not what it decodes"
+  fi
+  # PATH cut back to the system directories: if the bundle could only decode
+  # because this machine has a gfortran or a Homebrew libgfortran, that is the
+  # bug, and it must not be able to reach either.
+  if out=$(env PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+               "$contents/MacOS/FeetBrowser" "$flag" "${args[@]+"${args[@]}"}" 2>&1); then
+    printf '  %s\n' "$out"
+  else
+    bad "$flag failed inside the app:"
+    printf '   %s\n' "$out"
+  fi
+}
+check_decoder "H.264" '_h264_*' --check-video \
+  "$here/../../tests/fixtures/h264/mb1.264" \
+  "$here/../../tests/fixtures/h264/mb1.i420.z"
+check_decoder "AAC" '_aac_*' --check-audio \
+  "$here/../../tests/fixtures/aac/lowrate.aac" \
+  "$here/../../tests/fixtures/aac/lowrate.f32.z"
 
 echo
 echo "== no toolkit"

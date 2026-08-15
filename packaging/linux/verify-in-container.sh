@@ -89,18 +89,24 @@ HTML
 "$IMAGE" --screenshot file:///tmp/page/images.html "$OUT/images.png"
 ls -l "$OUT/images.png"
 
-say "video, on a machine with no compiler"
-# The one part of the browser that used to be missing from every shipped copy
-# and from no checkout. h264.py falls back to compiling fortran/ with
+say "video and sound, on a machine with no compiler"
+# The part of the browser that used to be missing from every shipped copy and
+# from no checkout. h264.py and aac.py fall back to compiling fortran/ with
 # gfortran, which every developer has and this container does not, so a
 # bundle that shipped no decoder would pass every other check above, start,
 # render, and only admit it to a user who opened a video. --check-video
 # decodes tests/fixtures/h264/mb1.264 inside the bundle and compares the
 # result with the picture a reference decoder produced, byte for byte: a
 # decoder that loads and returns rubbish is not a decoder.
+#
+# --check-audio is the same question for the sound decoder, and it is asked
+# separately because it is a separate library built from separate sources.
+# The bundle that shipped one and not the other played pictures in silence
+# and passed every check that existed at the time.
 command -v gfortran >/dev/null 2>&1 \
   && { echo "FAIL: this container has a gfortran; the test would prove nothing" >&2; exit 1; }
 "$IMAGE" --check-video "$TESTS/fixtures/h264/mb1.264" "$TESTS/fixtures/h264/mb1.i420.z"
+"$IMAGE" --check-audio "$TESTS/fixtures/aac/lowrate.aac" "$TESTS/fixtures/aac/lowrate.f32.z"
 
 say "a real X11 window"
 # tests/x11_shot.py is the repository's own end-to-end window check: it opens

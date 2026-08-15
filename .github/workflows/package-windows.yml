@@ -182,15 +182,17 @@ jobs:
       # checkout is the one thing that would put the project's own sources on
       # the machine that is supposed to prove it does not need them.
       #
-      # The two H.264 fixtures travel with it, staged into one directory so
-      # the artifact keeps them beside the script: they are 1.2 KB together,
-      # and without them the video check can only prove the decoder loads,
-      # not that the picture it produces is the right one.
+      # The H.264 and AAC fixtures travel with it, staged into one directory
+      # each so the artifact keeps them beside the script: a few KB in total,
+      # and without them the decoder checks can only prove the libraries load,
+      # not that the picture and the samples they produce are the right ones.
       - name: Stage the verification script and its fixtures
         run: |
           New-Item -ItemType Directory -Force -Path verify-kit\h264 | Out-Null
+          New-Item -ItemType Directory -Force -Path verify-kit\aac | Out-Null
           Copy-Item packaging\windows\verify-bundle.ps1 verify-kit
           Copy-Item tests\fixtures\h264\mb1.264, tests\fixtures\h264\mb1.i420.z verify-kit\h264
+          Copy-Item tests\fixtures\aac\lowrate.aac, tests\fixtures\aac\lowrate.f32.z verify-kit\aac
 
       - name: Upload the verification script
         uses: actions/upload-artifact@v4

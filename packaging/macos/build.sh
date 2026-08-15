@@ -12,9 +12,9 @@
 # codesign, iconutil, hdiutil, security -- ships with macOS. What the build
 # machine needs beyond that is a C compiler (the Command Line Tools, which
 # building the Rust engine already requires), a Rust toolchain with both
-# Apple targets installed, and a gfortran for the H.264 decoder (brew install
-# gcc). gfortran only ever targets the machine it is on, so the other
-# architecture's half of the decoder has to be built on the other
+# Apple targets installed, and a gfortran for the H.264 and AAC decoders
+# (brew install gcc). gfortran only ever targets the machine it is on, so the
+# other architecture's half of each decoder has to be built on the other
 # architecture and handed over -- see step 6.
 #
 #   packaging/macos/build.sh              build the .app and the .dmg
@@ -288,30 +288,39 @@ find "$applib/feetbrowser" -name __pycache__ -type d -exec rm -rf {} +
 mkdir -p "$applib/toes"
 cp "$root/toes/README.md" "$applib/toes/"
 
-# -- 6. the H.264 decoder ----------------------------------------------------
+# -- 6. the Fortran decoders -------------------------------------------------
 #
-# fortran/ is 5800 lines of FORTRAN 77 that feetbrowser/h264.py compiles with
-# gfortran the first time a video plays. That works from a checkout, where
-# there is a compiler; it cannot work in a shipped app, where there is not.
-# Left alone the app starts, renders, and says "[video: H.264: no gfortran on
-# PATH]" the first time anyone opens a video -- which no developer ever sees,
-# because developers run from a checkout.
+# fortran/ is FORTRAN 77: eleven sources and an include file that
+# feetbrowser/h264.py compiles the first time a video plays, and five and an
+# include file that feetbrowser/aac.py compiles the first time one has sound.
+# That works from a checkout, where there is a compiler; it cannot work in a
+# shipped app, where there is not. Left alone the app starts, renders, and
+# says "[video: H.264: no gfortran on PATH]" the first time anyone opens a
+# video -- which no developer ever sees, because developers run from a
+# checkout.
 #
-# So the library is built here, by a gfortran only this machine needs, and
-# ships inside the package under the name h264.py will look for. The sources
-# ship as well, beside the package like toes/ -- 250K, and the name h264.py
-# looks for is a hash of them, so the two cannot come apart. See
-# prebuilt_name() for why that is the whole guarantee.
+# Both decoders, and for the same reason. Shipping only the video half is
+# not half a fix: it produces an app that plays pictures in silence, which
+# looks like a bug in the player rather than like a missing decoder, and it
+# is the state this section was in until the sound half was added.
+#
+# So the libraries are built here, by a gfortran only this machine needs, and
+# ship inside the package under the names h264.py and aac.py look for. The
+# sources ship as well, beside the package like toes/ -- 250K, and each name
+# is a hash of them, so the two cannot come apart. See prebuilt_name() for
+# why that is the whole guarantee.
 #
 # Both architectures, like everything else in here. The build machine's
-# gfortran only targets its own, so the other half comes from
-# FEETBROWSER_H264_<ARCH> when it is set -- that is how the workflow hands
-# the x86_64 slice over from the Intel runner -- and otherwise from any
-# gfortran on PATH that targets it.
+# gfortran only targets its own -- gfortran does not cross-compile on Darwin
+# and Homebrew's does not pretend to -- so the other half comes from
+# FEETBROWSER_H264_<ARCH> and FEETBROWSER_AAC_<ARCH> when they are set, which
+# is how the workflow hands the x86_64 slices over from the Intel runner, and
+# otherwise from any gfortran on PATH that targets it.
 
-say "the H.264 decoder"
+say "the Fortran decoders"
 ditto "$root/fortran" "$applib/fortran"
 h264name=$(PYTHONPATH="$applib" "$pybin" -m feetbrowser.h264 --name)
+aacname=$(PYTHONPATH="$applib" "$pybin" -m feetbrowser.aac --name)
 
 # The first gfortran on PATH that targets $1, or nothing. gfortran calls
 # arm64 aarch64, hence the second pattern.
@@ -330,33 +339,41 @@ gfortran_for() {
   return 1
 }
 
-for arch in arm64 x86_64; do
-  case $arch in
-    arm64)  min=$MIN_MACOS_ARM;  prebuilt="${FEETBROWSER_H264_ARM64:-}"
-            hint="${FEETBROWSER_GFORTRAN_ARM64:-}" ;;
-    x86_64) min=$MIN_MACOS_X86;  prebuilt="${FEETBROWSER_H264_X86_64:-}"
-            hint="${FEETBROWSER_GFORTRAN_X86_64:-}" ;;
-  esac
-  mkdir -p "$work/h264/$arch"
-  slice="$work/h264/$arch/$h264name"
+# One decoder, one architecture, into $work/<module>/<arch>/<name>. Written
+# once and called twice rather than copied: the rpath surgery and the
+# dependency check below are the parts that decide whether a bundle works on
+# somebody else's machine, and two copies of them are one copy that is out of
+# date.
+#
+#   decoder_slice <module> <library name> <arch> <deployment target> \
+#                 <gfortran hint> <prebuilt slice or empty>
+decoder_slice() {
+  local module="$1" name="$2" arch="$3" min="$4" hint="$5" prebuilt="$6"
+  local slice fc rp bad upper
+  upper=$(printf '%s' "$module" | tr a-z A-Z)
+  mkdir -p "$work/$module/$arch"
+  slice="$work/$module/$arch/$name"
   if [ -n "$prebuilt" ]; then
-    [ -f "$prebuilt" ] || { echo "FEETBROWSER_H264_* names $prebuilt, which does not exist" >&2; exit 1; }
+    [ -f "$prebuilt" ] || {
+      echo "FEETBROWSER_${upper}_* names $prebuilt, which does not exist" >&2
+      exit 1
+    }
     # Named after the digest, so a slice built from other sources cannot be
     # lipo'd in silently: it would not be called this.
-    [ "$(basename "$prebuilt")" = "$h264name" ] || {
-      echo "$prebuilt is not $h264name -- it was built from different sources" >&2
+    [ "$(basename "$prebuilt")" = "$name" ] || {
+      echo "$prebuilt is not $name -- it was built from different sources" >&2
       exit 1
     }
     cp "$prebuilt" "$slice"
   else
     fc=$(gfortran_for "$arch" "$hint") || {
       echo "no gfortran on PATH targets $arch" >&2
-      echo "install one, or point FEETBROWSER_H264_$(echo "$arch" | tr a-z A-Z) at a slice built elsewhere" >&2
+      echo "install one, or point FEETBROWSER_${upper}_$(printf '%s' "$arch" | tr a-z A-Z) at a slice built elsewhere" >&2
       exit 1
     }
-    echo "$arch: $("$fc" -dumpmachine) ($fc)"
+    echo "$module $arch: $("$fc" -dumpmachine) ($fc)"
     MACOSX_DEPLOYMENT_TARGET=$min PYTHONPATH="$applib" \
-      "$pybin" -m feetbrowser.h264 --build "$slice" --fc "$fc" >/dev/null
+      "$pybin" -m "feetbrowser.$module" --build "$slice" --fc "$fc" >/dev/null
   fi
   # gfortran writes the path to its own runtime into the library as an
   # LC_RPATH -- on this machine, a directory under whoever's Homebrew Cellar
@@ -381,15 +398,36 @@ for arch in arm64 x86_64; do
   bad=$(otool -L "$slice" | tail -n +2 | awk '{print $1}' \
         | grep -v -e '^/usr/lib/' -e '^/System/' -e '^@loader_path/' || true)
   [ -z "$bad" ] || {
-    echo "the $arch decoder depends on something outside the bundle:" >&2
+    echo "the $arch $module decoder depends on something outside the bundle:" >&2
     echo "$bad" >&2
     exit 1
   }
+}
+
+for arch in arm64 x86_64; do
+  case $arch in
+    arm64)  min=$MIN_MACOS_ARM
+            h264slice="${FEETBROWSER_H264_ARM64:-}"
+            aacslice="${FEETBROWSER_AAC_ARM64:-}"
+            hint="${FEETBROWSER_GFORTRAN_ARM64:-}" ;;
+    x86_64) min=$MIN_MACOS_X86
+            h264slice="${FEETBROWSER_H264_X86_64:-}"
+            aacslice="${FEETBROWSER_AAC_X86_64:-}"
+            hint="${FEETBROWSER_GFORTRAN_X86_64:-}" ;;
+  esac
+  decoder_slice h264 "$h264name" "$arch" "$min" "$hint" "$h264slice"
+  decoder_slice aac  "$aacname"  "$arch" "$min" "$hint" "$aacslice"
 done
 
-lipo -create "$work/h264/arm64/$h264name" "$work/h264/x86_64/$h264name" \
-  -output "$applib/feetbrowser/$h264name"
-lipo -info "$applib/feetbrowser/$h264name"
+for module in h264 aac; do
+  case $module in
+    h264) name=$h264name ;;
+    aac)  name=$aacname ;;
+  esac
+  lipo -create "$work/$module/arm64/$name" "$work/$module/x86_64/$name" \
+    -output "$applib/feetbrowser/$name"
+  lipo -info "$applib/feetbrowser/$name"
+done
 
 # -- 7. certificates ---------------------------------------------------------
 #
