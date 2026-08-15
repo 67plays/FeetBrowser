@@ -144,6 +144,31 @@ C     Where the area is not flat it falls back to two samples.
       RETURN
       END
 
+C     Does the transform block containing 4x4 block (BX, BY) of
+C     macroblock A hold any non-zero coefficients?
+C
+C     MNZ is per 4x4 block because CAVLC needs it that way -- each 4x4's
+C     TotalCoeff is the next block's nC -- so when the 8x8 transform is
+C     in use the four counts of an 8x8 are four different numbers and the
+C     question has to be asked of all four.  Under CABAC an 8x8 is one
+C     coded block and all four slots hold its count, so the loop finds
+C     the same answer it would have found from any one of them.
+      INTEGER FUNCTION H2NZQ(A, BX, BY)
+      IMPLICIT NONE
+      INCLUDE 'h264com.inc'
+      INTEGER A, BX, BY, I, K
+      H2NZQ = 0
+      IF (MT8(A + 1) .EQ. 0) THEN
+         IF (MNZ(ZORD(BX, BY) + 1, A + 1) .GT. 0) H2NZQ = 1
+         RETURN
+      END IF
+      K = 4 * (BX / 2 + 2 * (BY / 2))
+      DO 10 I = 1, 4
+         IF (MNZ(K + I, A + 1) .GT. 0) H2NZQ = 1
+   10 CONTINUE
+      RETURN
+      END
+
 C     8.7.2.1, for a frame-coded P or I picture with one reference list.
 C     A and NB are the macroblocks on the q and p sides; MBEDG says the
 C     edge between them is a macroblock edge; the four block coordinates
@@ -157,18 +182,18 @@ C     whether the pictures are the same, not whether the numbers are.
       IMPLICIT NONE
       INCLUDE 'h264com.inc'
       INTEGER A, NB, MBEDG, PBX, PBY, QBX, QBY, BS
-      INTEGER PI, QI, PB, QB, PQ, QQ
+      INTEGER PI, QI, PQ, QQ, H2NZQ
+      EXTERNAL H2NZQ
       BS = 0
       IF (MINT(NB + 1) .NE. 0 .OR. MINT(A + 1) .NE. 0) THEN
          BS = 3
          IF (MBEDG .NE. 0) BS = 4
          RETURN
       END IF
-C     With the 8x8 transform every 4x4 block of an 8x8 carries that
-C     block's count, so this one test covers both transform sizes.
-      PB = ZORD(PBX, PBY) + 1
-      QB = ZORD(QBX, QBY) + 1
-      IF (MNZ(PB, NB + 1) .GT. 0 .OR. MNZ(QB, A + 1) .GT. 0) THEN
+C     8.7.2.1 asks about the transform block containing the 4x4, which
+C     is the 4x4 itself unless the 8x8 transform is in use.
+      IF (H2NZQ(NB, PBX, PBY) .NE. 0 .OR. H2NZQ(A, QBX, QBY) .NE. 0)
+     +   THEN
          BS = 2
          RETURN
       END IF

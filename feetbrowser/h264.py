@@ -1,6 +1,6 @@
 """H.264 video decoding, in Fortran, loaded through ctypes.
 
-The decoder itself is in ``fortran/`` -- fixed-form FORTRAN 77, about four
+The decoder itself is in ``fortran/`` -- fixed-form FORTRAN 77, about seven
 thousand lines of it, compiled on demand by gfortran into a shared library
 that this module loads and calls. Nothing here decodes anything; this is
 the part that finds a compiler, keeps the build cached, converts between
@@ -15,12 +15,13 @@ Fortran does it at 120 million. The rest of the codec followed the
 entropy layer across the boundary because splitting a decoder in half at
 the macroblock level would mean marshalling every coefficient.
 
-What decodes today: I and P slices, CABAC-coded, 4:2:0 8-bit, Baseline,
-Main and High profile. Every intra prediction mode, both transform sizes,
-scaling matrices, quarter-sample motion compensation with weighted
-prediction, up to four reference frames, the deblocking filter. Not B
-slices, not CAVLC, not interlace -- see the module docstring in
-``fortran/h264api.f`` for the status codes each of those produces.
+What decodes today: I and P slices, either entropy coder -- CABAC or
+CAVLC -- 4:2:0 8-bit, Baseline, Main and High profile. Every intra
+prediction mode, both transform sizes, scaling matrices, quarter-sample
+motion compensation with weighted prediction, up to four reference
+frames, the deblocking filter. Not B slices, not interlace -- see the
+module docstring in ``fortran/h264api.f`` for the status codes each of
+those produces.
 
 The library holds one decoder's worth of state in COMMON blocks, which
 is to say a single global one. ``_LOCK`` is what stops two ``<video>``
@@ -52,8 +53,8 @@ _FORTRAN = os.path.join(os.path.dirname(_HERE), "fortran")
 # only COMMON blocks and an INCLUDE -- but a fixed order keeps the cache key
 # stable across filesystems that list a directory in their own order.
 _SOURCES = ("h264ctx.f", "h264tab.f", "h264bits.f", "h264ps.f", "h264mb.f",
-            "h264pred.f", "h264rec.f", "h264mc.f", "h264dpb.f", "h264dbl.f",
-            "h264api.f")
+            "h264cav.f", "h264pred.f", "h264rec.f", "h264mc.f", "h264dpb.f",
+            "h264dbl.f", "h264api.f")
 _INCLUDES = ("h264com.inc",)
 
 # The version H2VERS reports. A library left in the cache by an older
@@ -288,8 +289,8 @@ _STATUS = {
     -20: "the slice claims more macroblocks than the picture has",
     -21: "the arithmetic decoder lost sync with the stream",
     -22: "a macroblock ran off the end of the slice",
+    -24: "a CAVLC codeword or syntax element the standard has no value for",
     -30: "a slice arrived before its SPS and PPS",
-    -31: "CAVLC entropy coding, which this decoder does not implement",
     -32: "no slice in this access unit",
     -33: "the NAL unit is larger than the decoder's buffer",
     -41: "a slice arrived before its SPS and PPS",

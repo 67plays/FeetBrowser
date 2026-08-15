@@ -1,15 +1,14 @@
 C     The outside of the decoder: Annex B framing, and the handful of
 C     C-callable entry points that feetbrowser/h264.py loads with ctypes.
 C
-C     What decodes today: I and P slices, CABAC, 4:2:0 8-bit, progressive,
-C     Baseline, Main and High profile.  Every intra prediction mode, both
-C     transform sizes, scaling matrices, quarter-sample motion
-C     compensation, weighted prediction, up to four reference frames, and
-C     the deblocking filter.
+C     What decodes today: I and P slices, both entropy coders (CABAC and
+C     CAVLC), 4:2:0 8-bit, progressive, Baseline, Main and High profile.
+C     Every intra prediction mode, both transform sizes, scaling
+C     matrices, quarter-sample motion compensation, weighted prediction,
+C     up to four reference frames, and the deblocking filter.
 C
 C     Refused, each by its own status code so that a report says which:
 C     * B, SP and SI slices                                     -43
-C     * CAVLC                                                   -31
 C     * interlace                                                -4
 C     * chroma other than 4:2:0, or more than 8 bits             -3
 C     * slice groups                                            -13
@@ -205,21 +204,39 @@ C     byte is never zero and this trim can never eat real payload.
       IF (NT .EQ. 7 .OR. NT .EQ. 8 .OR. NT .EQ. 1 .OR. NT .EQ. 5) THEN
          CALL H2LOAD(BUF, S + 1, E, ST)
          IF (ST .NE. 0) RETURN
-C     Parameter sets get their trailing bits trimmed; slices must not.
-C     The picture parameter set ends in an optional block guarded by
-C     more_rbsp_data(), and without the trim that predicate mistakes the
-C     rbsp_stop_one_bit for payload: a Baseline or Main PPS, which has no
-C     such block, then reads a transform_size_8x8 flag off the end of
-C     itself and fails.
+C     Three cases, and they do not agree.
 C
-C     A CABAC slice is the opposite case.  9.3.4.6 flushes the encoder by
+C     Parameter sets must be trimmed.  The picture parameter set ends in
+C     an optional block guarded by more_rbsp_data(), and without the trim
+C     that predicate mistakes the rbsp_stop_one_bit for payload: a
+C     Baseline or Main PPS, which has no such block, then reads a
+C     transform_size_8x8 flag off the end of itself and fails.
+C
+C     A CABAC slice must not be trimmed.  9.3.4.6 flushes the encoder by
 C     writing the low bits of codILow and then a one, and that one is the
 C     rbsp_stop_one_bit -- the stop bit is the last bit of the arithmetic
 C     codeword, not framing after it.  Trimming it away feeds the
 C     decoder a zero where the encoder wrote a one, and the final
 C     end_of_slice_flag reads as "more data" on the slices where the
 C     bit happened to matter.
-         IF (NT .EQ. 7 .OR. NT .EQ. 8) CALL H2TRIM
+C
+C     A CAVLC slice must be trimmed, and for the parameter sets' reason
+C     rather than against the CABAC one.  It has no end_of_slice_flag;
+C     7.3.4 runs its macroblock loop on more_rbsp_data(), so an untrimmed
+C     slice sees the stop bit as one more macroblock.  Its stop bit is
+C     ordinary framing -- rbsp_slice_trailing_bits, appended after the
+C     last codeword -- so nothing is lost by removing it.
+C
+C     ECMODE is the previous PPS's, and this NAL's slice header has not
+C     been read yet.  That is sound only because H2PPSP keeps one
+C     parameter set and H2SHDR ignores pic_parameter_set_id, so there is
+C     exactly one entropy_coding_mode_flag in play; a decoder that kept
+C     several would have to trim after the header instead.
+         IF (NT .EQ. 7 .OR. NT .EQ. 8) THEN
+            CALL H2TRIM
+         ELSE IF (PPSOK .NE. 0 .AND. ECMODE .EQ. 0) THEN
+            CALL H2TRIM
+         END IF
       END IF
 
       IF (NT .EQ. 7) THEN
@@ -250,12 +267,6 @@ C     second slice that recomputed them.
             NXTID = NXTID + 1
          END IF
          CALL H2WSCL
-         IF (ECMODE .EQ. 0) THEN
-C     CAVLC.  This decoder reads CABAC only; saying so here is better
-C     than decoding the slice header and then producing a grey picture.
-            ST = -31
-            RETURN
-         END IF
          RL0N = 0
          IF (SLTYPE .EQ. 0) THEN
 C     8.2.4, per slice and not per picture: two P slices of one picture
@@ -263,9 +274,15 @@ C     may reorder the same set of references differently.
             CALL H2RLST(ST)
             IF (ST .NE. 0) RETURN
          END IF
-         CALL H2ALGN
-         CALL H2CINI(SLQPY)
-         CALL H2SLIC(ST)
+         IF (ECMODE .EQ. 0) THEN
+C     CAVLC reads on from wherever the slice header stopped: no
+C     cabac_alignment_one_bit, no arithmetic decoder to initialise.
+            CALL H2CSLC(ST)
+         ELSE
+            CALL H2ALGN
+            CALL H2CINI(SLQPY)
+            CALL H2SLIC(ST)
+         END IF
          IF (ST .NE. 0) RETURN
       END IF
 

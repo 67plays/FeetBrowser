@@ -42,6 +42,7 @@ VECTORS = [
     ("qcif-main", 176, 144, "Main profile: CABAC without the 8x8 transform"),
     ("qcif-scaling", 176, 144, "picture-level scaling matrices"),
     ("qcif-slices", 176, 144, "four slices in one picture"),
+    ("qcif-cavlc", 176, 144, "Baseline profile: CAVLC instead of CABAC"),
     ("crop", 100, 60, "frame_cropping: 100x60 out of 112x64"),
     ("tiny-crop", 66, 50, "cropping on both axes at once"),
 ]
@@ -64,6 +65,12 @@ INTER_VECTORS = [
     ("p-multiref", 112, 80, 10, "four reference frames, ref_idx_l0 in use"),
     ("p-edge", 112, 80, 10, "the picture pans off its own edges"),
     ("p-weightp", 112, 80, 10, "weighted prediction across a fade"),
+    ("cavlc-intra", 128, 96, 3, "CAVLC with no inter syntax at all"),
+    ("cavlc-p", 128, 96, 10, "CAVLC P frames: mb_skip_run, ue(v) mb_type"),
+    ("cavlc-highqp", 176, 144, 8, "near-empty blocks: the nC derivation"),
+    ("cavlc-lowqp", 96, 64, 4, "huge levels: suffixLength and the escapes"),
+    ("cavlc-chromadc", 128, 96, 8, "the 2x2 chroma DC table"),
+    ("cavlc-8x8", 128, 96, 8, "CAVLC 8x8: four 4x4 blocks, four nC"),
 ]
 
 
@@ -208,18 +215,36 @@ def test_two_decoders_interleaved_do_not_corrupt_each_other():
           % (first[0], second[0]))
 
 
-def test_cavlc_is_refused_and_says_so():
-    """The one thing worse than not implementing CAVLC is implementing half
-    of it. A Baseline stream must come back as a sentence, not as a grey
-    picture and not as an exception from somewhere inside the decoder."""
+def test_cavlc_and_cabac_are_the_same_decoder_underneath():
+    """CAVLC is a second entropy layer, not a second decoder. Everything
+    below clause 9.2 -- prediction, the transforms, deblocking -- is the
+    code the CABAC vectors already exercise, so the thing worth asserting
+    separately is that switching entropy coders does not switch anything
+    else: the same picture, encoded both ways at the same quantiser,
+    reconstructs to two pictures that are close, and each is exactly its
+    own ground truth.
+
+    Close and not equal, because the two streams are two encodes and x264
+    makes different mode decisions when the bits cost differently. The
+    bit-exactness is asserted per stream by the vector tests above; what a
+    large difference here would mean is that one of the two paths is
+    reconstructing from correctly decoded coefficients differently, which
+    no amount of per-stream exactness against a truth file made by the
+    same decoder would catch."""
     if _skip():
         return
-    try:
-        h264.Decoder().decode_i420(_stream("qcif-cavlc"))
-    except h264.H264Error as exc:
-        assert "CAVLC" in str(exc), "unhelpful refusal: %s" % exc
-        return
-    raise AssertionError("a CAVLC stream decoded, which it should not have")
+    size = 128 * 96
+    _w, _h, cabac = h264.Decoder().decode_i420(
+        _access_units(_stream("p-sub8x8"))[0])
+    _w, _h, cavlc = h264.Decoder().decode_i420(
+        _access_units(_stream("cavlc-8x8"))[0])
+    worst = max(abs(a - b) for a, b in zip(cabac[:size], cavlc[:size]))
+    mean = sum(abs(a - b) for a, b in zip(cabac[:size], cavlc[:size])) / size
+    assert mean < 4.0, (
+        "the same frame decoded %.2f apart on average through the two "
+        "entropy coders (worst sample %d)" % (mean, worst))
+    print("  ok  one picture through both entropy coders: mean |diff| "
+          "%.2f, worst %d" % (mean, worst))
 
 
 def test_garbage_is_refused_rather_than_crashing():

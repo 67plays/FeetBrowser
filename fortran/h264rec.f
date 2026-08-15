@@ -339,7 +339,12 @@ C     block, in the raster order of the blocks rather than their z-order.
             CALL H2GATH(PY, MXW, BX + X0, BY + Y0, 8, 1)
             CALL H2F8
             CALL H2PNN(8, CI4(4 * K + 1), PRD)
-            IF (CNZ(4 * K + 1) .GT. 0) THEN
+C     CABAC codes an 8x8 as one block and stores the same count in all
+C     four of its 4x4 slots; CAVLC codes it as four 4x4 blocks with four
+C     separate counts, because each of them is the next block's nC.  So
+C     the question here is whether any of the four is non-zero.
+            IF (CNZ(4 * K + 1) + CNZ(4 * K + 2) + CNZ(4 * K + 3) +
+     +          CNZ(4 * K + 4) .GT. 0) THEN
                CALL H2IT8(CO8(1, K + 1), RES)
             ELSE
                DO 50 I = 0, 63
@@ -405,7 +410,9 @@ C     interpolated independently.
          DO 40 K = 0, 3
             X0 = MOD(K, 2) * 8
             Y0 = (K / 2) * 8
-            IF (CNZ(4 * K + 1) .GT. 0) THEN
+C     Any of the four 4x4 counts; see H2RECM.
+            IF (CNZ(4 * K + 1) + CNZ(4 * K + 2) + CNZ(4 * K + 3) +
+     +          CNZ(4 * K + 4) .GT. 0) THEN
                CALL H2IT8(CO8(1, K + 1), RES)
             ELSE
                DO 10 I = 0, 63

@@ -22,8 +22,12 @@
 # -- the pair is what matters -- but do not commit a regenerated `.264`
 # without regenerating its truth file from the same run.
 #
-# The nine intra-only vectors (mb1, mb4, qcif-*, crop, tiny-crop, and the
-# qcif-cavlc refusal case) predate this script and are not reproduced by it.
+# The nine intra-only vectors (mb1, mb4, qcif-*, crop, tiny-crop and
+# qcif-cavlc) predate this script and their `.264` files are not reproduced by
+# it. qcif-cavlc.i420.z is, though -- see the bottom of this file. That stream
+# arrived as a refusal case, with no truth beside it, and once CAVLC decoded
+# it needed one; regenerating the truth for a committed stream is a different
+# operation from encoding a new one, and `truth_only` below is it.
 #
 # Usage: ./make_inter_vectors.sh [output-directory]
 
@@ -100,3 +104,77 @@ vector p-edge 112x80 10 \
 vector p-weightp 112x80 10 \
   "testsrc2=size=112x80:rate=25,fade=t=out:st=0:d=0.4" \
   "--ref 3 --partitions all --no-8x8dct --qp 24 --weightp 2"
+
+# ---------------------------------------------------------------------------
+# CAVLC. Everything above is CABAC; clause 9.2 is a wholly separate entropy
+# layer and shares no code with 9.3, so it needs its own vectors rather than a
+# flag on the existing ones.
+#
+# The switch is --no-cabac. (FFmpeg spells the same thing -coder 0 when it
+# drives libx264; the x264 binary does not take that name.) It comes after
+# $common on the command line, so putting it in the per-vector options is
+# enough.
+
+# Intra only: --keyint 1 makes every frame an IDR, so this is the CAVLC
+# residual layer and nothing else -- no mb_skip_run, no mvd, no ref_idx.
+vector cavlc-intra 128x96 3 \
+  "testsrc2=size=256x192:rate=25" \
+  "--no-cabac --keyint 1 --partitions all --no-8x8dct --qp 26"
+
+# CAVLC with P frames and motion: mb_skip_run in place of mb_skip_flag,
+# mb_type and sub_mb_type as ue(v), mvd as se(v), ref_idx as te(v), and
+# coded_block_pattern through the inter column of Table 9-4.
+vector cavlc-p 128x96 10 \
+  "mandelbrot=size=128x96:rate=25:maxiter=200" \
+  "--no-cabac --ref 3 --partitions all --no-8x8dct --subme 9 --me umh --qp 24"
+
+# High QP: almost every block is empty or nearly so. That is the nC path --
+# with TotalCoeff mostly zero the coeff_token table a block is decoded with
+# depends entirely on getting its two neighbours' counts and their
+# availability right, and a slice full of long skip runs ends without an
+# end_of_slice_flag to say so.
+vector cavlc-highqp 176x144 8 \
+  "testsrc2=size=352x288:rate=25" \
+  "--no-cabac --ref 2 --partitions all --no-8x8dct --qp 44 --weightp 0"
+
+# Low QP on noise: the opposite end. Levels are large, so suffixLength
+# escalates through its whole range and level_prefix reaches the >= 15 and
+# >= 16 escapes -- the cases that never appear in an ordinary picture and so
+# never appear in a test that uses one.
+vector cavlc-lowqp 96x64 4 \
+  "nullsrc=size=96x64:rate=25,format=yuv444p,geq=lum_expr='random(1)*255':cb_expr='random(2)*255':cr_expr='random(3)*255'" \
+  "--no-cabac --ref 1 --partitions all --no-8x8dct --qp 3"
+
+# Smooth, saturated colour that keeps moving: the luma is nearly flat and
+# most of what is coded is chroma, which puts the weight on the 2x2 chroma DC
+# block -- its own coeff_token table (nC = -1), its own total_zeros table, and
+# no neighbours to derive anything from.
+vector cavlc-chromadc 128x96 8 \
+  "gradients=size=128x96:rate=25:c0=0xff0040:c1=0x0040ff:speed=0.15" \
+  "--no-cabac --ref 2 --partitions all --no-8x8dct --qp 20 --weightp 0"
+
+# CAVLC and the 8x8 transform together. There is no 8x8 CAVLC block: an 8x8
+# is coded as four 4x4 blocks, each with its own nC and its own TotalCoeff,
+# whose scans interleave into the 8x8 scan. Nothing else in the suite covers
+# that, and it is where a decoder that stores one count per 8x8 breaks.
+vector cavlc-8x8 128x96 8 \
+  "mandelbrot=size=128x96:rate=25:maxiter=200" \
+  "--no-cabac --ref 2 --partitions all --8x8dct --subme 9 --me umh --qp 22"
+
+# ---------------------------------------------------------------------------
+# Truth for a stream this script did not encode. qcif-cavlc.264 was committed
+# as a refusal case with nothing beside it; the stream is unchanged and only
+# its truth file is produced here.
+truth_only() {
+  local name="$1"
+  ffmpeg -v error -y -i "$out/$name.264" -pix_fmt yuv420p \
+         -f rawvideo "$work/truth.i420"
+  python3 -c 'import sys, zlib
+raw = open(sys.argv[1], "rb").read()
+open(sys.argv[2], "wb").write(zlib.compress(raw, 9))
+print("%-14s (existing stream) %7d -> %6d bytes"
+      % (sys.argv[3], len(raw), len(zlib.compress(raw, 9))))' \
+      "$work/truth.i420" "$out/$name.i420.z" "$name"
+}
+
+truth_only qcif-cavlc

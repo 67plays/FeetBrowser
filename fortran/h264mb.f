@@ -391,8 +391,12 @@ C     8x4, three for the two 4x8 and 4x4 cases.
       INTEGER FUNCTION H2SUBT()
       IMPLICIT NONE
       INCLUDE 'h264com.inc'
-      INTEGER H2DEC
-      EXTERNAL H2DEC
+      INTEGER H2DEC, H2CSUB
+      EXTERNAL H2DEC, H2CSUB
+      IF (ECMODE .EQ. 0) THEN
+         H2SUBT = H2CSUB()
+         RETURN
+      END IF
       IF (H2DEC(21) .NE. 0) THEN
          H2SUBT = 0
       ELSE IF (H2DEC(22) .EQ. 0) THEN
@@ -450,8 +454,12 @@ C     neighbour looked past the nearest reference picture.
       INTEGER FUNCTION H2REFI(BX, BY)
       IMPLICIT NONE
       INCLUDE 'h264com.inc'
-      INTEGER BX, BY, C, R, RA, RB, H2DEC
-      EXTERNAL H2DEC
+      INTEGER BX, BY, C, R, RA, RB, H2DEC, H2CREF
+      EXTERNAL H2DEC, H2CREF
+      IF (ECMODE .EQ. 0) THEN
+         H2REFI = H2CREF()
+         RETURN
+      END IF
       CALL H2GETR(BX - 1, BY, RA)
       CALL H2GETR(BX, BY - 1, RB)
       C = 0
@@ -490,8 +498,15 @@ C     learn neither well.
       INCLUDE 'h264com.inc'
       INTEGER BX, BY, COMP
       INTEGER AX, AY, BBX, BBY, S, BASE, C, V, NB, K, SUF
-      INTEGER H2DEC, H2BYP
-      EXTERNAL H2DEC, H2BYP
+      INTEGER H2DEC, H2BYP, H2SE
+      EXTERNAL H2DEC, H2BYP, H2SE
+      IF (ECMODE .EQ. 0) THEN
+C     CAVLC sends mvd as a plain se(v) and needs none of the context
+C     modelling below -- not the neighbours, not the two component
+C     context blocks, not the UEG3 suffix.
+         H2MVDC = H2SE()
+         RETURN
+      END IF
       CALL H2GETD(BX - 1, BY, AX, AY)
       CALL H2GETD(BX, BY - 1, BBX, BBY)
       IF (COMP .EQ. 0) THEN
@@ -1275,8 +1290,12 @@ C     9.3.1.2 leaves the bit cursor nine bits ahead of the last bin, so
 C     the PCM samples begin at the next byte boundary from there minus
 C     that lookahead.  Backing up by the two bytes of lookahead the
 C     engine holds and then aligning forwards lands on the right byte.
-      BITP = BITP - 16
-      IF (BITP .LT. 0) BITP = 0
+C     Under CAVLC the cursor is exactly where the syntax says it is and
+C     pcm_alignment_zero_bit is a plain alignment.
+      IF (ECMODE .NE. 0) THEN
+         BITP = BITP - 16
+         IF (BITP .LT. 0) BITP = 0
+      END IF
       CALL H2ALGN
       IF (BITP + 3072 .GT. BITN) THEN
          ST = -23
@@ -1314,6 +1333,7 @@ C     engine holds and then aligning forwards lands on the right byte.
       DQLAST = 0
       CALL H2CQP
       CALL H2SAVE
-      CALL H2CINI(SLQPY)
+C     Only CABAC has to be restarted; CAVLC never stopped.
+      IF (ECMODE .NE. 0) CALL H2CINI(SLQPY)
       RETURN
       END
