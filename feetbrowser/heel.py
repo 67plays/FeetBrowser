@@ -380,18 +380,40 @@ def lowpass(length, cutoff, beta):
             for i in range(length)]
 
 
+def _closer(trial, best, numerator, denominator):
+    """Is ``trial`` a better approximation of ``numerator/denominator``?
+
+    Compared as integers -- ``|t0*d - n*t1| / t1`` against the same for
+    ``best`` -- because the two candidates can agree to more decimal places
+    than a float has, and then the float comparison picks whichever way the
+    rounding fell rather than the closer one.
+    """
+    if best is None:
+        return True
+    return (abs(trial[0] * denominator - numerator * trial[1]) * best[1]
+            < abs(best[0] * denominator - numerator * best[1]) * trial[1])
+
+
 def best_ratio(numerator, denominator, limit):
     """``(n, d)`` closest to ``numerator/denominator`` with ``n <= limit``.
 
-    Continued fractions, stopping at the last convergent whose numerator
-    still fits. Only reached for rate pairs that do not reduce -- every
-    ordinary one does, and returns unchanged.
+    Continued fractions. Only reached for rate pairs that do not reduce --
+    every ordinary one does, and returns unchanged.
 
     The seeds are the standard ones and the order of them is not arbitrary:
     the convergents are ``p[k] = q[k]*p[k-1] + p[k-2]`` from ``p[-1] = 1`` and
     ``p[-2] = 0``, and swapping those two seeds gives the reciprocal of the
     answer -- which resamples 48 kHz to 40.5 rather than to 44.1 and sounds
     exactly like a tape running slow.
+
+    Stopping at the last convergent that fits is not quite the best answer,
+    and the gap is worth the four lines it costs to close. When the next
+    convergent overshoots ``limit``, some *semiconvergent* below it -- the
+    same recurrence with the quotient reduced -- may still fit and be closer
+    than anything before it. 11025 Hz into 32 kHz is the case that shows it:
+    the last convergent is 119/41, off by 1.9e-5, where 923/318 also fits
+    under 1024 and is off by 7.4e-6. That is 69 ms of drift an hour against
+    27, which nobody hears as pitch but which a long stream accumulates.
     """
     if numerator <= limit:
         return numerator, denominator
@@ -404,6 +426,17 @@ def best_ratio(numerator, denominator, limit):
         convergent = (quotient * current[0] + previous[0],
                       quotient * current[1] + previous[1])
         if convergent[0] > limit or convergent[1] <= 0:
+            # The full step does not fit. The largest partial one that does
+            # is the best remaining candidate; take it if it beats what we
+            # already have, and stop either way.
+            if current[0] > 0 and current[1] > 0:
+                room = (limit - previous[0]) // current[0]
+                if room > 0:
+                    trial = (room * current[0] + previous[0],
+                             room * current[1] + previous[1])
+                    if trial[1] > 0 and _closer(trial, best, numerator,
+                                                denominator):
+                        best = trial
             break
         previous, current = current, convergent
         best = convergent
@@ -1238,12 +1271,22 @@ def open_output(rate=DEFAULT_RATE, channels=DEFAULT_CHANNELS, backend=None,
     do not branch on the platform and do not have a no-audio code path,
     because a no-audio code path is a code path that is never tested.
 
-    ``backend="null"`` asks for the silent one outright.
+    ``backend="null"`` asks for the silent one outright. It is the only name
+    this argument takes, and an unrecognised one raises rather than quietly
+    handing back the platform's own device: ``backend="alsa"`` on a Mac used
+    to return CoreAudio without a word, which is how a test comes to believe
+    it has covered a backend it never loaded. Use ``FEETBROWSER_AUDIO`` to
+    force silence from outside the process.
     """
     global _problem
     reason = ""
     device = None
     asked_for = backend in ("null", "none")
+    if backend is not None and not asked_for and backend != "unpaced":
+        raise ValueError(
+            "no audio backend is called %r; the platform's own device is "
+            "chosen for you, and 'null' is the only name accepted here"
+            % (backend,))
     if asked_for:
         reason = "the silent audio backend was asked for by name"
     else:

@@ -254,6 +254,64 @@ def test_a_rational_ratio_is_found_or_approximated():
               "%d/%d approximated poorly" % (numerator, denominator))
 
 
+def test_the_ratio_is_the_best_one_the_phase_budget_allows():
+    """Not merely close: the closest that fits under the limit.
+
+    Stopping at the last whole convergent leaves accuracy on the table,
+    because a semiconvergent below the one that overshot can still fit and
+    still be nearer. Checked against Fraction.limit_denominator, which is the
+    standard best-rational-approximation and is applied to d/n here because
+    it bounds the denominator where best_ratio bounds the numerator.
+
+    Every rate pair a browser can meet, both directions, no exceptions: the
+    case that used to fail is 11025 Hz into 32 kHz, which took 119/41 where
+    923/318 fits and is two and a half times nearer.
+    """
+    from fractions import Fraction
+    rates = (8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000,
+             64000, 88200, 96000, 176400, 192000)
+    worst = 0.0
+    for source in rates:
+        for target in rates:
+            if source == target:
+                continue
+            divisor = math.gcd(target, source)
+            n, d = target // divisor, source // divisor
+            up, down = heel.best_ratio(n, d, heel.MAX_PHASES)
+            assert 1 <= up <= heel.MAX_PHASES, \
+                "%d->%d gave %d phases" % (source, target, up)
+            assert down >= 1, "%d->%d gave a zero step" % (source, target)
+            wanted = n / d
+            error = abs(up / down - wanted) / wanted
+            worst = max(worst, error)
+            ideal = Fraction(d, n).limit_denominator(heel.MAX_PHASES)
+            best = abs(ideal.denominator / ideal.numerator - wanted) / wanted
+            assert error <= best * 1.0001 + 1e-15, (
+                "%d -> %d took %d/%d (off by %.3g) when %d/%d fits and is "
+                "off by only %.3g" % (source, target, up, down, error,
+                                      ideal.denominator, ideal.numerator,
+                                      best))
+    assert worst < 1e-5, "worst approximation over all rate pairs: %.3g" % worst
+
+
+def test_an_unknown_backend_name_is_refused_rather_than_swapped():
+    """``backend="alsa"`` on a Mac used to return CoreAudio without a word.
+
+    Nothing was broken by it at runtime, but it is precisely how a test comes
+    to believe it has exercised a backend that was never even imported, so
+    the argument now only answers to the one name it actually implements.
+    """
+    for name in ("alsa", "winmm", "coreaudio", "pulse", ""):
+        try:
+            output = heel.open_output(backend=name, threaded=False)
+        except ValueError as exc:
+            assert name in str(exc) or not name, \
+                "the refusal should name what was asked for: %s" % exc
+        else:
+            output.close()
+            raise AssertionError("backend=%r was silently accepted" % name)
+
+
 def test_every_polyphase_branch_has_exactly_unity_gain():
     """The one property that makes the filter usable. A branch whose taps sum
     to something other than one is a branch that plays that phase of the
