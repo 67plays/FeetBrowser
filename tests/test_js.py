@@ -1639,6 +1639,91 @@ def test_js_generators():
     eq(g["inline"], "9", "a generator expression may be called where it stands")
 
 
+def test_js_symbol_value_type():
+    interp = Interpreter()
+    interp.run("""
+        var s = Symbol("tag");
+        var t = typeof s;
+        var sd = s.description;
+        var st = s.toString();
+        var distinct = Symbol("a") !== Symbol("a");
+        var i1 = Symbol.iterator;
+        var i2 = Symbol.iterator;
+        var sameWellKnown = i1 === i2;
+        var s1 = Symbol.for("k");
+        var s2 = Symbol.for("k");
+        var sameRegistered = s1 === s2;
+        var key = Symbol.keyFor(s1);
+        var kf = Symbol.keyFor(Symbol("other"));
+    """)
+    g = interp.globals
+    eq(g["t"], "symbol", "typeof symbol")
+    eq(g["sd"], "tag", "symbol description")
+    eq(g["st"], "Symbol(tag)", "symbol toString")
+    assert g["distinct"] is True, "two Symbol('a') calls are different values"
+    assert g["sameWellKnown"] is True, "Symbol.iterator read twice is the same symbol"
+    assert g["sameRegistered"] is True, "Symbol.for returns the same symbol per key"
+    eq(g["key"], "k", "Symbol.keyFor finds the registry key")
+    assert g["kf"] is UNDEFINED, "Symbol.keyFor returns undefined for unregistered symbols"
+
+
+def test_js_symbol_iterators_on_builtins():
+    interp = Interpreter()
+    interp.run("""
+        var arr = [1, 2, 3];
+        var it = arr[Symbol.iterator]();
+        var x1 = it.next().value;
+        var x2 = it.next().value;
+        var x3 = it.next().value;
+        var xdone = it.next().done;
+        var strIt = "ab"[Symbol.iterator]();
+        var ch1 = strIt.next().value;
+        var ch2 = strIt.next().value;
+        var m = new Map([["a", 1], ["b", 2]]);
+        var mIt = m[Symbol.iterator]();
+        var p1 = mIt.next().value;
+        var s = new Set([5, 6]);
+        var sIt = s[Symbol.iterator]();
+        var v1 = sIt.next().value;
+    """)
+    g = interp.globals
+    eq(g["x1"], 1, "array iterator step 1")
+    eq(g["x2"], 2, "array iterator step 2")
+    eq(g["x3"], 3, "array iterator step 3")
+    assert g["xdone"] is True, "array iterator is done"
+    eq(g["ch1"], "a", "string iterator yields code points")
+    eq(g["ch2"], "b", "string iterator second code point")
+    eq(g["p1"], ["a", 1], "map iterator yields [key, value] pairs")
+    eq(g["v1"], 5, "set iterator yields values")
+
+
+def test_js_custom_iterable_and_not_iterable():
+    interp = Interpreter()
+    interp.run("""
+        var obj = {};
+        obj[Symbol.iterator] = function () {
+            var n = 0;
+            return {
+                next: function () {
+                    n += 1;
+                    if (n <= 3) return { value: n * 10, done: false };
+                    return { value: undefined, done: true };
+                }
+            };
+        };
+        var total = 0;
+        for (var v of obj) { total += v; }
+        var spread = [...obj];
+        var plain = {};
+        var threw = false;
+        try { for (var v of plain) {} } catch (e) { threw = true; }
+    """)
+    g = interp.globals
+    eq(g["total"], 60, "for...of uses a custom Symbol.iterator")
+    eq(g["spread"], [10, 20, 30], "spread uses a custom Symbol.iterator")
+    assert g["threw"] is True, "for...of over a non-iterable throws"
+
+
 def test_js_destructuring_assignment_onto_properties():
     # vimeo.com, fb6eed97: `({comparer: f.moduleSpecifierComparer} = eaL(_, u))`
     # -- a destructuring assignment whose targets are properties, not names.
