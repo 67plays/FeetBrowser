@@ -1,6 +1,11 @@
 mod ast;
 mod css;
 mod dom;
+// The arena-backed DOM that replaces the `dom` proxy above. It is compiled
+// and tested from Phase 1, but nothing is wired onto it until the HTML tree
+// builder (Phase 2) and the interpreter (Phase 3) land; `dom` stays the live
+// path until then.
+mod domtree;
 mod font;
 mod image;
 mod interp;
