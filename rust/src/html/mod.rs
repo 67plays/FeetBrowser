@@ -19,9 +19,9 @@
 //! let (dom, root) = html::parse_fragment_html(source, "td");
 //! ```
 //!
-//! Nothing here is wired into the Python browser; that is Phase 3's job. The
-//! only consumers today are this module's tests and the html5lib-tests
-//! harness in [`tests`].
+//! This is the browser's parser. `feetbrowser/htmlparser.py` calls
+//! [`crate::materialize::parse_html`], which drives [`parse`] and hands the
+//! resulting tree to Python as `Element`/`Text` objects.
 
 // Same situation as `domtree`: this module is complete and tested but has no
 // in-crate caller until Phase 3 rewires the browser off
