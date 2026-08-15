@@ -11,15 +11,13 @@ seeing it. The selector classes below are the parser's output and the Rust
 matcher's input: each carries a `kind` the compiler over there reads, and the
 matching itself lives in `rust/src/css.rs`. What stays in Python is
 everything that is a table rather than a loop -- what inherits, which
-shorthands expand, how a var() resolves -- so the rules of the cascade remain
-readable in one place.
+shorthands expand, what a media query can ask about -- so the rules of the
+cascade remain readable in one place.
 """
 
 import re
 
 import feetbrowser_engine
-
-from .htmlparser import Element
 
 # Re-exported under this module's name, because that is where the rest of the
 # browser has always asked for it.
@@ -621,17 +619,39 @@ class CSSParser:
             self._read_block()  # skip @font-face, @keyframes, etc.
 
     def _read_block(self):
+        """Consume up to the `}` that closes the block already opened.
+
+        Only the braces matter, so this hops between them with `find` rather
+        than looking at every character in turn. That is the same scan, but the
+        stepping happens in C: a sheet written the modern way wraps everything
+        in `@layer`, and each nesting level re-reads the whole text below it,
+        so the bytes of a big sheet get walked several times over. Stepping
+        them one Python iteration at a time -- with a `len()` per character --
+        was most of the cost of parsing CSS at all.
+        """
         depth = 1
-        start = self.i
-        while self.i < len(self.s) and depth > 0:
-            if self.s[self.i] == "{":
+        s = self.s
+        n = len(s)
+        start = i = self.i
+        while i < n and depth > 0:
+            opened = s.find("{", i)
+            closed = s.find("}", i)
+            if closed < 0:
+                # Unbalanced: the block runs to the end of the text. Taking
+                # what there is beats discarding the rest of the sheet.
+                i = n
+                break
+            if 0 <= opened < closed:
                 depth += 1
-            elif self.s[self.i] == "}":
+                i = opened + 1
+            else:
                 depth -= 1
                 if depth == 0:
+                    i = closed
                     break
-            self.i += 1
-        block = self.s[start:self.i]
+                i = closed + 1
+        self.i = i
+        block = s[start:self.i]
         self.literal("}")
         return block
 
@@ -686,31 +706,10 @@ def _expand(prop, value):
                 yield "list-style-type", lowered
 
 
-_VAR_RE = re.compile(
-    r"var\(\s*(--[A-Za-z0-9_-]+)\s*(?:,\s*([^()]*))?\)")
-
-
-def _resolve_var(value, node):
-    """Substitute every `var(--name, fallback)` in `value`, walking the
-    ancestor chain for the custom property. Runs to a fixed point so nested
-    fallbacks (e.g. `var(--a, var(--b, #fff))`) also resolve."""
-    for _ in range(10):
-        resolved = value
-        for match in _VAR_RE.finditer(value):
-            custom_name = match.group(1)
-            fallback = match.group(2)
-            current = node
-            replacement = None
-            while current is not None:
-                if isinstance(current, Element) \
-                        and custom_name in current.style:
-                    replacement = current.style[custom_name]
-                    break
-                current = current.parent
-            if replacement is None:
-                replacement = fallback.strip() if fallback is not None else ""
-            resolved = resolved.replace(match.group(0), replacement, 1)
-        if resolved == value:
-            break
-        value = resolved
-    return value
+# `var(--name, fallback)` substitution used to live here, called back into
+# from the cascade once per var()-bearing declaration per node. On a page
+# built out of custom properties -- the `light-dark()` polyfill emits a
+# `:root *` rule setting thirty of them on every element -- that was a
+# quarter of a million calls across one style pass and 94% of its time. It is
+# a loop, not a table, so it moved to `find_vars`/`resolve_vars` in
+# rust/src/css.rs with the rest of the per-node work.

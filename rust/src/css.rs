@@ -6,6 +6,18 @@
 //! can be matched without touching Python at all, bucketing the rules, and
 //! walking the tree.
 //!
+//! That split was re-examined once the arena landed, on the theory that
+//! leaving the parser in Python forces a marshalling step that costs more
+//! than it saves. It does not: reading the parsed rules across the boundary
+//! into `RuleIndex` is 60ms against 1040ms of parsing and 570ms of matching
+//! over a corpus of real pages, and it is paid once per rules list rather
+//! than once per pass, so the boundary is not what the parser costs. The
+//! parser is simply slow in the ordinary way Python is slow, spread evenly
+//! across `pair`, `selector` and `parse` with no hot spot left to move. A
+//! port would buy the difference between Python and Rust on that work and
+//! nothing structural, so the case for it is a performance case to be made
+//! on its own, not a consequence of the DOM having moved.
+//!
 //! The document is mirrored into a flat arena first. That is the whole trick:
 //! the Python cascade spent most of its time in attribute lookups on node
 //! objects -- `node.parent`, `node.attributes`, `isinstance(node, Element)` --
@@ -13,6 +25,21 @@
 //! front turns the inner loop into integer indexing. Indices into that arena
 //! are ours, not the page's, which is why they are indexed directly; every
 //! value that did come from the page is a String we already own.
+//!
+//! The mirror is a copy of a tree that still lives in Python, and it will stop
+//! being one: `domtree.rs` is the arena the document itself will be built in,
+//! at which point `Tree` below is deleted and the matcher indexes that arena
+//! instead. It cannot be today, because nothing populates a `domtree::Dom` yet
+//! -- the HTML tree builder that will is Phase 2. What the mirror is *not* is
+//! the cost of this module: it is measured at ~1.4% of a style pass across a
+//! corpus of real pages, against 30-94% for the two things that were fixed
+//! here instead, so removing it is a tidiness win and not a performance one.
+//!
+//! Everything a selector can ask about is copied, so the mirror is not a
+//! correctness boundary either -- the matcher never wants a fact the mirror
+//! lacks. The boundary that does bite is the other one: what the cascade calls
+//! back into Python for, once per node. `var()` substitution used to be such a
+//! call and is now `resolve_vars` below.
 
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyString};
@@ -148,7 +175,14 @@ fn hint_of(sel: &Sel) -> Hint {
             }
             Hint::Any
         }
+        // Every combinator constrains the node being matched through its
+        // right-hand side, so that side's hint is the rule's hint. Without
+        // these two arms `.menu > li` and `li + li` fell into `Any` and were
+        // re-tested against every node in the document; a stylesheet written
+        // in modern CSS is mostly combinators, so that was most of the sheet.
         Sel::Descendant { descendant, .. } => hint_of(descendant),
+        Sel::Child { child, .. } => hint_of(child),
+        Sel::Sibling { after, .. } => hint_of(after),
         _ => Hint::Any,
     }
 }
@@ -262,6 +296,15 @@ struct CNode {
     primed: bool,
     /// The node's computed style dict, once we have written it.
     style: Option<Py<PyDict>>,
+    /// The `--custom` properties of that dict, kept in step with it.
+    ///
+    /// They are duplicated out of the dict because they are the one thing a
+    /// *descendant* reads back: custom properties cannot go in the inherited
+    /// table (it is a fixed list of known names), so their inheritance is a
+    /// walk up the ancestors, once per var() reference. Reading that walk out
+    /// of `PyDict`s meant a fresh Python string and a hash per step, several
+    /// million times on a page built out of custom properties.
+    customs: HashMap<String, String>,
 }
 
 impl CNode {
@@ -504,11 +547,27 @@ impl Tree {
                 self.structural(name, arg, i)
             }
             "empty" => n.element && n.children.is_empty(),
-            "link" => n.element && n.tag == "a" && n.attr("href").is_some(),
-            "checked" => {
+            // `:link` is "a hyperlink not yet visited", and an element is a
+            // hyperlink when it is an a, area or link carrying href -- <area>
+            // is how an image map's regions are addressed, and it was being
+            // left out.
+            "link" => {
                 n.element
-                    && (n.tag == "input" || n.tag == "option")
-                    && n.attr("checked").is_some()
+                    && matches!(n.tag.as_str(), "a" | "area" | "link")
+                    && n.attr("href").is_some()
+            }
+            "checked" => {
+                if !n.element {
+                    return false;
+                }
+                match n.tag.as_str() {
+                    "input" => n.attr("checked").is_some(),
+                    // An <option>'s selectedness comes from `selected`; it has
+                    // no `checked` attribute at all, so asking for one meant
+                    // `option:checked` could never match anything.
+                    "option" => n.attr("selected").is_some(),
+                    _ => false,
+                }
             }
             "disabled" | "enabled" | "required" => {
                 if !n.element || !is_form_tag(&n.tag) {
@@ -650,6 +709,7 @@ fn read_node(obj: &Bound<'_, PyAny>, element_cls: &Bound<'_, PyAny>,
         in_subtree,
         primed: false,
         style: None,
+        customs: HashMap::new(),
     })
 }
 
@@ -704,7 +764,13 @@ fn match_nth(expr: &Option<String>, index: i64) -> bool {
             return false;
         }
         let k = floordiv(diff, a);
-        return k >= 1 && index >= 1;
+        // `n` counts from zero, not one. Requiring `k >= 1` dropped the first
+        // term of every `an+b`: `:nth-child(2n+1)` skipped the first child
+        // rather than selecting it, `:nth-child(n+3)` started at the fourth,
+        // and `:nth-child(-n+3)` -- whose whole range is k in 0..2 -- lost its
+        // top element. `odd` and `even` are spelled out above and so were
+        // right; only the arithmetic forms were wrong, which is why this hid.
+        return k >= 0 && index >= 1;
     }
     match parse_int(&expr) {
         Some(v) => index == v,
@@ -768,6 +834,158 @@ fn parse_an_plus_b(expr: &str) -> Option<(i64, i64)> {
     Some((a, bsign.checked_mul(b)?))
 }
 
+// -- var() substitution ----------------------------------------------------
+
+/// One `var(--name, fallback)` reference found in a declaration value.
+///
+/// Byte ranges into the value rather than copies of it: a page built out of
+/// custom properties resolves a quarter of a million of these per style pass,
+/// and three `String`s apiece was most of the work.
+struct VarRef {
+    /// The whole `var(...)`, which is the span the replacement stands in for.
+    start: usize,
+    end: usize,
+    name: (usize, usize),
+    /// The fallback as written, or `None` when the reference had no comma.
+    fallback: Option<(usize, usize)>,
+}
+
+/// `var\(\s*(--[A-Za-z0-9_-]+)\s*(?:,\s*([^()]*))?\)`, by hand.
+///
+/// Scanned rather than matched with a regex for the same reason
+/// `parse_an_plus_b` is: the pattern is small, and this runs once per
+/// var()-bearing declaration per node, which on a page built out of custom
+/// properties is the hottest loop in the cascade.
+fn find_vars(value: &str) -> Vec<VarRef> {
+    let bytes = value.as_bytes();
+    let mut out = Vec::new();
+    let mut at = 0usize;
+    while let Some(rel) = value[at..].find("var(") {
+        let start = at + rel;
+        let mut i = start + 4;
+        at = start + 4;
+        // `\s*`
+        while i < bytes.len() && value[i..].starts_with(char::is_whitespace) {
+            i += value[i..].chars().next().map_or(1, char::len_utf8);
+        }
+        // `--[A-Za-z0-9_-]+`
+        if !value[i..].starts_with("--") {
+            continue;
+        }
+        let name_start = i;
+        i += 2;
+        let body_start = i;
+        while i < bytes.len()
+            && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' || bytes[i] == b'-')
+        {
+            i += 1;
+        }
+        if i == body_start {
+            continue;
+        }
+        let name = (name_start, i);
+        while i < bytes.len() && value[i..].starts_with(char::is_whitespace) {
+            i += value[i..].chars().next().map_or(1, char::len_utf8);
+        }
+        if i >= bytes.len() {
+            continue;
+        }
+        let fallback = if bytes[i] == b',' {
+            i += 1;
+            while i < bytes.len() && value[i..].starts_with(char::is_whitespace) {
+                i += value[i..].chars().next().map_or(1, char::len_utf8);
+            }
+            // `[^()]*`, which cannot stretch over a nested `var(`; a nested
+            // reference is resolved on an earlier pass of the fixed point,
+            // and only then does the outer one match.
+            let fstart = i;
+            while i < bytes.len() && bytes[i] != b'(' && bytes[i] != b')' {
+                i += 1;
+            }
+            if i >= bytes.len() || bytes[i] != b')' {
+                continue;
+            }
+            Some((fstart, i))
+        } else if bytes[i] == b')' {
+            None
+        } else {
+            continue;
+        };
+        out.push(VarRef { start, end: i + 1, name, fallback });
+        at = i + 1;
+    }
+    out
+}
+
+/// The value of a custom property, looked up from `i` outwards. Custom
+/// properties are not in the inherited table -- they cannot be, it is a fixed
+/// list of known names -- so their inheritance is this walk.
+fn custom_property(py: Python<'_>, tree: &Tree, i: usize, name: &str)
+                   -> PyResult<Option<String>> {
+    let mut cur = Some(i);
+    while let Some(ci) = cur {
+        let node = &tree.nodes[ci];
+        if node.element {
+            if node.style.is_some() {
+                // This pass wrote the node, so its customs are up to date.
+                if let Some(v) = node.customs.get(name) {
+                    return Ok(Some(v.clone()));
+                }
+            } else if let Ok(style) = node.obj.bind(py).getattr("style") {
+                // Above the styling root this pass wrote nothing, so the only
+                // answer is whatever Python last left on the node.
+                if let Ok(v) = style.get_item(name) {
+                    // A non-string custom property is not substitutable text.
+                    if let Ok(text) = v.extract::<String>() {
+                        return Ok(Some(text));
+                    }
+                }
+            }
+        }
+        cur = node.parent;
+    }
+    Ok(None)
+}
+
+/// Substitute every `var()` in `value`, running to a fixed point so that a
+/// nested fallback (`var(--a, var(--b, #fff))`) resolves too.
+fn resolve_vars(py: Python<'_>, tree: &Tree, i: usize, value: &str)
+                -> PyResult<String> {
+    let mut value = value.to_string();
+    for _ in 0..10 {
+        let refs = find_vars(&value);
+        if refs.is_empty() {
+            break;
+        }
+        // Rebuilt left to right in one pass. The references are in source
+        // order and none of them overlaps, so substituting each in place is
+        // what replacing them one at a time converged on anyway -- and it
+        // touches each byte of the value once instead of once per reference.
+        let mut out = String::with_capacity(value.len());
+        let mut last = 0usize;
+        for reference in &refs {
+            let name = &value[reference.name.0..reference.name.1];
+            let replacement = custom_property(py, tree, i, name)?;
+            out.push_str(&value[last..reference.start]);
+            match replacement {
+                Some(v) => out.push_str(&v),
+                None => {
+                    if let Some((a, b)) = reference.fallback {
+                        out.push_str(value[a..b].trim());
+                    }
+                }
+            }
+            last = reference.end;
+        }
+        out.push_str(&value[last..]);
+        if out == value {
+            break;
+        }
+        value = out;
+    }
+    Ok(value)
+}
+
 // -- relative font sizes ---------------------------------------------------
 
 /// `float()`, near enough: everything CSS can put in front of `%` or `em`.
@@ -786,8 +1004,12 @@ fn repr_float(v: f64) -> String {
     }
 }
 
-/// Resolve a percent / em / smaller / larger font size against the parent's.
-fn resolve_font_size(py: Python<'_>, tree: &Tree, i: usize) -> PyResult<()> {
+/// Resolve a percent / em / rem / smaller / larger font size.
+///
+/// Everything here but `rem` is relative to the parent's resolved size;
+/// `rem` is relative to the root element's, which is what `root_px` carries.
+fn resolve_font_size(py: Python<'_>, tree: &Tree, i: usize, root_px: f64)
+                     -> PyResult<()> {
     let style = match &tree.nodes[i].style {
         Some(d) => d.bind(py),
         None => return Ok(()),
@@ -808,6 +1030,13 @@ fn resolve_font_size(py: Python<'_>, tree: &Tree, i: usize) -> PyResult<()> {
     }
     let resolved = if let Some(num) = value.strip_suffix('%') {
         py_float(num).map(|v| parent_size * v / 100.0)
+    } else if let Some(num) = value.strip_suffix("rem") {
+        // Before `em`, because `rem` ends in one. Falling through to the `em`
+        // arm left `1.5r` in front of it, which parsed as nothing and took the
+        // "size we cannot read" path -- so every `font-size: 2rem` heading
+        // computed to its parent's size instead of twice the root's. That is
+        // most headings on a page written this decade.
+        py_float(num).map(|v| root_px * v)
     } else if let Some(num) = value.strip_suffix("em") {
         py_float(num).map(|v| parent_size * v)
     } else if value == "smaller" || value == "larger" {
@@ -822,6 +1051,19 @@ fn resolve_font_size(py: Python<'_>, tree: &Tree, i: usize) -> PyResult<()> {
         None => style.set_item("font-size", format!("{}px", repr_float(parent_size)))?,
     }
     Ok(())
+}
+
+/// A node's resolved font size in px, once this pass has written its dict.
+fn node_font_px(py: Python<'_>, tree: &Tree, i: usize) -> PyResult<Option<f64>> {
+    let dict = match &tree.nodes[i].style {
+        Some(d) => d.bind(py),
+        None => return Ok(None),
+    };
+    let value: String = match dict.get_item("font-size")? {
+        Some(v) => v.extract()?,
+        None => return Ok(None),
+    };
+    Ok(value.strip_suffix("px").and_then(py_float))
 }
 
 /// The parent's font size, from the style dict this pass wrote or, for a node
@@ -855,7 +1097,6 @@ pub fn style(py: Python<'_>, node: &Bound<'_, PyAny>, rules: &Bound<'_, PyAny>)
     let expanding = module.getattr("EXPANDING_SHORTHANDS")?;
     let expand = module.getattr("_expand")?;
     let parse_inline = module.getattr("parse_inline")?;
-    let resolve_var = module.getattr("_resolve_var")?;
 
     let mut defaults: Vec<(String, String)> = Vec::new();
     for pair in inherited.call_method0("items")?.try_iter()? {
@@ -865,6 +1106,24 @@ pub fn style(py: Python<'_>, node: &Bound<'_, PyAny>, rules: &Bound<'_, PyAny>)
 
     let index = index_for(rules, &expanding, &expand)?;
     let mut tree = Tree::build(node, &element_cls)?;
+
+    // What `rem` is relative to: the document root's font size. Node 0 is the
+    // topmost node the mirror holds, so on a whole-document pass it is the
+    // root and is styled first, and the value below is replaced with its
+    // resolved size before any descendant asks. On a subtree restyle node 0 is
+    // above the styling root and keeps whatever Python last left on it.
+    let mut root_px = 16.0f64;
+    if let Some(n) = tree.nodes.first() {
+        if let Ok(style) = n.obj.bind(py).getattr("style") {
+            if let Ok(Some(v)) = style.get_item("font-size").map(|v| Some(v)) {
+                if let Ok(text) = v.extract::<String>() {
+                    if let Some(px) = text.strip_suffix("px").and_then(py_float) {
+                        root_px = px;
+                    }
+                }
+            }
+        }
+    }
 
     // (node, the parent it inherits from). The styling root inherits from
     // nothing even when it has a parent, which is how a subtree restyle keeps
@@ -918,6 +1177,7 @@ pub fn style(py: Python<'_>, node: &Bound<'_, PyAny>, rules: &Bound<'_, PyAny>)
         candidates.sort_by_key(|&r| (index.rules[r].prio, r));
 
         tree.nodes[i].primed = true;
+        let mut customs: HashMap<String, String> = HashMap::new();
         for &r in &candidates {
             let rule = &index.rules[r];
             if !tree.matches(&rule.sel, i) {
@@ -925,6 +1185,9 @@ pub fn style(py: Python<'_>, node: &Bound<'_, PyAny>, rules: &Bound<'_, PyAny>)
             }
             for (prop, value) in &rule.decls {
                 dict.set_item(prop.as_str(), value.as_str())?;
+                if prop.starts_with("--") {
+                    customs.insert(prop.clone(), value.clone());
+                }
             }
         }
 
@@ -945,6 +1208,11 @@ pub fn style(py: Python<'_>, node: &Bound<'_, PyAny>, rules: &Bound<'_, PyAny>)
                         dict.set_item(out.get_item(0)?, out.get_item(1)?)?;
                     }
                 } else {
+                    if prop.starts_with("--") {
+                        if let Ok(text) = value.extract::<String>() {
+                            customs.insert(prop.clone(), text);
+                        }
+                    }
                     dict.set_item(prop, value)?;
                 }
             }
@@ -953,25 +1221,44 @@ pub fn style(py: Python<'_>, node: &Bound<'_, PyAny>, rules: &Bound<'_, PyAny>)
         let node_obj = tree.nodes[i].obj.bind(py).clone();
         node_obj.setattr("style", &dict)?;
         tree.nodes[i].style = Some(dict.clone().unbind());
+        tree.nodes[i].customs = customs;
 
         // 3b. var(--x) references, which read custom properties off the
         //     ancestors -- so they need the dicts above to be in place, and
         //     they are: this walk is depth-first and top down.
+        //     Scanned through `PyString::to_str`, which borrows, so that the
+        //     properties that have no var() in them -- almost all of them --
+        //     cost a look rather than a copy.
         let mut pending: Vec<(String, String)> = Vec::new();
         for (k, v) in dict.iter() {
-            if let (Ok(k), Ok(v)) = (k.extract::<String>(), v.extract::<String>()) {
-                if v.contains("var(") {
-                    pending.push((k, v));
+            let (key, value) = match (k.cast::<PyString>(), v.cast::<PyString>()) {
+                (Ok(k), Ok(v)) => (k, v),
+                _ => continue,
+            };
+            if let (Ok(key), Ok(value)) = (key.to_str(), value.to_str()) {
+                if value.contains("var(") {
+                    pending.push((key.to_string(), value.to_string()));
                 }
             }
         }
         for (prop, value) in pending {
-            let resolved = resolve_var.call1((value, &node_obj))?;
+            let resolved = resolve_vars(py, &tree, i, &value)?;
+            // Kept in step with the dict, so that a later reference on this
+            // node -- or on a descendant -- reads exactly what a lookup
+            // through the dict would have read at this point in the walk.
+            if prop.starts_with("--") {
+                tree.nodes[i].customs.insert(prop.clone(), resolved.clone());
+            }
             dict.set_item(prop, resolved)?;
         }
 
         // 4. Relative font sizes, against the parent's resolved one.
-        resolve_font_size(py, &tree, i)?;
+        resolve_font_size(py, &tree, i, root_px)?;
+        if i == 0 {
+            if let Some(px) = node_font_px(py, &tree, 0)? {
+                root_px = px;
+            }
+        }
 
         let children: Vec<usize> = tree.nodes[i].children.clone();
         for &c in children.iter().rev() {
@@ -979,4 +1266,176 @@ pub fn style(py: Python<'_>, node: &Bound<'_, PyAny>, rules: &Bound<'_, PyAny>)
         }
     }
     Ok(())
+}
+
+// -- tests -----------------------------------------------------------------
+//
+// What can be tested without a Python interpreter: the two hand-written
+// scanners and the bucketing hint. Everything else here needs a document and
+// a rules list, and is covered from `tests/test_units.py`.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `(whole, name, fallback)` per reference, for readable assertions.
+    fn refs(value: &str) -> Vec<(&str, &str, Option<&str>)> {
+        find_vars(value)
+            .into_iter()
+            .map(|r| {
+                (
+                    &value[r.start..r.end],
+                    &value[r.name.0..r.name.1],
+                    r.fallback.map(|(a, b)| &value[a..b]),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_bare_var_reference_is_found() {
+        assert_eq!(refs("var(--a)"), vec![("var(--a)", "--a", None)]);
+    }
+
+    #[test]
+    fn a_reference_is_found_in_the_middle_of_a_value() {
+        assert_eq!(
+            refs("1px solid var(--edge) inset"),
+            vec![("var(--edge)", "--edge", None)]
+        );
+    }
+
+    #[test]
+    fn whitespace_inside_the_parentheses_is_allowed() {
+        assert_eq!(refs("var(  --a  )"), vec![("var(  --a  )", "--a", None)]);
+    }
+
+    #[test]
+    fn a_fallback_is_captured_as_written() {
+        assert_eq!(
+            refs("var(--a,  navy )"),
+            vec![("var(--a,  navy )", "--a", Some("navy "))]
+        );
+    }
+
+    #[test]
+    fn every_reference_in_a_value_is_found_in_order() {
+        assert_eq!(
+            refs("var(--a) var(--b)"),
+            vec![("var(--a)", "--a", None), ("var(--b)", "--b", None)]
+        );
+    }
+
+    #[test]
+    fn the_same_reference_twice_is_found_twice() {
+        assert_eq!(refs("var(--a) var(--a)").len(), 2);
+    }
+
+    #[test]
+    fn a_name_without_the_double_dash_is_not_a_custom_property() {
+        assert!(refs("var(a)").is_empty());
+        assert!(refs("var(-a)").is_empty());
+        assert!(refs("var(--)").is_empty());
+    }
+
+    #[test]
+    fn an_unclosed_reference_is_not_a_reference() {
+        assert!(refs("var(--a").is_empty());
+        assert!(refs("var(--a, red").is_empty());
+    }
+
+    #[test]
+    fn a_fallback_may_not_contain_parentheses() {
+        // The outer reference cannot match while the inner one is still
+        // there; the inner one is found instead, and the fixed point in
+        // resolve_vars brings the outer one into range on the next pass.
+        assert_eq!(refs("var(--a, var(--b))"), vec![("var(--b)", "--b", None)]);
+    }
+
+    #[test]
+    fn a_reference_inside_calc_is_found() {
+        assert_eq!(refs("calc(var(--w) * 2)"), vec![("var(--w)", "--w", None)]);
+    }
+
+    #[test]
+    fn names_may_contain_digits_dashes_and_underscores() {
+        assert_eq!(refs("var(--a-b_2)"), vec![("var(--a-b_2)", "--a-b_2", None)]);
+    }
+
+    #[test]
+    fn an_empty_fallback_is_not_the_same_as_no_fallback() {
+        assert_eq!(refs("var(--a,)"), vec![("var(--a,)", "--a", Some(""))]);
+        assert_eq!(refs("var(--a)"), vec![("var(--a)", "--a", None)]);
+    }
+
+    #[test]
+    fn nth_expressions_select_the_right_indices() {
+        // Selected indices out of the first six children, so that the n=0 term
+        // of each expression is inside the window rather than off its edge --
+        // that term is what `k >= 1` used to discard.
+        let hits = |e: &str| -> Vec<i64> {
+            (1..=6)
+                .filter(|i| match_nth(&Some(e.to_string()), *i))
+                .collect()
+        };
+        assert_eq!(hits("odd"), vec![1, 3, 5]);
+        assert_eq!(hits("even"), vec![2, 4, 6]);
+        assert_eq!(hits("2n"), vec![2, 4, 6]);
+        assert_eq!(hits("2n+1"), vec![1, 3, 5]);
+        assert_eq!(hits("3n+1"), vec![1, 4]);
+        assert_eq!(hits("n"), vec![1, 2, 3, 4, 5, 6]);
+        assert_eq!(hits("n+3"), vec![3, 4, 5, 6]);
+        assert_eq!(hits("-n+3"), vec![1, 2, 3]);
+        assert_eq!(hits("-2n+5"), vec![1, 3, 5]);
+        // `0n+3` is the bare index in disguise; both must avoid dividing by
+        // the step, and neither may select anything else.
+        assert_eq!(hits("0n+3"), vec![3]);
+        assert_eq!(hits("3"), vec![3]);
+        // Nothing before the first child, whatever the offset asks for.
+        assert!(hits("n+9").is_empty());
+        assert!(hits("-n").is_empty());
+        assert!(!match_nth(&Some("2n+1".into()), 0));
+        assert!(!match_nth(&None, 1));
+    }
+
+    #[test]
+    fn a_zero_step_nth_is_one_index_and_does_not_divide_by_zero() {
+        assert!(match_nth(&Some("0n+3".to_string()), 3));
+        assert!(!match_nth(&Some("0n+3".to_string()), 6));
+    }
+
+    #[test]
+    fn a_combinator_takes_its_hint_from_the_right_hand_side() {
+        let child = Sel::Child {
+            parent: Box::new(Sel::Class("menu".into())),
+            child: Box::new(Sel::Tag("li".into())),
+        };
+        assert_eq!(hint_of(&child), Hint::Tag("li".into()));
+
+        let sibling = Sel::Sibling {
+            before: Box::new(Sel::Tag("li".into())),
+            after: Box::new(Sel::Class("mark".into())),
+            adjacent: true,
+        };
+        assert_eq!(hint_of(&sibling), Hint::Class("mark".into()));
+    }
+
+    #[test]
+    fn a_compound_hint_comes_from_its_last_bucketable_part() {
+        let compound = Sel::Compound(vec![
+            Sel::Tag("a".into()),
+            Sel::Class("btn".into()),
+            Sel::Pseudo { name: "first-child".into(), arg: None, subs: vec![] },
+        ]);
+        assert_eq!(hint_of(&compound), Hint::Class("btn".into()));
+    }
+
+    #[test]
+    fn a_selector_with_nothing_to_bucket_on_falls_back_to_any() {
+        assert_eq!(hint_of(&Sel::Tag("*".into())), Hint::Any);
+        assert_eq!(
+            hint_of(&Sel::Attr { attr: "href".into(), op: None, value: String::new() }),
+            Hint::Any
+        );
+    }
 }
