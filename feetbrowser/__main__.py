@@ -24,6 +24,8 @@ options:
   --toe-docs               print the Toes documentation
   --check-video [stream.264 [truth.i420.z]]
                    say whether this build can decode H.264, and prove it
+  --check-audio [stream.aac [truth.f32.z]]
+                   say whether this build can decode AAC, and prove it
 
 If no URL is given the browser opens the welcome page.
 """
@@ -130,6 +132,16 @@ def main():
         return
     if flag == "--check-video":
         sys.exit(check_video(args[1:]))
+    if flag == "--check-audio":
+        # The same question as --check-video, asked of the sound decoder,
+        # and by the same caller: all three packaging scripts run this
+        # inside what they have just built, with the compiler off PATH.
+        # The work is in aac.check() rather than here because the answer
+        # is that module's to give -- and because a bundle that plays
+        # pictures with no sound is a bundle that passes every other check
+        # in this file.
+        from . import aac
+        sys.exit(aac.check(args[1:]))
     # Anything else is a URL passed to the browser.
     from .browser import main as browser_main
     sys.exit(browser_main() or 0)
