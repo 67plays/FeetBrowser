@@ -6,14 +6,14 @@ history, submit forms (GET/POST), show page source, open links in new tabs,
 run JavaScript (scripts on load, DOM reads/writes, click handlers, `Promise`
 with microtasks, `async`/`await`, timers, `fetch`/`XMLHttpRequest`, and
 `throw`/`try`/`catch`, with `console.log` surfaced in the page's log buffer),
-manage extensions ("toes") from the built-in ToeHub — install, uninstall,
-enable, and disable them without a restart — restyle the whole browser
+manage extensions ("toes") from the built-in ToeHub (install, uninstall,
+enable, and disable them without a restart), restyle the whole browser
 with **Shoes** color themes (`about:shoes`, or `Ctrl+Shift+S`), and download
 files to disk with a manager that shows progress and can cancel (`Ctrl-J`).
 
 **Runs on:** macOS, Linux and Windows, with a real window of its own on each
 (`cocoa.py`, `x11.py` and `win32.py`, all ctypes and no toolkit), and
-anywhere at all headless — `--screenshot` and the whole test suite need no
+anywhere at all headless: `--screenshot` and the whole test suite need no
 display. X11 covers Wayland desktops through XWayland; a native Wayland
 backend is not written. On a platform with none of the three,
 `gui.platform_root()` finds nothing and you get the headless root, so the
@@ -37,7 +37,7 @@ extension that imports and passes the whole suite. It is not the cheaper road,
 though. It needs MinGW-w64's binutils on `PATH`; without them the build gets
 past the linker and stops at `error calling dlltool 'dlltool.exe': program not
 found` instead. The `dlltool.exe` rustup itself installs beside the toolchain
-does not stand in for them — it shells out to an assembler that ships in the
+does not stand in for them; it shells out to an assembler that ships in the
 same package and fails without it. So the GNU route swaps one download for
 another rather than removing one, and MSVC is what this project builds against
 in CI. The GNU path was checked by experiment on a Windows runner, not here.
@@ -63,8 +63,8 @@ where the server allows it. Nothing is opened after it is saved, and there is
 no history of past downloads across runs: the list is what this session did.
 
 **Video, within one family of formats:** a `<video>` element lays out,
-decodes and plays Motion JPEG — in an AVI, in a QuickTime `.mov`, or as a
-bare `.mjpeg` file of JPEGs end to end — along with uncompressed `BI_RGB`,
+decodes and plays Motion JPEG (in an AVI, in a QuickTime `.mov`, or as a
+bare `.mjpeg` file of JPEGs end to end), along with uncompressed `BI_RGB`,
 run-length `BI_RLE8`, and QuickTime's `raw ` and `png `. It plays and pauses
 on a click, and `<video controls>` gets a real transport bar with a play
 button, a scrubber you can seek with and a time readout. What it cannot do is
@@ -73,22 +73,22 @@ MPEG-4 ASP, so most MP4s and every WebM are identified and measured but not
 decoded, and an element carrying one draws a correctly sized box saying which
 codec it is and why it is not playing. YouTube and its neighbours do not
 work, and are not close to working. There is also **no audio** anywhere in
-the browser — nothing in the project opens an output device on any platform,
+the browser: nothing in the project opens an output device on any platform,
 so a clip with a soundtrack plays silently. The design, the exact unsupported
 list and the ordered next steps are in [media.md](media.md).
 
 **Doesn't (yet):** flexbox wrapping, `<textarea>`/`<select>` selection (beyond
 read-only), or the full ECMAScript feature set (see below). Shoes themes are
-preset solid-color palettes only — there's no custom color editor, and page
+preset solid-color palettes only; there's no custom color editor, and page
 colors aren't themed (only the browser chrome and the built-in pages). These
-are natural next milestones — the architecture has clean seams for each.
+are natural next milestones: the architecture has clean seams for each.
 
 ## Images
 
 Four formats decode: PNG, GIF, JPEG and Netpbm. Nothing else does, and an
 image we cannot read draws as its `alt` text rather than as an error or a
 blank space. The decoders are ours, so this list does not change with what is
-installed on the machine — it is the same on a fresh checkout as on a
+installed on the machine; it is the same on a fresh checkout as on a
 workstation with every graphics library on it.
 
 WebP is the loss that shows. It used to decode when Pillow happened to be
@@ -115,7 +115,7 @@ The engine is the `feetbrowser_engine` extension module, whose interpreter,
 DOM bridge and renderer inner loops are compiled to Rust (see rust/). What
 follows is what it leaves out.
 
-**Syntax it will not parse.** ES modules — `import`/`export` are reported as
+**Syntax it will not parse.** ES modules (`import`/`export`) are reported as
 "ES modules are not supported" rather than as a mystery syntax error, so a
 page whose scripts are `type="module"` runs none of them. Also `with`,
 generators (`function*`, `yield`), class static blocks, and `new.target`.
@@ -124,7 +124,7 @@ generators (`function*`, `yield`), class static blocks, and `new.target`.
 no `Symbol.iterator` protocol: `for...of` and spread work on arrays, strings,
 `Map`, `Set` and `arguments` because the engine knows about those types, not
 because an object can declare itself iterable. No `Proxy` and no `Reflect`.
-No `eval`, and `new Function(body)` throws — the `Function` global exists so
+No `eval`, and `new Function(body)` throws; the `Function` global exists so
 that `instanceof` and prototype lookups work, but compiling text that arrives
 as page data is a bigger security question than a browser at this stage
 should be answering. `String.raw` and
@@ -144,15 +144,15 @@ not all of them. Sorting is stable.
 
 **The DOM is smaller than the language.** The bridge exposes elements,
 attributes, `classList`, inline styles, `querySelector`/`querySelectorAll`
-(tag, class and id selectors only — no combinators), `matches`, `closest`,
+(tag, class and id selectors only, no combinators), `matches`, `closest`,
 `getElementsBy*`, `innerHTML`, `outerHTML`, `textContent`, document
 fragments, node insertion and removal, events, timers, `fetch`,
 `XMLHttpRequest`, `location`, `getComputedStyle`, and `localStorage`.
 `createTextNode` returns a text-node wrapper, but the tree walks
 (`childNodes`, `firstChild`) still see elements only; there are no
 `Element`/`Node` constructor objects to hang polyfills on, and no CSSOM.
-jQuery 1.8.2 parses, compiles and runs to completion against this — the whole
-library, its feature detection included — and `jQuery("#id")`, `.text()` and
+jQuery 1.8.2 parses, compiles and runs to completion against this (the whole
+library, its feature detection included), and `jQuery("#id")`, `.text()` and
 the traversal it drives all work. Its Sizzle half does not: the feature
 detection that decides whether `querySelectorAll` is usable runs against a
 detached element and fails here, so `jQuery(".class")` and `jQuery("li")`

@@ -212,7 +212,7 @@ def get_title(node):
     return None
 
 
-# @import url("..."); / @import "..." [media]; — matched at a statement
+# @import url("..."); / @import "..." [media]; matched at a statement
 # boundary so a bare "@import" mention inside a rule can't be grabbed.
 _IMPORT_RE = re.compile(
     r"(?P<lead>(?:^|[\s{};]))@import\s+"
@@ -881,7 +881,7 @@ class Tab:
         """Honor a zero-delay <meta http-equiv="refresh" content="0;url=...">
         redirect. Positive delays are left alone (they're scheduled auto-
         refreshes, not redirects) so no timer machinery is needed here, and
-        anything inside <noscript> is ignored — scripting is enabled, so that
+        anything inside <noscript> is ignored: scripting is enabled, so that
         fallback is not the one a real browser would follow."""
         for node in tree_to_list(self.nodes, []):
             if not (isinstance(node, Element) and node.tag == "meta"):
@@ -955,7 +955,7 @@ class Tab:
         """Which schemes page-context JS may fetch. Remote pages may only
         reach http(s)/data; `file:` is reserved for pages that were
         themselves loaded from a local file, and even then only within the
-        page's own directory — a hostile local HTML file cannot wander the
+        page's own directory; a hostile local HTML file cannot wander the
         whole filesystem. Everything else (toehub:, toe:, ...) is off-limits
         so a hostile site cannot read arbitrary local files and exfiltrate
         them."""
@@ -1246,7 +1246,7 @@ class Tab:
                 # without limit. Dict preserves insertion order: drop oldest.
                 while len(self.image_cache) > MAX_CACHED_IMAGES:
                     self.image_cache.pop(next(iter(self.image_cache)))
-        # Remove this URL (not necessarily the head) — background threads
+        # Remove this URL (not necessarily the head); background threads
         # finish in arbitrary order, so popping the head would reorder the
         # remaining queue and skip images.
         self._image_queue = [q for q in self._image_queue if q[0] != key]
@@ -2147,6 +2147,48 @@ class Tab:
             previous = (run, e)
 
 
+_MENU_FALLBACK = {
+    "menu_bg": "#ffffff", "menu_border": "#666666",
+    "menu_text": "#111111", "menu_hover": "#1a73e8",
+    "menu_sep": "#dddddd", "menu_shadow": "#d0d0d0",
+    "menu_disabled": "#aaaaaa",
+}
+
+
+def _menu_color(browser, key):
+    """Color from a browser's active shoe (or a fallback palette)."""
+    if browser is not None:
+        return browser.c(key)
+    return _MENU_FALLBACK.get(key, key)
+
+
+def _handle_context_menu_click(menu, x, y, draw):
+    """Route a click on an open menu: dismiss, select, or leave it."""
+    if not menu.point_in_menu(x, y):
+        menu.close()
+        draw()
+        return
+    idx = menu.hit(x, y)
+    if idx < 0:
+        menu.close()
+        draw()
+        return
+    menu.hover = idx
+    cb = menu.activate()
+    menu.close()
+    draw()
+    if cb:
+        cb()
+
+
+def _copy_text(window, text):
+    try:
+        window.clipboard_clear()
+        window.clipboard_append(text)
+    except CanvasError:
+        pass
+
+
 class ContextMenu:
     """A hand-drawn context menu painted on the browser canvas.
 
@@ -2173,15 +2215,7 @@ class ContextMenu:
 
     def c(self, key):
         """Color from the owning browser's active shoe (or a fallback)."""
-        if self.browser is not None:
-            return self.browser.c(key)
-        fallback = {
-            "menu_bg": "#ffffff", "menu_border": "#666666",
-            "menu_text": "#111111", "menu_hover": "#1a73e8",
-            "menu_sep": "#dddddd", "menu_shadow": "#d0d0d0",
-            "menu_disabled": "#aaaaaa",
-        }
-        return fallback.get(key, key)
+        return _menu_color(self.browser, key)
 
     def open(self, x, y, items, canvas_w, canvas_h):
         self.items = items
@@ -2316,15 +2350,7 @@ class SelectPopup:
 
     def c(self, key):
         """Colour from the owning browser's active shoe (or a fallback)."""
-        if self.browser is not None:
-            return self.browser.c(key)
-        fallback = {
-            "menu_bg": "#ffffff", "menu_border": "#666666",
-            "menu_text": "#111111", "menu_hover": "#1a73e8",
-            "menu_sep": "#dddddd", "menu_shadow": "#d0d0d0",
-            "menu_disabled": "#aaaaaa",
-        }
-        return fallback.get(key, key)
+        return _menu_color(self.browser, key)
 
     def open(self, node, rect, bounds):
         """Drop the list for `node`, whose control occupies `rect`.
@@ -3066,7 +3092,7 @@ class Browser:
                 return
             # Anchoring a text selection changes nothing visible yet (the
             # highlight grows during the drag), so no full canvas wipe is
-            # needed here — that wipe is what blanked the page on heavy pages.
+            # needed here; that wipe is what blanked the page on heavy pages.
             self.canvas.delete("selection")
             self.active_tab.selection = None
             if self._in_scrollbar_gutter(e.x):
@@ -3306,22 +3332,7 @@ class Browser:
         self.draw()
 
     def _context_menu_click(self, x, y):
-        menu = self.context_menu
-        if not menu.point_in_menu(x, y):
-            menu.close()
-            self.draw()
-            return
-        idx = menu.hit(x, y)
-        if idx < 0:
-            menu.close()
-            self.draw()
-            return
-        menu.hover = idx
-        cb = menu.activate()
-        menu.close()
-        self.draw()
-        if cb:
-            cb()
+        _handle_context_menu_click(self.context_menu, x, y, self.draw)
 
     @staticmethod
     def _enclosing_image(node):
@@ -3333,11 +3344,7 @@ class Browser:
         return None
 
     def _copy_text(self, text):
-        try:
-            self.window.clipboard_clear()
-            self.window.clipboard_append(text)
-        except CanvasError:
-            pass
+        _copy_text(self.window, text)
 
     def _view_source(self):
         tab = self.active_tab
@@ -4141,11 +4148,7 @@ class Browser:
             self.active_tab.draw(c, chrome)
         # Toe page overlays: tagged so _draw_page can clear + re-run them on
         # scroll instead of leaving stale copies behind.
-        before = set(c.find_all())
-        toes.dispatch(self.toe_contexts, "on_draw", c, chrome)
-        for item_id in c.find_all():
-            if item_id not in before:
-                c.addtag_withtag("toe-draw", item_id)
+        self._dispatch_toe_draw(c, chrome)
         self._draw_chrome()
         self.downloads_panel.draw(self.canvas)
         self.context_menu.draw(self.canvas)
@@ -4156,6 +4159,14 @@ class Browser:
         self.window.title(
             (self.active_tab.title if self.active_tab else "FeetBrowser")
             + " — FeetBrowser")
+
+    def _dispatch_toe_draw(self, c, chrome):
+        """Run toe on_draw hooks, tagging new items so a repaint clears them."""
+        before = set(c.find_all())
+        toes.dispatch(self.toe_contexts, "on_draw", c, chrome)
+        for item_id in c.find_all():
+            if item_id not in before:
+                c.addtag_withtag("toe-draw", item_id)
 
     def _draw_page(self):
         """Repaint the page layer, then re-assert the chrome on top of it.
@@ -4174,11 +4185,7 @@ class Browser:
             self.active_tab.tab_height = self.tab_height()
             self.active_tab.draw(c, self.chrome_height())
         chrome = self.chrome_height()
-        before = set(c.find_all())
-        toes.dispatch(self.toe_contexts, "on_draw", c, chrome)
-        for item_id in c.find_all():
-            if item_id not in before:
-                c.addtag_withtag("toe-draw", item_id)
+        self._dispatch_toe_draw(c, chrome)
         # An open drop-down (or the downloads panel) must stay on top of the
         # page it floats over; _draw_chrome ends by re-drawing both.
         self._draw_chrome()
@@ -4542,7 +4549,7 @@ class Browser:
         self.window.update_idletasks()
         self.draw()
         # Coalesced repaint: only redraw when a page marked itself dirty
-        # (render()) or an event handler drew directly — never on a bare
+        # (render()) or an event handler drew directly, never on a bare
         # timer. Previously this loop repainted the whole canvas every 120ms
         # forever, which burned CPU for idle pages.
         self.window.after(120, self._repaint_tick)
@@ -4755,22 +4762,7 @@ class PopupWindow:
         self.draw()
 
     def _context_menu_click(self, x, y):
-        menu = self.context_menu
-        if not menu.point_in_menu(x, y):
-            menu.close()
-            self.draw()
-            return
-        idx = menu.hit(x, y)
-        if idx < 0:
-            menu.close()
-            self.draw()
-            return
-        menu.hover = idx
-        cb = menu.activate()
-        menu.close()
-        self.draw()
-        if cb:
-            cb()
+        _handle_context_menu_click(self.context_menu, x, y, self.draw)
 
     def _on_motion(self, e):
         if self.context_menu.open_ and self.context_menu.set_hover(e.x, e.y):
@@ -4802,11 +4794,7 @@ class PopupWindow:
         return items
 
     def _copy_text(self, text):
-        try:
-            self.window.clipboard_clear()
-            self.window.clipboard_append(text)
-        except CanvasError:
-            pass
+        _copy_text(self.window, text)
 
     def _navigate(self, dest):
         if isinstance(dest, FormAction):
@@ -5012,6 +5000,27 @@ class _JSXHR:
                         interp.logs.append(f"JS error: {e}")
 
 
+def _resolve_internal(url, bookmarks=None, snapshot=None, theme=None,
+                      apply=None, active=None):
+    """Resolve an internal about: URL against the active tab's providers.
+
+    `bookmarks` and `snapshot` are callables that supply the data for the
+    bookmarks and history pages; the shoes classes do not carry them.
+    """
+    if url == "about:blank":
+        return _AboutURL(bookmarks, theme, apply, active)
+    if url == "about:bookmarks":
+        return _BookmarksURL(bookmarks, theme, apply, active)
+    if url == "about:history":
+        return _HistoryURL(snapshot, theme, apply, active)
+    if url == "about:shoes":
+        return _ShoesURL(apply, theme, active)
+    if url.startswith("about:shoes/"):
+        return _ShoesApplyURL(url[len("about:shoes/"):],
+                              apply, theme, active)
+    return URL(url) if "://" in url else URL("https://" + url)
+
+
 class _AboutURL:
     """Placeholder URL for the internal welcome page."""
     view_source = False
@@ -5025,22 +5034,10 @@ class _AboutURL:
         self.active = active
 
     def resolve(self, url):
-        if url == "about:blank":
-            return _AboutURL(self.bookmarks_provider, self.theme,
-                             self.apply, self.active)
-        if url == "about:bookmarks":
-            return _BookmarksURL(self.bookmarks_provider, self.theme,
-                                 self.apply, self.active)
-        if url == "about:history":
-            return _HistoryURL(
-                lambda: {"back": [], "current": "", "forward": []},
-                self.theme, self.apply, self.active)
-        if url == "about:shoes":
-            return _ShoesURL(self.apply, self.theme, self.active)
-        if url.startswith("about:shoes/"):
-            return _ShoesApplyURL(url[len("about:shoes/"):],
-                                  self.apply, self.theme, self.active)
-        return URL(url) if "://" in url else URL("https://" + url)
+        return _resolve_internal(
+            url, self.bookmarks_provider,
+            lambda: {"back": [], "current": "", "forward": []},
+            self.theme, self.apply, self.active)
 
     def request(self, payload=None):
         return {}, welcome_html(self.theme), "text/html"
@@ -5062,22 +5059,10 @@ class _BookmarksURL:
         self.active = active
 
     def resolve(self, url):
-        if url == "about:blank":
-            return _AboutURL(self.bookmarks_provider, self.theme,
-                             self.apply, self.active)
-        if url == "about:bookmarks":
-            return _BookmarksURL(self.bookmarks_provider, self.theme,
-                                 self.apply, self.active)
-        if url == "about:history":
-            return _HistoryURL(
-                lambda: {"back": [], "current": "", "forward": []},
-                self.theme, self.apply, self.active)
-        if url == "about:shoes":
-            return _ShoesURL(self.apply, self.theme, self.active)
-        if url.startswith("about:shoes/"):
-            return _ShoesApplyURL(url[len("about:shoes/"):],
-                                  self.apply, self.theme, self.active)
-        return URL(url) if "://" in url else URL("https://" + url)
+        return _resolve_internal(
+            url, self.bookmarks_provider,
+            lambda: {"back": [], "current": "", "forward": []},
+            self.theme, self.apply, self.active)
 
     def request(self, payload=None):
         return {}, bookmarks_html(self.bookmarks_provider(), self.theme), \
@@ -5101,21 +5086,9 @@ class _HistoryURL:
         self.active = active
 
     def resolve(self, url):
-        if url == "about:blank":
-            return _AboutURL(theme=self.theme, apply=self.apply,
-                             active=self.active)
-        if url == "about:bookmarks":
-            return _BookmarksURL(theme=self.theme, apply=self.apply,
-                                 active=self.active)
-        if url == "about:history":
-            return _HistoryURL(self.snapshot_provider, self.theme,
-                               self.apply, self.active)
-        if url == "about:shoes":
-            return _ShoesURL(self.apply, self.theme, self.active)
-        if url.startswith("about:shoes/"):
-            return _ShoesApplyURL(url[len("about:shoes/"):],
-                                  self.apply, self.theme, self.active)
-        return URL(url) if "://" in url else URL("https://" + url)
+        return _resolve_internal(
+            url, None, self.snapshot_provider,
+            self.theme, self.apply, self.active)
 
     def request(self, payload=None):
         return {}, history_html(self.snapshot_provider(), self.theme), \
@@ -5136,21 +5109,8 @@ class _ShoesURL:
         self.active = active
 
     def resolve(self, url):
-        if url == "about:shoes":
-            return _ShoesURL(self.apply, self.theme, self.active)
-        if url.startswith("about:shoes/"):
-            return _ShoesApplyURL(url[len("about:shoes/"):],
-                                  self.apply, self.theme, self.active)
-        if url == "about:blank":
-            return _AboutURL(theme=self.theme, apply=self.apply,
-                             active=self.active)
-        if url == "about:bookmarks":
-            return _BookmarksURL(theme=self.theme, apply=self.apply,
-                                 active=self.active)
-        if url == "about:history":
-            return _HistoryURL(theme=self.theme, apply=self.apply,
-                               active=self.active)
-        return URL(url) if "://" in url else URL("https://" + url)
+        return _resolve_internal(url, None, None,
+                                 self.theme, self.apply, self.active)
 
     def request(self, payload=None):
         active = self.active() if callable(self.active) else self.active
@@ -5172,21 +5132,8 @@ class _ShoesApplyURL:
         self.active = active
 
     def resolve(self, url):
-        if url == "about:shoes":
-            return _ShoesURL(self.apply, self.theme, self.active)
-        if url.startswith("about:shoes/"):
-            return _ShoesApplyURL(url[len("about:shoes/"):],
-                                  self.apply, self.theme, self.active)
-        if url == "about:blank":
-            return _AboutURL(theme=self.theme, apply=self.apply,
-                             active=self.active)
-        if url == "about:bookmarks":
-            return _BookmarksURL(theme=self.theme, apply=self.apply,
-                                 active=self.active)
-        if url == "about:history":
-            return _HistoryURL(theme=self.theme, apply=self.apply,
-                               active=self.active)
-        return URL(url) if "://" in url else URL("https://" + url)
+        return _resolve_internal(url, None, None,
+                                 self.theme, self.apply, self.active)
 
     def request(self, payload=None):
         canonical = shoes.find(self.name)

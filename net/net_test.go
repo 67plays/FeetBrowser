@@ -78,7 +78,7 @@ func TestParseUnknownScheme(t *testing.T) {
 		t.Errorf("extension scheme with host = %+v", u)
 	}
 	// Without "//" there is nothing to distinguish "toes:panel" from a bare
-	// host:port, so it is treated as one — same as the Python parser.
+	// host:port, so it is treated as one, same as the Python parser.
 	if _, err := Parse("toes:panel"); err == nil {
 		t.Error(`Parse("toes:panel") should fail as a bad port, matching net.py`)
 	}

@@ -70,7 +70,7 @@ IMPLICIT_CLOSE = {
 }
 
 # Elements that close an open <p> (the HTML "p implies end" rule). Does not
-# include <br>, <li>, <td>, <tr> — those may validly appear inside a <p>.
+# include <br>, <li>, <td>, <tr>: those may validly appear inside a <p>.
 P_CLOSING_ELEMENTS = {
     "address", "article", "aside", "blockquote", "details", "div", "dl",
     "fieldset", "figcaption", "figure", "footer", "form", "h1", "h2", "h3",

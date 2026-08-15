@@ -2,7 +2,7 @@
 // sockets speaking HTTP/1.1, TLS for https, plus support for data:, file: and
 // view-source: URLs.
 //
-// Nothing here uses net/http — connections are dialed directly and the
+// Nothing here uses net/http; connections are dialed directly and the
 // request/response framing is written and parsed by hand. It is a port of
 // feetbrowser/net.py and keeps that file's behavior, including its keep-alive
 // connection pool, address cache, response cache and body-size caps.
@@ -363,7 +363,7 @@ func (u *URL) Request(opts Options) (*Response, error) {
 // The Python version shells out to curl_cffi, which is built against BoringSSL
 // and reproduces Chrome's TLS + HTTP/2 + header fingerprints, so sites like
 // Google serve the real application instead of an "enable JavaScript" stub. Go
-// has no stdlib equivalent — crypto/tls emits a Go-shaped ClientHello that such
+// has no stdlib equivalent: crypto/tls emits a Go-shaped ClientHello that such
 // sites fingerprint the same way our raw stack is fingerprinted, and matching
 // Chrome needs a third-party library (uTLS).
 //
@@ -557,7 +557,7 @@ func (u *URL) requestHTTP(opts Options) (*Response, error) {
 		poolPark(origin, conn)
 	} else {
 		// Body was read to EOF (no framing), so the connection cannot be
-		// reused — it is already closed by the peer.
+		// reused; it is already closed by the peer.
 		conn.Close()
 	}
 
@@ -938,7 +938,7 @@ func dial(host string, port int) (net.Conn, error) {
 
 // Bounded pool of idle keep-alive connections, keyed by origin. HTTP/1.1 lets
 // one connection serve several requests to the same origin, which skips the
-// fresh TCP + TLS handshake each resource used to pay — the most expensive part
+// fresh TCP + TLS handshake each resource used to pay, the most expensive part
 // of a fetch. Sockets are parked after a fully-framed response and reclaimed by
 // the next request to that origin; a parked socket whose peer already closed it
 // is detected and retried once on a fresh connection.

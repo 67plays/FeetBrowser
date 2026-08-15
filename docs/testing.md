@@ -49,17 +49,17 @@ test says which. It exists because `<img>` once stopped drawing anything at
 all, on every page, and the suite had nothing that could tell.
 
 `download_cases.py` is the one file here that is not named `test_*.py`, and
-that is deliberate: it is a suite of its own — a local HTTP server serving
+that is deliberate: it is a suite of its own: a local HTTP server serving
 known lengths, chunked bodies, a connection cut mid-transfer and a shelf of
-hostile filenames — but it runs from the end of `test_nav.py` rather than from
+hostile filenames, but it runs from the end of `test_nav.py` rather than from
 a runner, because saving a file is where a navigation ends. Naming it
 `test_downloads.py` would put it in front of `test_suites.py` below, which
 would then demand a line in `test.sh`, `test.cmd` and the workflow.
 
 `test_suites.py` is the reason a new file in `tests/` cannot be forgotten.
-`test.sh`, `test.cmd` and the workflow all name their suites one at a time —
+`test.sh`, `test.cmd` and the workflow all name their suites one at a time:
 the first two so the order and the comments are readable, the third so a red
-job says which suite went red — and this fails if a file in `tests/` is
+job says which suite went red; and this fails if a file in `tests/` is
 missing from any of them.
 
 `test.sh` and `test.cmd` run each suite through `tests/watchdog.py`, which
@@ -68,7 +68,7 @@ reach the network, and any of those can stop forever rather than fail; a run
 that hangs reports nothing, and interrupting it prints a traceback from
 wherever the interrupt landed rather than from whatever was stuck. The
 watchdog arms `faulthandler`'s timer instead, so passing the deadline dumps
-every thread's stack — naming the line that hung — and exits non-zero. It is
+every thread's stack (naming the line that hung), and exits non-zero. It is
 a timer thread rather than `signal.alarm`, which is what makes it work on
 Windows too. `FEETBROWSER_TEST_TIMEOUT` overrides the 900 seconds, and `0`
 turns the deadline off for stepping through a suite in a debugger. CI invokes
@@ -85,7 +85,7 @@ least one system font, which every platform we support ships.
 The exceptions are `test_cocoa.py`, `test_x11.py` and `test_win32.py`, and
 deliberately so. They open real windows and feed them real platform events,
 because the
-platform layer is the one place a mistake is invisible from Python — a stale
+platform layer is the one place a mistake is invisible from Python: a stale
 attribute in the mouse path once swallowed every click with the browser
 underneath looking healthy. Each skips itself with a message where its
 platform is not there, so the suite is green on all three either way.
@@ -94,7 +94,7 @@ Real windows have real manners, and a suite that opens dozens of them in a
 few seconds inherits all of them: each one centres itself on the display,
 raises above everything and takes the keyboard, so for as long as the run
 lasts the machine belongs to the tests. `FEETBROWSER_QUIET` drops exactly
-those three habits and nothing else — a quiet window is still created,
+those three habits and nothing else: a quiet window is still created,
 mapped, sized, drawn into and sent real events, so every assertion in those
 suites is testing what it tested before. `test.sh` and `test.cmd` set it, so
 the ordinary way of running the tests already leaves you your machine; set
@@ -104,37 +104,37 @@ The mechanism differs per platform because the manners do: macOS runs the app
 under the accessory activation policy (no Dock icon, never becomes the active
 app) and orders each window in at the back instead of making it key; X11 maps
 the window override-redirect, which is the one portable way to tell a window
-manager not to place, decorate, raise or focus something — every other route
+manager not to place, decorate, raise or focus something; every other route
 is a hint it may ignore; Windows shows the window with `SW_SHOWNOACTIVATE`
 and skips `SetForegroundWindow`. Each backend's suite asserts the promise
 rather than the mechanism: open a quiet window, then check the keyboard did
 not move to it and that the window is nonetheless real and the size asked
-for. That last half matters — quiet is only worth having if the window it
+for. That last half matters: quiet is only worth having if the window it
 leaves behind is still the one the other tests are reading pixels off.
 
 One thing quiet does not do is make the windows invisible. On macOS they sit
 behind whatever you are working in; under X11 they map where the server puts
-them. Not ordering the window in at all was tried and does not work — AppKit
+them. Not ordering the window in at all was tried and does not work: AppKit
 gives an unordered window no usable backing store, and seventeen tests fail.
 If you want silence rather than good manners, the window suites skip cleanly
 when their platform is absent: quit XQuartz and `test_x11.py`'s live half
 steps aside on its own.
 
-`test_x11.py` splits in half. The arithmetic and the lookup tables — scanline
+`test_x11.py` splits in half. The arithmetic and the lookup tables (scanline
 padding, the byte layout a visual's channel masks imply, keysym names, wheel
-buttons — are plain functions over plain values, and those tests run
+buttons) are plain functions over plain values, and those tests run
 everywhere, including on macOS and Windows. The rest needs a server, and asks
 it real questions: XGetGeometry for the window's true size, XSendEvent for
 input, and XGetImage to read the frame back off the server and check the
 colours arrived in the right order. CI runs that half on Linux under
 `xvfb-run`, and `x11_shot.py` uploads the resulting window as a PNG so a human
-can see what the Linux build actually drew — after checking that the three
+can see what the Linux build actually drew, after checking that the three
 colour swatches on that page came back present and in order, which is what a
 wrong channel mask or byte order permutes.
 
 `test_win32.py` splits the same way, and for the same reason. Its offline
-half — DIB stride rounding, the BGRX byte order, virtual-key to keysym
-translation, the wheel-delta arithmetic — runs anywhere. Its other half opens
+half (DIB stride rounding, the BGRX byte order, virtual-key to keysym
+translation, the wheel-delta arithmetic) runs anywhere. Its other half opens
 real windows, pumps real messages through the window procedure and reads
 pixels back out of GDI, and that half only runs on the `windows-latest` rows
 of the matrix. Treat those rows as the verification of anything in `win32.py`:
@@ -154,7 +154,7 @@ their skips are clean.
 
 One job, `unused-image-libraries`, exists to be the negative. Every other job
 runs on a machine with no Pillow and no cairosvg, which means an import of
-either would fail there and prove nothing — a browser that cannot reach for a
+either would fail there and prove nothing: a browser that cannot reach for a
 library and a browser that does not are indistinguishable when the library is
 absent. So that job installs both, checks they really are importable, and runs
 the suites; `test_units.py` and `test_e2e.py` both assert afterwards that
@@ -164,5 +164,5 @@ drawing a page with a photograph on it.
 The Linux jobs build the Rust engine and run `test_js.py` once against it;
 the macOS and Windows lines do the same. The Rust engine's own tests are
 covered by the `rust` job, which never crosses into Python, so running them
-once says as much as running them on all eight interpreters would — the same
+once says as much as running them on all eight interpreters would, the same
 reason the Go toolchain has a job of its own.

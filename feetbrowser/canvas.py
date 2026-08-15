@@ -681,9 +681,7 @@ class Canvas:
         fill = color(opts.get("fill")) or (0, 0, 0)
         x, y = coords[0], coords[1]
         anchor = opts.get("anchor", "center")
-        if anchor == "w":
-            top = y - font.linespace / 2
-        elif anchor in ("nw", "n", "ne"):
+        if anchor in ("nw", "n", "ne"):
             top = y
         else:
             top = y - font.linespace / 2

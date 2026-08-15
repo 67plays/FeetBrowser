@@ -6,7 +6,7 @@ from . import __version__
 
 USAGE = """usage: python3 -m feetbrowser [options] [url]
 
-FeetBrowser — a functional web browser built from scratch.
+FeetBrowser: a functional web browser built from scratch.
 
 options:
   -h, --help       show this help message and exit

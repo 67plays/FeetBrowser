@@ -3689,9 +3689,9 @@ def paint_tree(layout_box, display_list, hidden=False, scroll=0):
     explicitly opts back in with `visibility:visible`) is not painted.
 
     Also applies, in tree order:
-      * `position: sticky` — offsets the box (and descendants) so it stays in
+      * `position: sticky`: offsets the box (and descendants) so it stays in
         view when the page has scrolled past its natural spot;
-      * `z-index` — a numeric z-index lifts the box (and its paint) above
+      * `z-index`: a numeric z-index lifts the box (and its paint) above
         lower stacking content. None/auto keeps document order (stable sort).
     """
     items = []

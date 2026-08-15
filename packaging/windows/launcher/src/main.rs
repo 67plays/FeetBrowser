@@ -1,4 +1,4 @@
-//! FeetBrowser.exe — the Windows front door.
+//! FeetBrowser.exe: the Windows front door.
 //!
 //! Windows cannot double-click a `.py`, so something has to be a real PE
 //! binary. That is the entire job of this file: find the CPython DLL sitting
@@ -24,7 +24,7 @@
 //! The DLL is resolved at run time with `LoadLibraryEx` + `GetProcAddress`,
 //! not linked against. The embeddable package ships no import library and no
 //! headers, and this way a Python version bump in the bundle needs no
-//! recompile of this binary — it scans for whatever `python3NN.dll` is there.
+//! recompile of this binary; it scans for whatever `python3NN.dll` is there.
 
 // No console window, ever. This is the difference between double-clicking the
 // icon and getting a browser, and double-clicking it and getting a black box

@@ -126,6 +126,11 @@ INHERITED_PROPERTIES = {
 }
 
 
+def _combine_priorities(a, b):
+    """Element-wise sum of two specificity tuples."""
+    return tuple(x + y for x, y in zip(a, b))
+
+
 class TagSelector:
     kind = "tag"
 
@@ -166,8 +171,8 @@ class DescendantSelector:
     def __init__(self, ancestor, descendant):
         self.ancestor = ancestor
         self.descendant = descendant
-        self.priority = tuple(
-            a + b for a, b in zip(ancestor.priority, descendant.priority))
+        self.priority = _combine_priorities(ancestor.priority,
+                                          descendant.priority)
 
 
 class ChildSelector:
@@ -182,8 +187,7 @@ class ChildSelector:
     def __init__(self, parent, child):
         self.parent = parent
         self.child = child
-        self.priority = tuple(
-            a + b for a, b in zip(parent.priority, child.priority))
+        self.priority = _combine_priorities(parent.priority, child.priority)
 
 
 class SiblingSelector:
@@ -195,8 +199,7 @@ class SiblingSelector:
         self.before = before
         self.after = after
         self.adjacent = adjacent
-        self.priority = tuple(
-            a + b for a, b in zip(before.priority, after.priority))
+        self.priority = _combine_priorities(before.priority, after.priority)
 
 
 class RootSelector:

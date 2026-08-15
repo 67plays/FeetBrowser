@@ -22,7 +22,7 @@ the venv automatically). Once the extension is built and installed for your
 interpreter, `python3 -m feetbrowser <url>` works directly.
 
 There is nothing else to install. The renderer is ours (see [the rendering
-engine](rendering.md)), so no GUI toolkit is needed — only Python 3, a Rust
+engine](rendering.md)), so no GUI toolkit is needed: only Python 3, a Rust
 toolchain for that one extension, and at least one system font. The window is
 ours as well: AppKit on macOS, Xlib on Linux and on Wayland desktops through
 XWayland, and user32/gdi32 on Windows, all reached by ctypes with no bindings
@@ -32,8 +32,8 @@ package in between.
 and the rest of the environment are described under [environment
 variables](#environment-variables) below.
 
-With no display at all — no `$DISPLAY`, no server answering, or a platform
-with no backend — the browser says which of those it was and carries on
+With no display at all (no `$DISPLAY`, no server answering, or a platform
+with no backend), the browser says which of those it was and carries on
 headless, where `--screenshot` still works.
 
 On Windows, "a Rust toolchain" is two installs rather than one, and the
@@ -41,7 +41,7 @@ second is the one that catches people out. rustup selects the MSVC toolchain
 by default (`stable-x86_64-pc-windows-msvc`), but selecting it is not the
 same as having it: `rustc` compiles the code and then hands it to a C++
 linker, and Windows does not ship one. Without it the first `run.cmd` gets a
-long way — venv made, maturin installed, crates downloaded — and then stops
+long way (venv made, maturin installed, crates downloaded), and then stops
 with
 
 ```
@@ -66,8 +66,8 @@ rustup toolchain install stable-x86_64-pc-windows-gnu
 rustup default stable-x86_64-pc-windows-gnu
 ```
 
-That does build a working engine — the extension imports and the whole suite
-passes on it — but it is a swap, not a saving, because it has a prerequisite
+That does build a working engine (the extension imports and the whole suite
+passes on it), but it is a swap, not a saving, because it has a prerequisite
 of its own that rustup does not install. Without MinGW-w64's binutils on
 `PATH` the build gets *past* the linker, spends a while compiling, and then
 stops at
@@ -77,7 +77,7 @@ error: error calling dlltool 'dlltool.exe': program not found
 error: could not compile `pyo3-ffi` (lib) due to 1 previous error
 ```
 
-Install MinGW-w64 — [MSYS2](https://www.msys2.org) is one way — and put its
+Install MinGW-w64 ([MSYS2](https://www.msys2.org) is one way) and put its
 `bin` directory on `PATH`. The `dlltool.exe` that rustup installs next to the
 toolchain is not a substitute: it is there, but it shells out to an assembler
 that ships in the same MinGW package, and without that it fails with
@@ -86,8 +86,8 @@ one CI builds against, so it is the better-trodden one; the GNU route was
 verified by experiment on a Windows runner rather than by a job in this
 repository.
 
-If `python` isn't on your `PATH` — a fresh install from the Microsoft Store
-often leaves only the launcher — use `py -3` in place of `python` in the two
+If `python` isn't on your `PATH` (a fresh install from the Microsoft Store
+often leaves only the launcher), use `py -3` in place of `python` in the two
 commands `run.cmd` runs.
 
 To render a page without opening a window:
@@ -96,15 +96,15 @@ To render a page without opening a window:
 ./run.sh --screenshot https://example.com page.png
 ```
 
-This runs the whole browser — chrome, tabs, toolbar, page, scrollbar — waits
+This runs the whole browser (chrome, tabs, toolbar, page, scrollbar), waits
 for images to load, and writes a PNG.
 
 ## Environment variables
 
 The browser reads two variables of its own, and neither of them has to be set
 for it to work: every one has a default that is the right answer on a normal
-machine. One of them exists because the browser has two of some things — two
-window backends — and a choice that is only ever made at build time cannot be
+machine. One of them exists because the browser has two of some things (two
+window backends), and a choice that is only ever made at build time cannot be
 tested both ways; the other names a directory whose right answer is different
 on every platform. A third, the standard `DISPLAY`, is not ours but decides
 whether the X11 window can open, so it is described here too.
@@ -115,9 +115,9 @@ then fixed for the life of the process; changing it from inside a running
 browser does nothing. The second is a path, so it is taken as written apart
 from a leading `~`.
 
-There is nothing here that picks a renderer. There is one — our own font
-engine, rasteriser and event loop — and every window backend, and the
-headless root, draws through it.
+There is nothing here that picks a renderer. There is one: our own font
+engine, rasteriser and event loop, and every window backend and the
+headless root draws through it.
 
 ### `FEETBROWSER_DISPLAY`
 
@@ -158,8 +158,8 @@ Windows, and `~/Downloads` on macOS and wherever those two have nothing to
 say. Set, it is that path, with a leading `~` expanded.
 
 Either way the directory is created if it is missing, when the first download
-starts rather than at import. A name that cannot be created — a file already
-sitting there, a volume that is not writable — is reported as a failed
+starts rather than at import. A name that cannot be created (a file already
+sitting there, a volume that is not writable) is reported as a failed
 download, not raised.
 
 Nothing a server sends can put a file outside this directory. See
@@ -210,7 +210,7 @@ A response that is a file rather than a page is saved instead of rendered.
 Three things start a download:
 
 * a `Content-Disposition: attachment` header, whatever the content type;
-* a content type this browser cannot put on screen — anything that is not
+* a content type this browser cannot put on screen (anything that is not
   HTML, plain text, an image, CSS, JavaScript, JSON or XML;
 * **Download Link** or **Download Image** from the right-click menu, which
   saves what a click would otherwise have opened.
@@ -231,8 +231,8 @@ complete. A second file of the same name becomes `file (1).txt` rather than
 overwriting the first. A transfer that dies against a server supporting
 `Range` is resumed from where it stopped rather than started again.
 
-The filename is the server's suggestion — `Content-Disposition`, else the last
-segment of the URL — reduced to one safe component before it is used:
+The filename is the server's suggestion (`Content-Disposition`, else the last
+segment of the URL), reduced to one safe component before it is used:
 percent-escapes are decoded first, directories are dropped, and NULs, control
 characters, `/`, `\`, and the characters Windows reserves are removed. `.` and
 `..` are refused, and a name that is a DOS device (`CON`, `NUL`, `LPT1`, and

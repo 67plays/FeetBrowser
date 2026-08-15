@@ -2,13 +2,13 @@
 
 A `<video>` element lays out at the right size, decodes real frames out of a
 real file, and presents them through the existing rasteriser against a real
-clock, with play, pause and a scrubber. Motion JPEG plays — in AVI, in
-QuickTime, and as a bare stream of JPEGs — as do uncompressed and RLE AVI and
+clock, with play, pause and a scrubber. Motion JPEG plays (in AVI, in
+QuickTime, and as a bare stream of JPEGs), as do uncompressed and RLE AVI and
 QuickTime's `raw ` and `png `. Everything else is identified by name and
 refused in public. There is no audio at all.
 
 Read this before adding a codec. The point of writing it down is that the
-hard parts here are not the codec — they are the seams the codec plugs into,
+hard parts here are not the codec; they are the seams the codec plugs into,
 and those are done.
 
 ## Why Motion JPEG
@@ -17,8 +17,8 @@ Because it is the only genuinely compressed video format this project can
 decode for free, and "for free" is doing real work in that sentence.
 
 The rule is no third-party code, so a codec has to be written here. H.264 is
-a multi-month project on its own — CABAC, deblocking, six intra prediction
-modes, quarter-pel motion compensation — before the patent question is even
+a multi-month project on its own (CABAC, deblocking, six intra prediction
+modes, quarter-pel motion compensation) before the patent question is even
 asked, and VP8, VP9 and AV1 are the same shape of problem. What is left is
 the small set of formats whose decoder is short enough to read: uncompressed
 frames, run-length frames, and pictures.
@@ -27,7 +27,7 @@ MJPEG is pictures. Every frame is a complete baseline JPEG, and the JPEG
 decoder was already written for `<img>` and already lives in Rust next to the
 rasteriser, where it decodes a 320x224 frame in about a millisecond. That is
 around two and a half per cent of a core to play 25 frames a second, against
-the 13 ms a frame that pure-Python `BI_RGB` costs at 320x240 — a format that
+the 13 ms a frame that pure-Python `BI_RGB` costs at 320x240, a format that
 compresses ten to one *and* decodes ten times faster, for the price of a
 fourcc case and a call. Nothing else on the list comes close.
 
@@ -43,14 +43,14 @@ all of them; the decoder is expected to know the standard ones from Annex K
 of the JPEG specification and splice them in, which is what `_jpeg_frame`
 does. And the keyframe flags in an AVI's `idx1` are routinely all zero in
 camera-written files, which would make every seek replay the clip from the
-start for a codec in which every frame is independent by definition — so for
+start for a codec in which every frame is independent by definition, so for
 MJPEG the index is overruled rather than believed.
 
 ## Why AVI as well, and why uncompressed and RLE
 
 The brief for a from-scratch browser rules out the obvious answer. We cannot
-link ffmpeg, and H.264 is a multi-month project on its own — CABAC,
-deblocking, six intra prediction modes, quarter-pel motion compensation —
+link ffmpeg, and H.264 is a multi-month project on its own (CABAC,
+deblocking, six intra prediction modes, quarter-pel motion compensation)
 before the patent question is even asked. So the choice was between formats
 that are genuinely writable in readable Python: animated GIF, MJPEG,
 container parsing on its own, and an uncompressed or RLE codec in a simple
@@ -61,7 +61,7 @@ own puts nothing on screen. What is left is AVI carrying `BI_RGB` and
 `BI_RLE8`: a container simple enough to parse exactly (RIFF is
 length-prefixed chunks and nothing else), with two codecs that are
 patent-free, decodable in a few
-hundred lines, and — this is the part that matters for a *foundation* —
+hundred lines, and (this is the part that matters for a *foundation*)
 between them exercise both halves of the problem. `BI_RGB` is intra-only, so
 any frame is a seek target. `BI_RLE8` has delta and end-of-bitmap escapes, so
 a frame depends on the one before it, and the player has to keep decoder
@@ -74,7 +74,7 @@ in an afternoon is the whole reason to start here.
 The split is deliberate: **bytes**, **time**, **pixels**. Each is testable
 without the other two, and only the last one knows what a canvas is.
 
-### `feetbrowser/mediacodec.py` — bytes
+### `feetbrowser/mediacodec.py`: bytes
 
 Containers and codecs. No clocks, no threads, no canvas, no imports from the
 browser. Everything in it is a pure function of a `bytes` object.
@@ -82,7 +82,7 @@ browser. Everything in it is a pure function of a `bytes` object.
 - `sniff(data)` returns `"AVI"`, `"MJPEG"`, `"MOV"`, `"MP4"`, `"WebM"` or
   `""` from the magic. `"MJPEG"` is the containerless case: a file that
   begins with a JPEG and holds nothing but JPEGs.
-- `probe(data)` returns a `MediaInfo` — container, codec fourcc or name,
+- `probe(data)` returns a `MediaInfo` (container, codec fourcc or name,
   width, height, duration, frame count, `supported`, and a `reason` when it
   is not. It does not raise for a file it merely cannot decode, because "an
   H.264 MP4, 320x180, 3 seconds" is information the layout wants.
@@ -113,16 +113,16 @@ durations, `stsc` the samples-per-chunk runs, `stsz` the sizes and
 17" into a byte range. `stss` lists the sync samples, and a track without one
 is all sync samples, which is exactly right for MJPEG. `stts` is run-length
 encoded and need not be constant, so the track carries real per-frame times
-rather than an average rate — `VideoTrack.index_at()` bisects them, and the
+rather than an average rate: `VideoTrack.index_at()` bisects them, and the
 scheduler asks it rather than dividing.
 
 WebM is still parsed only far enough to answer `probe()`: EBML
 variable-length IDs and sizes to `PixelWidth`, `PixelHeight`, `CodecID`, and
 `Duration` times `TimecodeScale`. It decodes no pixels and does not pretend
-to. An MP4 whose codec we lack is the same — the boxes are read, the numbers
+to. An MP4 whose codec we lack is the same: the boxes are read, the numbers
 are real, and the answer is still no.
 
-### `feetbrowser/media.py` — time
+### `feetbrowser/media.py`: time
 
 Decoding and presenting are two different jobs on two different schedules,
 and conflating them is how a player drifts.
@@ -131,7 +131,7 @@ and conflating them is how a player drifts.
   is set and advanced by hand, which is what the tests use, so frame timing
   is asserted deterministically rather than by sleeping and hoping.
 - `Scheduler` owns the playhead. Position is always
-  `clock.now() - origin + offset` — never a count of frames presented. A
+  `clock.now() - origin + offset`, never a count of frames presented. A
   decoder that falls behind therefore cannot slow playback down; it can only
   lose frames, which is the correct trade. `due_index()` maps position to a
   frame index; `tick()` pops the queue, discards anything already late, and
@@ -151,12 +151,12 @@ and conflating them is how a player drifts.
 carries the `MediaInfo`, reports `status()` as a human-readable line, and
 returns no frames. Layout needs that object to exist.
 
-### `layout.py` and `browser.py` — pixels
+### `layout.py` and `browser.py`: pixels
 
 Both changes are additive and local.
 
 `layout.py` treats `video` as inline, sizes the box from `width`/`height`
-attributes, then the container's declared intrinsic size, then 300x150 —
+attributes, then the container's declared intrinsic size, then 300x150,
 which means an H.264 MP4 still reserves its true 320x180, because the
 container told us even though the codec did not. A playable element emits
 `DrawVideo`, holding the player's `PhotoImage` and a `hit()` so clicks find
@@ -168,7 +168,7 @@ An element with `controls` also emits `DrawVideoControls`: a play/pause
 button, a scrubber with a played portion and a knob, and a `position /
 duration` readout, over the bottom 28 pixels of the picture. It is the only
 display list command that paints several primitives, and the only one whose
-*geometry* changes without layout running again — the frame timer repaints
+*geometry* changes without layout running again; the frame timer repaints
 the existing display list rather than rebuilding it, which `DrawVideo` gets
 away with because its photo is rewritten in place and a scrubber cannot,
 because where the knob goes is a number rather than a buffer. So the bar
@@ -196,8 +196,8 @@ Navigating away or closing a tab stops the decode threads.
 Bluntly, because a foundation that overstates itself is worse than none:
 
 - **No audio.** Not decoded, not parsed, not mixed, not synchronised. AVI
-  audio streams are skipped. This is not a small omission — A/V sync is its
-  own engineering problem — and nothing here is designed around it yet.
+  audio streams are skipped. This is not a small omission: A/V sync is its
+  own engineering problem, and nothing here is designed around it yet.
 - **No inter-frame codec.** No H.264, no VP8/VP9, no AV1, no MPEG-4 ASP.
   A file carrying one is named in the placeholder, not guessed at. This is
   the big one: it is why YouTube, and essentially every video on a modern
@@ -209,7 +209,7 @@ Bluntly, because a foundation that overstates itself is worse than none:
   frame. No range requests, no progressive start, no HLS or DASH. An MJPEG
   camera stream over HTTP, which never ends, therefore cannot be played even
   though its frames are the format that does.
-- **Controls are play/pause and a scrubber.** No volume — there is nothing
+- **Controls are play/pause and a scrubber.** No volume: there is nothing
   to make quieter. No fullscreen, no poster frame, no playback rate, no
   buffered ranges, no keyboard focus or shortcuts, no captions.
 - **No JavaScript media API.** No `HTMLMediaElement` on the DOM bridge:
@@ -225,7 +225,7 @@ Bluntly, because a foundation that overstates itself is worse than none:
 Performance is honest too. Pure-Python `BI_RGB` decode measures roughly 3 ms
 per frame at 160x120, 13 ms at 320x240 and 53 ms at 640x480 on the machine
 this was written on. So uncompressed standard definition at 24 fps is already
-past budget — which is exactly why the drop-frames-and-resync path exists and
+past budget, which is exactly why the drop-frames-and-resync path exists and
 is tested rather than assumed. MJPEG is a different story, because the decode
 is in Rust: about a millisecond a frame at 320x224, which leaves the
 rasteriser and the rest of the browser the other 39 ms of a 25 fps tick.
@@ -236,7 +236,7 @@ The seam is `_Codec`: `reset()`, and `decode(packet, keyframe)` returning
 RGBA bytes for one frame. A new codec is a class implementing those two
 methods, plus a line in the container's codec selection mapping its fourcc,
 and a keyframe rule so `keyframe_before()` is truthful. Nothing above that
-line changes — the scheduler, the drop logic, the resync, the layout box and
+line changes: the scheduler, the drop logic, the resync, the layout box and
 the paint path are all codec-agnostic today, and the RLE8 path exists
 specifically to prove that an inter-frame codec needs no new machinery.
 
@@ -260,7 +260,7 @@ agree, and a reorder buffer belongs in `VideoTrack.frame()`.
 3. **Animated GIF through the same player.** The frames already exist in the
    image decoder; this is a `_Codec` adapter and a layout rule, and it gives
    `<img src=x.gif>` real timing instead of a first frame.
-4. **`HTMLMediaElement` on the DOM bridge** — `play`, `pause`,
+4. **`HTMLMediaElement` on the DOM bridge**: `play`, `pause`,
    `currentTime`, `duration`, `paused`, `ended`, and the `timeupdate` and
    `ended` events. Cheap, and it is what makes video scriptable.
 5. **Streaming.** Range requests and a demuxer that can start before the
@@ -270,15 +270,15 @@ agree, and a reorder buffer belongs in `VideoTrack.frame()`.
 6. **Audio.** A decoder, a resampler, a platform output device on three
    platforms, and A/V sync against the same clock. This is the largest item
    on the list by a wide margin and should be planned on its own. Nothing in
-   the project outputs a sample today — there is no CoreAudio, ALSA or
-   WASAPI binding anywhere in it — so this starts from zero.
+   the project outputs a sample today (there is no CoreAudio, ALSA or
+   WASAPI binding anywhere in it), so this starts from zero.
 7. **A real inter-frame codec.** VP8 keyframes first, if any: intra-only VP8
    is a bounded problem and it is the on-ramp to WebM. Everything past that
    is months.
 
 ## Tests
 
-In `tests/test_render.py`, with muxers in `tests/media_fixtures.py` — real
+In `tests/test_render.py`, with muxers in `tests/media_fixtures.py`: real
 AVI, MOV, MP4 and WebM files built byte by byte at test time, so nothing
 binary is committed. That includes a baseline JPEG *encoder*, because an
 MJPEG fixture has to contain real JPEGs and there is nowhere to get one from
@@ -291,7 +291,7 @@ standard tables is right.
 The data-layer tests assert frame counts, dimensions, per-frame
 timing from `dwRate`/`dwScale` and from `stts`, and exact pixel values for
 frames whose content is known (the frame index is literally written into a
-pixel, so a test can tell you *which* frame it is looking at — for JPEG
+pixel, so a test can tell you *which* frame it is looking at: for JPEG
 fixtures the colour is constant across each 8x8 block, so the round trip is
 exact to within a count, and a single bright pixel in a flat field would be
 measuring the transform rather than the codec). Robustness is tested by
@@ -301,7 +301,7 @@ under a deadline, asserting a clean error rather than a crash or a hang. The
 scheduling tests run entirely on `ManualClock`: a slow decoder given a
 fraction of the budget it needs is asserted to end at exactly the right
 position with a bounded lag and a nonzero drop count. The integration tests
-go through the real browser — page load, layout, click to play, and reading
-the presented pixel back off the rendered surface — and the control bar is
+go through the real browser (page load, layout, click to play, and reading
+the presented pixel back off the rendered surface), and the control bar is
 driven the same way, through `Tab.click`, so what is tested is the path a
 mouse takes rather than a method call.

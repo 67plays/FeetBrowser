@@ -23,8 +23,8 @@ _FONTS = "fonts"
 class JSLocation:
     """Bridge for `window.location` / `document.location`.
 
-    Reads expose the parsed parts of the current page URL. Writes — assigning
-    `href`, or calling `assign`/`replace`/`reload` — hand a navigation request
+    Reads expose the parsed parts of the current page URL. Writes (assigning
+    `href`, or calling `assign`/`replace`/`reload`) hand a navigation request
     to the host's `navigate(url_str, replace)` callback, which the Tab wires to
     its load pipeline. This is how JS-driven redirects navigate the browser
     (e.g. DuckDuckGo's `window.parent.location.replace(...)`).

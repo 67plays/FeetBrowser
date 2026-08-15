@@ -1,19 +1,19 @@
 # Architecture
 
-FeetBrowser is a **functional web browser written from scratch** — the engine
+FeetBrowser is a **functional web browser written from scratch**: the engine
 (JS interpreter, DOM bridge, the CSS cascade, and the inner loops of the
 renderer) is a native Rust extension, and the rest is pure Python. It does not wrap Chromium,
-WebKit, Gecko, or any HTTP library — it implements its own:
+WebKit, Gecko, or any HTTP library; it implements its own:
 
-- **Networking** — raw TCP sockets speaking HTTP/1.1, TLS for `https`,
+- **Networking**: raw TCP sockets speaking HTTP/1.1, TLS for `https`,
   redirect following, `gzip`/`deflate` decoding, chunked transfer decoding,
   plus `data:`, `file:` and `view-source:` schemes, a small bounded response
   cache, and a keep-alive connection pool that reuses sockets per origin.
-- **HTML parser** — a tokenizer + tree builder producing a real DOM
+- **HTML parser**: a tokenizer + tree builder producing a real DOM
   (entities, comments, void elements, raw-text `<script>`/`<style>`, and
   implicit `<html>`/`<head>`/`<body>` + `<li>`/`<p>`/`<tr>` insertion, plus
   the spec's "a block element closes a `<p>`" rule).
-- **CSS engine** — a parser for tag / class / id / descendant / grouped
+- **CSS engine**: a parser for tag / class / id / descendant / grouped
   selectors (with pseudo-classes like `:hover` collapsed to their base
   selector), the cascade with specificity, inheritance, inline `style=""`,
   `@media` unwrapping, and a default user-agent stylesheet (`ua.css`). The
@@ -21,7 +21,7 @@ WebKit, Gecko, or any HTTP library — it implements its own:
   once per node per candidate rule and a long article has thousands of both.
   The selector objects the parser produces are plain Python data, and the
   matcher compiles them on first use.
-- **Layout engine** — a block-and-inline flow layout with line breaking and
+- **Layout engine**: a block-and-inline flow layout with line breaking and
   word wrapping, font size / weight / style, colors, backgrounds, list
   bullets, and `<hr>`, plus **CSS floats** (with text wrapping and `clear`),
   **`<table>` layout** (thead/tbody/tfoot, `colspan`/`rowspan`), a **flexbox**
@@ -32,14 +32,14 @@ WebKit, Gecko, or any HTTP library — it implements its own:
   JPEG and Netpbm, all decoded by us, fetched off the UI
   thread), plus form controls (text fields, checkboxes, submit/reset buttons,
   `<select>`), producing a display list of paint commands.
-- **Rendering engine** — our own pixels, no GUI toolkit: a TrueType parser
+- **Rendering engine**: our own pixels, no GUI toolkit: a TrueType parser
   (`cmap`/`glyf`/`hmtx`/…, composite glyphs, real metrics), an antialiased
   scanline rasteriser owning its own framebuffer, PNG/GIF/JPEG/PNM decoders, a
   retained scene graph, and an event loop. The three layers that touch every
-  pixel — the surface, the font parser and the image decoders — are in the
+  pixel (the surface, the font parser and the image decoders) are in the
   same Rust extension as the JS engine; the scene graph, the event loop and
   font *discovery* stay in Python. See [docs/rendering.md](rendering.md).
-- **Platform windows** — a real window on macOS (`cocoa.py`, ctypes into
+- **Platform windows**: a real window on macOS (`cocoa.py`, ctypes into
   AppKit), on Linux and the BSDs (`x11.py`, ctypes into Xlib, which also
   covers Wayland desktops through XWayland) and on Windows (`win32.py`,
   ctypes into `user32`/`gdi32`/`kernel32`), each translating native events
@@ -47,16 +47,16 @@ WebKit, Gecko, or any HTTP library — it implements its own:
   screen. None of them needs a bindings package. Anywhere else, and anywhere
   with no display, the browser runs headless, which is also how
   `--screenshot` and the whole test suite run on every platform.
-- **Browser UI** — a hand-drawn chrome on that canvas: tabs, an address bar
+- **Browser UI**: a hand-drawn chrome on that canvas: tabs, an address bar
   with search fallback, back / forward / reload / home buttons,
   hover + clickable links, middle-click / ctrl-click to open in a new tab,
   scrolling, a scrollbar, bookmark toggling, and a status bar. Repainting is
   layered: page, chrome, selection, and toe overlays are tracked by canvas
   tag, so a small change (a text selection drag, a focused address bar) only
   repaints the damaged region instead of the whole canvas.
-- **Extensions (Toes)** — a from-scratch hooking system. See
+- **Extensions (Toes)**: a from-scratch hooking system. See
   [docs/toes.md](toes.md).
-- **JavaScript engine** — a from-scratch interpreter compiled to a native
+- **JavaScript engine**: a from-scratch interpreter compiled to a native
   Rust extension (`feetbrowser_engine`, built with PyO3/maturin): a
   hand-written lexer + recursive-descent parser + tree-walking evaluator in
   `rust/`. It supports closures, `var`/`let`/`const`, objects, classes with
@@ -71,7 +71,7 @@ WebKit, Gecko, or any HTTP library — it implements its own:
   `Object`, `Map`, `Set`, `Date`, `RegExp`, `Math`, `JSON`, `console.log`,
   `fetch`, `XMLHttpRequest`. Scripts in `<script>` tags run on page load;
   errors are captured instead of crashing the page.
-- **DOM bridge** — a Rust DOM (`rust/src/dom.rs`): `getElementById`/
+- **DOM bridge**: a Rust DOM (`rust/src/dom.rs`): `getElementById`/
   `querySelector`/`querySelectorAll`, `textContent`, `innerHTML`, `style`,
   `classList`, attributes, and `addEventListener`, exposing `document`,
   elements, node lists, and the `body`/`head`/`documentElement` shortcuts.
