@@ -8,6 +8,7 @@ mod parser;
 mod pybind;
 mod pyutil;
 mod raster;
+mod regexp;
 mod stdlib;
 mod token;
 mod value;

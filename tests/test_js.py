@@ -710,6 +710,365 @@ def test_js_modern_syntax():
     eq(g["del"], True, "delete returns true")
 
 
+def test_js_object_literal_accessors():
+    interp = Interpreter()
+    interp.run("""
+        var seen = [];
+        var person = {
+            first: "Ada",
+            get name() { return this.first + " Lovelace"; },
+            set name(v) { seen.push(v); this.first = v.split(" ")[0]; }
+        };
+        var read = person.name;
+        person.name = "Grace Hopper";
+        var afterWrite = person.first;
+        var readAgain = person.name;
+        var readonly = { get v() { return 7; } };
+        readonly.v = 99;
+        var stillSeven = readonly.v;
+        var writeonly = { set v(n) { this.kept = n; } };
+        writeonly.v = 5;
+        var noGetter = writeonly.v;
+        var kept = writeonly.kept;
+        var shorthand = { twice(n) { return n * 2; } }.twice(21);
+    """)
+    g = interp.globals
+    eq(g["read"], "Ada Lovelace", "a getter runs on read with this bound")
+    eq(g["seen"], ["Grace Hopper"], "a setter runs on write with the new value")
+    eq(g["afterWrite"], "Grace", "the setter's own writes stick")
+    eq(g["readAgain"], "Grace Lovelace", "the getter sees what the setter did")
+    eq(g["stillSeven"], 7, "a write to a getter-only property is swallowed")
+    assert g["noGetter"] is UNDEFINED, "a setter-only property reads as undefined"
+    eq(g["kept"], 5, "but its setter still ran")
+    eq(g["shorthand"], 42, "method shorthand in an object literal")
+
+
+def test_js_computed_object_keys():
+    interp = Interpreter()
+    interp.run("""
+        var k = "dyn";
+        var i = 2;
+        var o = { [k]: 1, ["a" + "b"]: 2, [i * 3]: "six", plain: "yes" };
+        var a = o.dyn, b = o.ab, c = o[6], d = o.plain;
+        var keyCount = Object.keys(o).length;
+        var counter = 0;
+        var once = { [(counter += 1, "k" + counter)]: true };
+        var onceKey = Object.keys(once)[0];
+    """)
+    g = interp.globals
+    eq(g["a"], 1, "a computed key from a variable")
+    eq(g["b"], 2, "a computed key from an expression")
+    eq(g["c"], "six", "a numeric computed key stringifies")
+    eq(g["d"], "yes", "plain keys still work alongside computed ones")
+    eq(g["keyCount"], 4, "every computed key lands as its own property")
+    eq(g["onceKey"], "k1", "the key expression is evaluated exactly once")
+    eq(g["counter"], 1, "and only once")
+
+
+def test_js_optional_catch_binding():
+    interp = Interpreter()
+    interp.run("""
+        var hits = 0;
+        try { throw new Error("boom"); } catch { hits += 1; }
+        var fin = 0;
+        try { throw "x"; } catch { hits += 1; } finally { fin = 9; }
+        var nested = "";
+        try {
+            try { throw "inner"; } catch { throw "rethrown"; }
+        } catch (e) { nested = e; }
+        var bound = "";
+        try { throw "still works"; } catch (e) { bound = e; }
+    """)
+    g = interp.globals
+    eq(g["hits"], 2, "catch with no binding still catches")
+    eq(g["fin"], 9, "finally runs after an unbound catch")
+    eq(g["nested"], "rethrown", "an unbound catch can throw onwards")
+    eq(g["bound"], "still works", "the bound form is unaffected")
+
+
+def test_js_array_from_and_of():
+    interp = Interpreter()
+    interp.run("""
+        var copy = Array.from([1, 2, 3]);
+        var mapped = Array.from([1, 2, 3], function (x) { return x * 3; });
+        var indexes = Array.from([10, 20], function (x, i) { return i; });
+        var chars = Array.from("hey");
+        var deduped = Array.from(new Set([1, 1, 2]));
+        var like = Array.from({ length: 3, 0: "a", 1: "b", 2: "c" });
+        var empty = Array.from([]).length;
+        var nothing = Array.from(undefined).length;
+        var one = Array.of(7);
+        var many = Array.of(1, 2, 3);
+        var none = Array.of().length;
+        var sized = Array(3).length;
+    """)
+    g = interp.globals
+    eq(g["copy"], [1, 2, 3], "Array.from copies an array")
+    eq(g["mapped"], [3, 6, 9], "Array.from applies its mapping function")
+    eq(g["indexes"], [0, 1], "the mapping function is given the index too")
+    eq(g["chars"], ["h", "e", "y"], "Array.from splits a string")
+    eq(g["deduped"], [1, 2], "Array.from drains a Set")
+    eq(g["like"], ["a", "b", "c"], "Array.from honours length on a plain object")
+    eq(g["empty"], 0, "an empty array stays empty")
+    eq(g["nothing"], 0, "undefined yields an empty array rather than throwing")
+    eq(g["one"], [7], "Array.of(7) is the array [7], not seven empty slots")
+    eq(g["sized"], 3, "whereas Array(3) is still three slots")
+    eq(g["many"], [1, 2, 3], "Array.of takes every argument as a value")
+    eq(g["none"], 0, "Array.of() is empty")
+
+
+def test_js_date_fields():
+    interp = Interpreter()
+    interp.run("""
+        var epoch = new Date(0);
+        var y = epoch.getFullYear();
+        var mo = epoch.getMonth();
+        var d = epoch.getDate();
+        var h = epoch.getHours();
+        var dow = epoch.getDay();
+        var t = epoch.getTime();
+        var offset = epoch.getTimezoneOffset();
+        var iso = epoch.toISOString();
+        var parsed = new Date("2021-03-04T05:06:07Z");
+        var py = parsed.getFullYear(), pmo = parsed.getMonth(), pd = parsed.getDate();
+        var pmin = parsed.getMinutes(), psec = parsed.getSeconds();
+        var utcMatches = parsed.getHours() === parsed.getUTCHours();
+        var built = new Date(2021, 2, 4).getDate();
+        var builtYear = new Date(2021, 2, 4).getFullYear();
+        var stamp = Date.UTC(1970, 0, 2);
+        var roundTrip = new Date(Date.UTC(2000, 11, 31)).toISOString();
+        var ms = new Date(1234567890123).getTime();
+    """)
+    g = interp.globals
+    eq(g["y"], 1970, "the epoch is in 1970, not 1969 in some other zone")
+    eq(g["mo"], 0, "January is month zero")
+    eq(g["d"], 1, "the epoch is the first of the month")
+    eq(g["h"], 0, "and midnight, because local time is UTC here")
+    eq(g["dow"], 4, "1 Jan 1970 was a Thursday")
+    eq(g["t"], 0, "getTime returns the milliseconds it was built from")
+    eq(g["offset"], 0, "there is no zone offset to report")
+    eq(g["iso"], "1970-01-01T00:00:00.000Z", "toISOString")
+    eq(g["py"], 2021, "a parsed ISO year")
+    eq(g["pmo"], 2, "a parsed month is zero-based")
+    eq(g["pd"], 4, "a parsed day")
+    eq(g["pmin"], 6, "a parsed minute")
+    eq(g["psec"], 7, "a parsed second")
+    assert g["utcMatches"] is True, "the local and UTC getters agree"
+    eq(g["built"], 4, "a date built from parts keeps its day")
+    eq(g["builtYear"], 2021, "and its year")
+    eq(g["stamp"], 86400000, "Date.UTC counts milliseconds from the epoch")
+    eq(g["roundTrip"], "2000-12-31T00:00:00.000Z", "Date.UTC round-trips")
+    eq(g["ms"], 1234567890123, "a date built from a timestamp keeps it exactly")
+
+
+def test_js_regexp_named_groups():
+    interp = Interpreter()
+    interp.run(r"""
+        var m = /(?<y>\d{4})-(?<mo>\d{2})-(?<d>\d{2})/.exec("on 2021-03-04 ok");
+        var y = m.groups.y, mo = m.groups.mo, d = m.groups.d;
+        var whole = m[0];
+        var byNumber = m[1];
+        var at = m.index;
+        var plain = /\d+/.exec("x7");
+        var noGroups = plain.groups;
+        var backref = /(?<w>\w+) \k<w>/.test("go go");
+        var backrefNo = /(?<w>\w+) \k<w>/.test("go stop");
+        var swapped = "2021-03-04".replace(
+            /(?<y>\d{4})-(?<mo>\d{2})-(?<d>\d{2})/, "$<d>/$<mo>/$<y>");
+        var optional = /(?<a>x)|(?<b>y)/.exec("y");
+        var missing = optional.groups.a;
+        var present = optional.groups.b;
+    """)
+    g = interp.globals
+    eq(g["y"], "2021", "a named group reads back off .groups")
+    eq(g["mo"], "03", "second named group")
+    eq(g["d"], "04", "third named group")
+    eq(g["whole"], "2021-03-04", "the whole match is still index 0")
+    eq(g["byNumber"], "2021", "named groups are numbered as well as named")
+    eq(g["at"], 3, "the match reports where it started")
+    assert g["noGroups"] is UNDEFINED, "no named groups means no .groups object"
+    assert g["backref"] is True, r"\k<name> matches a repeat"
+    assert g["backrefNo"] is False, r"and rejects a non-repeat"
+    eq(g["swapped"], "04/03/2021", "$<name> in a replacement")
+    assert g["missing"] is UNDEFINED, "an unmatched named group is undefined"
+    eq(g["present"], "y", "while the one that matched holds its text")
+
+
+def test_js_regexp_lookaround():
+    interp = Interpreter()
+    interp.run(r"""
+        var pos = /foo(?=bar)/.test("foobar");
+        var posNo = /foo(?=bar)/.test("foobaz");
+        var neg = /foo(?!bar)/.test("foobaz");
+        var negNo = /foo(?!bar)/.test("foobar");
+        var kept = "foobar".replace(/foo(?=bar)/, "X");
+        var width = /foo(?=bar)/.exec("foobar")[0];
+        var grouped = "1234567".replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+        var behind = /(?<=\$)\d+/.exec("cost $42")[0];
+        var negBehind = /(?<!\$)\b\d+/.exec("cost 42")[0];
+        var chained = /\d+(?= dollars)(?!\d)/.exec("50 dollars")[0];
+    """)
+    g = interp.globals
+    assert g["pos"] is True, "lookahead accepts when what follows matches"
+    assert g["posNo"] is False, "and rejects when it does not"
+    assert g["neg"] is True, "negative lookahead accepts when it does not match"
+    assert g["negNo"] is False, "and rejects when it does"
+    eq(g["kept"], "Xbar", "lookahead is zero width, so 'bar' survives")
+    eq(g["width"], "foo", "the match itself excludes the lookahead")
+    eq(g["grouped"], "1,234,567", "the thousands-separator idiom works")
+    eq(g["behind"], "42", "lookbehind")
+    eq(g["negBehind"], "42", "negative lookbehind")
+    eq(g["chained"], "50", "two assertions in a row")
+
+
+def test_js_async_functions_beyond_expressions():
+    interp = Interpreter()
+    interp.run("""
+        var order = [];
+        async function twice(n) { return n * 2; }
+        async function work() {
+            var a = await twice(4);
+            var b = await Promise.resolve(a + 1);
+            order.push(a, b);
+            return "done";
+        }
+        var p = work();
+        var isThenable = typeof p.then === "function";
+        var settled = "";
+        work().then(function (v) { settled = v; });
+        var thrown = "";
+        async function boom() { throw "kaboom"; }
+        boom().catch(function (e) { thrown = e; });
+        class Loader {
+            async load() { return await Promise.resolve("payload"); }
+        }
+        var loaded = "";
+        new Loader().load().then(function (v) { loaded = v; });
+        var awaited = 0;
+        async function loop() {
+            var total = 0;
+            for (var i = 0; i < 3; i++) { total += await Promise.resolve(i); }
+            awaited = total;
+        }
+        loop();
+    """)
+    interp.drain()
+    g = interp.globals
+    assert g["isThenable"] is True, "an async declaration returns a promise"
+    eq(g["order"], [8, 9, 8, 9], "await inside a declared async function")
+    eq(g["settled"], "done", "its return value resolves the promise")
+    eq(g["thrown"], "kaboom", "a throw inside it rejects the promise")
+    eq(g["loaded"], "payload", "an async class method")
+    eq(g["awaited"], 3, "await inside a loop")
+
+
+def test_js_arguments_object():
+    interp = Interpreter()
+    interp.run("""
+        function count() { return arguments.length; }
+        var three = count(1, 2, 3);
+        var zero = count();
+        function second() { return arguments[1]; }
+        var b = second("a", "b", "c");
+        function total() {
+            var t = 0;
+            for (var i = 0; i < arguments.length; i++) { t += arguments[i]; }
+            return t;
+        }
+        var summed = total(1, 2, 3, 4);
+        function extras(named) { return named + ":" + arguments.length; }
+        var beyond = extras("x", "unused", "also unused");
+        var fromArrow = (function () {
+            var inner = function () { return arguments.length; };
+            return inner(1);
+        })(9, 8, 7);
+        var outerSeen = (function () {
+            var inner = () => arguments.length;
+            return inner();
+        })(9, 8, 7);
+        var asArray = (function () { return Array.from(arguments); })(1, 2);
+    """)
+    g = interp.globals
+    eq(g["three"], 3, "arguments.length counts what was passed")
+    eq(g["zero"], 0, "even when nothing was")
+    eq(g["b"], "b", "arguments is indexable")
+    eq(g["summed"], 10, "arguments can be walked")
+    eq(g["beyond"], "x:3", "arguments sees more than the declared parameters")
+    eq(g["fromArrow"], 1, "a nested function has its own arguments")
+    eq(g["outerSeen"], 3, "but an arrow borrows the enclosing one")
+    eq(g["asArray"], [1, 2], "arguments is array-like enough for Array.from")
+
+
+def test_js_class_accessors():
+    interp = Interpreter()
+    interp.run("""
+        class Temp {
+            constructor(c) { this.c = c; }
+            get f() { return this.c * 9 / 5 + 32; }
+            set f(v) { this.c = (v - 32) * 5 / 9; }
+            static get freezing() { return new Temp(0); }
+        }
+        var t = new Temp(100);
+        var boiling = t.f;
+        t.f = 32;
+        var afterSet = t.c;
+        var staticGet = Temp.freezing.f;
+        class Counted extends Temp {
+            get f() { return "overridden"; }
+        }
+        var overridden = new Counted(100).f;
+        var inheritedSet = new Counted(0);
+        inheritedSet.c = 37;
+        var inheritedField = inheritedSet.c;
+    """)
+    g = interp.globals
+    eq(g["boiling"], 212, "a class getter runs on read")
+    eq(g["afterSet"], 0, "a class setter runs on write")
+    eq(g["staticGet"], 32, "a static getter runs on the class itself")
+    eq(g["overridden"], "overridden", "a subclass getter shadows the parent's")
+    eq(g["inheritedField"], 37, "a plain field is untouched by all this")
+
+
+def test_js_class_extends_error():
+    interp = Interpreter()
+    interp.run("""
+        class AppError extends Error {
+            constructor(msg, code) {
+                super(msg);
+                this.name = "AppError";
+                this.code = code;
+            }
+            get label() { return this.name + "/" + this.code; }
+        }
+        var e = new AppError("bad input", 42);
+        var msg = e.message;
+        var nm = e.name;
+        var code = e.code;
+        var label = e.label;
+        var isApp = e instanceof AppError;
+        var isErr = e instanceof Error;
+        var caught = "";
+        try { throw new AppError("thrown", 7); }
+        catch (err) { caught = err.name + ":" + err.message + ":" + err.code; }
+        class Deeper extends AppError {
+            constructor() { super("deep", 1); this.name = "Deeper"; }
+        }
+        var deep = new Deeper();
+        var deepMsg = deep.message;
+        var deepLabel = deep.label;
+    """)
+    g = interp.globals
+    eq(g["msg"], "bad input", "super(msg) reaches the built-in Error")
+    eq(g["nm"], "AppError", "the subclass can rename itself")
+    eq(g["code"], 42, "and carry its own fields")
+    eq(g["label"], "AppError/42", "a getter on an Error subclass")
+    assert g["isApp"] is True, "instanceof the subclass"
+    assert g["isErr"] is True, "instanceof the built-in Error it extends"
+    eq(g["caught"], "AppError:thrown:7", "it survives being thrown and caught")
+    eq(g["deepMsg"], "deep", "two levels of subclassing still reach Error")
+    eq(g["deepLabel"], "Deeper/1", "and inherit the middle class's getter")
+
+
 def test_js_builtins_and_dom():
     interp = Interpreter()
     interp.run("""

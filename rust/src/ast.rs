@@ -98,6 +98,16 @@ pub enum Node {
 pub enum ObjectPair {
     Key(String, Rc<Node>),
     Spread(Rc<Node>),
+    /// `{ [expr]: value }`. The key is not known until the object is built, so
+    /// unlike `Key` it carries an expression to evaluate rather than a name.
+    Computed(Rc<Node>, Rc<Node>),
+    /// `{ get v() {...} }` / `{ set v(n) {...} }`. `kind` is `"get"` or
+    /// `"set"`; two pairs with the same name and different kinds describe one
+    /// property with both halves, which is why they are not merged here.
+    Accessor { key: String, kind: String, func: FuncNode },
+    /// `{ get [expr]() {...} }` / `{ set [expr](n) {...} }`. Same as
+    /// `Accessor`, but the key is only known once the object is built.
+    ComputedAccessor { key_expr: Rc<Node>, kind: String, func: FuncNode },
 }
 
 #[derive(Debug, Clone)]
@@ -127,6 +137,10 @@ pub struct ClassMethodNode {
     pub body: Vec<Rc<Node>>,
     pub is_static: bool,
     pub accessor: Option<String>,
+    /// `async f() {}`. Carried separately from `accessor` because the two are
+    /// mutually exclusive in the grammar -- there is no such thing as an
+    /// `async get` -- and because only this one changes how the body runs.
+    pub is_async: bool,
 }
 
 #[derive(Debug, Clone)]

@@ -39,6 +39,36 @@ pub type NativeFn = fn(&Rc<Interpreter>, &JsValue, Vec<JsValue>) -> EvResult;
 pub type NativeGet = fn(&Rc<Interpreter>, &JsValue, &str) -> Result<JsValue, JsError>;
 pub type NativeSet = fn(&Rc<Interpreter>, &JsValue, &str, &JsValue) -> Result<(), JsError>;
 
+/// A JS array: the elements, plus the handful of named properties an array is
+/// still allowed to carry. Almost nothing puts anything in `props` -- but a
+/// regexp match result is an array with `index`, `input` and `groups` hanging
+/// off it, and that is not a shape the element vector alone can express.
+///
+/// `borrow`/`borrow_mut` reach the elements, because that is what nearly every
+/// caller wants and reading `a.borrow()` as "the array's contents" keeps the
+/// call sites honest about which half they mean.
+pub struct JsArray {
+    pub items: RefCell<Vec<JsValue>>,
+    pub props: RefCell<BTreeMap<String, JsValue>>,
+}
+
+impl JsArray {
+    pub fn new(items: Vec<JsValue>) -> JsArray {
+        JsArray {
+            items: RefCell::new(items),
+            props: RefCell::new(BTreeMap::new()),
+        }
+    }
+
+    pub fn borrow(&self) -> std::cell::Ref<'_, Vec<JsValue>> {
+        self.items.borrow()
+    }
+
+    pub fn borrow_mut(&self) -> std::cell::RefMut<'_, Vec<JsValue>> {
+        self.items.borrow_mut()
+    }
+}
+
 /// A native host function/constructor object.
 pub struct Native {
     pub name: Rc<str>,
@@ -81,7 +111,7 @@ pub enum JsValue {
     Bool(bool),
     Number(f64),
     Str(Rc<str>),
-    Array(Rc<RefCell<Vec<JsValue>>>),
+    Array(Rc<JsArray>),
     Object(Rc<RefCell<BTreeMap<String, JsValue>>>),
     Function(Rc<JSFunction>),
     Promise(Rc<RefCell<JsPromise>>),
@@ -92,6 +122,12 @@ pub enum JsValue {
     Date(Rc<RefCell<JsDate>>),
     Regex(Rc<RefCell<JsRegex>>),
     Error(Rc<RefCell<JsHostError>>),
+    /// Not a value a program can ever hold: it is what sits in a property slot
+    /// that was defined with `get`/`set`, and `js_get`/`js_set` unwrap it by
+    /// running the accessor. Storing it inline like this is what lets objects,
+    /// class prototypes, statics and instance property bags all keep being
+    /// plain `name -> value` maps.
+    Accessor(Rc<JsAccessor>),
     Super(Rc<JsSuper>),
     Native(Rc<Native>),
     Callback(Rc<dyn JsCallback>),
@@ -117,6 +153,7 @@ impl std::fmt::Debug for JsValue {
             JsValue::Date(_) => write!(f, "Date"),
             JsValue::Regex(_) => write!(f, "RegExp"),
             JsValue::Error(_) => write!(f, "Error"),
+            JsValue::Accessor(_) => write!(f, "accessor"),
             JsValue::Super(_) => write!(f, "super"),
             JsValue::Native(n) => write!(f, "function {}", n.name),
             JsValue::Callback(_) => write!(f, "function"),
@@ -135,7 +172,7 @@ impl JsValue {
     }
 
     pub fn array(vals: Vec<JsValue>) -> JsValue {
-        JsValue::Array(Rc::new(RefCell::new(vals)))
+        JsValue::Array(Rc::new(JsArray::new(vals)))
     }
 
     pub fn str(text: impl Into<String>) -> JsValue {
@@ -208,6 +245,12 @@ pub fn to_int32(v: &JsValue) -> i32 {
     } else {
         n as i32
     }
+}
+
+/// Coerce to uint32 (ToUint32), used by Array.prototype.split limits.
+pub fn to_uint32(v: &JsValue) -> u32 {
+    let n = to_number(v) as u64 & 0xFFFF_FFFF;
+    n as u32
 }
 
 pub fn parse_number(text: &str) -> f64 {
@@ -284,6 +327,7 @@ pub fn map_key(v: &JsValue) -> String {
         JsValue::Date(d) => format!("obj:{:p}", Rc::as_ptr(d)),
         JsValue::Regex(r) => format!("obj:{:p}", Rc::as_ptr(r)),
         JsValue::Error(e) => format!("obj:{:p}", Rc::as_ptr(e)),
+        JsValue::Accessor(a) => format!("obj:{:p}", Rc::as_ptr(a)),
         JsValue::Super(s) => format!("obj:{:p}", Rc::as_ptr(s)),
         JsValue::Native(n) => format!("obj:{:p}", Rc::as_ptr(n)),
         JsValue::Callback(_) => format!("obj:{:p}", std::ptr::addr_of!(*v)),
@@ -422,6 +466,7 @@ pub fn js_typeof(v: &JsValue) -> &'static str {
         | JsValue::Date(_)
         | JsValue::Regex(_)
         | JsValue::Error(_)
+        | JsValue::Accessor(_)
         | JsValue::Super(_)
         | JsValue::Host(_) => "object",
         JsValue::Native(_) | JsValue::Callback(_) => "function",
@@ -654,6 +699,15 @@ pub struct JsClassInstance {
     pub props: Rc<RefCell<BTreeMap<String, JsValue>>>,
 }
 
+/// The two halves of an accessor property. Either may be missing: a getter
+/// with no setter silently swallows writes, and a setter with no getter reads
+/// back as `undefined`, which is exactly what the language says should happen.
+#[derive(Debug, Default)]
+pub struct JsAccessor {
+    pub get: RefCell<Option<JsValue>>,
+    pub set: RefCell<Option<JsValue>>,
+}
+
 #[derive(Debug)]
 pub struct JsSuper {
     pub this: JsValue,
@@ -677,10 +731,11 @@ pub struct JsHostError {
     pub name: String,
 }
 
+/// A date is a single number: milliseconds since the epoch. Every field a
+/// script can ask for is derived from it on demand by `date_parts`, so there
+/// is nothing here that can drift out of step with `ms` when it is written to.
 pub struct JsDate {
     pub ms: f64,
-    pub local: Option<chrono::NaiveDateTime>,
-    pub utc: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 pub struct JsRegex {
@@ -690,5 +745,5 @@ pub struct JsRegex {
     pub ignore_case: bool,
     pub multiline: bool,
     pub last_index: Cell<f64>,
-    pub re: regex::Regex,
+    pub re: crate::regexp::Regex,
 }
