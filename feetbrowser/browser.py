@@ -38,7 +38,8 @@ from .selection import Index as SelectionIndex, Selection, \
 from . import shoes as shoes
 from . import downloads as downloads
 from . import media
-from .jsdom import JSDocument, JSLocation, _JSStaticProps, _JSComputedStyle
+from .jsdom import JSDocument, JSLocation, _JSStaticProps, _JSComputedStyle, \
+    adopt_media_state, dispatch_media_events
 from .jsengine import Interpreter, JSException, UNDEFINED
 from . import toes as toes
 from . import __version__
@@ -92,17 +93,24 @@ VIDEO_TICK_MS = 40
 
 # `<source type="...">` values we will even try. Filtering here means a page
 # offering WebM first and AVI second gets the AVI, which is the entire purpose
-# of the element. A type we can decode is not the same as a container we can
-# decode -- `video/mp4` covers both an H.264 film we cannot play and a Motion
-# JPEG .mov we can -- so the container types stay on this list and the codec
-# question is settled by opening the file.
-PLAYABLE_TYPES = ("video/x-msvideo", "video/avi", "video/msvideo",
-                  "video/vnd.avi", "video/quicktime", "video/x-motion-jpeg",
-                  "video/x-jpeg", "video/mjpeg", "multipart/x-mixed-replace")
+# of the element. The list itself lives in `media.py` because
+# `HTMLMediaElement.canPlayType()` has to answer out of the same one -- a
+# browser that fetches a source it then tells the page it cannot play, or the
+# reverse, is worse than one that is simply wrong.
+PLAYABLE_TYPES = media.PLAYABLE_TYPES
 
 # The same question asked of a URL, for the many pages that write `<source>`
 # with no type on it at all.
 PLAYABLE_EXTENSIONS = (".avi", ".mov", ".qt", ".mjpeg", ".mjpg", ".mjpe")
+
+# How many times round the media event loop one drain will go. A handler that
+# queues another event is ordinary code -- `v.pause()` from a `play` handler is
+# how a play/pause button is written -- and making it wait for the next frame
+# would show as a button that changes a beat late. A handler that queues an
+# event every time it runs is also ordinary code, written by mistake, and it
+# must not be able to keep the UI thread; the events it is still owed simply
+# arrive on the next drain, which is 16 ms away.
+MEDIA_EVENT_ROUNDS = 8
 
 
 def _first_playable_source(node):
@@ -317,6 +325,11 @@ class Tab:
         self._video_nodes = {}
         self._video_results = deque()
         self._video_failures = deque()
+        # The media elements with a player behind them, in attachment order.
+        # This is the dispatch list for HTMLMediaElement events, and it is
+        # kept rather than derived because the frame timer would otherwise
+        # walk the whole document 25 times a second to rediscover it.
+        self._media_nodes = []
         self._image_queue = []
         self._image_results = deque()
         # Absolute URLs whose bytes arrived and could not be turned into
@@ -756,8 +769,18 @@ class Tab:
         """Resolve <img>/<video> src attributes to absolute URLs so the
         layout's cache lookup keys (absolute) always match what load_images()
         fetches. Run on the initial build and again after a JS mutation,
-        which can create media elements after the first scan."""
+        which can create media elements after the first scan.
+
+        The same walk registers `<video>` and `<audio>` elements for
+        HTMLMediaElement event dispatch. It happens here rather than where the
+        players are built because an `<audio>` never gets a player and a
+        `<video>` whose file is still on the wire does not have one yet, and
+        both can already owe the document a `volumechange`.
+        """
         for node in tree_to_list(self.nodes, []):
+            if isinstance(node, Element) and node.tag in ("video", "audio") \
+                    and node not in self._media_nodes:
+                self._media_nodes.append(node)
             if isinstance(node, Element) and node.tag == "video" \
                     and not node.attributes.get("src"):
                 # <video><source src=...></video>: hoist the first source we
@@ -766,7 +789,14 @@ class Tab:
                 picked = _first_playable_source(node)
                 if picked:
                     node.attributes["src"] = picked
-            if isinstance(node, Element) and node.tag in ("img", "video") \
+                    # Remembered because the hoist is a convenience for this
+                    # browser and not something the page did: `video.src` has
+                    # to keep reading empty, the way it does in every other
+                    # browser, or a script that tests `if (v.src)` to decide
+                    # whether the author gave it a URL gets the wrong answer.
+                    node.media_src_hoisted = True
+            if isinstance(node, Element) and node.tag in ("img", "video",
+                                                          "audio") \
                     and node.attributes.get("src"):
                 try:
                     node.attributes["src"] = str(
@@ -1139,6 +1169,13 @@ class Tab:
         while self._js_xhr_results:
             xhr, headers, body, ctype, status, err = self._js_xhr_results.popleft()
             xhr._finish(headers, body, status, err)
+        # Before drain() rather than after: a media handler is script like any
+        # other and may schedule a microtask or mutate the document, and both
+        # of those are picked up by the two steps below. Firing after them
+        # would leave a `play` handler's DOM change sitting until the next
+        # poll, 60 ms later, which is visible as a stutter on a page that
+        # swaps a play button for a pause button.
+        self._drain_media_events()
         try:
             interp.drain()
         except JSException as e:
@@ -1439,6 +1476,17 @@ class Tab:
             player.first_frame()
             node.video_player = player
             self.video_players.append(player)
+            if node not in self._media_nodes:
+                self._media_nodes.append(node)
+            # `muted` is not a reflection of the content attribute, but the
+            # attribute is what it starts as, and the player is where it now
+            # lives. Set before adopting so a script that assigned `muted`
+            # while the file was in flight still wins.
+            player.muted = "muted" in node.attributes
+            # And anything else a script set while the file was on the wire --
+            # volume, playback rate, a currentTime to start at -- belongs to
+            # this player now.
+            adopt_media_state(node, player)
             if "autoplay" in node.attributes and player.track is not None:
                 player.play()
                 if self.browser is not None:
@@ -1455,7 +1503,33 @@ class Tab:
         for player in self.video_players:
             if player.tick():
                 changed = True
+        # `timeupdate` and the end-of-media sequence are queued by the tick
+        # above and by nothing else, so this is the only place they can be
+        # noticed. It goes through the full JS drain rather than dispatching
+        # directly because a `timeupdate` handler is exactly the kind of code
+        # that moves an element, and a repaint owed to it must not wait for
+        # the 60 ms poll to come round.
+        if self._js_interp is not None \
+                and any(p.events for p in self.video_players):
+            self._drain_js()
         return changed
+
+    def _drain_media_events(self):
+        """Fire the HTMLMediaElement events every media element is owed."""
+        if self._js_interp is None:
+            return False
+        fired = False
+        for _round in range(MEDIA_EVENT_ROUNDS):
+            again = False
+            for node in self._media_nodes:
+                if dispatch_media_events(node, self._js_interp):
+                    again = True
+            if not again:
+                break
+            fired = True
+        if fired:
+            self._capture_js_errors(self._js_interp.logs)
+        return fired
 
     def playing_videos(self):
         return any(p.playing for p in self.video_players)
@@ -1469,6 +1543,7 @@ class Tab:
         self.video_players = []
         self._video_queue = []
         self._video_nodes = {}
+        self._media_nodes = []
 
     @staticmethod
     def _enclosing_video(node):

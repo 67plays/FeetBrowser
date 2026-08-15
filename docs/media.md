@@ -193,6 +193,63 @@ instead, and is swallowed there even when it means nothing, so a miss between
 the groove and the readout does not fall through and start the film.
 Navigating away or closing a tab stops the decode threads.
 
+### `jsdom.py`: `HTMLMediaElement`
+
+The bridge is a fourth layer over the three above, and it is deliberately
+thin: it owns no playback state at all, it resolves every name against the
+`VideoPlayer` on the node.
+
+`JSElement` in `jsdom.py` subclasses the Rust bridge's element wrapper and
+intercepts the interface's names before they reach the generic attribute path,
+which works because `dom.rs` looks that class up by name rather than holding a
+handle to it. `play()`, `pause()`, `load()` and `canPlayType()` are there,
+along with `currentTime` (settable, and setting it seeks), `duration`,
+`paused`, `ended`, `seeking`, `readyState`, `loop`, `autoplay`, `muted`,
+`volume`, `playbackRate`, `videoWidth`, `videoHeight`, `src`, `currentSrc` and
+the five `HAVE_*` constants. `play()` returns a promise, already settled,
+because `v.play().catch(...)` is how every autoplaying page is written and
+returning undefined turns that line into a TypeError.
+
+Events are the part with a shape worth knowing. The player queues names --
+`loadedmetadata`, `canplay`, `play`, `playing`, `pause`, `timeupdate`,
+`seeking`, `seeked`, `ended`, `volumechange`, `ratechange` -- and knows
+nothing about a DOM; the Tab drains that queue and fires them at the element.
+They are queued rather than dispatched because the player is reached from a
+decode thread and from inside the Rust interpreter, and running page script
+from either is not a thing to do. Firing from the drain is also close to the
+specification's "queue a media element task", which is why `v.play()` returns
+before its `play` handler runs, exactly as it does in a real browser. Media
+events do not bubble: a `timeupdate` arriving at `document.body` four times a
+second would be both wrong and expensive.
+
+`timeupdate` during ordinary playback is throttled to four a second
+(`TIMEUPDATE_INTERVAL`), which is what every shipping browser does and what a
+page driving a progress bar is written against. The `timeupdate` inside the
+seek algorithm is not throttled, because a scrubber that asks for 0.4s must
+not be told 0.0s for another 240 ms.
+
+An `<audio>` element gets the whole interface and never gets a player, because
+nothing here decodes a sample. It therefore answers exactly what the
+specification says a `HAVE_NOTHING` element answers: `duration` NaN, `paused`
+true, `canPlayType()` empty. `volume`, `muted` and `playbackRate` assigned
+before a `<video>`'s file arrives are held on the element and adopted by the
+player when it is built, so a script that configures a video is not undone by
+a slow connection.
+
+### The audio seam
+
+There is no audio, and the one place that will change is
+`VideoPlayer.attach_audio()`. `volume`, `muted` and `playback_rate` are real
+state on the player rather than on the bridge precisely so that an output
+device has something to read, `gain()` folds the first two the way a mixer
+wants them, and every transport method already routes through `_tell_audio()`
+so no path can forget to tell a track that exists. The docstring on
+`attach_audio()` states what a track has to provide -- `start`, `stop`,
+`seek`, `set_gain`, `set_rate`, `position` -- and, more importantly, that
+wiring A/V sync means backing `Scheduler`'s injected `Clock` with the device's
+delivered position rather than adding a correction term, because the sound
+card's crystal is the one a listener can hear drifting.
+
 ## H.264, in Fortran
 
 The sections above say twice that H.264 is a multi-month project. They were
@@ -321,12 +378,19 @@ Bluntly, because a foundation that overstates itself is worse than none:
   frame. No range requests, no progressive start, no HLS or DASH. An MJPEG
   camera stream over HTTP, which never ends, therefore cannot be played even
   though its frames are the format that does.
-- **Controls are play/pause and a scrubber.** No volume: there is nothing
-  to make quieter. No fullscreen, no poster frame, no playback rate, no
-  buffered ranges, no keyboard focus or shortcuts, no captions.
-- **No JavaScript media API.** No `HTMLMediaElement` on the DOM bridge:
-  `play()`, `pause()`, `currentTime`, `timeupdate` and friends do not exist.
-  `autoplay`, `muted` and `preload` are ignored; `loop` is honoured.
+- **On-screen controls are play/pause and a scrubber.** No volume slider:
+  there is nothing to make quieter. No fullscreen, no poster frame, no rate
+  control, no keyboard focus or shortcuts, no captions. Script can reach
+  `volume`, `muted` and `playbackRate` even though the chrome cannot.
+- **The JavaScript media API is a subset.** What exists is listed below.
+  `buffered`, `seekable`, `played`, `networkState`, `error`, `preload`,
+  `defaultPlaybackRate`, `defaultMuted`, `crossOrigin`, `textTracks` and
+  `HTMLMediaElement.captureStream` do not, and neither do the events
+  `loadstart`, `durationchange`, `loadeddata`, `canplaythrough`, `waiting`,
+  `stalled`, `emptied`, `progress`, `suspend`, `abort` or `error` -- a page
+  that waits on one of those waits for ever. Assigning `src` from script
+  writes the attribute but does not start a fetch, so a player cannot be
+  swapped to a different file after load. `preload` is ignored.
 - **No progressive or 12-bit JPEG in MJPEG.** Whatever
   `imagecodec.decode_jpeg` reads is what a frame can be, which is baseline
   and progressive 8-bit; arithmetic coding and 12-bit are not.
@@ -372,19 +436,16 @@ agree, and a reorder buffer belongs in `VideoTrack.frame()`.
 3. **Animated GIF through the same player.** The frames already exist in the
    image decoder; this is a `_Codec` adapter and a layout rule, and it gives
    `<img src=x.gif>` real timing instead of a first frame.
-4. **`HTMLMediaElement` on the DOM bridge**: `play`, `pause`,
-   `currentTime`, `duration`, `paused`, `ended`, and the `timeupdate` and
-   `ended` events. Cheap, and it is what makes video scriptable.
-5. **Streaming.** Range requests and a demuxer that can start before the
+4. **Streaming.** Range requests and a demuxer that can start before the
    last byte arrives. Worth doing now rather than later, because MJPEG over
    HTTP is a format we can already decode and cannot currently play at all:
    the stream never ends, so waiting for the last byte waits forever.
-6. **Audio.** A decoder, a resampler, a platform output device on three
+5. **Audio.** A decoder, a resampler, a platform output device on three
    platforms, and A/V sync against the same clock. This is the largest item
    on the list by a wide margin and should be planned on its own. Nothing in
    the project outputs a sample today (there is no CoreAudio, ALSA or
    WASAPI binding anywhere in it), so this starts from zero.
-7. **B slices in the H.264 decoder.** P slices are done, so this is now the
+6. **B slices in the H.264 decoder.** P slices are done, so this is now the
    shortest route to the rest of the web's video: a second reference list,
    bi-prediction with its own rounding, direct modes (spatial and temporal,
    and 8.4.1.2 is the fiddliest derivation in the standard), and the

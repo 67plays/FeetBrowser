@@ -81,6 +81,11 @@ jobs:
       - name: JS engine tests
         run: $PY tests/test_js.py
 
+      # HTMLMediaElement: the events a page hears, and the order it hears
+      # them in, which is the part of that interface a page depends on.
+      - name: Media API tests
+        run: $PY tests/test_media_api.py
+
       - name: Shoes tests
         run: $PY tests/test_shoes.py
 

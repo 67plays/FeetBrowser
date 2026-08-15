@@ -76,6 +76,8 @@ rem one that skips everywhere else.
 %RUN% tests\test_win32.py || exit /b 1
 %RUN% tests\test_units.py || exit /b 1
 %RUN% tests\test_js.py || exit /b 1
+rem HTMLMediaElement: the events, and their order.
+%RUN% tests\test_media_api.py || exit /b 1
 %RUN% tests\test_shoes.py || exit /b 1
 rem A fixture page in, its pixels back out.
 %RUN% tests\test_e2e.py || exit /b 1
