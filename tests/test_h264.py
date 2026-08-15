@@ -877,6 +877,35 @@ def test_the_runtime_shipped_beside_the_decoder_is_the_whole_chain():
     print("  ok  the compiler's runtime ships beside the decoder, transitively")
 
 
+def _fake_compiler(directory):
+    """A compiler that always succeeds and records the flags it was given.
+
+    It writes everything from ``-o`` onwards into the file ``-o`` names, so a
+    check() can see which flag set produced which library. A shell script
+    would have been shorter and would not run on Windows, which is the one
+    platform these tests exist for; the launcher below is a `.cmd` there and a
+    shebang line everywhere else, and both hand the work to the same Python.
+    """
+    worker = os.path.join(directory, "fakegfortran.py")
+    with open(worker, "w") as handle:
+        handle.write("import sys\n"
+                     "a = sys.argv[1:]\n"
+                     "i = a.index('-o')\n"
+                     "open(a[i + 1], 'w').write(' '.join(a[i:]))\n")
+    if os.name == "nt":
+        fc = os.path.join(directory, "fakegfortran.cmd")
+        with open(fc, "w") as handle:
+            handle.write('@echo off\r\n"%s" "%s" %%*\r\n'
+                         % (sys.executable, worker))
+        return fc
+    fc = os.path.join(directory, "fakegfortran")
+    with open(fc, "w") as handle:
+        handle.write('#!/bin/sh\nexec "%s" "%s" "$@"\n' % (sys.executable,
+                                                           worker))
+    os.chmod(fc, 0o755)
+    return fc
+
+
 def test_a_flag_set_that_links_but_does_not_ship_is_not_used():
     """The reason _compile takes a check at all.
 
@@ -888,12 +917,7 @@ def test_a_flag_set_that_links_but_does_not_ship_is_not_used():
     import tempfile
 
     with tempfile.TemporaryDirectory() as tmp:
-        fc = os.path.join(tmp, "fakegfortran")
-        with open(fc, "w") as handle:
-            handle.write('#!/bin/sh\n'
-                         'while [ "$1" != "-o" ]; do shift; done\n'
-                         'echo "$*" > "$2"\n')
-        os.chmod(fc, 0o755)
+        fc = _fake_compiler(tmp)
         out = os.path.join(tmp, "lib.so")
         attempts = (["-first"], ["-second"], ["-third"])
 
