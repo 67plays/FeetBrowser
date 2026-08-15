@@ -620,8 +620,9 @@ global namespace and two decoders in one process have to stay out of each
 other's way.
 
 **Exactly what it does.** ADTS framing and MP4's `AudioSpecificConfig` out
-of an `esds` box, including the backward-compatible SBR sync word and the
-`program_config_element` that an implicit channel configuration needs;
+of an `esds` box, including the backward-compatible SBR sync word *and the
+flag inside it*, and the `program_config_element` that an implicit channel
+configuration needs;
 `raw_data_block` with its SCE, CPE, LFE, CCE, DSE, PCE and FIL elements;
 `ics_info`, section data, the three scalefactor difference chains, pulse
 data, TNS and spectral data; all eleven spectral Huffman codebooks and
@@ -730,6 +731,21 @@ and a sentence of its own, because a decoder that silently ignores SBR
 produces something that sounds like a bad phone line and a decoder that
 ignores PS produces mono.
 
+Refusing SBR is a decision about the *tool*, though, and not about the
+signalling, and conflating the two cost us most of the web's AAC for a
+while. An `AudioSpecificConfig` may append an 11-bit sync word (`0x2B7`)
+and an object type of 5 to say "SBR is described below", and what follows
+that object type is `sbrPresentFlag`, which is allowed to say no. FFmpeg's
+MP4 muxer writes the whole extension into every file it encodes straight
+into MP4 -- `121056e500` -- whether or not the encoder used the tool, and
+writes the bare `1210` for the identical coded frames when it remuxes from
+ADTS instead. Refusing on the object type alone therefore turned down
+ordinary AAC-LC that we decode perfectly, and the two configurations are
+committed as a pair of fixtures (`sbr_signalled.mp4`, `sbr_absent.mp4`)
+whose samples are asserted to be identical, because the config parse is
+allowed to permit a decode and not to change one. With the flag set, the
+stream really is HE-AAC and is refused as before.
+
 Two smaller gaps worth naming. Pulse data is implemented and is not covered
 by any fixture, because FFmpeg's encoder never emits it. And the decoder
 refuses more than two channels rather than downmixing, so a 5.1 soundtrack
@@ -739,27 +755,24 @@ is silent rather than folded.
 
 Bluntly, because a foundation that overstates itself is worse than none:
 
-- **No file has ever made a noise.** Both halves exist and nothing joins
-  them. AAC-LC decodes to PCM (see [AAC, in Fortran](#aac-in-fortran)) and
-  the output stack plays PCM (see [Audio output](#audio-output)), and no
-  code hands the first to the second: `AudioTrack` produces samples with
-  timestamps and nothing consumes them, so a page with a `<video>` element
-  on it is still silent. The `<audio>` element is not implemented at all.
-  AVI and WebM audio streams are named by `probe_audio` and not decoded --
-  the decoder is wired to MP4 only, because MP4 is where AAC is. MP3,
-  Vorbis and Opus are absent entirely.
-- **No A/V synchronisation.** The clock video should follow exists and is
-  duck-compatible with `media.Clock`, but nothing has been wired to it:
-  `VideoPlayer` still runs off `SystemClock`. Handing a `Scheduler` a
-  `heel.AudioClock` works today and is tested; making `<video>` do it when
-  the file has an audio track is not done, and doing it correctly means
-  following `Source.position()` rather than the device clock -- see
-  [Audio output](#audio-output).
+- **MP4 is the only container with sound in it.** An MP4 with an AAC-LC
+  track plays, in sync -- see [Sound and pictures
+  together](#sound-and-pictures-together). Nothing else does. AVI and WebM
+  audio streams are named by `probe_audio` and not decoded: WebM for want
+  of a Vorbis or Opus decoder, AVI for want of a demuxer that reaches its
+  audio. MP3 is absent entirely. The `<audio>` element is not implemented
+  at all, so sound arrives only alongside a picture.
+- **No user-facing volume or mute.** `VideoPlayer.set_volume()` and
+  `AudioPlayer.muted` exist and are tested; nothing in the GUI calls them,
+  and `volume` and `muted` are not scriptable from JavaScript yet.
 - **AAC-LC only.** HE-AAC (SBR), HE-AAC v2 (Parametric Stereo), Main
   profile, LTP, SSR, coupling channels, LFE, more than two channels and
   960-sample frames are each refused by name with a status code of their
   own. SBR is the one worth knowing about: a low-bitrate web stream is
   often HE-AAC, and it is refused rather than played at half its bandwidth.
+  What is *not* refused, and is worth knowing about for the opposite
+  reason, is an AAC-LC config that merely carries SBR's signalling with
+  the flag clear -- see below.
 - **No inter-frame codec other than H.264.** I, P and B slices decode, under
   either entropy coder, which is what an ordinary well-compressed web MP4 is;
   but there is no VP8, VP9, AV1 or MPEG-4 ASP at all. A stream with SP or SI

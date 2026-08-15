@@ -657,6 +657,81 @@ def test_what_we_do_not_implement_is_refused_by_name():
     print("  ok  refused 960-frames:  %s" % reason)
 
 
+def test_sbr_signalled_and_absent_is_still_plain_aac_lc():
+    """The extension says SBR; the flag inside it says no. Believe the flag.
+
+    ``121056e500`` is AAC-LC at 44.1 kHz in stereo, followed by the 11 bit
+    sync word 0x2B7, then object type 5, then ``sbrPresentFlag = 0``. The
+    last of those is the whole content of the config: the encoder did not
+    use SBR. The bits before it are the muxer's, not the encoder's --
+    ffmpeg writes that extension into every MP4 it encodes straight into,
+    and writes the bare ``1210`` for the identical stream when it remuxes
+    from ADTS instead.
+
+    So refusing on the object type turns down most of the AAC-LC on the
+    web. The case below is the pair we can prove it with, and the one after
+    is the negative control: same sync word, same object type, flag set,
+    and that one is genuinely HE-AAC and must still be refused.
+    """
+    if _skip():
+        return
+    signalled_absent = bytes.fromhex("121056e500")
+    bare = bytes.fromhex("1210")
+    reason = aac.probe(signalled_absent)
+    assert reason is None, "SBR signalled as absent was refused: %s" % reason
+    lit = aac.Decoder(signalled_absent)
+    plain = aac.Decoder(bare)
+    assert lit.sample_rate == plain.sample_rate == 44100, lit.sample_rate
+    assert lit.channels == plain.channels == 2, lit.channels
+    print("  ok  sbrPresentFlag=0 accepted: 44100 Hz, 2 ch, same as 1210")
+
+    # sbrPresentFlag = 1: the trailing 0xa0 is 1 in the top bit. Genuine
+    # backward-compatible HE-AAC, and a decoder without a band replicator
+    # would play it at half its bandwidth.
+    present = bytes.fromhex("121056e5a0")
+    reason = aac.probe(present)
+    assert reason is not None, "sbrPresentFlag=1 was accepted"
+    assert "Spectral Band Replication" in reason, reason
+    print("  ok  sbrPresentFlag=1 refused: %s" % reason)
+
+    # And the object type in the field proper, which never reaches the
+    # extension at all.
+    reason = aac.probe(_asc(5))
+    assert reason and "Spectral Band Replication" in reason, reason
+    print("  ok  object type 5 up front still refused")
+
+
+def test_the_two_containers_ffmpeg_writes_decode_to_the_same_samples():
+    """One encode, two containers, two configs, and it must not matter.
+
+    The fixtures are the same AAC-LC bitstream muxed the two ways ffmpeg
+    muxes it: ``sbr_signalled.mp4`` straight from the encoder, whose esds
+    carries ``121056e500``, and ``sbr_absent.mp4`` remuxed from ADTS with
+    ``-c copy``, whose esds carries the bare ``1210``. If the samples ever
+    stop matching, the config parse has started changing the decode rather
+    than merely permitting it.
+    """
+    if _skip():
+        return
+    got = []
+    for name in ("sbr_signalled.mp4", "sbr_absent.mp4"):
+        with open(os.path.join(FIXTURES, name), "rb") as handle:
+            data = handle.read()
+        info = mediacodec.probe_audio(data)
+        assert info.supported, "refused: %s" % info.reason
+        track = mediacodec.open_audio(data)
+        samples = []
+        for i in range(info.frame_count):
+            samples.extend(track.frame(i).samples)
+        got.append(samples)
+    assert len(got[0]) == len(got[1]), \
+        "%d samples against %d" % (len(got[0]), len(got[1]))
+    worst = max((abs(a - b) for a, b in zip(*got)), default=0.0)
+    assert worst == 0.0, "the two containers differ by %.3e" % worst
+    print("  ok  both containers decode to the same %d samples exactly"
+          % len(got[0]))
+
+
 def test_a_stereo_stream_really_uses_the_stereo_tools():
     """A guard on the fixtures, not on the decoder.
 

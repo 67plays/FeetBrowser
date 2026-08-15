@@ -160,3 +160,23 @@ fi
 # the same samples, which is only a test if the frames really are the same.
 ffmpeg -v error -y -i "$out/stereo.aac" -c copy "$out/stereo.mp4"
 echo "stereo.mp4 $(wc -c < "$out/stereo.mp4") bytes"
+
+# The two configurations ffmpeg writes for one encode, as a pair.
+#
+# Muxing straight into MP4 writes an AudioSpecificConfig with the backward
+# compatible SBR signalling appended -- 121056e500 -- whether or not the
+# encoder used SBR; the flag at the end of it is what says whether it did,
+# and here it is clear. Remuxing the same coded frames from ADTS writes the
+# bare 1210 instead. Both are AAC-LC, both must decode, and they must decode
+# to the same samples: that is the whole point of the pair. Short and quiet
+# because nothing here is compared against a reference, only against itself.
+ffmpeg -v error -y -f lavfi \
+  -i "sine=frequency=440:sample_rate=44100:duration=0.5" \
+  -ac 2 -c:a aac -b:a 64k "$out/sbr_signalled.mp4"
+ffmpeg -v error -y -f lavfi \
+  -i "sine=frequency=440:sample_rate=44100:duration=0.5" \
+  -ac 2 -c:a aac -b:a 64k -f adts "$out/sbr_pair.aac"
+ffmpeg -v error -y -i "$out/sbr_pair.aac" -c copy "$out/sbr_absent.mp4"
+rm -f "$out/sbr_pair.aac"
+echo "sbr_signalled.mp4 $(wc -c < "$out/sbr_signalled.mp4") bytes," \
+     "sbr_absent.mp4 $(wc -c < "$out/sbr_absent.mp4") bytes"

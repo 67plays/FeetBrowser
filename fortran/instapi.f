@@ -146,7 +146,7 @@ C     carries and what everything else quotes.  Two bytes, usually.
       IMPLICIT NONE
       INCLUDE 'instcom.inc'
       INTEGER ST
-      INTEGER AOT, FLF, DEP, EXT, SYNC, EAOT, NC(0:7)
+      INTEGER AOT, FLF, DEP, EXT, SYNC, EAOT, SBRP, NC(0:7)
       INTEGER IPAOT, IPU1, IPUN, IPLEFT
       EXTERNAL IPAOT, IPU1, IPUN, IPLEFT
       DATA NC /0, 1, 2, 3, 4, 5, 6, 8/
@@ -205,18 +205,35 @@ C     ignore.
       END IF
 C     Backward compatible SBR signalling: an 11 bit sync word after the
 C     configuration proper, then the extension's object type.  A decoder
-C     that ignores it plays the stream at half its intended bandwidth and
-C     often at half its sample rate, which sounds like a fault rather
-C     than like a missing feature.  Refused by name.
+C     that ignores a stream that really does use SBR plays it at half
+C     its intended bandwidth and often at half its sample rate, which
+C     sounds like a fault rather than like a missing feature.  Refused
+C     by name.
+C
+C     But the object type is not the answer on its own, and reading it
+C     as though it were is the trap here.  What follows AOT 5 is
+C     sbrPresentFlag, and the flag is allowed to say no.  Every file
+C     ffmpeg encodes straight into MP4 carries this extension with the
+C     flag clear -- 121056e500 against a bare 1210 for the identical
+C     LC stream -- because the muxer writes the signalling whether or
+C     not the encoder used the tool.  Refusing on the object type alone
+C     therefore turns down most of the AAC-LC on the web for a feature
+C     the config has just finished saying is absent.  Read the flag.
       IF (IPLEFT() .GE. 16) THEN
          SYNC = IPUN(11)
          IF (SYNC .EQ. 695) THEN
             EAOT = IPAOT()
             IF (EAOT .EQ. 5) THEN
-               ST = -25
-               RETURN
-            END IF
-            IF (EAOT .EQ. 29) THEN
+               SBRP = IPU1()
+               IF (SBRP .NE. 0) THEN
+                  ST = -25
+                  RETURN
+               END IF
+C     Flag clear.  Nothing else in Table 1.15 follows it: the extension
+C     sampling frequency and the nested 0x548 that carries
+C     psPresentFlag are both inside the sbrPresentFlag branch, so a
+C     stream that says no ends here and is plain AAC-LC.
+            ELSE IF (EAOT .EQ. 29) THEN
                ST = -26
                RETURN
             END IF

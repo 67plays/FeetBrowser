@@ -1812,13 +1812,25 @@ def test_a_tab_that_goes_away_lets_go_of_its_sound():
 # -- the live half ---------------------------------------------------------
 
 def _live_reason():
-    """Whether there is a device here that actually consumes samples.
+    """Whether there is a device here that actually consumes samples, at a rate.
 
     Opening one is not enough to prove it. A CI runner with no sound hardware
     can still have a backend that opens, initialises and starts without ever
     asking for a buffer, and every test below would then fail for the one
     reason that is not a bug. So the gate is empirical: start a device, wait
     a moment, and see whether the clock moved.
+
+    Moving is not enough either, and that is the second half of this gate. A
+    virtual device on a runner with nothing to drive it has no crystal: it is
+    a timer thread, it is descheduled whenever the host is busy, and it then
+    delivers a quarter second of samples somewhere between twice and half as
+    fast as the wall. A rate test run against that clock is measuring the CI
+    provider's scheduler, not our code, and it fails at random. So the gate
+    measures the rate too, and a device that cannot keep time is reported as
+    absent rather than left to fail the tests below one run in five. The
+    band is deliberately wide -- real hardware sits at 1.00 and nothing we
+    could ship moves it to 0.7 -- because this is a check for the absence of
+    a clock source, not a measurement.
     """
     if (os.environ.get("FEETBROWSER_AUDIO") or "").strip().lower() in (
             "null", "off", "none", "silent"):
@@ -1836,6 +1848,14 @@ def _live_reason():
             return "the device opened but never asked for a sample"
         if output.device.failure is not None:
             return "the device failed at once: %s" % (output.device.failure,)
+        started = time.monotonic()
+        base = output.clock.now()
+        time.sleep(0.25)
+        wall = time.monotonic() - started
+        rate = (output.clock.now() - base) / wall if wall > 0 else 0.0
+        if not 0.7 <= rate <= 1.4:
+            return "the device consumes samples at %.2fx the wall, so it has" \
+                   " no clock source to test against" % rate
     finally:
         output.close()
     return ""
