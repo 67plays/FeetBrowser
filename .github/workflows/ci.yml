@@ -74,6 +74,14 @@ jobs:
           $PY tests/test_x11.py
           $PY tests/test_win32.py
 
+      # The audio stack. Its pure half -- ring, resampler, mixer, clock --
+      # is nearly all of it and runs everywhere; the live half needs an
+      # output device that actually consumes samples, which no runner has,
+      # so it skips and says so. What this checks on a runner is that a
+      # machine with no sound card ends up silent-but-working.
+      - name: Audio tests
+        run: $PY tests/test_audio.py
+
       - name: Unit tests
         run: $PY tests/test_units.py
 
@@ -89,11 +97,10 @@ jobs:
 
       # Linux/x86-64 assembles and runs the real kernels here; everywhere
       # else the module's pure-Python fallback is what gets checked.
-      - name: Assembly span kernels
-        run: $PY tests/test_asmblend.py
-
-      - name: Assembly image-codec kernels
-        run: $PY tests/test_asmops.py
+      - name: Assembly X11 pixel-packing kernels
+        run: $PY tests/test_asmx11.py
+      - name: Assembly selection nearest-boundary kernel
+        run: $PY tests/test_asmselect.py
 
       # The Fortran H.264 decoder, against pixel-exact ground truth from a
       # reference decoder. All three runners turn out to have a gfortran,
@@ -104,6 +111,23 @@ jobs:
       # library away itself and asserts the browser still works without it.
       - name: H.264 decoder
         run: $PY tests/test_h264.py
+
+      # The Fortran AAC-LC decoder, against PCM from the same reference
+      # decoder. Three compilers on three operating systems is worth more
+      # here than it is for H.264: AAC is not a bit-exact standard, so what
+      # is being checked across the three is that the transform lands inside
+      # the same tolerance wherever it is built, not just on the machine the
+      # vectors were measured on.
+      - name: AAC decoder
+        run: $PY tests/test_aac.py
+
+      # Uncompressed sound in MP4/MOV, AVI and WAV. Unlike AAC this is exact
+      # everywhere -- there is no transform in it to round differently on a
+      # different compiler -- so a disagreement between the three operating
+      # systems here would be a byte-order bug in the reader, which is the
+      # one thing about PCM worth running on three machines to catch.
+      - name: PCM audio
+        run: $PY tests/test_pcm.py
 
       # The check this whole file was rebuilt for. A page with text, a PNG,
       # a GIF, a background and a border is fetched from a local server and

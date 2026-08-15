@@ -52,6 +52,11 @@ FeetBrowser.AppDir/
   usr/lib/python3.12/                 its standard library
       site-packages/feetbrowser/      this repository's package
       site-packages/feetbrowser_engine/  the Rust extension
+      site-packages/feetbrowser/_h264_<digest>.so
+                                      the H.264 decoder, compiled
+      site-packages/feetbrowser/_aac_<digest>.so
+                                      the AAC decoder, the same way
+      site-packages/fortran/          the Fortran both were built from
   usr/lib/*.so.*                      the private libraries CPython needs:
                                       libssl, libcrypto, libffi, ...
   usr/lib/feetbrowser/launcher.py     bundled-font wiring, then __main__
@@ -195,11 +200,11 @@ path degrades to the ordinary socket/TLS client, which is what happens on any
 machine without it today. Verified rather than assumed: the acceptance test
 navigates and renders with it absent.
 
-`asmblend.py` compiles `asm/spanblend.S` at import time if a C compiler is on
+`asmlib.py` compiles `asm/x11pack.S` at import time if a C compiler is on
 `PATH`, and returns pure-Python kernels when there is none. A user's machine
-has no compiler, so the fallback is what runs, and nothing in the renderer
-calls those kernels any more anyway. It writes only to `TMPDIR`, never inside
-the bundle.
+has no compiler, so the fallback is what runs; the kernels only matter on an
+X server whose TrueColor visual is depth 15 or 16, which almost nobody meets.
+It writes only to `TMPDIR`, never inside the bundle.
 
 The mounted image is read-only. `PYTHONDONTWRITEBYTECODE=1` is set and every
 `.pyc` is compiled in at build time, so imports are a mapped read rather than
@@ -343,7 +348,11 @@ being tested).
 It then checks, in order: the file runs and prints its version; a live
 `https://` page fetches and renders; a local fixture page renders with no font
 package installed; a page with a PNG and a GIF on it renders, which is the
-compiled engine decoding them; and `tests/x11_shot.py`, the repository's own
+compiled engine decoding them; `--check-video` decodes an H.264 frame and
+compares it with the reference picture, and `--check-audio` decodes an AAC
+frame and compares it with the reference samples, both on a machine with no
+gfortran on it (the test refuses to run if there is one, because it would
+then prove nothing); and `tests/x11_shot.py`, the repository's own
 end-to-end window check, opens a real window on the Xvfb server, paints a
 page into it, reads the pixels back with `XGetImage` and fails unless the red,
 green and blue swatches are all present and land in that order across the

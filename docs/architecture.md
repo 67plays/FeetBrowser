@@ -129,10 +129,14 @@ rust/
   font.rs        TrueType tables, cmap, metrics, outlines, flattening
   image.rs       PNG / GIF / PNM decoders and nearest-neighbour resize
   pyutil.rs      shared argument conversions (bytes, coordinates, strings)
-fortran/         the H.264 decoder: NAL/SPS/PPS, CABAC, intra prediction,
-                 the inverse transforms, deblocking and YUV->RGBA. Compiled
-                 on demand by feetbrowser/h264.py and loaded with ctypes; the
-                 browser works without a Fortran compiler. See docs/media.md.
+fortran/         two decoders. h264*.f is H.264: NAL/SPS/PPS, CABAC, intra
+                 and inter prediction, the inverse transforms, deblocking and
+                 YUV->RGBA. inst*.f is AAC-LC ("the instep"): bitstream,
+                 Huffman, dequantisation, TNS, the stereo tools and the
+                 inverse MDCT, out to PCM. Compiled on demand by
+                 feetbrowser/h264.py and feetbrowser/aac.py and loaded with
+                 ctypes; the browser works without a Fortran compiler.
+                 See docs/media.md.
 toes/            user-installed toes (gitignored; empty on a fresh checkout)
 tests/
   test_render.py offline tests for fonts, rasteriser, image codecs, canvas

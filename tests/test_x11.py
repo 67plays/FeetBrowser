@@ -246,6 +246,128 @@ def test_a_release_cannot_be_caught_by_a_typing_binding():
     assert "<Left>" not in names
 
 
+# -- connecting ------------------------------------------------------------
+
+class _Refusing:
+    """Enough of libX11 to answer XOpenDisplay, refusing the first N times.
+
+    ECONNREFUSED because that is what a full listen backlog gives, which is
+    the failure this retry loop exists for.
+    """
+
+    def __init__(self, failures, errno=111):
+        self.failures, self.errno, self.calls = failures, errno, 0
+
+    def XOpenDisplay(self, _name):
+        self.calls += 1
+        if self.calls <= self.failures:
+            ctypes.set_errno(self.errno)
+            return None
+        return 0x5EE1
+
+
+class _Lib:
+    """The real libX11, put back however the test ends."""
+
+    def __init__(self, lib):
+        self.lib = lib
+
+    def __enter__(self):
+        self.saved = x11._libs.get("x11")
+        x11._libs["x11"] = self.lib
+        return self.lib
+
+    def __exit__(self, *_exc):
+        if self.saved is None:
+            x11._libs.pop("x11", None)
+        else:
+            x11._libs["x11"] = self.saved
+        return False
+
+
+def test_a_connection_refused_once_is_tried_again():
+    """The whole point: a server that says no and then says yes is reached."""
+    lib = _Refusing(failures=3)
+    with _Lib(lib):
+        display, err, waited = x11._connect(attempts=6, pause=0.001)
+    eq(display, 0x5EE1, "the fourth attempt should have connected")
+    eq(lib.calls, 4, "it stops asking as soon as it is let in")
+    eq(err, 0, "a connection that succeeded has no error to report")
+    assert waited > 0, "it waited between the attempts"
+
+
+def test_a_server_that_is_really_gone_is_not_waited_on_for_ever():
+    """The other side of it: refusals do not become a hang, and the reason
+    the last one gave survives to the caller."""
+    lib = _Refusing(failures=1000, errno=2)
+    with _Lib(lib):
+        started = time.monotonic()
+        display, err, waited = x11._connect(attempts=5, pause=0.001)
+        spent = time.monotonic() - started
+    assert display is None, "there was never a server"
+    eq(lib.calls, 5, "it tried exactly as often as it was told to")
+    eq(err, 2, "the last errno is what gets reported")
+    assert spent < 1.0, "five attempts a millisecond apart took %.2f s" % spent
+    assert waited < spent, "it cannot have waited longer than it ran"
+
+
+def test_a_connection_that_works_first_time_costs_nothing():
+    """A retry loop that slept before its first attempt would make every
+    window on every machine a tenth of a second slower to open."""
+    lib = _Refusing(failures=0)
+    with _Lib(lib):
+        started = time.monotonic()
+        display, _err, waited = x11._connect(attempts=6, pause=5.0)
+        spent = time.monotonic() - started
+    eq(lib.calls, 1, "one attempt was enough, so one attempt is what it made")
+    eq(display, 0x5EE1)
+    eq(waited, 0.0, "it reported waiting that it did not do")
+    assert spent < 0.5, "a first-attempt connection slept for %.2f s" % spent
+
+
+def test_the_default_budget_stays_small_enough_to_fall_back_on():
+    """A machine with DISPLAY set and no server falls back to a headless
+    root, and pays this budget to find out. Doubling waits are easy to grow
+    by one attempt and hard to notice, so the arithmetic is pinned."""
+    pause, total = x11._CONNECT_PAUSE, 0.0
+    for _ in range(x11._CONNECT_ATTEMPTS - 1):
+        total += pause
+        pause *= 2
+    assert total < 0.5, "startup would stall for %.2f s with no server" % total
+    assert x11._CONNECT_ATTEMPTS >= 3, "one retry is not a retry loop"
+
+
+def test_a_display_name_says_which_socket_it_means():
+    eq(x11._display_socket(":99"), "/tmp/.X11-unix/X99")
+    eq(x11._display_socket(":0.0"), "/tmp/.X11-unix/X0")
+    eq(x11._display_socket("unix:99.0"), "/tmp/.X11-unix/X99")
+    # A remote display has no local socket, and guessing one would put a
+    # confident, wrong sentence in front of somebody debugging ssh -X.
+    eq(x11._display_socket("host.example:0"), "")
+    eq(x11._display_socket("localhost:10.0"), "")
+    eq(x11._display_socket(""), "")
+    eq(x11._display_socket(":bogus"), "")
+
+
+def test_the_failure_says_what_was_wrong_not_only_that_something_was():
+    """Three causes wear the same NULL return; the message has to tell them
+    apart on a runner nobody can log into."""
+    missing = str(x11._unreachable(":99", 2, 0.31))
+    assert "cannot reach the X server at :99" in missing, missing
+    assert "0.31 s" in missing, missing
+    # Whether it exists depends on whether this machine is running the very
+    # server CI runs on, so the test asks the same question the message did.
+    there = "" if os.path.exists("/tmp/.X11-unix/X99") else " not"
+    assert ("/tmp/.X11-unix/X99 does%s exist" % there) in missing, missing
+    assert os.strerror(2) in missing, missing
+    # A display we cannot map to a socket claims nothing about one, and a
+    # first-attempt failure does not claim to have retried.
+    remote = str(x11._unreachable("host.example:0", 0, 0.0))
+    assert ".X11-unix" not in remote, remote
+    assert "retrying" not in remote, remote
+    assert "last error" not in remote, remote
+
+
 # -- the live half ---------------------------------------------------------
 
 def _live_reason():

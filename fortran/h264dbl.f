@@ -169,21 +169,49 @@ C     the same answer it would have found from any one of them.
       RETURN
       END
 
-C     8.7.2.1, for a frame-coded P or I picture with one reference list.
-C     A and NB are the macroblocks on the q and p sides; MBEDG says the
-C     edge between them is a macroblock edge; the four block coordinates
-C     name the 4x4 block on each side, in raster order within its own
-C     macroblock.
+C     One full luma sample of disagreement, which is four quarter-sample
+C     units, is where a seam becomes visible.
+      INTEGER FUNCTION H2MVNE(AX, AY, BX, BY)
+      IMPLICIT NONE
+      INTEGER AX, AY, BX, BY
+      H2MVNE = 0
+      IF (ABS(AX - BX) .GE. 4) H2MVNE = 1
+      IF (ABS(AY - BY) .GE. 4) H2MVNE = 1
+      RETURN
+      END
+
+C     8.7.2.1, for a frame-coded picture.  A and NB are the macroblocks
+C     on the q and p sides; MBEDG says the edge between them is a
+C     macroblock edge; the four block coordinates name the 4x4 block on
+C     each side, in raster order within its own macroblock.
 C
 C     MRPI and not MREF: two slices of one picture can reach the same
 C     reference picture through different indices, and 8.7.2.1 asks
 C     whether the pictures are the same, not whether the numbers are.
+C     In a B slice that is not a nicety.  The same picture sits at
+C     different indices in the two lists of one slice, so an edge
+C     between a list-0 partition and a list-1 partition of the very same
+C     picture would be filtered on every macroblock of every B frame if
+C     indices were compared -- and every one of those edges is smooth.
+C
+C     Two vectors on each side is where 8.7.2.1 stops being a comparison
+C     and becomes a matching problem.  The two predictions are a set and
+C     not a pair: which of them the encoder called list 0 says nothing
+C     about the picture.  When the two sides used two different pictures
+C     the matching is forced, and each vector is compared with the one
+C     that points at the same picture.  When both sides used the same
+C     picture twice there are two matchings, and the edge is smooth if
+C     either of them agrees -- which is the standard's rule, and it is
+C     the right one: a block predicted from a picture twice with two
+C     vectors is the average of both, and swapping them changes nothing.
       SUBROUTINE H2BS(A, NB, MBEDG, PBX, PBY, QBX, QBY, BS)
       IMPLICIT NONE
       INCLUDE 'h264com.inc'
       INTEGER A, NB, MBEDG, PBX, PBY, QBX, QBY, BS
-      INTEGER PI, QI, PQ, QQ, H2NZQ
-      EXTERNAL H2NZQ
+      INTEGER PI, QI, PQ, QQ, L, NPR, NQR, J1, J2, D1, D2
+      INTEGER PR(2), QR(2), PMX(2), PMY(2), QMX(2), QMY(2)
+      INTEGER H2MVNE, H2NZQ
+      EXTERNAL H2MVNE, H2NZQ
       BS = 0
       IF (MINT(NB + 1) .NE. 0 .OR. MINT(A + 1) .NE. 0) THEN
          BS = 3
@@ -191,7 +219,11 @@ C     whether the pictures are the same, not whether the numbers are.
          RETURN
       END IF
 C     8.7.2.1 asks about the transform block containing the 4x4, which
-C     is the 4x4 itself unless the 8x8 transform is in use.
+C     is the 4x4 itself unless the 8x8 transform is in use.  H2NZQ and
+C     not MNZ read directly: under CABAC all four slots of an 8x8 carry
+C     that block's count and either would answer, but CAVLC keeps a
+C     separate TotalCoeff per 4x4 because the next block's nC comes from
+C     it, and there one slot is not the block.
       IF (H2NZQ(NB, PBX, PBY) .NE. 0 .OR. H2NZQ(A, QBX, QBY) .NE. 0)
      +   THEN
          BS = 2
@@ -201,14 +233,61 @@ C     is the 4x4 itself unless the 8x8 transform is in use.
       QI = 1 + QBX + 4 * QBY
       PQ = 1 + PBX / 2 + 2 * (PBY / 2)
       QQ = 1 + QBX / 2 + 2 * (QBY / 2)
-      IF (MRPI(PQ, NB + 1) .NE. MRPI(QQ, A + 1)) THEN
+      NPR = 0
+      NQR = 0
+      DO 10 L = 1, 2
+         IF (MREF(PQ, L, NB + 1) .GE. 0) THEN
+            NPR = NPR + 1
+            PR(NPR) = MRPI(PQ, L, NB + 1)
+            PMX(NPR) = MMVX(PI, L, NB + 1)
+            PMY(NPR) = MMVY(PI, L, NB + 1)
+         END IF
+         IF (MREF(QQ, L, A + 1) .GE. 0) THEN
+            NQR = NQR + 1
+            QR(NQR) = MRPI(QQ, L, A + 1)
+            QMX(NQR) = MMVX(QI, L, A + 1)
+            QMY(NQR) = MMVY(QI, L, A + 1)
+         END IF
+   10 CONTINUE
+      IF (NPR .NE. NQR) THEN
          BS = 1
          RETURN
       END IF
-C     One full luma sample of disagreement, which is four quarter-sample
-C     units, is where a seam becomes visible.
-      IF (ABS(MMVX(PI, NB + 1) - MMVX(QI, A + 1)) .GE. 4) BS = 1
-      IF (ABS(MMVY(PI, NB + 1) - MMVY(QI, A + 1)) .GE. 4) BS = 1
+      IF (NPR .EQ. 0) RETURN
+      IF (NPR .EQ. 1) THEN
+         IF (PR(1) .NE. QR(1)) THEN
+            BS = 1
+         ELSE IF (H2MVNE(PMX(1), PMY(1), QMX(1), QMY(1)) .NE. 0) THEN
+            BS = 1
+         END IF
+         RETURN
+      END IF
+      IF (PR(1) .EQ. PR(2)) THEN
+         IF (QR(1) .NE. PR(1) .OR. QR(2) .NE. PR(1)) THEN
+            BS = 1
+            RETURN
+         END IF
+         D1 = 0
+         IF (H2MVNE(PMX(1), PMY(1), QMX(1), QMY(1)) .NE. 0) D1 = 1
+         IF (H2MVNE(PMX(2), PMY(2), QMX(2), QMY(2)) .NE. 0) D1 = 1
+         D2 = 0
+         IF (H2MVNE(PMX(1), PMY(1), QMX(2), QMY(2)) .NE. 0) D2 = 1
+         IF (H2MVNE(PMX(2), PMY(2), QMX(1), QMY(1)) .NE. 0) D2 = 1
+         IF (D1 .NE. 0 .AND. D2 .NE. 0) BS = 1
+         RETURN
+      END IF
+      IF (PR(1) .EQ. QR(1) .AND. PR(2) .EQ. QR(2)) THEN
+         J1 = 1
+         J2 = 2
+      ELSE IF (PR(1) .EQ. QR(2) .AND. PR(2) .EQ. QR(1)) THEN
+         J1 = 2
+         J2 = 1
+      ELSE
+         BS = 1
+         RETURN
+      END IF
+      IF (H2MVNE(PMX(1), PMY(1), QMX(J1), QMY(J1)) .NE. 0) BS = 1
+      IF (H2MVNE(PMX(2), PMY(2), QMX(J2), QMY(J2)) .NE. 0) BS = 1
       RETURN
       END
 

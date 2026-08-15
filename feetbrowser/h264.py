@@ -1,11 +1,17 @@
 """H.264 video decoding, in Fortran, loaded through ctypes.
 
 The decoder itself is in ``fortran/`` -- fixed-form FORTRAN 77, about seven
-thousand lines of it, compiled on demand by gfortran into a shared library
-that this module loads and calls. Nothing here decodes anything; this is
-the part that finds a compiler, keeps the build cached, converts between
-the two shapes an H.264 stream comes in, and gets out of the way when the
-machine has no Fortran on it.
+thousand lines of it, compiled by gfortran into a shared library that this
+module loads and calls. Nothing here decodes anything; this is the part
+that finds the library, converts between the two shapes an H.264 stream
+comes in, and gets out of the way when the machine has no Fortran on it.
+
+Where the library comes from depends on who is running. From a checkout it
+is compiled on demand and cached in the temporary directory, keyed by the
+sources and the compiler. In a packaged application there is no compiler,
+so the packaging compiles it on the build machine and ships it inside this
+package under the name ``prebuilt_name()`` -- see ``build_library``, which
+is the one entry point all three packagers use.
 
 Why Fortran: the arithmetic decoder in clause 9.3 is a serial dependency
 chain -- one table lookup, one subtract, one compare, per *bit* -- and a
@@ -15,20 +21,27 @@ Fortran does it at 120 million. The rest of the codec followed the
 entropy layer across the boundary because splitting a decoder in half at
 the macroblock level would mean marshalling every coefficient.
 
-What decodes today: I and P slices, either entropy coder -- CABAC or
+What decodes today: I, P and B slices, either entropy coder -- CABAC or
 CAVLC -- 4:2:0 8-bit, Baseline, Main and High profile. Every intra
 prediction mode, both transform sizes, scaling matrices, quarter-sample
-motion compensation with weighted prediction, up to four reference
-frames, the deblocking filter. Not B slices, not interlace -- see the
-module docstring in ``fortran/h264api.f`` for the status codes each of
-those produces.
+motion compensation, explicit and implicit weighted prediction,
+bi-prediction, both spatial and temporal direct prediction, up to four
+reference frames, the deblocking filter. Not interlace, not SP or SI
+slices, and not a B slice under CAVLC -- see the module docstring in
+``fortran/h264api.f`` for the status codes each of those produces.
+
+B slices decode in decode order, which is not presentation order. This
+module hands back a picture per access unit and says nothing about when
+it should be shown -- only what its picture order count is, through
+``Decoder.poc``. Reordering is the container's business and lives in
+``mediacodec``, which has the composition offsets to do it with.
 
 The library holds one decoder's worth of state in COMMON blocks, which
 is to say a single global one. ``_LOCK`` is what stops two ``<video>``
 elements from interleaving their macroblocks; it is not an optimisation
 to remove later, it is load-bearing.
 
-P slices made that state persistent, which makes it sharper still: a
+Inter slices made that state persistent, which makes it sharper still: a
 frame is now decoded against the pictures the previous calls left behind,
 so a second ``Decoder`` touching the library does not merely slow the
 first one down, it invalidates it. ``_owner`` tracks whose pictures are
@@ -41,6 +54,8 @@ import ctypes
 import hashlib
 import os
 import platform
+import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -60,7 +75,7 @@ _INCLUDES = ("h264com.inc",)
 # The version H2VERS reports. A library left in the cache by an older
 # checkout has the old entry points and the old meanings, and calling it
 # would be worse than not having one.
-_ABI = 3
+_ABI = 4
 
 _LOCK = threading.Lock()
 _lib = None
@@ -100,11 +115,14 @@ def _library_suffix():
 
 
 def _digest():
-    """A hash over every source, so a changed decoder rebuilds itself.
+    """A hash over the ABI and every source, so a changed decoder rebuilds.
 
-    The compiler's identity goes in too. The same sources built by two
-    gfortrans are two different libraries, and a cache that cannot tell
-    them apart hands the wrong one to whichever runs second.
+    Nothing about the machine goes in, deliberately: the same sources hash
+    the same everywhere, which is what lets the packaging build a library
+    on one machine, name it after this digest, and have _open_library find
+    it on another. Which gfortran built a given file is a separate
+    question, answered by _compiler_id for the cache and by the h264_version
+    check for anything that gets loaded.
     """
     sha = hashlib.sha256()
     sha.update(("abi%d" % _ABI).encode("ascii"))
@@ -114,54 +132,431 @@ def _digest():
     return sha.hexdigest()[:16]
 
 
-def _compile(fc, out):
-    """Build the shared library, or raise. Called at most once per machine
-    per version of the sources."""
+def _compiler_id(fc):
+    """Which gfortran this is, in eight hex digits.
+
+    The same sources built by two gfortrans are two different libraries --
+    different runtime, different instruction set, different bugs -- and a
+    cache in a shared temporary directory that cannot tell them apart hands
+    the wrong one to whichever process runs second.
+    """
+    sha = hashlib.sha256()
+    for flag in ("--version", "-dumpmachine"):
+        try:
+            done = subprocess.run([fc, flag], capture_output=True)
+        except OSError:
+            return "unknown0"
+        sha.update(done.stdout)
+    return sha.hexdigest()[:8]
+
+
+# What a library has to be built with to be *shipped* rather than used where
+# it was built: gfortran's own runtime linked in, instead of left behind as
+# three dependencies on a compiler installation the user does not have.
+# -march=native is left out for the same reason the rest is in: the machine
+# that runs this is not the machine that built it.
+#
+# It is a list of attempts rather than one flag set because the three
+# platforms disagree about which of these a toolchain will accept, and the
+# compiler is the only authority on that. -static-libquadmath is GCC 10 and
+# later and older gfortrans reject it outright, so every platform has a second
+# attempt without it. The rest is per-platform and explained in
+# _ship_attempts.
+_PORTABLE = ["-static-libgfortran", "-static-libgcc"]
+_QUADMATH = _PORTABLE + ["-static-libquadmath"]
+
+
+def _ship_attempts(system=None):
+    """The flag sets ``build_library`` tries, most self-contained first."""
+    if system is None:
+        system = platform.system()
+    if system == "Windows":
+        # MinGW's static flags cover libgfortran, libgcc and libquadmath and
+        # not libwinpthread, which a posix-threading-model libgcc pulls in
+        # whatever else is asked for. The result links, runs on the build
+        # machine, which has the compiler's bin/ on PATH, and fails on the
+        # user's with "could not find module ... (or one of its dependencies)"
+        # naming the decoder and not the dependency. -static covers everything
+        # and is tried first; _dangling below is what decides whether it
+        # worked, because on this platform the link succeeding proves nothing.
+        return (["-static"], _QUADMATH, _PORTABLE)
+    if system == "Linux":
+        # manylinux's libgfortran.a is not built -fPIC -- the link fails on a
+        # TPOFF32 relocation against a thread-local in async.o -- and no flag
+        # makes a local-exec TLS relocation legal in a shared object. So the
+        # last attempt links the runtime dynamically, which on this platform
+        # is not a dead end: packaging/linux copies every NEEDED library into
+        # the image and points an $ORIGIN rpath at it, so the AppImage is
+        # still self-contained. -static-libgcc stays, being PIC either way.
+        return (_QUADMATH, _PORTABLE, ["-static-libgcc"])
+    return (_QUADMATH, _PORTABLE)
+
+# From a checkout: tuned for this machine, because it will only ever run on
+# this machine, and dropped if the compiler will not have it (gfortran on
+# Apple silicon rejects -march=native outright).
+_LOCAL_ATTEMPTS = (["-march=native"], [])
+
+
+def _compile(fc, out, attempts=_LOCAL_ATTEMPTS, check=None):
+    """Build the shared library at `out`, or raise.
+
+    `attempts` is a list of extra-flag lists, tried in order until one
+    compiles: the compiler is the only authority on what it accepts.
+
+    `check` is given the library that came out and returns the reasons it is
+    not fit to ship, empty when it is. A flag set whose output fails it is
+    treated exactly like one the compiler rejected, and the next is tried --
+    which is the only way to choose between flag sets that all link and do not
+    all produce something that will load elsewhere.
+    """
     tmp = out + ".%d.tmp" % os.getpid()
-    # -march=native is worth having and is not portable: gfortran on Apple
-    # silicon rejects it outright, and a binary built with it on one machine
-    # is not safe to run on another. So it is tried and dropped, rather than
-    # detected -- the compiler is the only authority on what it accepts.
     base = ["-O3", "-shared", "-fPIC", "-std=legacy", "-fno-align-commons",
             "-I", _FORTRAN, "-o", tmp]
+    if platform.system() == "Darwin":
+        # Otherwise the library records its own bare filename as its install
+        # name, which resolves against nothing once it is inside a bundle --
+        # and packaging/macos/verify.sh rejects it, correctly.
+        base += ["-Wl,-install_name,@loader_path/" + os.path.basename(out)]
     sources = [os.path.join(_FORTRAN, name) for name in _SOURCES]
-    for extra in (["-march=native"], []):
+    failures = []
+    for extra in attempts:
         try:
-            subprocess.run([fc] + base + extra + sources, check=True,
+            subprocess.run([fc] + base + list(extra) + sources, check=True,
                            stdout=subprocess.DEVNULL,
                            stderr=subprocess.PIPE)
         except subprocess.CalledProcessError as exc:
-            last = exc
+            noise = (exc.stderr or b"").decode("utf8", "replace").strip()
+            failures.append((list(extra), noise))
             continue
         except OSError as exc:
             raise H264Error("could not run %s: %s" % (fc, exc))
+        complaints = check(tmp) if check is not None else []
+        if complaints:
+            failures.append((list(extra), "\n".join(complaints)))
+            os.unlink(tmp)
+            continue
         os.replace(tmp, out)
-        return
-    detail = (last.stderr or b"").decode("utf8", "replace").strip()
-    raise H264Error("gfortran could not build the decoder: %s"
-                    % (detail.splitlines()[-1] if detail else "no output"))
+        return list(extra)
+    raise H264Error("no way of building the decoder worked.\n%s"
+                    % _why(fc, failures))
+
+
+# How many lines of a failed compile are worth keeping. A missing static
+# runtime says so on the first line and an undefined symbol on the last, so
+# both ends are kept and only the middle of a long one is dropped.
+_KEEP = 12
+
+
+def _why(fc, failures):
+    """Every attempt and what it said, laid out to be read in a CI log.
+
+    Reporting only the last line of the last attempt is how "ld returned 1
+    exit status" comes to be the whole of a build failure -- which is the
+    exit status and not the reason, and names neither the flag that was
+    tried nor the symbol that was missing.
+    """
+    report = ["%s tried %d flag set%s and none of them worked:"
+              % (fc, len(failures), "" if len(failures) == 1 else "s")]
+    for extra, noise in failures:
+        report.append("  with %s:" % (" ".join(extra) if extra
+                                      else "no extra flags"))
+        lines = [line for line in noise.splitlines() if line.strip()]
+        if not lines:
+            report.append("    (it said nothing at all)")
+            continue
+        if len(lines) > _KEEP:
+            head, tail = lines[:_KEEP // 2], lines[-(_KEEP // 2):]
+            lines = head + ["    ... %d lines omitted ..."
+                            % (len(lines) - _KEEP)] + tail
+        report.extend("    " + line for line in lines)
+    return "\n".join(report)
+
+
+# -- what the built library still needs from outside itself -------------------
+#
+# A library that loads on the machine that built it and not on the machine
+# that runs it is the failure this section exists to catch. It has one
+# symptom, and the symptom names the wrong file: Windows says "could not find
+# module _h264_<digest>.dll (or one of its dependencies)" when the module it
+# could not find is the dependency, which it does not name, ever. Reading the
+# dependencies out of the file here -- on the build machine, while there is
+# still something to be done about them -- is the difference between a
+# packaging job that fails with a name in it and one that ships.
+
+
+def _pe_imports(path):
+    """Every DLL named in the import table of a PE file.
+
+    A parser rather than a call to dumpbin or objdump: the first is MSVC's and
+    the second is the compiler's own, and a packaging script should not have
+    to go looking for a second tool to check the output of the first. This
+    reads one table out of a file gfortran has just written, and raises rather
+    than guesses at anything it does not recognise.
+    """
+    with open(path, "rb") as handle:
+        data = handle.read()
+
+    def u16(off):
+        return struct.unpack_from("<H", data, off)[0]
+
+    def u32(off):
+        return struct.unpack_from("<I", data, off)[0]
+
+    if data[:2] != b"MZ":
+        raise H264Error("%s does not begin with a DOS header" % path)
+    pe = u32(0x3C)
+    if data[pe:pe + 4] != b"PE\0\0":
+        raise H264Error("%s has no PE signature at 0x%x" % (path, pe))
+    sections_n = u16(pe + 6)
+    optional_size = u16(pe + 20)
+    optional = pe + 24
+    magic = u16(optional)
+    if magic == 0x10B:                          # PE32
+        directories = optional + 96
+    elif magic == 0x20B:                        # PE32+
+        directories = optional + 112
+    else:
+        raise H264Error("%s: unknown optional header magic 0x%04x"
+                        % (path, magic))
+    # NumberOfRvaAndSizes is the field immediately before the array it counts.
+    # Data directory 1 is the import table: an RVA and a size.
+    if u32(directories - 4) < 2:
+        return []
+    imports = u32(directories + 8)
+    if imports == 0 or u32(directories + 12) == 0:
+        return []
+
+    sections = []
+    for i in range(sections_n):
+        head = optional + optional_size + i * 40
+        # Virtual size is zero in object files and short in some linkers'
+        # output, so the larger of it and the raw size is what covers the RVA.
+        sections.append((u32(head + 12),
+                         max(u32(head + 8), u32(head + 16)),
+                         u32(head + 20)))
+
+    def offset(rva):
+        for start, size, raw in sections:
+            if start <= rva < start + size:
+                return raw + (rva - start)
+        raise H264Error("%s: RVA 0x%x falls in no section" % (path, rva))
+
+    names, entry = [], offset(imports)
+    while True:
+        descriptor = data[entry:entry + 20]
+        # The table ends with an all-zero descriptor and nothing else. A table
+        # that runs off the end of the file has no end, which is a truncated
+        # file and not a library with no dependencies -- and answering "none"
+        # for it would be the one wrong answer this whole check cannot afford.
+        if len(descriptor) < 20:
+            raise H264Error("%s: the import table runs off the end" % path)
+        if not any(descriptor):
+            break
+        start = offset(u32(entry + 12))
+        end = data.find(b"\0", start)
+        if end < 0:
+            raise H264Error("%s: an import name runs off the end" % path)
+        names.append(data[start:end].decode("ascii", "replace"))
+        entry += 20
+    return names
+
+
+def _dangling(path):
+    """The dependencies of `path` that a machine without a compiler lacks.
+
+    Windows only. The other two platforms answer this question elsewhere and
+    better: packaging/linux copies every NEEDED library into the image, and
+    packaging/macos/verify.sh runs otool over the finished bundle. Windows has
+    neither, and is the one platform where the loader's own error message
+    withholds the name of what is missing.
+
+    "A machine without a compiler" is taken literally rather than guessed at
+    from a list of known-good DLL names: a dependency is satisfied if the
+    system directory has it, or if it sits in the same directory as the file
+    that wants it -- which is where _load's LOAD_WITH_ALTERED_SEARCH_PATH
+    makes the loader look first, and so where _ship_runtime_beside puts
+    things. Anything else is ours to deal with.
+    """
+    if platform.system() != "Windows":
+        return []
+    directories = [os.path.dirname(os.path.abspath(path)),
+                   os.path.join(os.environ.get("SystemRoot", "C:\\Windows"),
+                                "System32")]
+    missing = []
+    for name in _pe_imports(path):
+        # api-ms-win-*.dll are API set contract names. They are resolved from
+        # a table inside the loader and need not exist as files anywhere.
+        if name.lower().startswith("api-ms-win-"):
+            continue
+        if any(os.path.exists(os.path.join(d, name)) for d in directories):
+            continue
+        missing.append(name)
+    return missing
+
+
+def _find_beside_compiler(fc, name):
+    """Where the compiler keeps `name`, or None."""
+    directories = [os.path.dirname(os.path.abspath(fc))] if fc else []
+    directories += os.environ.get("PATH", "").split(os.pathsep)
+    for directory in directories:
+        if not directory:
+            continue
+        candidate = os.path.join(directory, name)
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def _ship_runtime_beside(out, fc, names):
+    """Copy the compiler's runtime DLLs next to the library that needs them.
+
+    The last resort, when no flag set produced a self-contained file. What
+    gets copied is gfortran's own runtime -- the same code -static-libgfortran
+    would have put inside the library -- so putting it beside the library
+    instead of in it changes the size of the bundle and nothing else. It is no
+    more a third-party library here than it is when it is linked in, and no
+    more a sock than libgcc: licence condition 2 is about what the browser is
+    grown from, and this is what the compiler is grown from.
+
+    The walk is transitive, because libgfortran needs libquadmath which needs
+    libgcc which needs libwinpthread, and a bundle that stops after the first
+    of those fails in exactly the way this is here to prevent.
+
+    Returns (copied, still missing), both sorted, so the caller can print the
+    first and refuse over the second.
+    """
+    directory = os.path.dirname(os.path.abspath(out))
+    copied, missing, queue = [], [], list(names)
+    seen = set(name.lower() for name in queue)
+    while queue:
+        name = queue.pop(0)
+        source = _find_beside_compiler(fc, name)
+        if source is None:
+            missing.append(name)
+            continue
+        target = os.path.join(directory, name)
+        shutil.copyfile(source, target)
+        copied.append(name)
+        for further in _dangling(target):
+            if further.lower() not in seen:
+                seen.add(further.lower())
+                queue.append(further)
+    return sorted(copied), sorted(missing)
+
+
+def prebuilt_name():
+    """What a library built by the packaging has to be called.
+
+    The digest is the whole guarantee. It comes from the sources in
+    ``fortran/``, which ship beside the package in every bundle exactly as
+    they sit beside it in a checkout, so a file under this name was built
+    from precisely the decoder this Python code was written against. Change
+    a line of Fortran or the ABI and the name changes with it: a stale
+    prebuilt is not preferred over the sources, it is simply not found.
+    """
+    return "_h264_%s%s" % (_digest(), _library_suffix())
+
+
+def prebuilt_path():
+    """Where a bundled prebuilt library lives -- inside the package, next to
+    this file, so that whatever copied the package copied the decoder too."""
+    return os.path.join(_HERE, prebuilt_name())
+
+
+def build_library(out, fc=None, report=None):
+    """Compile the decoder for shipping, into `out`. Returns `out`.
+
+    This is what packaging/{macos,linux,windows} call, and the only caller
+    there is. Keeping the flags here rather than in three scripts is what
+    stops what a library is built with from drifting away from what the
+    loader expects of it -- and the same argument puts the check that the
+    result is fit to ship here rather than in the scripts, because a check
+    three scripts each own is a check two of them are out of date.
+
+    `report` is called with a line at a time about what was built and what it
+    still needs, which is what the packaging prints into its log.
+    """
+    if not os.path.isdir(_FORTRAN):
+        raise H264Error("the fortran/ directory is missing from this checkout")
+    if fc is None:
+        fc = _find_gfortran()
+    if fc is None:
+        raise H264Error("no gfortran on PATH")
+    if report is None:
+        report = lambda line: None                          # noqa: E731
+    directory = os.path.dirname(os.path.abspath(out))
+    if not os.path.isdir(directory):
+        os.makedirs(directory)
+    used = _compile(fc, out, _ship_attempts(), _dangling)
+    report("built with %s" % (" ".join(used) if used else "no extra flags"))
+
+    # Only reachable where _dangling has an opinion, which is Windows. Every
+    # flag set left something behind, so the runtime ships beside the library
+    # instead of inside it -- and _load opens the library in a way that finds
+    # it there. Anything not found at all is fatal: a bundle that is missing a
+    # DLL says so here, with the name in it, rather than on a stranger's
+    # machine without.
+    left = _dangling(out)
+    if left:
+        copied, still = _ship_runtime_beside(out, fc, left)
+        for name in copied:
+            report("shipped %s beside it" % name)
+        if still:
+            raise H264Error(
+                "the decoder needs %s, and neither the compiler's directory "
+                "nor PATH has %s. A bundle shipped like this would install, "
+                "start, and fail to play video."
+                % (", ".join(still), "it" if len(still) == 1 else "them"))
+    return out
+
+
+def _load(path):
+    """Open a built library and check it is the one we think it is."""
+    if platform.system() == "Windows":
+        # LOAD_WITH_ALTERED_SEARCH_PATH. Without it Windows resolves the
+        # library's dependencies against the *process's* search path, which in
+        # a bundle is the interpreter's directory and never this one, so a
+        # runtime DLL shipped beside the decoder by build_library sits there
+        # unfound. With it, the directory the library came out of is searched
+        # first -- which is the only reason shipping it beside works.
+        lib = ctypes.CDLL(os.path.abspath(path), winmode=0x00000008)
+    else:
+        lib = ctypes.CDLL(path)
+    for name in ("h264_version", "h264_reset", "h264_dims", "h264_decode",
+                 "h264_i420", "h264_rgba", "h264_poc"):
+        getattr(lib, name).restype = None
+    version = ctypes.c_int(0)
+    lib.h264_version(ctypes.byref(version))
+    if version.value != _ABI:
+        raise H264Error("the decoder at %s reports ABI %d, expected %d"
+                        % (path, version.value, _ABI))
+    return lib
 
 
 def _open_library():
     if not os.path.isdir(_FORTRAN):
         raise H264Error("the fortran/ directory is missing from this checkout")
+    # A library the packaging built and shipped beside this file. Preferred
+    # over compiling, because in a bundle there is no compiler to fall back
+    # on -- and a shipped library that will not load is worth saying out
+    # loud, so its failure is only swallowed if there is a gfortran to try.
+    shipped = prebuilt_path()
+    failure = None
+    if os.path.exists(shipped):
+        try:
+            return _load(shipped)
+        except (H264Error, OSError) as exc:
+            failure = H264Error("the bundled decoder %s did not load: %s"
+                                % (prebuilt_name(), exc))
     fc = _find_gfortran()
     if fc is None:
-        raise H264Error("no gfortran on PATH")
+        raise failure or H264Error("no gfortran on PATH")
     out = os.path.join(tempfile.gettempdir(),
-                       "feetbrowser_h264_%s%s" % (_digest(), _library_suffix()))
+                       "feetbrowser_h264_%s_%s%s"
+                       % (_digest(), _compiler_id(fc), _library_suffix()))
     if not os.path.exists(out):
         _compile(fc, out)
-    lib = ctypes.CDLL(out)
-    for name in ("h264_version", "h264_reset", "h264_dims", "h264_decode",
-                 "h264_i420", "h264_rgba"):
-        getattr(lib, name).restype = None
-    version = ctypes.c_int(0)
-    lib.h264_version(ctypes.byref(version))
-    if version.value != _ABI:
-        raise H264Error("the built decoder reports ABI %d, expected %d"
-                        % (version.value, _ABI))
-    return lib
+    return _load(out)
 
 
 def _library():
@@ -185,6 +580,17 @@ def _library():
 def available():
     """True when this machine can decode H.264."""
     return _library() is not None
+
+
+def library_path():
+    """Which file the decoder was loaded from, or None if there is none.
+
+    A bundled library and one a compiler made thirty seconds ago behave
+    identically, which is exactly why a check that video works has to be
+    able to say which of the two answered.
+    """
+    lib = _library()
+    return getattr(lib, "_name", None) if lib is not None else None
 
 
 def unavailable_reason():
@@ -281,6 +687,7 @@ _STATUS = {
     -6: "the picture is larger than this decoder's fixed buffers",
     -7: "the SPS crops the picture away to nothing",
     -8: "the stream asks for more reference frames than this decoder keeps",
+    -9: "lossless coding (transform bypass), which x264 uses at --qp 0",
     -11: "a PPS arrived before any SPS",
     -12: "the PPS ran off the end of its own NAL unit",
     -13: "slice groups (FMO), which no browser stream uses",
@@ -295,7 +702,7 @@ _STATUS = {
     -33: "the NAL unit is larger than the decoder's buffer",
     -41: "a slice arrived before its SPS and PPS",
     -42: "pic_order_cnt_type 1, which no browser stream uses",
-    -43: "a B, SP or SI slice -- this decoder does I and P slices",
+    -43: "an SP or SI slice -- this decoder does I, P and B slices",
     -44: "the slice header ran off the end of its own NAL unit",
     -45: "the slice header gives an impossible quantiser",
     -46: "the slice starts past the end of the picture",
@@ -303,10 +710,12 @@ _STATUS = {
     -48: "an unknown cabac_init_idc",
     -49: "the slice gives an impossible reference list length",
     -50: "long-term references, which this decoder does not implement",
-    -51: "a P slice with no reference picture to predict from",
+    -51: "an inter slice with no reference picture to predict from",
     -52: "the slice reorders in a picture that is not in the buffer",
     -53: "the decoded picture buffer has no free slot",
     -54: "a partition points at a reference index with no picture behind it",
+    -55: "temporal direct prediction without direct_8x8_inference_flag",
+    -56: "a B slice coded with CAVLC, a combination this decoder refuses",
 }
 
 
@@ -420,6 +829,7 @@ class Decoder:
         self._length_size = 0
         self._headers = b""
         self._since_idr = []
+        self._poc = 0
         if extradata and extradata[:1] == b"\x01":
             self._headers, self._length_size = parameter_sets_from_avcc(
                 extradata)
@@ -434,6 +844,7 @@ class Decoder:
         global _owner
         with _LOCK:
             self._since_idr = []
+            self._poc = 0
             if _owner is self:
                 self._lib.h264_reset()
                 _owner = None
@@ -481,6 +892,20 @@ class Decoder:
             _owner = None
             raise
         self._since_idr.append(data)
+        poc = ctypes.c_int(0)
+        self._lib.h264_poc(ctypes.byref(poc))
+        self._poc = poc.value
+
+    @property
+    def poc(self):
+        """The picture order count of the last picture decoded.
+
+        A stream with B pictures hands them over out of order: this is the
+        key you sort on to get presentation order back. Zero before any
+        picture has been decoded, which is also an IDR's own count, so it
+        only means anything once you have decoded something.
+        """
+        return self._poc
 
     def decode(self, packet):
         """One access unit in, ``(width, height, rgba)`` out.
@@ -545,16 +970,53 @@ def probe(extradata=b""):
 
 
 __all__ = ["Decoder", "H264Error", "available", "unavailable_reason", "probe",
-           "annexb_from_avcc", "parameter_sets_from_avcc", "slice_types"]
+           "annexb_from_avcc", "parameter_sets_from_avcc", "slice_types",
+           "build_library", "prebuilt_name", "prebuilt_path", "library_path"]
+
+
+_USAGE = """usage: python3 -m feetbrowser.h264 [--name | --build PATH [--fc GFORTRAN] | FILE...]
+
+  --name          print the filename a prebuilt library must have
+  --build PATH    compile the decoder for shipping, into PATH
+  --fc GFORTRAN   which compiler --build should use
+  FILE...         decode a .264 stream and say what came out
+"""
+
+
+def _cli(argv):                                 # pragma: no cover
+    """The packaging's entry point, and a way to ask this module a question
+    without a browser in the way."""
+    if argv and argv[0] == "--help":
+        sys.stdout.write(_USAGE)
+        return 0
+    if argv and argv[0] == "--name":
+        print(prebuilt_name())
+        return 0
+    if argv and argv[0] == "--build":
+        rest = argv[1:]
+        if not rest:
+            sys.stderr.write(_USAGE)
+            return 2
+        out, fc = rest[0], None
+        if rest[1:2] == ["--fc"]:
+            fc = rest[2] if len(rest) > 2 else None
+        try:
+            build_library(out, fc, report=lambda line: print("    %s" % line))
+        except H264Error as exc:
+            sys.stderr.write("%s\n" % exc)
+            return 1
+        print(out)
+        return 0
+    if not available():
+        sys.stderr.write("no decoder: %s\n" % unavailable_reason())
+        return 1
+    for path in argv:
+        with open(path, "rb") as handle:
+            blob = handle.read()
+        w, h, planes = Decoder().decode_i420(blob)
+        print("%s: %dx%d, %d bytes of I420" % (path, w, h, len(planes)))
+    return 0
+
 
 if __name__ == "__main__":                      # pragma: no cover
-    # Decode a .264 or .mp4 named on the command line and say what came out.
-    # Not a test; a way to ask this module a question without a browser.
-    if available():
-        for path in sys.argv[1:]:
-            with open(path, "rb") as handle:
-                blob = handle.read()
-            w, h, planes = Decoder().decode_i420(blob)
-            print("%s: %dx%d, %d bytes of I420" % (path, w, h, len(planes)))
-    else:
-        print("no decoder: %s" % unavailable_reason())
+    sys.exit(_cli(sys.argv[1:]))

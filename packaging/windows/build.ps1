@@ -197,6 +197,88 @@ Get-ChildItem -Path $package -Recurse -Force -File |
 New-Item -ItemType Directory -Force -Path (Join-Path $stage 'toes') | Out-Null
 Copy-Item (Join-Path $RepoRoot 'toes\README.md') (Join-Path $stage 'toes') -Force
 
+# ---------------------------------------------------------------------------
+# The H.264 and AAC decoders.
+#
+# feetbrowser\h264.py and feetbrowser\aac.py compile fortran\ with gfortran
+# the first time a video or a soundtrack plays. That works from a checkout,
+# where a developer has a compiler; it cannot work here, where the user has
+# neither gfortran nor any reason to. Left alone the bundle installs, starts,
+# renders, and tells anyone who opens a video "[video: H.264: no gfortran on
+# PATH]" -- which no developer ever sees, because developers run from a
+# checkout.
+#
+# Both, in one step, because they are one decision: a bundle with the video
+# library and not the sound one plays pictures in silence, which is read as a
+# broken player rather than as a decoder that was never shipped.
+#
+# So they are compiled now, into the package, each under a name that is a hash
+# of the sources it was built from; fortran\ ships beside the package so the
+# loader can recompute those hashes and refuse anything that does not match.
+# The compiler is a build-machine tool exactly like cargo: nothing it produced
+# is a third-party library, the .dlls are our own Fortran, and the compiler's
+# runtime is no more third-party than libgcc is.
+#
+# Whether that runtime ends up inside the .dll or beside it is build_library's
+# decision and not this script's: it reads the finished file's import table,
+# picks the most static flag set that leaves nothing behind, and copies what
+# it could not link in next to the library. (MinGW's -static-libgfortran does
+# not cover libwinpthread; plain -static does, and is tried first.) Either way
+# nothing outside the package is needed, which is what verify-bundle.ps1
+# checks on a machine whose PATH has been cut back to Windows itself. What
+# actually happened is printed below, because "built with -static" and
+# "shipped libgfortran-5.dll beside it" are different bundles and a log that
+# does not distinguish them is a log that cannot explain the next failure.
+# ---------------------------------------------------------------------------
+Step "the H.264 and AAC decoders"
+Copy-Item -Recurse -Force -Path (Join-Path $RepoRoot 'fortran') -Destination $stage
+$stagedPython = Join-Path $stage 'python.exe'
+if (-not (Test-Path $stagedPython)) { Fail "no python.exe in the embeddable package" }
+# The gfortrans that exist on a Windows build machine, in the order worth
+# trying. The GitHub runner image has Strawberry Perl's MinGW; a developer is
+# more likely to have MSYS2. FEETBROWSER_GFORTRAN wins over both.
+$gfortran = $null
+foreach ($candidate in @(
+        $env:FEETBROWSER_GFORTRAN,
+        'gfortran',
+        'C:\msys64\mingw64\bin\gfortran.exe',
+        'C:\Strawberry\c\bin\gfortran.exe',
+        'C:\ProgramData\mingw64\mingw64\bin\gfortran.exe',
+        'C:\ProgramData\chocolatey\bin\gfortran.exe')) {
+    if (-not $candidate) { continue }
+    $found = Get-Command $candidate -ErrorAction SilentlyContinue
+    if ($found) { $gfortran = $found.Source; break }
+}
+if (-not $gfortran) {
+    Fail ("no gfortran found. Install MinGW-w64 (choco install mingw) or point`n" +
+          "      FEETBROWSER_GFORTRAN at one. A bundle without it ships a browser`n" +
+          "      that cannot play video, and says so only to the user.")
+}
+Write-Host "    gfortran: $gfortran"
+foreach ($decoder in @(
+        @{ Module = 'h264'; What = 'H.264' },
+        @{ Module = 'aac';  What = 'AAC'   })) {
+    $module = $decoder.Module
+    $name = (& $stagedPython -m "feetbrowser.$module" --name) | Select-Object -Last 1
+    if ($LASTEXITCODE -ne 0 -or -not $name) {
+        Fail "could not ask $module.py for the library name"
+    }
+    & $stagedPython -m "feetbrowser.$module" --build (Join-Path $package $name) --fc $gfortran
+    if ($LASTEXITCODE -ne 0) { Fail "gfortran could not build the $($decoder.What) decoder" }
+    Write-Host ("    {0}, {1:N0} KB" -f $name, ((Get-Item (Join-Path $package $name)).Length / 1KB))
+}
+# Any runtime DLL build_library could not link in went next to the two
+# libraries rather than inside them. Listed here because it is the difference
+# between the two bundles the comment above describes, and because the second
+# decoder built finds whatever the first one already copied and says nothing.
+$runtime = @(Get-ChildItem -Path $package -File -Filter '*.dll' |
+             Where-Object { $_.Name -notlike '_h264_*' -and $_.Name -notlike '_aac_*' })
+if ($runtime.Count -gt 0) {
+    Write-Host ("    beside them: " + (($runtime | ForEach-Object { $_.Name }) -join ', '))
+} else {
+    Write-Host "    nothing beside them: both are self-contained"
+}
+
 foreach ($doc in @('LICENSE', 'README.md')) {
     $src = Join-Path $RepoRoot $doc
     if (Test-Path $src) { Copy-Item $src $stage -Force }

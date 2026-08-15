@@ -49,7 +49,17 @@ C     8-bit by definition and say nothing.
          IF (CHFMT .EQ. 3) SEPCP = H2U1()
          BITDL = H2UE() + 8
          BITDC = H2UE() + 8
-         DUMMY = H2U1()
+C     qpprime_y_zero_transform_bypass_flag.  With it set, a macroblock at
+C     QP 0 skips the transform and the deblocking filter entirely and its
+C     residual is added to the prediction as it stands -- x264's lossless
+C     mode, which is what --qp 0 turns on.  Reading the flag and ignoring
+C     it does not produce a slightly wrong picture, it produces a wholly
+C     wrong one, because every coefficient goes through an inverse
+C     transform that was never applied.  Refuse instead.
+         IF (H2U1() .NE. 0) THEN
+            ST = -9
+            RETURN
+         END IF
          SLPRES = H2U1()
          IF (SLPRES .NE. 0) THEN
             N = 8
@@ -90,7 +100,7 @@ C     8-bit by definition and say nothing.
       FRMBO = H2U1()
       MBAFF = 0
       IF (FRMBO .EQ. 0) MBAFF = H2U1()
-      DUMMY = H2U1()
+      D8INF = H2U1()
       CRPL = 0
       CRPR = 0
       CRPT = 0
@@ -183,9 +193,9 @@ C     The picture parameter set.
       BFPOC = H2U1()
       NSG = H2UE()
       NRDEF = H2UE() + 1
-      DUMMY = H2UE()
+      NRDEF1 = H2UE() + 1
       WPRED = H2U1()
-      DUMMY = H2UN(2)
+      WBIDC = H2UN(2)
       PIQP = H2SE() + 26
       DUMMY = H2SE()
       CQPO = H2SE()
@@ -447,9 +457,9 @@ C     picture-level matrices at all sends most of them by omission.
       RETURN
       END
 
-C     7.3.3, the slice header, for I and P slices.
+C     7.3.3, the slice header, for I, P and B slices.
 C
-C     A B, SP or SI slice is rejected as soon as slice_type is known,
+C     An SP or SI slice is rejected as soon as slice_type is known,
 C     because everything after that point in the header is read
 C     conditionally on the slice type and a header parsed under the wrong
 C     assumption does not fail, it succeeds with the wrong numbers.
@@ -473,8 +483,21 @@ C     assumption does not fail, it succeeds with the wrong numbers.
 C     A slice_type of 5 or more says every slice of this picture has the
 C     same type; the type itself is the low five.
       IF (SLTYPE .GE. 5) SLTYPE = SLTYPE - 5
-      IF (SLTYPE .NE. 0 .AND. SLTYPE .NE. 2) THEN
+      IF (SLTYPE .NE. 0 .AND. SLTYPE .NE. 1 .AND. SLTYPE .NE. 2) THEN
          ST = -43
+         RETURN
+      END IF
+C     A B slice under CAVLC is refused rather than attempted.  The two
+C     were written for different halves of the syntax and their overlap
+C     is untested: CAVLC's mb_type table stops at the four P shapes,
+C     sub_mb_type at the four P sub-shapes rather than B's thirteen, and
+C     ref_idx is bounded by NREF0 with no list to select NREF1.  Every
+C     one of those reads the wrong number of bits rather than failing,
+C     so the whole slice would decode to plausible rubbish.  Baseline
+C     has no B slices and Main and High streams that use them use CABAC,
+C     so this refuses a combination that a browser does not meet.
+      IF (SLTYPE .EQ. 1 .AND. ECMODE .EQ. 0) THEN
+         ST = -56
          RETURN
       END IF
       DUMMY = H2UE()
@@ -499,18 +522,38 @@ C     0 or 2. Refusing is honest; guessing the field's presence is not.
       IF (RPCP .NE. 0) DUMMY = H2UE()
 
       NREF0 = 0
-      NRMOP = 0
-      IF (SLTYPE .EQ. 0) THEN
+      NREF1 = 0
+      NRMOP(1) = 0
+      NRMOP(2) = 0
+      DSMVP = 0
+      IF (SLTYPE .EQ. 1) DSMVP = H2U1()
+      IF (SLTYPE .EQ. 0 .OR. SLTYPE .EQ. 1) THEN
          NREF0 = NRDEF
-         IF (H2U1() .NE. 0) NREF0 = H2UE() + 1
-         CALL H2RPLM(ST)
+         IF (SLTYPE .EQ. 1) NREF1 = NRDEF1
+         IF (H2U1() .NE. 0) THEN
+            NREF0 = H2UE() + 1
+            IF (SLTYPE .EQ. 1) NREF1 = H2UE() + 1
+         END IF
+         CALL H2RPLM(1, ST)
          IF (ST .NE. 0) RETURN
-         IF (WPRED .NE. 0) THEN
+         IF (SLTYPE .EQ. 1) THEN
+            CALL H2RPLM(2, ST)
+            IF (ST .NE. 0) RETURN
+         END IF
+C     7.3.3: the explicit table is present for a P slice when
+C     weighted_pred_flag is set and for a B slice when
+C     weighted_bipred_idc is exactly 1.  Value 2 is the implicit mode,
+C     which carries no table at all and derives its weights per
+C     partition from picture order counts in 8.4.2.3.1.
+         IF ((SLTYPE .EQ. 0 .AND. WPRED .NE. 0) .OR.
+     +       (SLTYPE .EQ. 1 .AND. WBIDC .EQ. 1)) THEN
             CALL H2PWT(ST)
             IF (ST .NE. 0) RETURN
          ELSE
             CALL H2DWT
          END IF
+      ELSE
+         CALL H2DWT
       END IF
 
       CALL H2DRPM(NALR, ST)
@@ -558,8 +601,24 @@ C     the others, so the column is the idc plus one.
          ST = -47
          RETURN
       END IF
-      IF (SLTYPE .EQ. 0 .AND. (NREF0 .LT. 1 .OR. NREF0 .GT. 32)) THEN
+      IF (SLTYPE .NE. 2 .AND. (NREF0 .LT. 1 .OR. NREF0 .GT. 32)) THEN
          ST = -49
+         RETURN
+      END IF
+      IF (SLTYPE .EQ. 1 .AND. (NREF1 .LT. 1 .OR. NREF1 .GT. 32)) THEN
+         ST = -49
+         RETURN
+      END IF
+C     8.4.1.2.3 reads the colocated macroblock's motion at the corner of
+C     each 8x8, which is only the same thing as its per-4x4 motion when
+C     direct_8x8_inference_flag is set.  Every encoder that reaches a
+C     browser sets it -- x264 emits 1 unconditionally, and levels 3 and
+C     above require it -- so the zero case has no test vector we could
+C     hold ourselves to, and shipping an untested derivation in the
+C     fiddliest corner of the standard is worse than saying no.  Spatial
+C     direct does not care: its reference indices are macroblock-level.
+      IF (SLTYPE .EQ. 1 .AND. DSMVP .EQ. 0 .AND. D8INF .EQ. 0) THEN
+         ST = -55
          RETURN
       END IF
       RETURN
@@ -568,13 +627,13 @@ C     the others, so the column is the idc plus one.
 C     7.3.3.1, ref_pic_list_modification.  The commands are recorded and
 C     not obeyed: 8.2.4.3 runs them against a list that does not exist
 C     until the whole header has been read.
-      SUBROUTINE H2RPLM(ST)
+      SUBROUTINE H2RPLM(L, ST)
       IMPLICIT NONE
       INCLUDE 'h264com.inc'
-      INTEGER ST, IDC, N, H2U1, H2UE
+      INTEGER L, ST, IDC, N, H2U1, H2UE
       EXTERNAL H2U1, H2UE
       ST = 0
-      NRMOP = 0
+      NRMOP(L) = 0
       IF (H2U1() .EQ. 0) RETURN
       N = 0
    10 IDC = H2UE()
@@ -593,9 +652,9 @@ C     A long-term picture, which we never mark and therefore never have.
          ST = -50
          RETURN
       END IF
-      RMOP(N) = IDC
-      RMVAL(N) = H2UE() + 1
-      NRMOP = N
+      RMOP(N,L) = IDC
+      RMVAL(N,L) = H2UE() + 1
+      NRMOP(L) = N
       GOTO 10
       END
 
@@ -605,17 +664,19 @@ C     reference index the table skips means.
       SUBROUTINE H2DWT
       IMPLICIT NONE
       INCLUDE 'h264com.inc'
-      INTEGER I
+      INTEGER I, L
       LOGWL = 0
       LOGWC = 0
-      DO 10 I = 0, 31
-         WPL(I) = 1
-         WOL(I) = 0
-         WPCB(I) = 1
-         WOCB(I) = 0
-         WPCR(I) = 1
-         WOCR(I) = 0
-   10 CONTINUE
+      DO 20 L = 1, 2
+         DO 10 I = 0, 31
+            WPL(I,L) = 1
+            WOL(I,L) = 0
+            WPCB(I,L) = 1
+            WOCB(I,L) = 0
+            WPCR(I,L) = 1
+            WOCR(I,L) = 0
+   10    CONTINUE
+   20 CONTINUE
       RETURN
       END
 
@@ -626,8 +687,8 @@ C     of a stream that used it.
       SUBROUTINE H2PWT(ST)
       IMPLICIT NONE
       INCLUDE 'h264com.inc'
-      INTEGER ST, I, H2U1, H2UE, H2SE
-      EXTERNAL H2U1, H2UE, H2SE
+      INTEGER ST, I, L, H2UE
+      EXTERNAL H2UE
       ST = 0
       LOGWL = H2UE()
       LOGWC = H2UE()
@@ -635,28 +696,45 @@ C     of a stream that used it.
          ST = -50
          RETURN
       END IF
-      DO 10 I = 0, 31
-         WPL(I) = ISHFT(1, LOGWL)
-         WOL(I) = 0
-         WPCB(I) = ISHFT(1, LOGWC)
-         WOCB(I) = 0
-         WPCR(I) = ISHFT(1, LOGWC)
-         WOCR(I) = 0
-   10 CONTINUE
-      DO 20 I = 0, NREF0 - 1
+C     Every index the table does not mention keeps the neutral weight of
+C     Table 8-2, which at this denominator is 1 << log2_denom and not 1.
+      DO 20 L = 1, 2
+         DO 10 I = 0, 31
+            WPL(I,L) = ISHFT(1, LOGWL)
+            WOL(I,L) = 0
+            WPCB(I,L) = ISHFT(1, LOGWC)
+            WOCB(I,L) = 0
+            WPCR(I,L) = ISHFT(1, LOGWC)
+            WOCR(I,L) = 0
+   10    CONTINUE
+   20 CONTINUE
+      CALL H2PWTL(1, NREF0, ST)
+      IF (ST .NE. 0) RETURN
+      IF (SLTYPE .EQ. 1) CALL H2PWTL(2, NREF1, ST)
+      RETURN
+      END
+
+C     The body of 7.3.3.2, split out because a B slice runs it twice.
+      SUBROUTINE H2PWTL(L, NL, ST)
+      IMPLICIT NONE
+      INCLUDE 'h264com.inc'
+      INTEGER L, NL, ST, I, H2U1, H2SE
+      EXTERNAL H2U1, H2SE
+      ST = 0
+      DO 20 I = 0, NL - 1
          IF (I .GT. 31 .OR. BITERR .NE. 0) THEN
             ST = -50
             RETURN
          END IF
          IF (H2U1() .NE. 0) THEN
-            WPL(I) = H2SE()
-            WOL(I) = H2SE()
+            WPL(I,L) = H2SE()
+            WOL(I,L) = H2SE()
          END IF
          IF (H2U1() .NE. 0) THEN
-            WPCB(I) = H2SE()
-            WOCB(I) = H2SE()
-            WPCR(I) = H2SE()
-            WOCR(I) = H2SE()
+            WPCB(I,L) = H2SE()
+            WOCB(I,L) = H2SE()
+            WPCR(I,L) = H2SE()
+            WOCR(I,L) = H2SE()
          END IF
    20 CONTINUE
       RETURN

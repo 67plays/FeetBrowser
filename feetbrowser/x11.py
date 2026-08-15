@@ -34,6 +34,7 @@ import ctypes.util
 import os
 import time
 
+from . import asmx11
 from .window import (QUIET, STATE_ALT, STATE_CONTROL, STATE_SHIFT, Event,
                      Window, key_sequences)
 
@@ -290,6 +291,12 @@ WHEEL_STEP = 20
 # `libX11.so` is in the -dev package and is missing on most installed systems.
 SONAMES = ("libX11.so.6", "libX11.so", "libX11.6.dylib", "libX11.dylib")
 
+# How hard to try to connect before deciding there is nothing to connect to:
+# six attempts with the wait doubling from 10 ms, so 0.31 s in all. See
+# `_connect` for why a refusal is worth doubting and why the budget is small.
+_CONNECT_ATTEMPTS = 6
+_CONNECT_PAUSE = 0.01
+
 # Tk cursor names -> the standard X cursor font shapes.
 CURSORS = {
     "": 68,             # XC_left_ptr
@@ -488,24 +495,18 @@ def _pack_generic(pixels, width, height, stride, fmt, line):
     """The slow path: any TrueColor layout at all, a pixel at a time.
 
     Depth 15 and 16 are what this is for, and on anything made this century
-    nothing reaches it. Written for correctness rather than speed accordingly
-    -- a window on such a server works, and feels like it is working hard.
+    nothing reaches it. The packing loop itself is a raw-assembly kernel on
+    Linux/x86-64 (``asmx11``) and a byte-identical Python loop elsewhere;
+    either way a window on such a server works, and feels like it is working
+    hard.
     """
     pixel_bytes = (fmt.bits_per_pixel + 7) // 8
-    red = channel_table(fmt.red_mask)
-    green = channel_table(fmt.green_mask)
-    blue = channel_table(fmt.blue_mask)
-    order = "little" if fmt.byte_order == LSB_FIRST else "big"
     out = bytearray(line * height)
-    for row in range(height):
-        src = row * stride
-        dst = row * line
-        for _column in range(width):
-            value = (red[pixels[src]] | green[pixels[src + 1]]
-                     | blue[pixels[src + 2]])
-            out[dst:dst + pixel_bytes] = value.to_bytes(pixel_bytes, order)
-            src += 3
-            dst += pixel_bytes
+    asmx11.pack_rows(pixels, out, width, height, stride, line,
+                     channel_table(fmt.red_mask),
+                     channel_table(fmt.green_mask),
+                     channel_table(fmt.blue_mask),
+                     pixel_bytes, fmt.byte_order != LSB_FIRST)
     return out
 
 
@@ -631,7 +632,10 @@ def _load():
     problem = None
     for name in names:
         try:
-            _libs["x11"] = ctypes.CDLL(name)
+            # use_errno so a failed connection can say *why* it failed:
+            # ctypes swaps the thread's errno around each call, and without
+            # this the value read afterwards is whatever ctypes did last.
+            _libs["x11"] = ctypes.CDLL(name, use_errno=True)
             break
         except OSError as exc:
             problem = exc
@@ -730,6 +734,81 @@ def _on_x_error(_display, error):
     return 0
 
 
+def _display_socket(name):
+    """The unix socket a display name refers to, or "" if it names none.
+
+    ``:99`` and ``unix:99.0`` are the server on this machine; ``host:0`` and
+    anything with a transport in front of it are not, and this says nothing
+    about those rather than inventing a path they would never use.
+    """
+    head, _, rest = name.partition(":")
+    if not rest or head not in ("", "unix"):
+        return ""
+    number = rest.split(".")[0]
+    if not number.isdigit():
+        return ""
+    return "/tmp/.X11-unix/X%s" % number
+
+
+def _connect(attempts=_CONNECT_ATTEMPTS, pause=_CONNECT_PAUSE):
+    """Open a connection, allowing for a server that refuses one for a moment.
+
+    XOpenDisplay returning NULL does not mean there is no server. It also
+    covers a server that has one, briefly: a connection arriving while the
+    listening socket's backlog is full, or during the moment a server that has
+    just been started is not yet answering. tests/test_x11.py opens and closes
+    about thirty connections a second against one Xvfb, and CI has seen a
+    single one of them fail in the middle of a run whose connections either
+    side of it were fine -- a server that was demonstrably up.
+
+    So try again for a third of a second before believing it. The waiting is
+    doubled each time rather than spread evenly because a refusal that clears
+    at all clears in milliseconds, and because the cost of this loop is paid in
+    full on a machine that really has no server -- a container with DISPLAY
+    exported into it, which falls back to a headless root and should not spend
+    a second finding that out.
+
+    Returns ``(display, errno, waited)``; ``display`` is None if every attempt
+    failed, and ``errno`` is from the last of them.
+    """
+    x11 = _libs["x11"]
+    err, waited = 0, 0.0
+    for attempt in range(attempts):
+        ctypes.set_errno(0)
+        display = x11.XOpenDisplay(None)
+        if display:
+            return display, 0, waited
+        err = ctypes.get_errno()
+        if attempt + 1 < attempts:
+            time.sleep(pause)
+            waited += pause
+            pause *= 2
+    return None, err, waited
+
+
+def _unreachable(name, err, waited):
+    """Why the connection failed, in as much detail as we actually have.
+
+    The bare "cannot reach the X server at :99" that this replaces is true of
+    a server that is absent, one that is present and refused us, and one that
+    threw us out over authorisation, and those want three different fixes. The
+    next failure will be on a runner nobody can log into, so it has to say
+    which it was on its own.
+    """
+    parts = ["cannot reach the X server at %s" % name]
+    if waited:
+        parts.append("after retrying for %.2f s" % waited)
+    socket = _display_socket(name)
+    if socket:
+        there = "" if os.path.exists(socket) else " not"
+        parts.append("%s does%s exist" % (socket, there))
+    if err > 0:
+        parts.append("last error: %s" % os.strerror(err))
+    if os.environ.get("XAUTHORITY"):
+        parts.append("XAUTHORITY=%s" % os.environ["XAUTHORITY"])
+    return X11Unavailable("; ".join(parts))
+
+
 def _open_display():
     """Connect to the X server and describe it. Idempotent.
 
@@ -743,10 +822,9 @@ def _open_display():
     if not os.environ.get("DISPLAY"):
         raise X11Unavailable(
             "$DISPLAY is not set, so there is no X server to draw on")
-    display = x11.XOpenDisplay(None)
+    display, err, waited = _connect()
     if not display:
-        raise X11Unavailable("cannot reach the X server at %s"
-                             % os.environ["DISPLAY"])
+        raise _unreachable(os.environ["DISPLAY"], err, waited)
     # Installed before anything is asked of the server, because the first
     # error is as fatal as any other with the default handler in place.
     handler = ERROR_HANDLER(_on_x_error)

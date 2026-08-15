@@ -400,12 +400,11 @@ def test_fill_rect_alpha_blends_halfway():
 
 def test_fill_rect_alpha_lands_in_the_right_rows_and_nowhere_else():
     """This is what is left of the span-kernel test after the fill moved to
-    Rust. The row-at-a-time asmblend path is gone -- the Rust fill covers the
+    Rust. The row-at-a-time assembly path is gone -- the Rust fill covers the
     whole rectangle in one crossing instead of one per row -- so what is worth
     checking is the same thing that test checked underneath the plumbing: the
     blend is exact, it covers every pixel of the rectangle, and it touches
-    nothing outside it. The kernels themselves are still exercised, directly
-    against their Python references, in tests/test_asmblend.py.
+    nothing outside it.
 
     Note the arithmetic: `// 255`, as the translate tables did. The assembly
     rounded by `>> 8`, which is one level darker at the top of the range.
@@ -2350,7 +2349,15 @@ def test_probe_reports_mp4_and_webm_without_pretending_to_decode_them():
     assert info.codec == "V_VP9"
     assert not info.supported
 
-    for payload in (b"", b"not a video at all", b"RIFF\x04\x00\x00\x00WAVE"):
+    # A WAV is a container we now read, so it is recognised and comes back
+    # unsupported rather than raising: it is sound with no picture in it, and
+    # `<video src="x.wav">` deserves to be told that rather than "not a media
+    # container". `probe_audio` is the one with the answer for it.
+    info = mediacodec.probe(b"RIFF\x04\x00\x00\x00WAVE")
+    assert info.container == "WAV"
+    assert not info.supported and "no picture" in info.reason
+
+    for payload in (b"", b"not a video at all", b"RIFF\x04\x00\x00\x00AVI "):
         try:
             mediacodec.probe(payload)
         except mediacodec.MediaError:
@@ -2604,6 +2611,418 @@ def test_a_broken_jpeg_frame_fails_rather_than_painting_noise():
         except mediacodec.MediaError:
             continue
         raise AssertionError("open_video accepted %r" % payload)
+
+
+# -- audio: demuxing sound out of MP4 and MOV -------------------------------
+#
+# None of these need a working AAC decoder, and that is deliberate: the
+# decoder is Fortran and a machine without gfortran must still be able to
+# prove that the demuxer finds the right bytes. So they check offsets,
+# timestamps, the AudioSpecificConfig, the sample rate and the channel count
+# -- everything the container knows -- and the one test that exercises
+# `AudioTrack.frame()` hands it a decoder written here.
+
+# AAC-LC, 44100 Hz, stereo, spelled out: five bits of object type (2), four
+# of sampling frequency index (4), four of channel configuration (2), and
+# three of frame length and extension flags, all zero.
+_ASC_44100_STEREO = b"\x12\x10"
+
+
+def _aac_packets(count=4):
+    """Packet payloads of distinct lengths, so an offset bug cannot land on
+    the right bytes by accident."""
+    return [bytes([0x21 + i]) * (7 + i * 3) for i in range(count)]
+
+
+def _parse_soun(data):
+    """The one `soun` track of an MP4, straight out of the demuxer's own
+    parser -- which is where the sample entry and the `esds` are read."""
+    _duration, tracks = mediacodec._parse_mp4(data)
+    for track in tracks:
+        if track.handler == "soun":
+            return track
+    raise AssertionError("no sound track in this fixture")
+
+
+def test_an_mp4_audio_track_demuxes_to_offsets_times_and_a_config():
+    packets = _aac_packets(4)
+    # A short final frame: real encoders write one, and a demuxer that
+    # divides a duration by a frame count never notices.
+    data = media_fixtures.mp4_audio(packets, durations=[1024, 1024, 1024, 512])
+    assert mediacodec.sniff(data) == "MP4"
+
+    track = _parse_soun(data)
+    assert track.codec == "mp4a"
+    assert track.channels == 2
+    assert abs(track.sample_rate - 44100.0) < 1e-9
+    assert track.sample_size == 16
+    assert track.object_type == 0x40
+    assert track.extradata == _ASC_44100_STEREO
+
+    samples = mediacodec._mp4_samples(track)
+    assert len(samples) == 4
+    base = data.index(b"mdat") + 4
+    running = base
+    for i, payload in enumerate(packets):
+        offset, length, _key = samples[i]
+        assert (offset, length) == (running, len(payload))
+        assert data[offset:offset + length] == payload
+        running += len(payload)
+
+    times = mediacodec._mp4_times(track, len(samples))
+    assert abs(times[0][0]) < 1e-9
+    assert abs(times[2][0] - 2048 / 44100.0) < 1e-9
+    assert abs(times[3][1] - 512 / 44100.0) < 1e-9
+
+    info = mediacodec.probe_audio(data)
+    assert info.container == "MP4" and info.codec == "mp4a"
+    assert (info.sample_rate, info.channels) == (44100, 2)
+    assert info.frame_count == 4
+    assert abs(info.duration - 3584 / 44100.0) < 1e-6
+    # Whether this machine has a decoder is not this test's business; that it
+    # says one thing or the other, with a sentence when it says no, is.
+    assert info.supported or info.reason
+
+
+def test_a_quicktime_sound_entry_is_read_in_all_three_of_its_versions():
+    """Versions 1 and 2 append fields before the child boxes -- sixteen bytes
+    and thirty-six -- and version 2 puts the real sample rate in a float64.
+    A parser that does not know that looks for `esds` inside a number."""
+    packets = _aac_packets(2)
+    plain = _parse_soun(media_fixtures.mp4_audio(packets))
+    assert plain.extradata == _ASC_44100_STEREO
+
+    old = _parse_soun(media_fixtures.mp4_audio(packets, entry_version=1))
+    assert old.extradata == _ASC_44100_STEREO
+    assert old.channels == 2 and abs(old.sample_rate - 44100.0) < 1e-9
+
+    new = _parse_soun(media_fixtures.mp4_audio(packets, entry_version=2,
+                                               sample_rate=48000))
+    assert new.extradata == _ASC_44100_STEREO
+    assert new.channels == 2 and abs(new.sample_rate - 48000.0) < 1e-9
+
+    # QuickTime hides the same `esds` one box deeper, inside `wave`.
+    wrapped = _parse_soun(media_fixtures.mp4_audio(packets, in_wave=True))
+    assert wrapped.extradata == _ASC_44100_STEREO
+
+    # And the descriptor lengths have four legal spellings; the four-byte one
+    # is what QuickTime writes.
+    longhand = _parse_soun(media_fixtures.mp4_audio(packets,
+                                                    long_lengths=True))
+    assert longhand.extradata == _ASC_44100_STEREO
+
+
+def test_a_file_with_both_tracks_keeps_the_two_sample_tables_apart():
+    """The bug this catches is reading the audio track's samples out of the
+    video track's chunk offsets, which produces a file that plays and a
+    sound that is someone else's bytes."""
+    frames = _mjpeg_frames(3)
+    packets = _aac_packets(2)
+    data = media_fixtures.mov(frames, 16, 12, codec="jpeg",
+                              audio={"packets": packets})
+    video = mediacodec.open_video(data)
+    assert video.frame_count == 3
+    assert _rgba_at(video.frame(2), 0, 0)[0] == 40      # frame index in red
+
+    track = _parse_soun(data)
+    samples = mediacodec._mp4_samples(track)
+    assert len(samples) == 2
+    for i, payload in enumerate(packets):
+        offset, length, _key = samples[i]
+        assert data[offset:offset + length] == payload
+    info = mediacodec.probe_audio(data)
+    assert info.container == "MOV" and info.frame_count == 2
+    assert (info.sample_rate, info.channels) == (44100, 2)
+
+
+def test_probe_audio_names_the_codecs_it_will_not_decode():
+    packets = _aac_packets(2)
+    ac3 = mediacodec.probe_audio(
+        media_fixtures.mp4_audio(packets, codec="ac-3", asc=None))
+    assert ac3.codec == "ac-3" and not ac3.supported
+    assert "Dolby" in ac3.reason
+
+    # An MP3 inside an `mp4a` sample entry is legal, and calling it AAC
+    # because of the fourcc is exactly the mistake the object type exists
+    # to prevent.
+    mp3 = mediacodec.probe_audio(
+        media_fixtures.mp4_audio(packets, object_type=0x69))
+    assert mp3.codec == "mp4a" and not mp3.supported
+    assert "MP3" in mp3.reason
+
+    avi = mediacodec.probe_audio(
+        media_fixtures.avi([b"\x00" * 8], 4, 2,
+                           audio={"format_tag": 0x00FF, "channels": 2,
+                                  "sample_rate": 48000, "length": 480}))
+    assert avi.container == "AVI" and avi.codec == "AAC"
+    assert (avi.sample_rate, avi.channels) == (48000, 2)
+    assert not avi.supported and "AVI" in avi.reason
+
+    mp3_avi = mediacodec.probe_audio(
+        media_fixtures.avi([b"\x00" * 8], 4, 2,
+                           audio={"format_tag": 0x0055}))
+    assert mp3_avi.codec == "MP3" and not mp3_avi.supported
+
+    webm = mediacodec.probe_audio(
+        media_fixtures.webm(640, 360, 2.5, audio_codec="A_OPUS"))
+    assert webm.container == "WebM" and webm.codec == "Opus"
+    assert abs(webm.duration - 2.5) < 0.01
+    assert not webm.supported and "WebM" in webm.reason
+
+
+def test_a_file_with_no_sound_in_it_says_so_rather_than_guessing():
+    silent = media_fixtures.mp4(1280, 720, 4.5)
+    info = mediacodec.probe_audio(silent)
+    assert info.container == "MP4" and not info.supported
+    assert "no audio track" in info.reason
+    try:
+        mediacodec.open_audio(silent)
+    except mediacodec.MediaError as exc:
+        assert "no audio track" in str(exc)
+    else:
+        raise AssertionError("open_audio invented an audio track")
+
+    # A bare MJPEG stream is pictures and nothing else.
+    stream = b"".join(_mjpeg_frames(2))
+    assert not mediacodec.probe_audio(stream).supported
+
+    for payload in (b"", b"not a video at all", b"RIFF\x04\x00\x00\x00WAVE"):
+        try:
+            mediacodec.probe_audio(payload)
+        except mediacodec.MediaError:
+            continue
+        raise AssertionError("probe_audio accepted %r" % payload)
+
+
+def test_a_truncated_or_lying_sound_entry_never_takes_the_picture_with_it():
+    """A stranger's `esds` is not a reason to refuse to describe the video
+    track next to it, and no length in it may hang the parse."""
+    data = media_fixtures.mov(_mjpeg_frames(2), 16, 12, codec="jpeg",
+                              audio={"packets": _aac_packets(2)})
+    for cut in range(len(data) - 200, len(data)):
+        start = time.monotonic()
+        try:
+            mediacodec.probe(data[:cut])
+            mediacodec.probe_audio(data[:cut])
+        except mediacodec.MediaError:
+            pass
+        assert time.monotonic() - start < 5.0, \
+            "parsing a %d-byte cut hung" % cut
+
+    # A descriptor length that says "another byte follows" forever, and one
+    # that claims more than the box holds. Both are files, not hangs.
+    esds_at = data.index(b"esds")
+    for patch in (b"\x80" * 8, b"\xff\xff\xff\xff\xff\xff\xff\xff"):
+        broken = bytearray(data)
+        broken[esds_at + 4:esds_at + 4 + len(patch)] = patch
+        start = time.monotonic()
+        try:
+            info = mediacodec.probe_audio(bytes(broken))
+            assert info.container == "MOV"
+        except mediacodec.MediaError:
+            pass
+        assert time.monotonic() - start < 5.0
+        # And the video track is still described, whatever the sound did.
+        assert mediacodec.probe(bytes(broken)).width == 16
+
+
+class _StubAacDecoder:
+    """Stands in for the Fortran decoder, so the track's own logic -- replay,
+    reset, timing -- can be tested on a machine with no compiler.
+
+    It behaves the way a real AAC decoder does in the one respect that
+    matters here: it is stateful, and it says so, by numbering the samples it
+    emits with how many frames it has seen since the last reset.
+    """
+
+    def __init__(self, channels=2, frame_length=4):
+        self.channels = channels
+        self.frame_length = frame_length
+        self.sample_rate = 44100
+        self.seen = []
+        self.resets = 0
+
+    def reset(self):
+        self.resets += 1
+        self.seen = []
+
+    def decode(self, packet):
+        self.seen.append(packet)
+        count = self.frame_length * self.channels
+        block = struct.pack("<%df" % count, *([float(len(self.seen))] * count))
+        return self.frame_length, self.channels, block
+
+
+def _stub_track(count=5):
+    data = b"".join(bytes([0x41 + i]) * 4 for i in range(count))
+    packets = [(i * 4, 4, True) for i in range(count)]
+    times = [(i * 1024 / 44100.0, 1024 / 44100.0) for i in range(count)]
+    info = mediacodec.AudioInfo("MP4", "mp4a", 44100, 2,
+                                count * 1024 / 44100.0, count, True, "")
+    codec = _StubAacDecoder()
+    return codec, mediacodec.AudioTrack(data, info, packets, codec,
+                                        times=times, asc=_ASC_44100_STEREO)
+
+
+def test_an_audio_frame_carries_its_time_its_shape_and_its_samples():
+    codec, track = _stub_track()
+    assert (track.sample_rate, track.channels) == (44100, 2)
+    assert track.sample_count == 5 and track.container == "MP4"
+    assert track.codec_name == "mp4a" and track.asc == _ASC_44100_STEREO
+    assert track.packet(1) == b"BBBB"
+
+    frame = track.frame(0)
+    assert isinstance(frame, mediacodec.AudioFrame)
+    assert frame.index == 0 and frame.channels == 2
+    assert frame.sample_count == 4              # per channel, not in bytes
+    assert len(frame.samples) == 4 * 2 * 4      # floats, interleaved
+    assert abs(frame.pts) < 1e-9
+    assert abs(frame.duration - 1024 / 44100.0) < 1e-9
+    assert abs(frame.end - frame.duration) < 1e-9
+    assert "AudioFrame" in repr(frame)
+    assert struct.unpack("<f", frame.samples[:4])[0] == 1.0
+
+    assert abs(track.frame_time(2) - 2048 / 44100.0) < 1e-9
+    assert track.index_at(0.0) == 0
+    assert track.index_at(2049 / 44100.0) == 2
+    assert track.index_at(1000.0) == 4
+    for index in (-1, 5):
+        try:
+            track.packet(index)
+        except mediacodec.MediaError:
+            continue
+        raise AssertionError("packet(%d) came back" % index)
+    assert codec.resets == 0                    # nothing seeked, nothing reset
+
+
+def test_audio_decoding_replays_from_the_start_because_there_is_no_keyframe():
+    """AAC has no keyframe, but the decoder carries the previous frame's
+    overlap, so an out-of-order request has to start again from frame zero.
+    Sequential playback must not pay that price."""
+    codec, track = _stub_track()
+    for index in range(5):
+        frame = track.frame(index)
+        assert frame.index == index
+    assert codec.resets == 0
+    assert len(codec.seen) == 5, "sequential playback decoded twice"
+
+    # Backwards: reset, then replay everything up to the frame asked for.
+    frame = track.frame(1)
+    assert codec.resets == 1
+    assert len(codec.seen) == 2
+    # The stub numbers its output with frames-since-reset, so this is proof
+    # the replay actually happened rather than the cursor being moved.
+    assert struct.unpack("<f", frame.samples[:4])[0] == 2.0
+
+    track.reset()
+    assert codec.resets == 2
+    assert track.frame(3).index == 3
+    assert len(codec.seen) == 4
+
+    try:
+        track.frame(5)
+    except mediacodec.MediaError:
+        pass
+    else:
+        raise AssertionError("decoded a frame that is not in the file")
+
+
+class _StubAacModule:
+    """A stand-in for `feetbrowser.aac`, installed for the length of one test.
+
+    The real decoder is Fortran and its own suite tests it. What is tested
+    here is the seam: that `open_audio` hands the AudioSpecificConfig over,
+    wraps the decoder's exception type in a `MediaError` with the codec named
+    once, and believes the decoder over the container about the sample rate.
+    """
+
+    class AacError(Exception):
+        pass
+
+    def __init__(self, reason=None, refuse=None, raises=False,
+                 sample_rate=44100, channels=2):
+        self._reason = reason
+        self._refuse = refuse
+        self._raises = raises
+        self.sample_rate = sample_rate
+        self.channels = channels
+        self.asc = None
+        module = self
+
+        class Decoder(_StubAacDecoder):
+            def __init__(self, asc):
+                _StubAacDecoder.__init__(self, module.channels)
+                module.asc = asc
+                if module._raises:
+                    raise module.AacError("this config is not AAC-LC")
+                self.sample_rate = module.sample_rate
+
+        self.Decoder = Decoder
+
+    def available(self):
+        return self._reason is None
+
+    def unavailable_reason(self):
+        return self._reason
+
+    def probe(self, asc):
+        return self._refuse
+
+
+def _with_stub_aac(module, run):
+    import feetbrowser
+    key = "feetbrowser.aac"
+    had_module = sys.modules.get(key)
+    had_attribute = getattr(feetbrowser, "aac", None)
+    sys.modules[key] = module
+    feetbrowser.aac = module
+    try:
+        return run()
+    finally:
+        if had_module is None:
+            sys.modules.pop(key, None)
+        else:
+            sys.modules[key] = had_module
+        if had_attribute is None:
+            if hasattr(feetbrowser, "aac"):
+                delattr(feetbrowser, "aac")
+        else:
+            feetbrowser.aac = had_attribute
+
+
+def test_open_audio_hands_the_config_over_and_names_the_codec_when_it_fails():
+    data = media_fixtures.mp4_audio(_aac_packets(3),
+                                    durations=[1024, 1024, 512])
+
+    stub = _StubAacModule(sample_rate=22050)
+    track = _with_stub_aac(stub, lambda: mediacodec.open_audio(data))
+    assert stub.asc == _ASC_44100_STEREO, "the ASC never reached the decoder"
+    assert track.sample_count == 3 and track.container == "MP4"
+    # HE-AAC codes at half the rate the sample entry declares, so where the
+    # config and the container disagree the config wins.
+    assert track.sample_rate == 22050 and track.info.sample_rate == 22050
+    frame = track.frame(2)
+    assert frame.channels == 2 and frame.sample_count == 4
+    assert abs(frame.duration - 512 / 44100.0) < 1e-9
+    assert track.info.supported
+
+    for stub, expected in ((_StubAacModule(reason="no gfortran"), "gfortran"),
+                           (_StubAacModule(refuse="AAC: SBR is not decoded"),
+                            "SBR"),
+                           (_StubAacModule(raises=True), "AAC-LC")):
+        info = _with_stub_aac(stub, lambda: mediacodec.probe_audio(data))
+        assert not info.supported
+        assert info.reason.startswith("AAC: ") and expected in info.reason
+        # The container's numbers survive a missing decoder: that is the
+        # whole point of reporting them separately from the ability to play.
+        assert (info.sample_rate, info.channels) == (44100, 2)
+        assert info.frame_count == 3
+        try:
+            _with_stub_aac(stub, lambda: mediacodec.open_audio(data))
+        except mediacodec.MediaError as exc:
+            assert str(exc).startswith("AAC: ")
+        else:
+            raise AssertionError("open_audio decoded %r" % expected)
 
 
 # -- video: scheduling against a clock we control ---------------------------

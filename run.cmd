@@ -20,7 +20,7 @@ if errorlevel 1 (
 rem Already importable, because someone installed it into this Python? Run.
 python -c "import feetbrowser_engine" >nul 2>&1
 if not errorlevel 1 (
-  call :warmh264 python
+  call :warmfortran python
   python -m feetbrowser %*
   exit /b %errorlevel%
 )
@@ -61,21 +61,22 @@ echo.
 echo FeetBrowser: engine built. Starting.
 
 :run
-call :warmh264 ".venv\Scripts\python.exe"
+call :warmfortran ".venv\Scripts\python.exe"
 ".venv\Scripts\python.exe" -m feetbrowser %*
 exit /b %errorlevel%
 
-rem The H.264 decoder is Fortran (see fortran\ and feetbrowser\h264.py), built
-rem on demand by gfortran into a cache keyed on the sources. Building it here
-rem rather than on the first <video> costs a second or two once per checkout
-rem and saves a stall in the middle of a page. Everything about it is
-rem optional: no gfortran, or a build that fails, means the browser reports
-rem H.264 as a codec it does not have, which is what it did before this
-rem existed. So nothing here is allowed to change the exit status.
-:warmh264
+rem The H.264 and AAC decoders are Fortran (see fortran\, feetbrowser\h264.py
+rem and feetbrowser\aac.py), built on demand by gfortran into a cache keyed on
+rem the sources. Building them here rather than on the first <video> costs a
+rem second or two once per checkout and saves a stall in the middle of a page.
+rem Everything about it is optional: no gfortran, or a build that fails, means
+rem the browser reports H.264 and AAC as codecs it does not have, which is
+rem what it did before this existed. So nothing here is allowed to change the
+rem exit status.
+:warmfortran
 where /q gfortran
 if errorlevel 1 goto :eof
-%1 -c "from feetbrowser import h264; h264.available()" >nul 2>&1
+%1 -c "import feetbrowser.h264 as v, feetbrowser.aac as a; v.available(); a.available()" >nul 2>&1
 goto :eof
 
 rem The two failures worth explaining, both written to stderr by redirecting
