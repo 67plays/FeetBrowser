@@ -11,3 +11,12 @@
 *.mp4 binary
 *.aac binary
 *.f32.z binary
+
+# And the PCM vectors, for the same reason twice over: a container whose
+# byte offsets moved is not a container, and the whole point of the source
+# waveform beside them is that it is compared sample for sample.
+*.mov binary
+*.avi binary
+*.wav binary
+*.s16le.z binary
+*.u8.z binary

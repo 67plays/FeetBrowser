@@ -122,6 +122,14 @@ jobs:
       - name: AAC decoder
         run: $PY tests/test_aac.py
 
+      # Uncompressed sound in MP4/MOV, AVI and WAV. Unlike AAC this is exact
+      # everywhere -- there is no transform in it to round differently on a
+      # different compiler -- so a disagreement between the three operating
+      # systems here would be a byte-order bug in the reader, which is the
+      # one thing about PCM worth running on three machines to catch.
+      - name: PCM audio
+        run: $PY tests/test_pcm.py
+
       # The check this whole file was rebuilt for. A page with text, a PNG,
       # a GIF, a background and a border is fetched from a local server and
       # rendered, and then the pixels are counted: an image that stops
