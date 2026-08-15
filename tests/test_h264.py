@@ -413,6 +413,265 @@ def test_a_machine_without_gfortran_still_has_a_browser():
         h264._loaded, h264._lib, h264._load_error = saved
 
 
+# -- the shipping checks -----------------------------------------------------
+#
+# None of these can run on the platform that breaks: the Windows bundle is
+# built by CI and the failure they exist to stop -- a decoder that loads on the
+# build machine and not on the user's -- shows up two jobs later as "could not
+# find module (or one of its dependencies)". So the PE reader is fed files
+# made here, byte by byte, with the answer known in advance, and the flag
+# selection is driven with a compiler that is a shell script.
+
+
+def _fake_pe(names, magic=0x20B):
+    """A PE file with `names` in its import table and nothing else in it."""
+    import struct
+
+    # The descriptor array, a null descriptor to end it, then the name
+    # strings, all inside one section mapped at RVA 0x1000.
+    table = 20 * (len(names) + 1)
+    descriptors, strings = b"", b""
+    for name in names:
+        descriptors += struct.pack("<IIIII", 0, 0, 0,
+                                   0x1000 + table + len(strings), 0)
+        strings += name.encode("ascii") + b"\0"
+    blob = descriptors + b"\0" * 20 + strings
+
+    # PE32 puts the data directories sixteen bytes earlier than PE32+ does,
+    # NumberOfRvaAndSizes being the field immediately before them.
+    dirs_at = 96 if magic == 0x10B else 112
+    optional = struct.pack("<H", magic) + b"\0" * (dirs_at - 6)
+    optional += struct.pack("<I", 16)                    # NumberOfRvaAndSizes
+    dirs = [(0, 0)] * 16
+    dirs[1] = (0x1000, len(blob))
+    optional += b"".join(struct.pack("<II", rva, size) for rva, size in dirs)
+
+    coff = struct.pack("<HHIIIHH", 0x8664, 1, 0, 0, 0, len(optional), 0x2022)
+    section = struct.pack("<8sIIIIIIHHI", b".rdata", len(blob), 0x1000,
+                          (len(blob) + 511) // 512 * 512, 0x400,
+                          0, 0, 0, 0, 0x40000040)
+    head = b"PE\0\0" + coff + optional + section
+
+    out = bytearray(0x400 + (len(blob) + 511) // 512 * 512)
+    out[0:2] = b"MZ"
+    out[0x3C:0x40] = struct.pack("<I", 0x80)
+    out[0x80:0x80 + len(head)] = head
+    out[0x400:0x400 + len(blob)] = blob
+    return bytes(out)
+
+
+def _write(tmp, data):
+    path = os.path.join(tmp, "fake.dll")
+    with open(path, "wb") as handle:
+        handle.write(data)
+    return path
+
+
+def test_the_pe_reader_names_every_dll_a_library_depends_on():
+    """The reader, against files whose import table this test wrote."""
+    import tempfile
+
+    wanted = ["KERNEL32.dll", "libgfortran-5.dll", "libwinpthread-1.dll",
+              "api-ms-win-crt-runtime-l1-1-0.dll"]
+    with tempfile.TemporaryDirectory() as tmp:
+        got = h264._pe_imports(_write(tmp, _fake_pe(wanted)))
+        assert got == wanted, got
+        # PE32 as well as PE32+: the data directories sit sixteen bytes
+        # earlier and everything found above would be found in the wrong
+        # place if that offset were wrong.
+        got = h264._pe_imports(_write(tmp, _fake_pe(wanted, magic=0x10B)))
+        assert got == wanted, got
+        # A library that imports nothing is not an error.
+        assert h264._pe_imports(_write(tmp, _fake_pe([]))) == []
+    print("  ok  PE import table read, PE32 and PE32+")
+
+
+def test_the_pe_reader_refuses_what_it_cannot_read():
+    """Negative controls. A reader that answers "no dependencies" for a file
+    it did not understand is worse than one that raises: the whole point of
+    the check is that an empty answer means the library is self-contained."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        good = _fake_pe(["KERNEL32.dll"])
+        cases = [
+            ("not a PE file at all", b"#!/bin/sh\n" + good[10:]),
+            ("no PE signature", good[:0x80] + b"XX\0\0" + good[0x84:]),
+            ("an unknown optional header magic",
+             good[:0x98] + b"\x0c\x02" + good[0x9A:]),
+            # Truncated two ways: mid-descriptor, and after a descriptor whose
+            # name string is no longer in the file. Neither may come back as
+            # "this library depends on nothing", which is what the caller
+            # reads as "fit to ship".
+            ("a file cut off inside the import table",
+             _fake_pe(["a.dll", "b.dll"])[:0x400 + 10]),
+            ("a file cut off before its import names",
+             _fake_pe(["a.dll", "b.dll"])[:0x400 + 20]),
+        ]
+        for what, data in cases:
+            try:
+                h264._pe_imports(_write(tmp, data))
+            except h264.H264Error:
+                pass
+            else:
+                raise AssertionError("read imports out of %s" % what)
+    print("  ok  a file it cannot read raises rather than answering 'none'")
+
+
+def test_only_dependencies_the_system_lacks_are_reported():
+    """_dangling's rule, which is the whole judgement: what the system
+    directory has is the system's, and the rest is ours to ship."""
+    import tempfile
+
+    saved = h264.platform.system
+    with tempfile.TemporaryDirectory() as tmp:
+        system32 = os.path.join(tmp, "System32")
+        os.makedirs(system32)
+        for present in ("KERNEL32.dll", "msvcrt.dll"):
+            open(os.path.join(system32, present), "wb").close()
+        data = _fake_pe(["KERNEL32.dll", "msvcrt.dll",
+                         "api-ms-win-crt-runtime-l1-1-0.dll",
+                         "libgfortran-5.dll", "libwinpthread-1.dll"])
+        path = _write(tmp, data)
+        try:
+            h264.platform.system = lambda: "Windows"
+            os.environ["SystemRoot"] = tmp
+            assert h264._dangling(path) == ["libgfortran-5.dll",
+                                            "libwinpthread-1.dll"], \
+                h264._dangling(path)
+            h264.platform.system = lambda: "Darwin"
+            assert h264._dangling(path) == []
+        finally:
+            h264.platform.system = saved
+            os.environ.pop("SystemRoot", None)
+    print("  ok  system DLLs and API sets ignored, the compiler's reported")
+
+
+def test_the_runtime_shipped_beside_the_decoder_is_the_whole_chain():
+    """The last resort, when no flag set produced a self-contained library.
+
+    It has to be transitive. libgfortran needs libquadmath, which needs
+    libwinpthread, and a bundle that copies the first and stops fails in
+    exactly the way copying it was meant to prevent -- and fails identically,
+    with the loader naming the decoder and not the DLL it could not find."""
+    import tempfile
+
+    saved_system, saved_path = h264.platform.system, os.environ.get("PATH", "")
+    with tempfile.TemporaryDirectory() as tmp:
+        binaries = os.path.join(tmp, "bin")
+        system32 = os.path.join(tmp, "System32")
+        package = os.path.join(tmp, "feetbrowser")
+        for directory in (binaries, system32, package):
+            os.makedirs(directory)
+        open(os.path.join(system32, "KERNEL32.dll"), "wb").close()
+
+        chain = {
+            "libgfortran-5.dll": ["libquadmath-0.dll", "KERNEL32.dll"],
+            "libquadmath-0.dll": ["libwinpthread-1.dll"],
+            "libwinpthread-1.dll": ["KERNEL32.dll"],
+        }
+        for name, needs in chain.items():
+            with open(os.path.join(binaries, name), "wb") as handle:
+                handle.write(_fake_pe(needs))
+        out = os.path.join(package, "_h264_deadbeef.dll")
+        with open(out, "wb") as handle:
+            handle.write(_fake_pe(["libgfortran-5.dll", "KERNEL32.dll"]))
+        try:
+            h264.platform.system = lambda: "Windows"
+            os.environ["SystemRoot"] = tmp
+            os.environ["PATH"] = binaries
+            assert h264._dangling(out) == ["libgfortran-5.dll"]
+            copied, missing = h264._ship_runtime_beside(out, None,
+                                                        h264._dangling(out))
+            assert copied == sorted(chain), copied
+            assert missing == [], missing
+            assert h264._dangling(out) == [], "still dangling after the copy"
+
+            # And what cannot be found anywhere is reported by name rather
+            # than shipped as a hole in the bundle. A second package, because
+            # the first now has the chain in it and nothing would be looked
+            # for at all.
+            second = os.path.join(tmp, "feetbrowser2")
+            os.makedirs(second)
+            other = os.path.join(second, "_h264_deadbeef.dll")
+            with open(other, "wb") as handle:
+                handle.write(_fake_pe(["libgfortran-5.dll", "KERNEL32.dll"]))
+            os.remove(os.path.join(binaries, "libwinpthread-1.dll"))
+            copied, missing = h264._ship_runtime_beside(other, None,
+                                                        ["libgfortran-5.dll"])
+            assert missing == ["libwinpthread-1.dll"], missing
+            assert copied == ["libgfortran-5.dll", "libquadmath-0.dll"], copied
+        finally:
+            h264.platform.system = saved_system
+            os.environ["PATH"] = saved_path
+            os.environ.pop("SystemRoot", None)
+    print("  ok  the compiler's runtime ships beside the decoder, transitively")
+
+
+def test_a_flag_set_that_links_but_does_not_ship_is_not_used():
+    """The reason _compile takes a check at all.
+
+    Every Windows flag set links. Only some of them produce a library that
+    will load on a machine without the compiler, and the link succeeding says
+    nothing about which. This drives _compile with a compiler that always
+    succeeds and a check that only accepts the third flag set, and asserts it
+    got there rather than stopping at the first."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        fc = os.path.join(tmp, "fakegfortran")
+        with open(fc, "w") as handle:
+            handle.write('#!/bin/sh\n'
+                         'while [ "$1" != "-o" ]; do shift; done\n'
+                         'echo "$*" > "$2"\n')
+        os.chmod(fc, 0o755)
+        out = os.path.join(tmp, "lib.so")
+        attempts = (["-first"], ["-second"], ["-third"])
+
+        def only_the_third(path):
+            with open(path) as handle:
+                if "-third" in handle.read():
+                    return []
+            return ["still needs libgfortran-5.dll"]
+
+        used = h264._compile(fc, out, attempts, only_the_third)
+        assert used == ["-third"], used
+        assert os.path.exists(out)
+        # And a tried-and-rejected attempt leaves nothing behind: the .tmp
+        # files would otherwise pile up inside the package being built.
+        leftovers = [n for n in os.listdir(tmp) if ".tmp" in n]
+        assert not leftovers, leftovers
+
+        # When nothing satisfies the check, it fails -- naming every flag set
+        # and what was still wrong with it, because a packaging log that says
+        # only "could not build" is a log nobody can act on.
+        try:
+            h264._compile(fc, out, attempts, lambda p: ["needs libquadmath"])
+        except h264.H264Error as exc:
+            assert "-first" in str(exc) and "-third" in str(exc), exc
+            assert "libquadmath" in str(exc), exc
+        else:
+            raise AssertionError("shipped a library nothing accepted")
+    print("  ok  _compile walks past a flag set whose output would not load")
+
+
+def test_the_flag_sets_answer_each_platforms_own_problem():
+    """Windows leaves libwinpthread behind unless everything is static;
+    manylinux cannot link libgfortran.a into a shared object at all."""
+    windows = h264._ship_attempts("Windows")
+    assert windows[0] == ["-static"], windows
+    linux = h264._ship_attempts("Linux")
+    assert "-static-libgfortran" not in linux[-1], linux
+    assert "-static-libgfortran" in linux[0], linux
+    for system in ("Windows", "Linux", "Darwin"):
+        sets = h264._ship_attempts(system)
+        assert "-march=native" not in sum(sets, []), system
+        # A fallback that is the same as what it falls back from is not a
+        # fallback, it is the same link done twice.
+        assert len(set(map(tuple, sets))) == len(sets), (system, sets)
+    print("  ok  Windows tries -static first, Linux falls back to dynamic")
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

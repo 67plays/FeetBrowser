@@ -45,8 +45,15 @@ Three things in one directory:
    compiler, which is everyone who develops the browser. The DLL is named
    after a hash of the sources it was built from and the loader recomputes
    it, so a stale one is not preferred over the sources, it is not found.
-   `-static-libgfortran -static-libgcc` mean it does not drag MinGW's
-   runtime DLLs along with it; the verification job proves that by running
+   Whether gfortran's runtime ends up inside that DLL or beside it is
+   decided by reading the finished file's import table: `build_library`
+   tries `-static` first and falls back through the narrower static flags,
+   and copies whatever it still could not link in -- `libgfortran-5.dll`
+   and its own dependencies -- next to the decoder, where
+   `LOAD_WITH_ALTERED_SEARCH_PATH` finds them. It is a build-time check
+   rather than a claim because the flags that fail here fail invisibly:
+   every one of them links, and the difference only shows up on a machine
+   that has no compiler. The verification job is what proves it, running
    with `PATH` cut back to the system directories.
 
 Plus `FeetBrowser.exe`, which is the subject of most of this document.

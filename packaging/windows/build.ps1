@@ -211,10 +211,18 @@ Copy-Item (Join-Path $RepoRoot 'toes\README.md') (Join-Path $stage 'toes') -Forc
 # sources it was built from; fortran\ ships beside the package so the loader
 # can recompute that hash and refuse anything that does not match. The
 # compiler is a build-machine tool exactly like cargo: nothing it produced is
-# a third-party library, the .dll is our own Fortran, and -static-libgfortran
-# and friends mean it does not drag MinGW's runtime DLLs along behind it.
-# verify-bundle.ps1 is where that last claim is checked, on a machine whose
-# PATH has been cut back to Windows itself.
+# a third-party library, the .dll is our own Fortran, and the compiler's
+# runtime is no more third-party than libgcc is.
+#
+# Whether that runtime ends up inside the .dll or beside it is build_library's
+# decision and not this script's: it reads the finished file's import table,
+# picks the most static flag set that leaves nothing behind, and copies what
+# it could not link in next to the library. Either way nothing outside the
+# package is needed, which is what verify-bundle.ps1 checks on a machine whose
+# PATH has been cut back to Windows itself. What actually happened is printed
+# below, because "built with -static" and "shipped libgfortran-5.dll beside
+# it" are different bundles and a log that does not distinguish them is a log
+# that cannot explain the next failure.
 # ---------------------------------------------------------------------------
 Step "the H.264 decoder"
 Copy-Item -Recurse -Force -Path (Join-Path $RepoRoot 'fortran') -Destination $stage
