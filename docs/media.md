@@ -206,12 +206,16 @@ removal; SPS and PPS including the High-profile block and both scaling-matrix
 fall-back rules; I- and P-slice headers, including the reference list
 modification and weighted prediction tables; CABAC, which is the whole of
 clause 9.3: context initialisation from the (m, n) tables, decode-decision,
-decode-bypass, decode-terminate and renormalisation; I macroblocks in all of
-Intra_4x4, Intra_8x8, Intra_16x16 and the four chroma modes; residual
-decoding with the 4x4 and 8x8 integer inverse transforms and the chroma DC
-Hadamard; the deblocking filter; and the colour conversion out to RGBA. There
-is no CAVLC. A `-coder 0` stream is refused by name rather than decoded
-wrongly, which is the same contract every other unplayable file here gets.
+decode-bypass, decode-terminate and renormalisation; CAVLC, which is the
+whole of clause 9.2: all five `coeff_token` tables with the `nC` derivation
+that picks between them, the `level_prefix`/`level_suffix` escalation and
+both of its escapes, `total_zeros` and `run_before`, and the macroblock and
+slice syntax that goes with them -- `mb_skip_run`, the two columns of Table
+9-4, and a residual loop terminated by `more_rbsp_data()` rather than an
+`end_of_slice_flag`; I macroblocks in all of Intra_4x4, Intra_8x8,
+Intra_16x16 and the four chroma modes; residual decoding with the 4x4 and 8x8
+integer inverse transforms and the chroma DC Hadamard; the deblocking filter;
+and the colour conversion out to RGBA.
 
 **And what inter prediction added.** A decoded picture buffer; picture order
 count (8.2.1) for types 0 and 2; reference picture list initialisation and
@@ -270,7 +274,7 @@ decoder in the process no matter how many `Decoder` objects Python holds. The
 bearing rather than defensive: the browser decodes video on a worker thread
 per element.
 
-**What it is not.** No B slices, no CAVLC, no SP or SI slices, no interlaced
+**What it is not.** No B slices, no SP or SI slices, no interlaced
 coding in any of its forms, no long-term reference pictures, and no picture
 order count type 1. Those are not stubbed or half-written: the parser sees
 what it does not handle and refuses the stream by name.
@@ -306,9 +310,10 @@ Bluntly, because a foundation that overstates itself is worse than none:
   drawn, and there is no VP8, VP9, AV1 or MPEG-4 ASP at all. B frames are
   the common case in a well-compressed web MP4, so plenty of real files
   still do not play -- but the ordinary I-then-P encode now does, which is
-  what the `<video>` element on most pages that roll their own is.
-- **No CAVLC.** The other half of H.264's entropy coding. Baseline profile
-  and anything encoded with `-coder 0` is refused by name.
+  what the `<video>` element on most pages that roll their own is. Baseline
+  profile is one of those: it has no B slices by definition, and now that
+  CAVLC decodes, a Baseline file plays unless it uses slice groups or
+  arbitrary slice order, which are refused separately.
 - **WebM is probe-only.** Geometry and duration, no pixels. An MP4 is
   demuxed but only plays if its codec is `jpeg`, `mjpa`, `raw `, `png `, or
   H.264 without B slices.
@@ -385,8 +390,7 @@ agree, and a reorder buffer belongs in `VideoTrack.frame()`.
    and 8.4.1.2 is the fiddliest derivation in the standard), and the
    decode-order-versus-presentation-order problem, which is the one part
    that is not confined to `fortran/` -- `VideoTrack.frame()` assumes the
-   two orders agree and would need a reorder buffer. CAVLC is separate work
-   again, and is what Baseline files need.
+   two orders agree and would need a reorder buffer.
 
 ## Tests
 
@@ -427,17 +431,23 @@ decodes each and compares every sample: not a PSNR, not a tolerance, every
 byte. A single wrong luma sample fails the suite, because in a codec this
 size a single wrong sample is never a rounding difference; it is a bug in a
 prediction mode or a scan order that happens to be small today. The vectors
-between them cover 16x16 through 1280x720, Baseline-shaped, Main and High,
-QP 1 to 51, deblocking on and off, the 8x8 transform, picture-level scaling
-matrices, multiple slices per picture and frame cropping on both axes.
+between them cover 16x16 through 1280x720, Baseline, Main and High, both
+entropy coders, QP 1 to 51, deblocking on and off, the 8x8 transform,
+picture-level scaling matrices, multiple slices per picture and frame
+cropping on both axes.
 
-Six of them are inter-coded, and for those *every frame* is compared, not the
-first: a wrong motion vector predictor shows up in one macroblock and then
-spreads by prediction, so a decoder that is checked only on its IDR is not
-checked at all. They cover a plain I-then-P sequence, runs of P_Skip over a
-still background, sub-8x8 partitions with the 8x8 transform, four reference
-frames, a picture that pans off its own edges so the interpolator has to
-clamp, and weighted prediction across a fade. `make_inter_vectors.sh` beside
+Twelve of them run to several frames, and for those *every frame* is
+compared, not the first: a wrong motion vector predictor shows up in one
+macroblock and then spreads by prediction, so a decoder that is checked only
+on its IDR is not checked at all. They cover a plain I-then-P sequence, runs
+of P_Skip over a still background, sub-8x8 partitions with the 8x8 transform,
+four reference frames, a picture that pans off its own edges so the
+interpolator has to clamp, and weighted prediction across a fade -- and then
+the same ground again in CAVLC, plus the two ends of the quantiser range that
+only CAVLC cares about: QP 44, where almost every block is empty and the
+`nC` derivation is all that is left, and QP 3 on noise, where the levels are
+long enough to run `suffixLength` up to its limit and reach the
+`level_prefix` >= 15 escape. `make_inter_vectors.sh` beside
 them is the offline tool that made them and says what each encoder option is
 for; it is not run by `test.sh` and ffmpeg is not a dependency of anything.
 The fixtures are committed so the suite runs offline and on a machine with no
