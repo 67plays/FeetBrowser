@@ -24,6 +24,7 @@ fn native(name: &str, call: NativeFn) -> JsValue {
         ctor: None,
         get: None,
         set: None,
+        method_of: None,
     }))
 }
 
@@ -37,6 +38,7 @@ fn getter(
         ctor: None,
         get: Some(get),
         set: None,
+        method_of: None,
     }))
 }
 
@@ -47,6 +49,7 @@ fn ctor(name: &str, call: NativeFn, ctor_: NativeFn, get: Option<NativeGet>, set
         ctor: Some(ctor_),
         get,
         set,
+        method_of: None,
     }))
 }
 
@@ -287,9 +290,20 @@ fn string_from_code_point(_this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsV
 fn string_raw(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
     let this = this.clone();
     Box::pin(async move {
+        // The pieces to join are the ones on the `raw` property, not the array
+        // itself: that is the entire difference between `String.raw` and
+        // interpolating the template normally, and it is why every Windows
+        // path and every regex source written as `` String.raw`\d+` `` comes
+        // out with its backslashes intact. A caller handing over a plain array
+        // with no `raw` -- which happens, `String.raw` gets used as an ordinary
+        // function -- falls back to the array.
         let parts: Vec<String> = match args.first() {
             Some(JsValue::Array(a)) => {
-                a.borrow().iter().map(|v| this.repr(v)).collect()
+                let raw = a.props.borrow().get("raw").cloned();
+                match raw {
+                    Some(JsValue::Array(r)) => r.borrow().iter().map(|v| this.repr(v)).collect(),
+                    _ => a.borrow().iter().map(|v| this.repr(v)).collect(),
+                }
             }
             _ => vec![],
         };
@@ -342,6 +356,8 @@ fn number_get(_this: &Rc<Interpreter>, _obj: &JsValue, name: &str) -> Result<JsV
         "isNaN" => native("isNaN", number_is_nan),
         "isFinite" => native("isFinite", number_is_finite),
         "isInteger" => native("isInteger", number_is_integer),
+        "isSafeInteger" => native("isSafeInteger", number_is_safe_integer),
+        "EPSILON" => JsValue::Number(f64::EPSILON),
         "parseInt" => native("parseInt", parse_int_call),
         "parseFloat" => native("parseFloat", parse_float_call),
         "MAX_VALUE" => JsValue::Number(1.7976931348623157e308),
@@ -563,6 +579,23 @@ fn global_is_finite(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) 
 
 // -- Number.isInteger ------------------------------------------------------
 
+/// An integer small enough that no other integer shares its double. Code that
+/// asks is usually about to use the value as an id or an array index, and the
+/// answer it wants is "yes" for the ordinary numbers and "no" for the ones
+/// that have quietly stopped being exact.
+fn number_is_safe_integer(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
+    let _ = this;
+    Box::pin(async move {
+        let v = first(&args);
+        Ok(JsValue::Bool(match v {
+            JsValue::Number(n) => {
+                n.fract() == 0.0 && n.abs() <= 9_007_199_254_740_991.0
+            }
+            _ => false,
+        }))
+    })
+}
+
 fn number_is_integer(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
     let _ = this;
     Box::pin(async move {
@@ -611,40 +644,13 @@ fn array_is_array(_this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -
 fn array_from(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
     let this = this.clone();
     Box::pin(async move {
+        // `iterate` knows all three shapes -- iterable, iterator protocol, and
+        // the `length`-and-numeric-keys array-like -- and knowing them in one
+        // place is what keeps `Array.from(x)` and `[...x]` from disagreeing.
+        // Strings come apart by code point there, not by byte or by UTF-16
+        // unit, which is most of why anyone reaches for `Array.from` on one.
         let v = first(&args);
-        let items: Vec<JsValue> = match &v {
-            JsValue::Array(a) => a.borrow().clone(),
-            // By code point, not by byte or by UTF-16 unit: `Array.from` is
-            // the standard way to split a string without tearing an emoji in
-            // half, which is most of why anyone reaches for it on a string.
-            JsValue::Str(s) => s.chars().map(|c| JsValue::str(c.to_string())).collect(),
-            JsValue::Set(s) => s.borrow().store.borrow().values().cloned().collect(),
-            // A Map yields one `[key, value]` pair per entry, matching the
-            // spec's iterator protocol without depending on generators.
-            JsValue::Map(m) => m
-                .borrow()
-                .store
-                .borrow()
-                .iter()
-                .map(|(k, val)| JsValue::array(vec![JsValue::str(k.clone()), val.clone()]))
-                .collect(),
-            JsValue::Undefined | JsValue::Null => vec![],
-            other => {
-                // Array-like: honour `length` even when nothing is iterable.
-                let len = js_get(&this, other, "length")?;
-                let n = to_number(&len);
-                if n.is_nan() || n <= 0.0 {
-                    vec![]
-                } else {
-                    let n = n.min(MAX_ARRAY_LEN as f64) as usize;
-                    let mut out = Vec::with_capacity(n);
-                    for i in 0..n {
-                        out.push(js_get(&this, other, &i.to_string())?);
-                    }
-                    out
-                }
-            }
-        };
+        let items: Vec<JsValue> = iterate(&this, &v).await?.unwrap_or_default();
         let f = args.get(1).cloned().unwrap_or(JsValue::Undefined);
         if !nullish(&f) && !is_js_function(&f) {
             // The spec throws a TypeError when a mapping function is given
@@ -684,11 +690,83 @@ fn array_of(_this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvRe
     Box::pin(async move { Ok(JsValue::array(args)) })
 }
 
+/// Every array method that can sensibly be borrowed by something that is not
+/// an array.
+///
+/// The list is closed rather than open on purpose. Handing back a function for
+/// any name at all would make `if (!Array.prototype.includes) { …polyfill… }`
+/// skip a polyfill we do not actually have, which turns a missing method into
+/// a wrong answer much later on -- feature detection has to be allowed to
+/// fail.
+const ARRAY_PROTO_METHODS: &[&str] = &[
+    "at", "concat", "every", "fill", "filter", "find", "findIndex", "flat", "flatMap", "forEach",
+    "includes", "indexOf", "join", "lastIndexOf", "map", "pop", "push", "reduce", "reduceRight",
+    "reverse", "shift", "slice", "some", "sort", "splice", "toString", "unshift",
+];
+
+/// Coerce a borrowed receiver into a real array.
+///
+/// `Array.prototype.slice.call(arguments)` is the oldest idiom in the language
+/// and the reason this exists: the thing on the left is almost never an array,
+/// it is `arguments`, a `NodeList`, or a string, and all of those answer
+/// `length` and numeric keys. An actual array is passed through by reference
+/// so that the mutating methods still mutate it.
+fn array_like(this: &Rc<Interpreter>, v: &JsValue) -> Result<Rc<JsArray>, JsError> {
+    if let JsValue::Array(a) = v {
+        return Ok(a.clone());
+    }
+    let items: Vec<JsValue> = match v {
+        JsValue::Str(s) => s.chars().map(|c| JsValue::str(c.to_string())).collect(),
+        JsValue::Undefined | JsValue::Null => vec![],
+        other => {
+            let n = to_number(&js_get(this, other, "length")?);
+            if n.is_nan() || n <= 0.0 {
+                vec![]
+            } else {
+                let n = n.min(MAX_ARRAY_LEN as f64) as usize;
+                let mut out = Vec::with_capacity(n);
+                for i in 0..n {
+                    out.push(js_get(this, other, &i.to_string())?);
+                }
+                out
+            }
+        }
+    };
+    Ok(Rc::new(JsArray::new(items)))
+}
+
+/// `Array.prototype.<method>`, as a function that takes its receiver first.
+///
+/// That argument order is not a shortcut, it is the convention every native
+/// here follows: `make_method_wrapper` prepends the `this` argument for
+/// natives and callbacks, so `f.call(x, y)` arrives as `[x, y]`, which is
+/// exactly the shape a borrowed method wants anyway.
+fn array_proto_get(_this: &Rc<Interpreter>, _obj: &JsValue, name: &str) -> Result<JsValue, JsError> {
+    if !ARRAY_PROTO_METHODS.contains(&name) {
+        return Ok(JsValue::Undefined);
+    }
+    let name = name.to_string();
+    Ok(JsValue::Callback(Rc::new(
+        move |i: &Rc<Interpreter>, args: Vec<JsValue>| -> EvResult {
+            let name = name.clone();
+            let i2 = i.clone();
+            Box::pin(async move {
+                let recv = args.first().cloned().unwrap_or(JsValue::Undefined);
+                let rest: Vec<JsValue> = args.into_iter().skip(1).collect();
+                let list = array_like(&i2, &recv)?;
+                let m = list_get(&i2, &list, &name);
+                call_value(&i2, &m, rest, JsValue::Array(list)).await
+            })
+        },
+    )))
+}
+
 fn array_get(_this: &Rc<Interpreter>, _obj: &JsValue, name: &str) -> Result<JsValue, JsError> {
     Ok(match name {
         "isArray" => native("isArray", array_is_array),
         "from" => native("from", array_from),
         "of" => native("of", array_of),
+        "prototype" => getter("prototype", array_proto_get),
         _ => JsValue::Undefined,
     })
 }
@@ -708,8 +786,13 @@ fn obj_keys(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvRes
     let _this = this.clone();
     Box::pin(async move {
         let v = first(&args);
+        // Own keys only, and `__proto__` is a link rather than a property, so
+        // it never appears -- listing it would have every `for (k in o)` in a
+        // page walk into the prototype as if it were data.
         let keys: Vec<String> = match v {
-            JsValue::Object(m) => m.borrow().keys().cloned().collect(),
+            JsValue::Object(m) => m.borrow().keys().filter(|k| *k != "__proto__").cloned().collect(),
+            JsValue::Instance(i) => i.borrow().props.borrow().keys().cloned().collect(),
+            JsValue::Array(a) => (0..a.borrow().len()).map(|i| i.to_string()).collect(),
             _ => vec![],
         };
         Ok(JsValue::array(keys.into_iter().map(JsValue::str).collect()))
@@ -720,7 +803,17 @@ fn obj_values(_this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> Ev
     Box::pin(async move {
         let v = first(&args);
         Ok(match v {
-            JsValue::Object(m) => JsValue::array(m.borrow().values().cloned().collect()),
+            JsValue::Object(m) => JsValue::array(
+                m.borrow()
+                    .iter()
+                    .filter(|(k, _)| k.as_str() != "__proto__")
+                    .map(|(_, v)| v.clone())
+                    .collect(),
+            ),
+            JsValue::Instance(i) => {
+                JsValue::array(i.borrow().props.borrow().values().cloned().collect())
+            }
+            JsValue::Array(a) => JsValue::array(a.borrow().clone()),
             _ => JsValue::array(vec![]),
         })
     })
@@ -774,6 +867,10 @@ fn obj_get_proto_of(_this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>)
         let v = first(&args);
         Ok(match v {
             JsValue::Instance(i) => JsValue::Object(i.borrow().proto.clone()),
+            // A plain object wears its link as a `__proto__` entry, the same
+            // one the lookup walks.
+            JsValue::Object(m) => m.borrow().get("__proto__").cloned().unwrap_or(JsValue::Null),
+            JsValue::Function(f) => JsValue::Object(JSFunction::prototype_obj(&f)),
             _ => JsValue::Undefined,
         })
     })
@@ -782,14 +879,67 @@ fn obj_get_proto_of(_this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>)
 fn obj_set_proto_of(_this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
     Box::pin(async move {
         if args.len() >= 2 {
-            if let JsValue::Instance(i) = &args[0] {
-                if let JsValue::Object(m) = &args[1] {
-                    i.borrow_mut().proto = m.clone();
+            match (&args[0], &args[1]) {
+                (JsValue::Instance(i), JsValue::Object(m)) => i.borrow_mut().proto = m.clone(),
+                // Re-parenting a plain object is the same operation written
+                // one level down: leave the link where the lookup will find it.
+                (JsValue::Object(o), JsValue::Object(m)) => {
+                    o.borrow_mut()
+                        .insert("__proto__".to_string(), JsValue::Object(m.clone()));
                 }
+                (JsValue::Object(o), JsValue::Instance(i)) => {
+                    let (own, parent) = {
+                        let b = i.borrow();
+                        (b.props.clone(), b.proto.clone())
+                    };
+                    own.borrow_mut()
+                        .insert("__proto__".to_string(), JsValue::Object(parent));
+                    o.borrow_mut()
+                        .insert("__proto__".to_string(), JsValue::Object(own));
+                }
+                (JsValue::Instance(o), JsValue::Instance(i)) => {
+                    let (own, parent) = {
+                        let b = i.borrow();
+                        (b.props.clone(), b.proto.clone())
+                    };
+                    own.borrow_mut()
+                        .insert("__proto__".to_string(), JsValue::Object(parent));
+                    o.borrow_mut().proto = own;
+                }
+                _ => {}
             }
         }
         Ok(first(&args))
     })
+}
+
+/// One property, described the long way round. A descriptor is either a data
+/// one (`value`) or an accessor one (`get`/`set`); the accessor form used to be
+/// stored as the getter function itself, so reading the property handed back
+/// the function instead of calling it -- which is the difference between
+/// `el.length` being 3 and being `function`. `JsValue::Accessor` is the same
+/// thing object literals build for `get x()`, so writing one here means both
+/// spellings of the same idea end up as the same value.
+fn define_one(map: &Rc<RefCell<BTreeMap<String, JsValue>>>, key: String, desc: &JsValue) {
+    let desc = match desc {
+        JsValue::Object(d) => d,
+        _ => return,
+    };
+    let get = desc.borrow().get("get").cloned();
+    let set = desc.borrow().get("set").cloned();
+    let has_accessor = get.as_ref().is_some_and(is_js_function)
+        || set.as_ref().is_some_and(is_js_function);
+    if has_accessor {
+        let acc = Rc::new(JsAccessor::default());
+        *acc.get.borrow_mut() = get.filter(is_js_function);
+        *acc.set.borrow_mut() = set.filter(is_js_function);
+        map.borrow_mut().insert(key, JsValue::Accessor(acc));
+        return;
+    }
+    let value = desc.borrow().get("value").cloned();
+    if let Some(v) = value {
+        map.borrow_mut().insert(key, v);
+    }
 }
 
 fn obj_define_property(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
@@ -797,15 +947,29 @@ fn obj_define_property(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue
     Box::pin(async move {
         if args.len() >= 3 {
             if let JsValue::Object(map) = &args[0] {
-                let key = this.repr(&args[1]);
-                if let JsValue::Object(desc) = &args[2] {
-                    if let Some(v) = desc.borrow().get("value") {
-                        map.borrow_mut().insert(key, v.clone());
-                    } else if let Some(g) = desc.borrow().get("get") {
-                        if is_js_function(g) {
-                            map.borrow_mut().insert(key, g.clone());
-                        }
-                    }
+                define_one(map, this.repr(&args[1]), &args[2]);
+            }
+        }
+        Ok(args.into_iter().next().unwrap_or(JsValue::Undefined))
+    })
+}
+
+/// `Object.defineProperties(o, {a: {...}, b: {...}})`. The compiled output of
+/// every transpiler that has to emulate a class reaches for this, and Google's
+/// own bundles alias it into a one-letter local at the top of the file -- so
+/// its absence took out the whole script, not one property.
+fn obj_define_properties(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
+    let _ = this;
+    Box::pin(async move {
+        if args.len() >= 2 {
+            if let (JsValue::Object(map), JsValue::Object(descs)) = (&args[0], &args[1]) {
+                let pairs: Vec<(String, JsValue)> = descs
+                    .borrow()
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                for (k, d) in pairs {
+                    define_one(map, k, &d);
                 }
             }
         }
@@ -813,9 +977,74 @@ fn obj_define_property(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue
     })
 }
 
+/// The descriptor for one own property, or `undefined`. Ours are all writable,
+/// enumerable and configurable, because nothing here can make them otherwise;
+/// reporting that honestly is better than reporting nothing, since the code
+/// that asks is usually copying a property from one object to another and
+/// needs the shape of the answer more than its finer details.
+fn obj_get_own_descriptor(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
+    let this = this.clone();
+    Box::pin(async move {
+        if args.len() >= 2 {
+            if let JsValue::Object(map) = &args[0] {
+                let key = this.repr(&args[1]);
+                let slot = map.borrow().get(&key).cloned();
+                if let Some(slot) = slot {
+                    return Ok(descriptor_for(&slot));
+                }
+            }
+        }
+        Ok(JsValue::Undefined)
+    })
+}
+
+fn descriptor_for(slot: &JsValue) -> JsValue {
+    let mut d = BTreeMap::new();
+    match slot {
+        JsValue::Accessor(a) => {
+            d.insert(
+                "get".to_string(),
+                a.get.borrow().clone().unwrap_or(JsValue::Undefined),
+            );
+            d.insert(
+                "set".to_string(),
+                a.set.borrow().clone().unwrap_or(JsValue::Undefined),
+            );
+        }
+        other => {
+            d.insert("value".to_string(), other.clone());
+            d.insert("writable".to_string(), JsValue::Bool(true));
+        }
+    }
+    d.insert("enumerable".to_string(), JsValue::Bool(true));
+    d.insert("configurable".to_string(), JsValue::Bool(true));
+    JsValue::Object(Rc::new(RefCell::new(d)))
+}
+
+fn obj_get_own_descriptors(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
+    let _ = this;
+    Box::pin(async move {
+        let mut out = BTreeMap::new();
+        if let Some(JsValue::Object(map)) = args.first() {
+            for (k, v) in map.borrow().iter() {
+                out.insert(k.clone(), descriptor_for(v));
+            }
+        }
+        Ok(JsValue::Object(Rc::new(RefCell::new(out))))
+    })
+}
+
 fn obj_freeze(_this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
     let v = first(&args);
     Box::pin(async move { Ok(v) })
+}
+
+fn obj_false(_this: &Rc<Interpreter>, _obj: &JsValue, _args: Vec<JsValue>) -> EvResult {
+    Box::pin(async move { Ok(JsValue::Bool(false)) })
+}
+
+fn obj_true(_this: &Rc<Interpreter>, _obj: &JsValue, _args: Vec<JsValue>) -> EvResult {
+    Box::pin(async move { Ok(JsValue::Bool(true)) })
 }
 
 fn obj_has_own(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
@@ -882,15 +1111,63 @@ fn object_proto_has_own(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValu
     })
 }
 
-fn object_proto_to_string(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
-    let this = this.clone();
+/// `Object.prototype.toString.call(x)` is not a way to print `x`; it is the
+/// oldest type test in the language, and the whole point of it is that it
+/// ignores everything the value has been taught to say about itself. Library
+/// code still reaches for it in preference to `instanceof` -- a value that
+/// crossed a frame boundary fails `instanceof` and passes this -- so it has to
+/// answer with the tag, `[object Array]`, and never with the contents.
+pub fn object_proto_to_string_native() -> JsValue {
+    native("toString", object_proto_to_string)
+}
+
+fn object_proto_to_string(_this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
     let v = first(&args);
-    Box::pin(async move { Ok(JsValue::str(this.repr(&v))) })
+    let tag = match &v {
+        JsValue::Undefined => "Undefined",
+        JsValue::Null => "Null",
+        JsValue::Bool(_) => "Boolean",
+        JsValue::Number(_) => "Number",
+        JsValue::Str(_) => "String",
+        JsValue::Array(_) => "Array",
+        JsValue::Date(_) => "Date",
+        JsValue::Regex(_) => "RegExp",
+        JsValue::Error(_) => "Error",
+        JsValue::Map(_) => "Map",
+        JsValue::Set(_) => "Set",
+        JsValue::Promise(_) => "Promise",
+        JsValue::Function(_) | JsValue::Class(_) | JsValue::Native(_) | JsValue::Callback(_) => {
+            "Function"
+        }
+        _ => "Object",
+    };
+    Box::pin(async move { Ok(JsValue::str(format!("[object {tag}]"))) })
 }
 
 fn object_proto_value_of(_this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
     let v = first(&args);
     Box::pin(async move { Ok(v) })
+}
+
+/// `new Function(...)` and `Function(...)` compile a string, which is the one
+/// thing this engine will not do: a page that reaches for it is either
+/// building code out of data or feature-testing for a place that forbids it,
+/// and the second is far more common than the first. Throwing is what a page
+/// with a strict Content-Security-Policy sees, so the surrounding `try` that
+/// real code already wraps this in does the right thing with it.
+fn function_call(_this: &Rc<Interpreter>, _obj: &JsValue, _args: Vec<JsValue>) -> EvResult {
+    Box::pin(async move {
+        Err(JsError::js(
+            "Refused to evaluate a string as JavaScript: the Function constructor is disabled",
+        ))
+    })
+}
+
+fn function_get(_this: &Rc<Interpreter>, _obj: &JsValue, name: &str) -> Result<JsValue, JsError> {
+    Ok(match name {
+        "prototype" => function_proto_object(),
+        _ => JsValue::Undefined,
+    })
 }
 
 fn object_get(_this: &Rc<Interpreter>, _obj: &JsValue, name: &str) -> Result<JsValue, JsError> {
@@ -903,6 +1180,24 @@ fn object_get(_this: &Rc<Interpreter>, _obj: &JsValue, name: &str) -> Result<JsV
         "getPrototypeOf" => native("getPrototypeOf", obj_get_proto_of),
         "setPrototypeOf" => native("setPrototypeOf", obj_set_proto_of),
         "defineProperty" => native("defineProperty", obj_define_property),
+        "defineProperties" => native("defineProperties", obj_define_properties),
+        "getOwnPropertyDescriptor" => {
+            native("getOwnPropertyDescriptor", obj_get_own_descriptor)
+        }
+        "getOwnPropertyDescriptors" => {
+            native("getOwnPropertyDescriptors", obj_get_own_descriptors)
+        }
+        // Nothing here can actually make an object immutable, so `freeze` and
+        // friends are the identity and the three questions answer for a world
+        // where no one ever froze anything. That is a lie only to code that
+        // freezes and then checks, and the truth -- a thrown TypeError on the
+        // next write -- would be a worse one.
+        "getOwnPropertyNames" => native("getOwnPropertyNames", obj_keys),
+        "seal" => native("seal", obj_freeze),
+        "preventExtensions" => native("preventExtensions", obj_freeze),
+        "isFrozen" => native("isFrozen", obj_false),
+        "isSealed" => native("isSealed", obj_false),
+        "isExtensible" => native("isExtensible", obj_true),
         "freeze" => native("freeze", obj_freeze),
         "hasOwnProperty" => native("hasOwnProperty", obj_has_own),
         "hasOwn" => native("hasOwn", obj_has_own),
@@ -1086,6 +1381,7 @@ fn math_value(name: &str) -> JsValue {
         ctor: None,
         get: None,
         set: None,
+        method_of: None,
     }))
 }
 
@@ -1236,8 +1532,17 @@ fn json_parse(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvR
 
 // -- Error / RegExp / Date -------------------------------------------------
 
-fn error_make(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
+/// Every error constructor, told apart by the name of the native being
+/// called. `TypeError` and its siblings differ from `Error` in exactly one
+/// visible way -- the `name` they carry -- and library code throws and
+/// compares them constantly, so the alternative to having them was a page
+/// dying on `new TypeError(...)` with "is not a constructor".
+fn error_make(this: &Rc<Interpreter>, obj: &JsValue, args: Vec<JsValue>) -> EvResult {
     let this = this.clone();
+    let name = match obj {
+        JsValue::Native(n) => n.name.to_string(),
+        _ => "Error".to_string(),
+    };
     Box::pin(async move {
         let msg = match args.first() {
             Some(v) if !nullish(v) => this.repr(v),
@@ -1245,7 +1550,7 @@ fn error_make(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvR
         };
         Ok(JsValue::Error(Rc::new(RefCell::new(JsHostError {
             message: msg,
-            name: "Error".to_string(),
+            name,
         }))))
     })
 }
@@ -1463,6 +1768,71 @@ fn date_get(_this: &Rc<Interpreter>, _obj: &JsValue, name: &str) -> Result<JsVal
     })
 }
 
+// -- Symbol ----------------------------------------------------------------
+
+// A symbol here is a string with a name no source file can spell. Real symbols
+// are a value type of their own, kept out of `Object.keys` and reported by
+// `typeof` as "symbol"; ours are strings, so they show up in a key listing and
+// `typeof` calls them strings. That is the whole of the compromise, and what it
+// buys is everything symbols are actually used for on a page: a property name
+// that will not collide, `Symbol.iterator` as a well-known key, and a `Symbol`
+// global that exists at all -- transpiled bundles test for it and take a much
+// worse path when it is missing, and Google's opens by handing it to a helper
+// that then calls it, so its absence took the whole script down.
+//
+// The well-known ones are spelled "@@iterator" and so on, which is the name
+// every polyfill of the last decade has used for the same reason.
+thread_local! {
+    static SYMBOL_SEQ: Cell<u64> = const { Cell::new(0) };
+}
+
+fn symbol_call(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
+    let this = this.clone();
+    Box::pin(async move {
+        let n = SYMBOL_SEQ.with(|c| {
+            c.set(c.get() + 1);
+            c.get()
+        });
+        let desc = match args.first() {
+            Some(JsValue::Undefined) | None => String::new(),
+            Some(v) => this.repr(v),
+        };
+        Ok(JsValue::str(format!("@@sym:{n}:{desc}")))
+    })
+}
+
+/// `Symbol.for` shares one symbol per key across the whole page, which for a
+/// string-backed symbol is just a name derived from the key.
+fn symbol_for(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
+    let this = this.clone();
+    Box::pin(async move {
+        let key = this.repr(&first(&args));
+        Ok(JsValue::str(format!("@@for:{key}")))
+    })
+}
+
+fn symbol_key_for(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
+    let this = this.clone();
+    Box::pin(async move {
+        let s = this.repr(&first(&args));
+        Ok(match s.strip_prefix("@@for:") {
+            Some(k) => JsValue::str(k.to_string()),
+            None => JsValue::Undefined,
+        })
+    })
+}
+
+fn symbol_get(_this: &Rc<Interpreter>, _obj: &JsValue, name: &str) -> Result<JsValue, JsError> {
+    Ok(match name {
+        "iterator" | "asyncIterator" | "hasInstance" | "toPrimitive" | "toStringTag"
+        | "species" | "isConcatSpreadable" | "unscopables" | "match" | "replace"
+        | "search" | "split" => JsValue::str(format!("@@{name}")),
+        "for" => native("for", symbol_for),
+        "keyFor" => native("keyFor", symbol_key_for),
+        _ => JsValue::Undefined,
+    })
+}
+
 // -- Map / Set -------------------------------------------------------------
 
 fn map_new(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
@@ -1479,22 +1849,23 @@ fn map_new(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResu
                             if pair.borrow().len() == 2 {
                                 let k = pair.borrow()[0].clone();
                                 let v = pair.borrow()[1].clone();
-                                m.borrow().store.borrow_mut().insert(map_key(&k), v);
+                                m.borrow().store.borrow_mut().insert(map_key(&k), (k, v));
                                 continue;
                             }
                         }
                         m.borrow()
                             .store
                             .borrow_mut()
-                            .insert(map_key(p), JsValue::Undefined);
+                            .insert(map_key(p), (p.clone(), JsValue::Undefined));
                     }
                 }
                 JsValue::Object(o) => {
                     for (k, v) in o.borrow().iter() {
+                        let k = JsValue::str(k.clone());
                         m.borrow()
                             .store
                             .borrow_mut()
-                            .insert(map_key(&JsValue::str(k.clone())), v.clone());
+                            .insert(map_key(&k), (k, v.clone()));
                     }
                 }
                 _ => {}
@@ -1809,6 +2180,7 @@ pub fn init_globals(this: &Rc<Interpreter>) -> Result<(), JsError> {
     globals.insert("Boolean".to_string(), native("Boolean", boolean_call));
     globals.insert("Array".to_string(), ctor("Array", array_call, array_call, Some(array_get), None));
     globals.insert("Object".to_string(), ctor("Object", object_call, object_call, Some(object_get), None));
+    globals.insert("Function".to_string(), ctor("Function", function_call, function_call, Some(function_get), None));
     globals.insert("parseInt".to_string(), native("parseInt", parse_int_call));
     globals.insert("parseFloat".to_string(), native("parseFloat", parse_float_call));
     globals.insert("isNaN".to_string(), native("isNaN", global_is_nan));
@@ -1823,10 +2195,42 @@ pub fn init_globals(this: &Rc<Interpreter>) -> Result<(), JsError> {
     globals.insert("Infinity".to_string(), JsValue::Number(f64::INFINITY));
     globals.insert("Promise".to_string(), ctor("Promise", promise_ctor, promise_ctor, Some(promise_get_static), None));
     globals.insert("Error".to_string(), ctor("Error", error_make, error_make, None, None));
+    for name in [
+        "TypeError",
+        "RangeError",
+        "SyntaxError",
+        "ReferenceError",
+        "EvalError",
+        "URIError",
+    ] {
+        globals.insert(name.to_string(), ctor(name, error_make, error_make, None, None));
+    }
     globals.insert("RegExp".to_string(), ctor("RegExp", regexp_call, regexp_call, None, None));
     globals.insert("Date".to_string(), ctor("Date", date_call, date_call, Some(date_get), None));
+    globals.insert(
+        "Symbol".to_string(),
+        // `new Symbol()` is a TypeError in a real engine and nobody writes it,
+        // so there is no constructor here -- only the call form.
+        JsValue::Native(Rc::new(Native {
+            name: Rc::from("Symbol"),
+            call: Some(symbol_call),
+            ctor: None,
+            get: Some(symbol_get),
+            set: None,
+            method_of: None,
+        })),
+    );
     globals.insert("Map".to_string(), ctor("Map", map_call, map_new, None, None));
     globals.insert("Set".to_string(), ctor("Set", set_call, set_new, None, None));
+    // WeakMap and WeakSet are Map and Set that hold their keys weakly, and
+    // weakly is the one thing this engine cannot do -- nothing here is ever
+    // collected, so every reference is already strong. What is left of the
+    // difference is the API, which is a strict subset of the strong one, so
+    // the strong one stands in. A page keeps its private data alive longer
+    // than it meant to; a page that cannot construct a WeakMap at all stops
+    // dead, and one of those two is a bundle that runs.
+    globals.insert("WeakMap".to_string(), ctor("WeakMap", map_call, map_new, None, None));
+    globals.insert("WeakSet".to_string(), ctor("WeakSet", set_call, set_new, None, None));
 
     let mut math = BTreeMap::new();
     for name in [
@@ -1867,6 +2271,7 @@ pub fn init_globals(this: &Rc<Interpreter>) -> Result<(), JsError> {
             ctor: None,
             get: Some(window_get),
             set: Some(window_set),
+            method_of: None,
         }),
         _ => unreachable!(),
     };
@@ -1880,6 +2285,7 @@ pub fn init_globals(this: &Rc<Interpreter>) -> Result<(), JsError> {
         ctor: None,
         get: Some(ls_get),
         set: Some(ls_set),
+        method_of: None,
     }));
     globals.insert("localStorage".to_string(), ls);
 

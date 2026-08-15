@@ -76,6 +76,26 @@ pub struct Native {
     pub ctor: Option<NativeFn>,
     pub get: Option<NativeGet>,
     pub set: Option<NativeSet>,
+    /// Set when this value is a method that was read off a receiver rather
+    /// than a free function: `"abc".slice` remembers `"abc"`.
+    ///
+    /// A method here is built as a closure that has already captured the value
+    /// it was found on, which is exactly right until someone takes it off one
+    /// value and runs it on another -- `Function.prototype.call.apply(fn,
+    /// args)`, the shape every polyfill bundle is made of. Remembering where
+    /// the method came from is what lets `.call`, `.apply` and `.bind` put a
+    /// different receiver underneath it.
+    ///
+    /// The three parts are the receiver, what to run for it, and whether that
+    /// second thing takes the receiver as its first argument. Most methods are
+    /// bound closures and are re-bound by looking the name up again on the new
+    /// receiver -- `"abc".slice` on another string finds that string's own
+    /// `slice`. The ones flagged generic cannot be: `({}).toString` applied to
+    /// an array has to stay `Object.prototype.toString` and answer `[object
+    /// Array]`, not turn into the array's own `toString` and answer `1,2`, so
+    /// those keep one receiver-first implementation and only swap the value in
+    /// front of it.
+    pub method_of: Option<(JsValue, JsValue, bool)>,
 }
 
 impl Native {
@@ -86,6 +106,7 @@ impl Native {
             ctor: None,
             get: None,
             set: None,
+            method_of: None,
         }
     }
 }
@@ -469,7 +490,20 @@ pub fn js_typeof(v: &JsValue) -> &'static str {
         | JsValue::Accessor(_)
         | JsValue::Super(_)
         | JsValue::Host(_) => "object",
-        JsValue::Native(_) | JsValue::Callback(_) => "function",
+        // A Native is whatever it was built to be. `Math`, `JSON`, `console`
+        // and `window` are all Natives and none of them is callable, so
+        // answering "function" for the lot of them told a feature test the
+        // opposite of the truth -- and `typeof window == "function"` is the
+        // sort of answer that sends a bundle down a code path written for
+        // some other host entirely.
+        JsValue::Native(n) => {
+            if n.call.is_some() || n.ctor.is_some() {
+                "function"
+            } else {
+                "object"
+            }
+        }
+        JsValue::Callback(_) => "function",
     }
 }
 
@@ -586,25 +620,48 @@ impl Environment {
         JsValue::Undefined
     }
 
+    /// `assign`, in the shape the loop and destructuring binders want: they
+    /// hold a `fn` pointer that also stands for `set_var`/`set_let`/`set_const`
+    /// and so cannot report anything. Assigning to a `const` is the only thing
+    /// `assign` complains about, and a loop head that does it is a program that
+    /// was already wrong before it got here.
+    pub fn assign_loop_var(&self, name: &str, value: JsValue) {
+        let _ = self.assign(name, value);
+    }
+
     pub fn assign(&self, name: &str, value: JsValue) -> Result<(), JsError> {
-        let mut env: Option<Env> = Some(Rc::new(self.clone()));
-        while let Some(e) = env {
-            if e.lets.borrow().contains_key(name) {
-                e.lets.borrow_mut().insert(name.to_string(), value);
+        let mut env: Env = Rc::new(self.clone());
+        loop {
+            if env.lets.borrow().contains_key(name) {
+                env.lets.borrow_mut().insert(name.to_string(), value);
                 return Ok(());
             }
-            if e.consts.borrow().contains_key(name) {
+            if env.consts.borrow().contains_key(name) {
                 return Err(JsError::js(format!(
                     "Assignment to constant variable '{name}'."
                 )));
             }
-            if e.vars.borrow().contains_key(name) {
-                e.vars.borrow_mut().insert(name.to_string(), value);
+            if env.vars.borrow().contains_key(name) {
+                env.vars.borrow_mut().insert(name.to_string(), value);
                 return Ok(());
             }
-            env = e.parent.clone();
+            let parent = env.parent.clone();
+            match parent {
+                Some(p) => env = p,
+                None => break,
+            }
         }
-        self.vars.borrow_mut().insert(name.to_string(), value);
+        // Nothing up the chain owns the name, so this is sloppy mode's implicit
+        // global: `x = 1` with no declaration anywhere makes a property of the
+        // global object, however deep inside functions and blocks it happens.
+        // The binding used to land in the innermost scope instead, which reads
+        // as correct right up until the next statement -- the assignment
+        // appears to work, and then the value vanishes the moment the block
+        // ends. Bundled code leans on this more than you would hope: an IIFE
+        // that publishes its namespace with a bare `MyLib = {...}` and a later
+        // script that reads it are a pairing older minifiers emit freely, and
+        // one that used to leave the second script staring at undefined.
+        env.vars.borrow_mut().insert(name.to_string(), value);
         Ok(())
     }
 }
@@ -621,8 +678,18 @@ pub struct JSFunction {
     pub env: Env,
     pub async_: bool,
     pub arrow: bool,
+    /// `function*`. Calling one runs the body to the end and collects what it
+    /// yielded, rather than suspending it -- see `run_generator`.
+    pub generator: bool,
     pub super_info: Option<(JsValue, JsValue)>,
     pub prototype: RefCell<Option<Rc<RefCell<BTreeMap<String, JsValue>>>>>,
+    /// Properties hung on the function itself. A function is an object, and
+    /// the pre-class way to write a static member -- `Foo.create = ...`,
+    /// `Foo.VERSION = 3`, a memo cache on `f.cache` -- is to hang it here.
+    /// Writes used to be dropped on the floor unless the name was `prototype`,
+    /// so the value read back as undefined and the library that wrote it
+    /// looked broken for reasons nowhere near where it had gone wrong.
+    pub props: RefCell<BTreeMap<String, JsValue>>,
 }
 
 impl JSFunction {
@@ -638,8 +705,30 @@ impl JSFunction {
     }
 
     pub fn set_prototype(&self, value: JsValue) {
-        if let JsValue::Object(map) = value {
-            *self.prototype.borrow_mut() = Some(map);
+        match value {
+            JsValue::Object(map) => *self.prototype.borrow_mut() = Some(map),
+            // `C.prototype = Object.create(P.prototype)` and its older sibling
+            // `C.prototype = new P()` are how inheritance was spelled for the
+            // fifteen years of JavaScript that most shipped bundles were
+            // written in, and both hand over an object that already has a
+            // prototype of its own. Taking only the literal-object form meant
+            // the assignment did nothing at all: the subclass kept its own
+            // empty prototype, and every inherited method was undefined.
+            //
+            // The instance's own property map becomes the prototype -- shared,
+            // not copied, so `C.prototype.m = ...` afterwards is visible
+            // through both -- with a `__proto__` link added so the lookup
+            // carries on up to the parent.
+            JsValue::Instance(inst) => {
+                let (own, parent) = {
+                    let i = inst.borrow();
+                    (i.props.clone(), i.proto.clone())
+                };
+                own.borrow_mut()
+                    .insert("__proto__".to_string(), JsValue::Object(parent));
+                *self.prototype.borrow_mut() = Some(own);
+            }
+            _ => {}
         }
     }
 }
@@ -691,6 +780,15 @@ pub struct JsClass {
     pub ctor: Option<Rc<JSFunction>>,
     pub parent: Option<JsValue>,
     pub statics: Rc<RefCell<BTreeMap<String, JsValue>>>,
+    /// Instance field initialisers, already reduced to a name and the
+    /// expression that produces the value, in source order. They cannot be
+    /// evaluated when the class is defined the way a static field can: each
+    /// one belongs to a different object and may read `this`, so the
+    /// expression has to be kept and re-run for every instance made. The
+    /// environment it closes over is kept beside it because the class body's
+    /// scope is gone by the time anything calls `new`.
+    pub fields: Vec<(String, Option<Rc<crate::ast::Node>>)>,
+    pub field_env: Option<Env>,
 }
 
 #[derive(Debug)]
@@ -715,9 +813,18 @@ pub struct JsSuper {
     pub parent_ctor: JsValue,
 }
 
+/// A Map keyed by `map_key`'s string form of the key, holding the key itself
+/// alongside the value.
+///
+/// The string is only an identity: `map_key` gives objects their address and
+/// primitives their spelling, which is what makes `m.get(k)` a lookup rather
+/// than a scan. It cannot be handed back, though -- `m.keys()`, `m.forEach`
+/// and `for (const [k, v] of m)` all want the original value, and a Map whose
+/// keys are objects (the case Map exists for at all) has nothing to
+/// reconstruct them from. So the key rides along with the value.
 #[derive(Debug)]
 pub struct JsMap {
-    pub store: RefCell<BTreeMap<String, JsValue>>,
+    pub store: RefCell<BTreeMap<String, (JsValue, JsValue)>>,
 }
 
 #[derive(Debug)]

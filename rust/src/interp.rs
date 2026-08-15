@@ -49,6 +49,10 @@ pub struct Interpreter {
     pub undefined_ref: Py<PyAny>,
     pub js_exception: Py<PyAny>,
     pub local_storage: Rc<RefCell<BTreeMap<String, String>>>,
+    /// One entry per generator body currently running, holding what it has
+    /// yielded so far. A stack rather than a field because a generator can
+    /// call another one, and `yield*` does exactly that.
+    pub yields: RefCell<Vec<Vec<JsValue>>>,
 }
 
 impl Interpreter {
@@ -73,6 +77,7 @@ impl Interpreter {
             undefined_ref,
             js_exception,
             local_storage: Rc::new(RefCell::new(BTreeMap::new())),
+            yields: RefCell::new(Vec::new()),
         });
         crate::stdlib::init_globals(&interp)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyException, _>(js_error_message(&interp, &e)))?;
@@ -938,11 +943,48 @@ fn regex_split(re: &crate::regexp::Regex, text: &str, limit: usize) -> Vec<JsVal
     out
 }
 
+/// `str.match(x)` and `str.search(x)` both take "a RegExp, or anything at all"
+/// -- the spec's answer to a non-RegExp is `new RegExp(x)`, so `"a.b".match(".")`
+/// matches the first character rather than the dot. Page code writes the string
+/// form freely, usually because the pattern arrived in a variable, and refusing
+/// it used to throw out of a method that had a perfectly good answer.
+fn as_regex(this: &Interpreter, v: &JsValue) -> Rc<RefCell<JsRegex>> {
+    match v {
+        JsValue::Regex(r) => r.clone(),
+        JsValue::Undefined => Rc::new(RefCell::new(compile_regex("", ""))),
+        _ => Rc::new(RefCell::new(compile_regex(&this.repr(v), ""))),
+    }
+}
+
+/// The index of the first match, or -1. `lastIndex` plays no part even for a
+/// global regex: `search` is the one method on the family that ignores it, and
+/// a page that alternates `search` with `exec` on the same regex would
+/// otherwise get answers that depend on the order it called them in.
+pub fn string_search(this: &Interpreter, text: &str, pattern: &JsValue) -> JsValue {
+    let r = as_regex(this, pattern);
+    let r = r.borrow();
+    match r.re.exec(text, 0) {
+        Some(caps) => match caps[0] {
+            Some(span) => JsValue::Number(char_of_byte(text, span.start as usize) as f64),
+            None => JsValue::Number(-1.0),
+        },
+        None => JsValue::Number(-1.0),
+    }
+}
+
 pub fn string_match(
-    _this: &Interpreter,
+    this: &Interpreter,
     text: &str,
     regex: &JsValue,
 ) -> Result<JsValue, JsError> {
+    let coerced;
+    let regex = match regex {
+        JsValue::Regex(_) => regex,
+        other => {
+            coerced = JsValue::Regex(as_regex(this, other));
+            &coerced
+        }
+    };
     if let JsValue::Regex(r) = regex {
         let r = r.borrow();
         if r.global_ {
@@ -1097,15 +1139,162 @@ fn write_slot(
     }
 }
 
+/// Does `obj` carry `name` itself, as opposed to inheriting it?
+pub fn has_own(obj: &JsValue, name: &str) -> bool {
+    match obj {
+        JsValue::Object(m) => name != "__proto__" && m.borrow().contains_key(name),
+        JsValue::Instance(i) => i.borrow().props.borrow().contains_key(name),
+        JsValue::Array(a) => match int_index(name) {
+            Some(idx) => idx >= 0 && (idx as usize) < a.borrow().len(),
+            None => name == "length",
+        },
+        JsValue::Function(f) => f.props.borrow().contains_key(name),
+        _ => false,
+    }
+}
+
+/// The members every object inherits from `Object.prototype`, bound to the
+/// object that was asked for them.
+///
+/// Nothing here has a prototype chain that reaches `Object.prototype`, so
+/// these had to be answered somewhere, and the place they are actually reached
+/// from is ordinary page code: `o.hasOwnProperty(k)` guards half the
+/// `for...in` loops ever written, and `Object.prototype.toString.call(x)` is
+/// still how a bundle asks whether something is an Array without trusting
+/// `instanceof` across frames.
+/// The methods every value inherits from `Object.prototype`.
+///
+/// Each one is receiver-first: the value it works on arrives as the first
+/// argument rather than being captured, because these are the methods most
+/// likely to be pulled off one object and run against another. `js_get` puts
+/// the receiver back in front for an ordinary `o.hasOwnProperty(k)` call.
+fn object_proto_method(name: &str) -> Option<JsValue> {
+    match name {
+        "hasOwnProperty" | "propertyIsEnumerable" => Some(JsValue::Callback(Rc::new(
+            move |i: &Rc<Interpreter>, args: Vec<JsValue>| -> EvResult {
+                let r = args.first().cloned().unwrap_or(JsValue::Undefined);
+                let key = i.repr(&args.get(1).cloned().unwrap_or(JsValue::Undefined));
+                Box::pin(async move { Ok(JsValue::Bool(has_own(&r, &key))) })
+            },
+        ))),
+        "isPrototypeOf" => Some(JsValue::Callback(Rc::new(
+            move |_i: &Rc<Interpreter>, args: Vec<JsValue>| -> EvResult {
+                let r = args.first().cloned().unwrap_or(JsValue::Undefined);
+                Box::pin(async move {
+                    let other = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+                    let target = match &r {
+                        JsValue::Object(m) => m.clone(),
+                        JsValue::Instance(i) => i.borrow().props.clone(),
+                        _ => return Ok(JsValue::Bool(false)),
+                    };
+                    let mut cur = match &other {
+                        JsValue::Instance(i) => Some(i.borrow().proto.clone()),
+                        _ => None,
+                    };
+                    for _ in 0..64 {
+                        let m = match cur {
+                            Some(m) => m,
+                            None => break,
+                        };
+                        if Rc::ptr_eq(&m, &target) {
+                            return Ok(JsValue::Bool(true));
+                        }
+                        let next = m.borrow().get("__proto__").cloned();
+                        cur = match next {
+                            Some(JsValue::Object(p)) => Some(p),
+                            _ => None,
+                        };
+                    }
+                    Ok(JsValue::Bool(false))
+                })
+            },
+        ))),
+        // The inherited `toString` is the tag one, `[object Array]`. For the
+        // plain objects that actually inherit it that is the same string
+        // `repr` would produce, so nothing about `String(o)` changes; the
+        // difference only shows once the method has been taken off an object
+        // and applied to something else, which is the one thing it is for.
+        "toString" | "toLocaleString" => Some(crate::stdlib::object_proto_to_string_native()),
+        "valueOf" => Some(JsValue::Callback(Rc::new(
+            move |_i: &Rc<Interpreter>, args: Vec<JsValue>| -> EvResult {
+                let r = args.first().cloned().unwrap_or(JsValue::Undefined);
+                Box::pin(async move { Ok(r) })
+            },
+        ))),
+        _ => None,
+    }
+}
+
+/// Wrap a method that has just been read off `recv` so that it remembers
+/// where it came from. See `Native::method_of` for why that matters.
+fn bound_method(recv: JsValue, name: &str, target: JsValue, generic: bool) -> JsValue {
+    JsValue::Native(Rc::new(Native {
+        name: Rc::from(name),
+        call: Some(invoke_bound_method),
+        ctor: None,
+        get: None,
+        set: None,
+        method_of: Some((recv, target, generic)),
+    }))
+}
+
+fn invoke_bound_method(this: &Rc<Interpreter>, callee: &JsValue, args: Vec<JsValue>) -> EvResult {
+    let (recv, target, generic) = match callee {
+        JsValue::Native(n) => match &n.method_of {
+            Some(m) => m.clone(),
+            None => (JsValue::Undefined, JsValue::Undefined, false),
+        },
+        _ => (JsValue::Undefined, JsValue::Undefined, false),
+    };
+    if generic {
+        let mut all = vec![recv.clone()];
+        all.extend(args);
+        return call_value(this, &target, all, JsValue::Undefined);
+    }
+    call_value(this, &target, args, recv)
+}
+
+/// The same method, ready to run on a different receiver.
+fn rebind_method(
+    this: &Rc<Interpreter>,
+    n: &Native,
+    recv: &JsValue,
+) -> Result<JsValue, JsError> {
+    match &n.method_of {
+        Some((_, target, true)) => Ok(bound_method(recv.clone(), &n.name, target.clone(), true)),
+        // Looking the name up again is what makes a re-bound `slice` the new
+        // receiver's own `slice`, which is what an uncurried method is for.
+        _ => js_get(this, recv, &n.name),
+    }
+}
+
+/// Tag a method with the value it was found on, leaving everything else --
+/// plain properties, array elements, `length` -- exactly as it was.
+fn as_method(obj: &JsValue, name: &str, v: JsValue) -> JsValue {
+    match v {
+        JsValue::Callback(_) => bound_method(obj.clone(), name, v, false),
+        other => other,
+    }
+}
+
 pub fn js_get(this: &Rc<Interpreter>, obj: &JsValue, name: &str) -> Result<JsValue, JsError> {
     match obj {
         JsValue::Object(map) => {
-            let slot = map.borrow().get(name).cloned().unwrap_or(JsValue::Undefined);
+            // Plain objects inherit too: `Object.setPrototypeOf(o, p)` and an
+            // object literal used as a prototype both leave a `__proto__` link
+            // to follow.
+            let slot = match map_chain_get(map, name) {
+                Some(v) => v,
+                None => match object_proto_method(name) {
+                    Some(m) => return Ok(bound_method(obj.clone(), name, m, true)),
+                    None => JsValue::Undefined,
+                },
+            };
             read_slot(this, obj, slot)
         }
-        JsValue::Array(arr) => Ok(list_get(this, arr, name)),
-        JsValue::Str(s) => Ok(string_get(this, s, name)),
-        JsValue::Number(n) => Ok(number_get(this, *n, name)),
+        JsValue::Array(arr) => Ok(as_method(obj, name, list_get(this, arr, name))),
+        JsValue::Str(s) => Ok(as_method(obj, name, string_get(this, s, name))),
+        JsValue::Number(n) => Ok(as_method(obj, name, number_get(this, *n, name))),
         JsValue::Function(f) => function_get(this, f, name),
         JsValue::Promise(p) => promise_get(this, p, name),
         JsValue::Class(c) => {
@@ -1114,13 +1303,18 @@ pub fn js_get(this: &Rc<Interpreter>, obj: &JsValue, name: &str) -> Result<JsVal
         }
         JsValue::Instance(inst) => {
             let slot = instance_get(inst, name);
+            if matches!(slot, JsValue::Undefined) {
+                if let Some(m) = object_proto_method(name) {
+                    return Ok(bound_method(obj.clone(), name, m, true));
+                }
+            }
             read_slot(this, obj, slot)
         }
-        JsValue::Map(m) => Ok(map_get(this, m, name)),
-        JsValue::Set(s) => Ok(set_get(this, s, name)),
-        JsValue::Date(d) => Ok(date_get(this, d, name)),
-        JsValue::Regex(r) => Ok(regex_get(this, r, name)),
-        JsValue::Error(e) => Ok(error_get(e, name)),
+        JsValue::Map(m) => Ok(as_method(obj, name, map_get(this, m, name))),
+        JsValue::Set(s) => Ok(as_method(obj, name, set_get(this, s, name))),
+        JsValue::Date(d) => Ok(as_method(obj, name, date_get(this, d, name))),
+        JsValue::Regex(r) => Ok(as_method(obj, name, regex_get(this, r, name))),
+        JsValue::Error(e) => Ok(as_method(obj, name, error_get(e, name))),
         JsValue::Super(s) => Ok(super_get(s, name)),
         JsValue::Native(n) => {
             if matches!(name, "call" | "apply" | "bind") {
@@ -1144,12 +1338,32 @@ pub fn js_get(this: &Rc<Interpreter>, obj: &JsValue, name: &str) -> Result<JsVal
     }
 }
 
+/// `Some` when `f` is a method that remembers its receiver, holding the same
+/// method ready to run on `recv` instead. `None` for everything else, which is
+/// left to the ordinary paths below.
+fn rebound(
+    this: &Rc<Interpreter>,
+    f: &JsValue,
+    recv: &JsValue,
+) -> Option<Result<JsValue, JsError>> {
+    match f {
+        JsValue::Native(n) if n.method_of.is_some() => Some(rebind_method(this, n, recv)),
+        _ => None,
+    }
+}
+
 fn make_method_wrapper(f: JsValue, name: &str) -> JsValue {
     let f2 = f.clone();
     match name {
         "call" => JsValue::Callback(Rc::new(move |interp: &Rc<Interpreter>, args: Vec<JsValue>| -> EvResult {
             let this_arg = args.first().cloned().unwrap_or(JsValue::Undefined);
-            let rest = args.into_iter().skip(1).collect();
+            let rest: Vec<JsValue> = args.into_iter().skip(1).collect();
+            if let Some(g) = rebound(interp, &f2, &this_arg) {
+                return match g {
+                    Ok(g) => call_value(interp, &g, rest, this_arg),
+                    Err(e) => Box::pin(async move { Err(e) }),
+                };
+            }
             if matches!(f2, JsValue::Native(_) | JsValue::Callback(_)) {
                 let mut all = vec![this_arg];
                 all.extend(rest);
@@ -1164,6 +1378,12 @@ fn make_method_wrapper(f: JsValue, name: &str) -> JsValue {
                 Some(JsValue::Array(a)) => a.borrow().clone(),
                 _ => vec![],
             };
+            if let Some(g) = rebound(interp, &f2, &this_arg) {
+                return match g {
+                    Ok(g) => call_value(interp, &g, rest, this_arg),
+                    Err(e) => Box::pin(async move { Err(e) }),
+                };
+            }
             if matches!(f2, JsValue::Native(_) | JsValue::Callback(_)) {
                 let mut all = vec![this_arg];
                 all.extend(rest);
@@ -1172,13 +1392,55 @@ fn make_method_wrapper(f: JsValue, name: &str) -> JsValue {
                 call_value(interp, &f2, rest, this_arg)
             }
         })),
-        _ => JsValue::Callback(Rc::new(move |_interp: &Rc<Interpreter>, args: Vec<JsValue>| -> EvResult {
+        _ => JsValue::Callback(Rc::new(move |interp: &Rc<Interpreter>, args: Vec<JsValue>| -> EvResult {
             let this_arg = args.first().cloned().unwrap_or(JsValue::Undefined);
             let pre = args.into_iter().skip(1).collect();
-            let out = make_bound_js(f2.clone(), this_arg, pre);
+            let target = match rebound(interp, &f2, &this_arg) {
+                Some(Ok(g)) => g,
+                Some(Err(e)) => return Box::pin(async move { Err(e) }),
+                None => f2.clone(),
+            };
+            let out = make_bound_js(target, this_arg, pre);
             Box::pin(async move { Ok(out) })
         })),
     }
+}
+
+/// `Function.prototype`, with `call`, `apply` and `bind` as values that can be
+/// pulled off it and used on their own.
+///
+/// Reading one of those three off a particular function is easy and was
+/// already handled; reading it off `Function.prototype`, where there is no
+/// particular function yet, is the shape every polyfill bundle opens with:
+///
+/// ```js
+/// var call = Function.prototype.call;
+/// var uncurryThis = function (fn) { return function () { return call.apply(fn, arguments); }; };
+/// ```
+///
+/// core-js builds nearly every method it ships that way, so failing here took
+/// the entire polyfill bundle -- and with it everything that depended on it --
+/// out of a page in one go. The receiver arrives as the first argument, the
+/// convention every callback in this engine follows, and from there the
+/// existing per-function wrapper does the work.
+pub fn function_proto_object() -> JsValue {
+    let mut m = BTreeMap::new();
+    for name in ["call", "apply", "bind"] {
+        let cb = JsValue::Callback(Rc::new(
+            move |interp: &Rc<Interpreter>, args: Vec<JsValue>| -> EvResult {
+                let mut args = args;
+                let f = if args.is_empty() {
+                    JsValue::Undefined
+                } else {
+                    args.remove(0)
+                };
+                let m = make_method_wrapper(f, name);
+                call_value(interp, &m, args, JsValue::Undefined)
+            },
+        ));
+        m.insert(name.to_string(), cb);
+    }
+    JsValue::Object(Rc::new(RefCell::new(m)))
 }
 
 fn make_bound_js(f: JsValue, this_arg: JsValue, pre: Vec<JsValue>) -> JsValue {
@@ -1208,6 +1470,8 @@ pub fn js_set(
         JsValue::Function(f) => {
             if name == "prototype" {
                 f.set_prototype(value.clone());
+            } else {
+                f.props.borrow_mut().insert(name.to_string(), value.clone());
             }
             Ok(())
         }
@@ -1215,6 +1479,15 @@ pub fn js_set(
             // A setter declared on the class sits on the prototype, so the
             // whole chain has to be consulted before deciding this is a plain
             // own-property write.
+            // Assigning `__proto__` re-parents the object rather than storing
+            // a property called that -- the one property name in the language
+            // that means something.
+            if name == "__proto__" {
+                if let JsValue::Object(m) = value {
+                    inst.borrow_mut().proto = m.clone();
+                }
+                return Ok(());
+            }
             let slot = Some(instance_get(inst, name)).filter(|v| matches!(v, JsValue::Accessor(_)));
             if write_slot(this, obj, slot, value)? {
                 return Ok(());
@@ -2142,6 +2415,18 @@ pub fn string_get(this: &Rc<Interpreter>, text: &Rc<str>, name: &str) -> JsValue
                 })
             }));
         }
+        "search" => {
+            let i0 = this.clone();
+            return JsValue::Callback(Rc::new(move |i: &Rc<Interpreter>, args: Vec<JsValue>| -> EvResult {
+                let _i2 = i.clone();
+                let i3 = i0.clone();
+                let t2 = t.clone();
+                Box::pin(async move {
+                    let pattern = args.first().cloned().unwrap_or(JsValue::Undefined);
+                    Ok(string_search(&i3, &t2, &pattern))
+                })
+            }));
+        }
         "replace" | "replaceAll" => {
             let op = name.to_string();
             return JsValue::Callback(Rc::new(move |i: &Rc<Interpreter>, args: Vec<JsValue>| -> EvResult {
@@ -2245,7 +2530,7 @@ pub fn map_get(this: &Rc<Interpreter>, m: &Rc<RefCell<JsMap>>, name: &str) -> Js
                 let k = args.first().cloned().unwrap_or(JsValue::Undefined);
                 let v = args.get(1).cloned().unwrap_or(JsValue::Undefined);
                 let key = map_key(&k);
-                m2.borrow().store.borrow_mut().insert(key, v);
+                m2.borrow().store.borrow_mut().insert(key, (k, v));
                 let out = JsValue::Map(m2.clone());
                 Box::pin(async move { Ok(out) })
             }));
@@ -2255,7 +2540,13 @@ pub fn map_get(this: &Rc<Interpreter>, m: &Rc<RefCell<JsMap>>, name: &str) -> Js
             return JsValue::Callback(Rc::new(move |_i: &Rc<Interpreter>, args: Vec<JsValue>| -> EvResult {
                 let k = args.first().cloned().unwrap_or(JsValue::Undefined);
                 let key = map_key(&k);
-                let v = m2.borrow().store.borrow().get(&key).cloned().unwrap_or(JsValue::Undefined);
+                let v = m2
+                    .borrow()
+                    .store
+                    .borrow()
+                    .get(&key)
+                    .map(|(_k, v)| v.clone())
+                    .unwrap_or(JsValue::Undefined);
                 Box::pin(async move { Ok(v) })
             }));
         }
@@ -2295,22 +2586,52 @@ pub fn map_get(this: &Rc<Interpreter>, m: &Rc<RefCell<JsMap>>, name: &str) -> Js
                 let m2 = m3.clone();
                 Box::pin(async move {
                     let fn_ = args.first().cloned().unwrap_or(JsValue::Undefined);
-                    let entries: Vec<(JsValue, JsValue)> = m2
-                        .borrow()
-                        .store
-                        .borrow()
-                        .iter()
-                        .map(|(_, v)| (v.clone(), v.clone()))
-                        .collect();
-                    for (_k, v) in entries {
-                        call_value(&i2, &fn_, vec![v.clone(), JsValue::Undefined, JsValue::Map(m2.clone())], JsValue::Undefined).await?;
+                    let entries = map_entries(&m2);
+                    for (k, v) in entries {
+                        call_value(&i2, &fn_, vec![v, k, JsValue::Map(m2.clone())], JsValue::Undefined).await?;
                     }
                     Ok(JsValue::Undefined)
                 })
             }));
         }
+        // `keys()`, `values()` and `entries()` are meant to hand back lazy
+        // iterators, and hand back arrays here instead. Everything anyone does
+        // with them -- spread, `for...of`, `Array.from` -- works the same on an
+        // array; what does not work is a Map that is mutated while one of them
+        // is being walked, which is a thing the real iterators are specified to
+        // notice and a thing almost no code does on purpose.
+        "keys" | "values" | "entries" => {
+            let m2 = m.clone();
+            let which = name.to_string();
+            return JsValue::Callback(Rc::new(move |_i: &Rc<Interpreter>, _args: Vec<JsValue>| -> EvResult {
+                let entries = map_entries(&m2);
+                let out = JsValue::array(match which.as_str() {
+                    "keys" => entries.into_iter().map(|(k, _v)| k).collect(),
+                    "values" => entries.into_iter().map(|(_k, v)| v).collect(),
+                    _ => entries
+                        .into_iter()
+                        .map(|(k, v)| JsValue::array(vec![k, v]))
+                        .collect(),
+                });
+                Box::pin(async move { Ok(out) })
+            }));
+        }
         _ => JsValue::Undefined,
     }
+}
+
+/// A Map's contents as real key/value pairs, in insertion order... or rather
+/// in `map_key` order, which is the order the underlying tree keeps them in.
+/// Insertion order is what the language promises and what a serialiser that
+/// round-trips a Map through an array would need; nothing here has ever
+/// recorded it.
+pub fn map_entries(m: &Rc<RefCell<JsMap>>) -> Vec<(JsValue, JsValue)> {
+    m.borrow()
+        .store
+        .borrow()
+        .values()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
 }
 
 pub fn set_get(this: &Rc<Interpreter>, s: &Rc<RefCell<JsSet>>, name: &str) -> JsValue {
@@ -2369,8 +2690,29 @@ pub fn set_get(this: &Rc<Interpreter>, s: &Rc<RefCell<JsSet>>, name: &str) -> Js
                 })
             }));
         }
+        // A Set's keys are its values, which is why `keys` and `values` are the
+        // same list and `entries` pairs each value with itself.
+        "values" | "keys" | "entries" => {
+            let s2 = s.clone();
+            let pairs = name == "entries";
+            return JsValue::Callback(Rc::new(move |_i: &Rc<Interpreter>, _args: Vec<JsValue>| -> EvResult {
+                let vals = set_values(&s2);
+                let out = JsValue::array(if pairs {
+                    vals.into_iter()
+                        .map(|v| JsValue::array(vec![v.clone(), v]))
+                        .collect()
+                } else {
+                    vals
+                });
+                Box::pin(async move { Ok(out) })
+            }));
+        }
         _ => JsValue::Undefined,
     }
+}
+
+pub fn set_values(s: &Rc<RefCell<JsSet>>) -> Vec<JsValue> {
+    s.borrow().store.borrow().values().cloned().collect()
 }
 
 // -- date ------------------------------------------------------------------
@@ -2665,23 +3007,48 @@ pub fn class_get(this: &Rc<Interpreter>, c: &Rc<RefCell<JsClass>>, name: &str) -
     Ok(JsValue::Undefined)
 }
 
-pub fn instance_get(inst: &Rc<RefCell<JsClassInstance>>, name: &str) -> JsValue {
-    let inst = inst.borrow();
-    if let Some(v) = inst.props.borrow().get(name) {
-        return v.clone();
-    }
-    let mut p = Some(inst.proto.clone());
-    while let Some(pp) = p {
-        if let Some(v) = pp.borrow().get(name) {
-            return v.clone();
+/// Follow the prototype chain from one object map, looking for `name`.
+///
+/// The chain is spelled as a `__proto__` entry holding the next map along,
+/// which is how the link survives in a world where a prototype is a plain map
+/// rather than a value with an identity of its own. The hop limit is not
+/// paranoia: `a.__proto__ = b; b.__proto__ = a` is two assignments away in any
+/// script, and a real engine answers that with a TypeError at assignment time,
+/// which we are not in a position to.
+pub fn map_chain_get(
+    map: &Rc<RefCell<BTreeMap<String, JsValue>>>,
+    name: &str,
+) -> Option<JsValue> {
+    let mut cur = Some(map.clone());
+    for _ in 0..64 {
+        let m = match cur {
+            Some(m) => m,
+            None => break,
+        };
+        if let Some(v) = m.borrow().get(name) {
+            return Some(v.clone());
         }
-        let next = pp.borrow().get("__proto__").cloned();
-        p = match next {
-            Some(JsValue::Object(m)) => Some(m),
+        let next = m.borrow().get("__proto__").cloned();
+        cur = match next {
+            Some(JsValue::Object(p)) => Some(p),
             _ => None,
         };
     }
-    JsValue::Undefined
+    None
+}
+
+pub fn instance_get(inst: &Rc<RefCell<JsClassInstance>>, name: &str) -> JsValue {
+    let inst = inst.borrow();
+    // `o.__proto__` is the prototype itself, not whatever the prototype's own
+    // `__proto__` entry says -- the two differ by exactly one link, and reading
+    // the wrong one skips a whole level of the chain.
+    if name == "__proto__" {
+        return JsValue::Object(inst.proto.clone());
+    }
+    if let Some(v) = inst.props.borrow().get(name) {
+        return v.clone();
+    }
+    map_chain_get(&inst.proto, name).unwrap_or(JsValue::Undefined)
 }
 
 // -- function_get ----------------------------------------------------------
@@ -2691,10 +3058,30 @@ pub fn function_get(
     f: &Rc<JSFunction>,
     name: &str,
 ) -> Result<JsValue, JsError> {
+    // Anything hung on the function wins over the built-in answers, the way
+    // an own property wins in a real engine -- a library that assigns its own
+    // `name` or `length` means that one.
+    if let Some(v) = f.props.borrow().get(name) {
+        return Ok(v.clone());
+    }
     match name {
         "length" => Ok(JsValue::Number(f.params.len() as f64)),
         "name" => Ok(JsValue::str(f.name.clone())),
         "prototype" => Ok(JsValue::Object(JSFunction::prototype_obj(f))),
+        // Every function has a `toString`, and code calls it far more often to
+        // sniff at the source than to print it: `/native code/.test(String(f))`
+        // is how a bundle decides whether a builtin has been polyfilled. What
+        // comes back is honest about being a stand-in rather than pretending
+        // to be the source we no longer have.
+        "toString" => {
+            let name = f.name.clone();
+            Ok(JsValue::Callback(Rc::new(move |_i: &Rc<Interpreter>, _a: Vec<JsValue>| -> EvResult {
+                let name = name.clone();
+                Box::pin(async move {
+                    Ok(JsValue::str(format!("function {name}() {{ [native code] }}")))
+                })
+            })))
+        }
         "call" => {
             let f2 = f.clone();
             Ok(JsValue::Callback(Rc::new(move |i: &Rc<Interpreter>, args: Vec<JsValue>| -> EvResult {
@@ -3063,17 +3450,33 @@ fn bind_args(
     let fn_ = fn_.clone();
     Box::pin(async move {
         for (i, name) in fn_.params.iter().enumerate() {
-            if i < args.len() {
-                scope.set_var(name, args[i].clone());
-            } else if let Some(default) = fn_.defaults.get(name) {
-                let v = eval(&this, default, scope.clone()).await?;
-                scope.set_var(name, v);
-            } else {
-                scope.set_var(name, JsValue::Undefined);
+            // A default stands in for a missing argument *and* for one passed
+            // as `undefined`; the two are the same thing to the caller, and
+            // `f(a, undefined, c)` is how you reach past a middle parameter to
+            // set a later one. Only checking the count meant that call handed
+            // the middle parameter `undefined` instead of its default.
+            let given = match args.get(i) {
+                Some(JsValue::Undefined) | None => None,
+                Some(v) => Some(v.clone()),
+            };
+            match given {
+                Some(v) => scope.set_var(name, v),
+                None => match fn_.defaults.get(name) {
+                    Some(default) => {
+                        let v = eval(&this, default, scope.clone()).await?;
+                        scope.set_var(name, v);
+                    }
+                    None => scope.set_var(name, JsValue::Undefined),
+                },
             }
         }
         if let Some(rest) = &fn_.rest {
-            scope.set_var(rest, JsValue::array(args[fn_.params.len()..].to_vec()));
+            // `args` is shorter than the parameter list whenever the caller
+            // left some off, and slicing from past the end of a slice is a
+            // panic rather than an empty slice -- so `function f(a, ...b) {}`
+            // called as `f()` took the whole engine down with it.
+            let extra = args.get(fn_.params.len()..).unwrap_or(&[]).to_vec();
+            scope.set_var(rest, JsValue::array(extra));
         }
         // `arguments` is everything that was actually passed, however many
         // parameters were declared -- which is the whole point of it, and why
@@ -3092,15 +3495,41 @@ fn bind_args(
     })
 }
 
-fn set_this(scope: &Env, fn_: &JSFunction, this_arg: &JsValue) {
+/// The global object, as `this` and `globalThis` both see it. It is the same
+/// `window` proxy `stdlib` publishes, so a property set through it lands in
+/// the globals map and shows up as a bare name afterwards.
+pub fn global_this(this: &Interpreter) -> JsValue {
+    this.globals
+        .borrow()
+        .get("globalThis")
+        .cloned()
+        .unwrap_or(JsValue::Undefined)
+}
+
+fn set_this(interp: &Rc<Interpreter>, scope: &Env, fn_: &JSFunction, this_arg: &JsValue) {
     if fn_.arrow {
         let t = fn_.env.get("this");
         scope.vars.borrow_mut().insert("this".to_string(), t);
-    } else if !matches!(this_arg, JsValue::Undefined) {
-        scope
-            .vars
-            .borrow_mut()
-            .insert("this".to_string(), this_arg.clone());
+    } else {
+        // Sloppy mode's `this` substitution: a plain `f()` -- and `f.call(null)`
+        // -- runs with `this` bound to the global object, not to nothing. Every
+        // script on a page is sloppy unless it says otherwise, and the pattern
+        // that depends on it is the one every bundle opens with: an IIFE that
+        // publishes itself with `this.thing = ...`, or that hands itself the
+        // global as `(typeof self != "undefined" ? self : this)`. Leaving
+        // `this` undefined made both of those write into nowhere, silently,
+        // and the failure only surfaced much later when a second script went
+        // looking for what the first had supposedly exported.
+        //
+        // Binding it unconditionally matters as much as the value does: with
+        // no entry of its own, a plain call used to see whatever `this` the
+        // enclosing scope had, which is an arrow function's rule applied to a
+        // function that is not one.
+        let t = match this_arg {
+            JsValue::Undefined | JsValue::Null => global_this(interp),
+            other => other.clone(),
+        };
+        scope.vars.borrow_mut().insert("this".to_string(), t);
     }
     if let Some((pp, pc)) = &fn_.super_info {
         scope.vars.borrow_mut().insert(
@@ -3125,7 +3554,10 @@ fn call_function(
     Box::pin(async move {
         let scope = Environment::function(Some(fn_.env.clone()));
         bind_args(&this, &fn_, scope.clone(), args).await?;
-        set_this(&scope, &fn_, &this_arg);
+        set_this(&this, &scope, &fn_, &this_arg);
+        if fn_.generator {
+            return run_generator(&this, &fn_, scope).await;
+        }
         let result = if let Some(expr) = &fn_.body_expr {
             eval(&this, expr, scope.clone()).await
         } else {
@@ -3140,6 +3572,86 @@ fn call_function(
         };
         result
     })
+}
+
+/// Run a generator body to the end and hand back an iterator over everything
+/// it yielded.
+///
+/// A real generator suspends: `next()` runs the body as far as the next
+/// `yield`, hands that value out, and stops until it is asked again. Nothing
+/// here can stop a Rust call stack in the middle and resume it later -- that
+/// is a coroutine, and the futures this interpreter is built from are driven
+/// to completion, not parked. So the body is run once, straight through, and
+/// the values it produced are walked afterwards.
+///
+/// The difference is visible in three places, all of them accepted knowingly.
+/// A generator that never ends now fails instead of streaming, which is why
+/// there is a cap. A generator whose side effects are meant to be interleaved
+/// with the loop that drives it does all of them first. And `g.next(v)` cannot
+/// send a value back in, so a two-way generator sees `undefined` where it
+/// expected the reply. What works -- and what page code overwhelmingly uses a
+/// generator for -- is producing a finite sequence to be walked once, which
+/// `for...of`, spread, destructuring, and `Array.from` all now do correctly.
+async fn run_generator(
+    this: &Rc<Interpreter>,
+    fn_: &Rc<JSFunction>,
+    scope: Env,
+) -> Result<JsValue, JsError> {
+    this.yields.borrow_mut().push(Vec::new());
+    let outcome = match exec_block(this, &fn_.body, scope).await {
+        Ok(()) | Err(JsError::Return(_)) => Ok(()),
+        Err(JsError::Break(_)) | Err(JsError::Continue(_)) => {
+            Err(JsError::js("Break or continue outside of a loop."))
+        }
+        Err(e) => Err(e),
+    };
+    let items = this.yields.borrow_mut().pop().unwrap_or_default();
+    outcome?;
+    Ok(make_iterator(items))
+}
+
+/// An object that walks `items` once: `next()`, and a `Symbol.iterator` that
+/// hands back itself, which is the whole of the protocol anything here asks
+/// for. The cursor lives in the closure, so the object is single-use exactly
+/// as a generator's is.
+pub fn make_iterator(items: Vec<JsValue>) -> JsValue {
+    let cursor = Rc::new(Cell::new(0usize));
+    let items = Rc::new(items);
+    let map = Rc::new(RefCell::new(BTreeMap::new()));
+    let next = {
+        let items = items.clone();
+        let cursor = cursor.clone();
+        JsValue::Callback(Rc::new(move |_i: &Rc<Interpreter>, _args: Vec<JsValue>| -> EvResult {
+            let i = cursor.get();
+            let step = Rc::new(RefCell::new(BTreeMap::new()));
+            if i < items.len() {
+                cursor.set(i + 1);
+                step.borrow_mut().insert("value".to_string(), items[i].clone());
+                step.borrow_mut().insert("done".to_string(), JsValue::Bool(false));
+            } else {
+                step.borrow_mut().insert("value".to_string(), JsValue::Undefined);
+                step.borrow_mut().insert("done".to_string(), JsValue::Bool(true));
+            }
+            let out = JsValue::Object(step);
+            Box::pin(async move { Ok(out) })
+        }))
+    };
+    map.borrow_mut().insert("next".to_string(), next);
+    // Weakly, because the object holds the closure that hands the object back:
+    // a strong reference here would be a cycle, and a cycle of `Rc`s is a leak
+    // that nothing in this engine ever collects.
+    let weak = Rc::downgrade(&map);
+    map.borrow_mut().insert(
+        "@@iterator".to_string(),
+        JsValue::Callback(Rc::new(move |_i: &Rc<Interpreter>, _args: Vec<JsValue>| -> EvResult {
+            let out = match weak.upgrade() {
+                Some(m) => JsValue::Object(m),
+                None => JsValue::Undefined,
+            };
+            Box::pin(async move { Ok(out) })
+        })),
+    );
+    JsValue::Object(map)
 }
 
 fn start_async_call(
@@ -3157,7 +3669,7 @@ fn start_async_call(
         let scope = Environment::function(Some(fn2.env.clone()));
         match bind_args(&this2, &fn2, scope.clone(), args).await {
             Ok(()) => {
-                set_this(&scope, &fn2, &this_arg);
+                set_this(&this2, &scope, &fn2, &this_arg);
                 let r = exec_block(&this2, &fn2.body, scope.clone()).await;
                 finish_async(&this2, &p2, r);
             }
@@ -3240,6 +3752,51 @@ pub fn construct(this: &Rc<Interpreter>, callee: &JsValue, args: Vec<JsValue>) -
     })
 }
 
+/// Give a fresh instance the fields its class declares.
+///
+/// The language runs these after `super()` returns and before the rest of the
+/// constructor body, which is a place this engine cannot stand in: `super()`
+/// is an ordinary call somewhere inside that body, and nothing here can pause
+/// mid-body to slip the fields in behind it. They therefore run first, before
+/// the constructor is entered at all. The difference is visible in exactly one
+/// case -- a base class whose own field has the same name as a field the
+/// derived class declares, where the base's value would legitimately win --
+/// and invisible in the case that made fields worth supporting at all, which
+/// is `static styles = ...` and `state = {}` declared and then read back by
+/// the constructor and the methods.
+async fn init_fields(
+    this: &Rc<Interpreter>,
+    c: &Rc<RefCell<JsClass>>,
+    obj: &JsValue,
+) -> Result<(), JsError> {
+    let (fields, env) = {
+        let b = c.borrow();
+        match &b.field_env {
+            Some(e) => (b.fields.clone(), e.clone()),
+            None => return Ok(()),
+        }
+    };
+    let props = match obj {
+        JsValue::Instance(i) => i.borrow().props.clone(),
+        _ => return Ok(()),
+    };
+    // A field initialiser is a tiny function body of its own: it sees the
+    // class's scope, and `this` is the object being built.
+    let scope = Environment::function(Some(env));
+    scope
+        .vars
+        .borrow_mut()
+        .insert("this".to_string(), obj.clone());
+    for (name, expr) in fields {
+        let v = match &expr {
+            Some(e) => eval(this, e, scope.clone()).await?,
+            None => JsValue::Undefined,
+        };
+        props.borrow_mut().insert(name, v);
+    }
+    Ok(())
+}
+
 fn class_construct_on_obj(
     this: &Rc<Interpreter>,
     c: &Rc<RefCell<JsClass>>,
@@ -3250,7 +3807,9 @@ fn class_construct_on_obj(
     let c = c.clone();
     let obj = obj.clone();
     Box::pin(async move {
-        if let Some(ctor) = &c.borrow().ctor {
+        init_fields(&this, &c, &obj).await?;
+        let ctor = c.borrow().ctor.clone();
+        if let Some(ctor) = &ctor {
             construct_on(&this, &obj, ctor, args).await?;
         } else {
             // No constructor of its own: the implicit one is `constructor(...a)
@@ -3319,7 +3878,7 @@ async fn construct_on(
 ) -> Result<JsValue, JsError> {
     let scope = Environment::function(Some(fn_.env.clone()));
     bind_args(this, fn_, scope.clone(), args).await?;
-    set_this(&scope, fn_, obj);
+    set_this(this, &scope, fn_, obj);
     match exec_block(this, &fn_.body, scope.clone()).await {
         Ok(()) => Ok(obj.clone()),
         Err(JsError::Return(v)) => {
@@ -3402,7 +3961,16 @@ async fn eval_inner(
             }
             Ok(value)
         }
-        Node::This => Ok(env.get("this")),
+        Node::This => {
+            // Top level: there is no call frame to have bound `this`, and the
+            // answer a script expects is the window. Scripts open with
+            // `this.gbar_ = this.gbar_ || {}` more often than you would guess.
+            let t = env.get("this");
+            Ok(match t {
+                JsValue::Undefined => global_this(this),
+                other => other,
+            })
+        }
         Node::Super => {
             let sup = env.get("__super__");
             if let JsValue::Super(s) = sup {
@@ -3416,14 +3984,9 @@ async fn eval_inner(
             for item in items {
                 if let Node::Spread(e) = &**item {
                     let v = eval(this, e, env.clone()).await?;
-                    match &v {
-                        JsValue::Array(a) => out.extend(a.borrow().iter().cloned()),
-                        JsValue::Str(s) => {
-                            for c in s.chars() {
-                                out.push(JsValue::str(c.to_string()));
-                            }
-                        }
-                        _ => out.push(v),
+                    match iterate(this, &v).await? {
+                        Some(items) => out.extend(items),
+                        None => out.push(v),
                     }
                 } else {
                     out.push(eval(this, item, env.clone()).await?);
@@ -3488,6 +4051,42 @@ async fn eval_inner(
             }
             Ok(JsValue::str(out))
         }
+        Node::TaggedTemplate {
+            tag,
+            quasis,
+            raws,
+            exprs,
+        } => {
+            // The tag is called with the literal pieces first and the
+            // substitutions after, and a member tag keeps its receiver:
+            // ``a.b`x` `` runs `b` with `this` still `a`, exactly as `a.b(...)`
+            // would. Reaching for the same lvalue path a call uses is what
+            // makes that fall out rather than having to be arranged.
+            let (recv, f) = match &**tag {
+                Node::Member { obj, name, .. } => {
+                    let o = eval(this, obj, env.clone()).await?;
+                    let f = js_get(this, &o, name)?;
+                    (o, f)
+                }
+                _ => (JsValue::Undefined, eval(this, tag, env.clone()).await?),
+            };
+            let strings = JsValue::Array(Rc::new(JsArray::new(
+                quasis.iter().map(|q| JsValue::str(q.clone())).collect(),
+            )));
+            if let JsValue::Array(a) = &strings {
+                a.props.borrow_mut().insert(
+                    "raw".to_string(),
+                    JsValue::Array(Rc::new(JsArray::new(
+                        raws.iter().map(|r| JsValue::str(r.clone())).collect(),
+                    ))),
+                );
+            }
+            let mut args = vec![strings];
+            for e in exprs {
+                args.push(eval(this, e, env.clone()).await?);
+            }
+            call_value(this, &f, args, recv).await
+        }
         Node::Regex { source, flags } => Ok(JsValue::Regex(Rc::new(RefCell::new(
             compile_regex(source, flags),
         )))),
@@ -3533,13 +4132,68 @@ async fn eval_inner(
             }
         }
         Node::Assign { op, target, value } => eval_assign(this, op, target, value, env.clone()).await,
+        Node::Yield { arg, delegate } => {
+            let v = match arg {
+                Some(e) => eval(this, e, env.clone()).await?,
+                None => JsValue::Undefined,
+            };
+            let produced = if *delegate {
+                // `yield* other` yields everything `other` would, one at a
+                // time, and is the reason a generator can be written in pieces.
+                iterate(this, &v).await?.unwrap_or_default()
+            } else {
+                vec![v]
+            };
+            let mut frames = this.yields.borrow_mut();
+            match frames.last_mut() {
+                Some(frame) => {
+                    if frame.len() + produced.len() > MAX_ITERATIONS {
+                        return Err(JsError::js(
+                            "a generator yielded more values than this engine will collect",
+                        ));
+                    }
+                    frame.extend(produced);
+                }
+                // Unreachable while `yield` only parses inside a generator, but
+                // the parser is where that is enforced and this is not the
+                // place to be certain of it.
+                None => return Err(JsError::js("'yield' outside of a generator")),
+            }
+            // Nothing can be sent back in, so a `yield` used as an expression
+            // reads as `undefined`. See `run_generator`.
+            Ok(JsValue::Undefined)
+        }
+        Node::AssignPattern { target, value } => {
+            let v = eval(this, value, env.clone()).await?;
+            bind_target(this, target, &v, env.clone(), Environment::assign_loop_var).await?;
+            // An assignment is an expression, and its value is the right-hand
+            // side -- `if (({a} = f()))` is rare but `x = [a, b] = pair` is not
+            // much rarer, and both need something back.
+            Ok(v)
+        }
         Node::Call { callee, args, optional } => {
             eval_call(this, callee, args, *optional, env.clone()).await
         }
         Node::New { callee, args } => {
-            let callee = eval(this, callee, env.clone()).await?;
+            let f = eval(this, callee, env.clone()).await?;
+            // Named for the same reason a failed call is: `undefined is not a
+            // constructor` names the value, and the value is the one thing you
+            // already know. `_.Ka is not a constructor` names the missing
+            // builtin.
+            let constructible = match &f {
+                JsValue::Class(_) | JsValue::Function(_) | JsValue::Host(_) => true,
+                JsValue::Native(n) => n.ctor.is_some(),
+                _ => false,
+            };
+            if !constructible {
+                return Err(JsError::js(format!(
+                    "{} is not a constructor (it is {}).",
+                    callee_path(callee),
+                    this.repr(&f)
+                )));
+            }
             let args = eval_args(this, args, env.clone()).await?;
-            construct(this, &callee, args).await
+            construct(this, &f, args).await
         }
         Node::Member { obj, name, optional } => {
             let o = eval(this, obj, env.clone()).await?;
@@ -3588,8 +4242,10 @@ fn js_function_from(f: &FuncNode, env: Env) -> Rc<JSFunction> {
         env,
         async_: f.async_,
         arrow: f.arrow,
+        generator: f.is_generator,
         super_info: None,
         prototype: RefCell::new(None),
+        props: RefCell::new(BTreeMap::new()),
     })
 }
 
@@ -3617,6 +4273,84 @@ async fn await_promise(
     .await
 }
 
+/// Everything `v` would yield if it were walked, or `None` if it is not the
+/// sort of thing that can be.
+///
+/// One list, drained eagerly, is not what the language describes: `for...of`
+/// pulls one value at a time and stops pulling the moment the body breaks, and
+/// an iterator is allowed to be endless on that understanding. Draining first
+/// buys something worth more here, which is that spread, `for...of`, and
+/// `Array.from` cannot disagree about what a value contains -- they used to,
+/// and the disagreement was silent: a `Set` spread to `[]` and a `Map` walked
+/// to nothing. The cap below is what an endless iterator gets instead of a
+/// hung tab.
+pub fn iterate(
+    this: &Rc<Interpreter>,
+    v: &JsValue,
+) -> BoxFut<Result<Option<Vec<JsValue>>, JsError>> {
+    let this = this.clone();
+    let v = v.clone();
+    Box::pin(async move {
+        match &v {
+            JsValue::Array(a) => return Ok(Some(a.borrow().clone())),
+            JsValue::Str(s) => {
+                return Ok(Some(s.chars().map(|c| JsValue::str(c.to_string())).collect()))
+            }
+            JsValue::Set(s) => return Ok(Some(set_values(s))),
+            JsValue::Map(m) => {
+                return Ok(Some(
+                    map_entries(m)
+                        .into_iter()
+                        .map(|(k, val)| JsValue::array(vec![k, val]))
+                        .collect(),
+                ))
+            }
+            _ => {}
+        }
+        // A hand-written `[Symbol.iterator]() { return { next() {…} } }`, which
+        // is how a bundle makes its own collection walkable.
+        let iter_fn = js_get(&this, &v, "@@iterator")?;
+        if callable(&iter_fn) {
+            let iter = call_value(&this, &iter_fn, vec![], v.clone()).await?;
+            let mut out = Vec::new();
+            for _ in 0..MAX_ITERATIONS {
+                let next = js_get(&this, &iter, "next")?;
+                if !callable(&next) {
+                    break;
+                }
+                let step = call_value(&this, &next, vec![], iter.clone()).await?;
+                if truthy(&js_get(&this, &step, "done")?) {
+                    return Ok(Some(out));
+                }
+                out.push(js_get(&this, &step, "value")?);
+            }
+            return Err(JsError::js(
+                "an iterator yielded more values than this engine will collect",
+            ));
+        }
+        // `arguments`, a `NodeList`, and every other array-like: no iterator,
+        // but a `length` and numeric keys, and spreading one is common enough
+        // that refusing would be the wrong answer.
+        if matches!(v, JsValue::Host(_) | JsValue::Object(_) | JsValue::Instance(_)) {
+            let n = to_number(&js_get(&this, &v, "length")?);
+            if n.is_finite() && n >= 0.0 {
+                let n = n.min(MAX_ARRAY_LEN as f64) as usize;
+                let mut out = Vec::with_capacity(n);
+                for i in 0..n {
+                    out.push(js_get(&this, &v, &i.to_string())?);
+                }
+                return Ok(Some(out));
+            }
+        }
+        Ok(None)
+    })
+}
+
+/// How many values an iterator may hand over before `iterate` gives up. High
+/// enough that no real collection reaches it, low enough that `while (true)`
+/// wearing an iterator's clothes fails in a second rather than never.
+const MAX_ITERATIONS: usize = 1_000_000;
+
 async fn eval_args(
     this: &Rc<Interpreter>,
     args: &[Rc<Node>],
@@ -3626,20 +4360,61 @@ async fn eval_args(
     for a in args {
         if let Node::Spread(e) = &**a {
             let v = eval(this, e, env.clone()).await?;
-            match &v {
-                JsValue::Array(arr) => out.extend(arr.borrow().iter().cloned()),
-                JsValue::Str(s) => {
-                    for c in s.chars() {
-                        out.push(JsValue::str(c.to_string()));
-                    }
-                }
-                _ => out.push(v),
+            match iterate(this, &v).await? {
+                Some(items) => out.extend(items),
+                None => out.push(v),
             }
         } else {
             out.push(eval(this, a, env.clone()).await?);
         }
     }
     Ok(out)
+}
+
+/// The source-ish path of whatever is being called, for the message you get
+/// when it turns out not to be callable.
+///
+/// "undefined is not a function." is true and useless. It is the single most
+/// common runtime failure a real page produces here, and it names the value
+/// rather than the expression, so the one thing you need to know -- which
+/// builtin we are missing -- is exactly what it withholds. Rebuilding the
+/// callee's spelling from the AST costs nothing until something has already
+/// gone wrong and turns that error into a bug report: "document.querySelector
+/// is not a function" tells you where to go. Anything more elaborate than a
+/// dotted path is written as `(expr)`, since a faithful re-print of arbitrary
+/// syntax is a pretty-printer, and we do not need one to name a missing
+/// method.
+fn callee_path(node: &Node) -> String {
+    match node {
+        Node::Identifier(name) => name.clone(),
+        Node::This => "this".to_string(),
+        Node::Member { obj, name, .. } => format!("{}.{}", callee_path(obj), name),
+        Node::Index { obj, index, .. } => match &**index {
+            Node::Literal(LiteralVal::Str(s)) => format!("{}.{}", callee_path(obj), s),
+            _ => format!("{}[...]", callee_path(obj)),
+        },
+        Node::Call { callee, .. } => format!("{}(...)", callee_path(callee)),
+        _ => "(intermediate value)".to_string(),
+    }
+}
+
+/// Whether `call_value` would get anywhere with this. Kept next to the match
+/// in `call_value` -- if a new callable kind is added there it belongs here
+/// too, or calls of it start reporting themselves as not functions.
+fn callable(v: &JsValue) -> bool {
+    match v {
+        JsValue::Function(_) | JsValue::Callback(_) | JsValue::Host(_) => true,
+        JsValue::Native(n) => n.call.is_some(),
+        _ => false,
+    }
+}
+
+fn not_a_function(this: &Rc<Interpreter>, f: &JsValue, callee: &Node) -> JsError {
+    JsError::js(format!(
+        "{} is not a function (it is {}).",
+        callee_path(callee),
+        this.repr(f)
+    ))
 }
 
 async fn eval_call(
@@ -3664,6 +4439,15 @@ async fn eval_call(
             return Ok(JsValue::Undefined);
         }
         let f = js_get(this, &obj_val, name)?;
+        // `o.f?.()` asks about `f`, not about `o`: the object is there and the
+        // method may not be, which is exactly the shape of a callback that was
+        // never installed.
+        if optional && nullish(&f) {
+            return Ok(JsValue::Undefined);
+        }
+        if !callable(&f) {
+            return Err(not_a_function(this, &f, callee));
+        }
         let args = eval_args(this, args, env.clone()).await?;
         let this_arg = match &obj_val {
             JsValue::Super(s) => s.this.clone(),
@@ -3678,6 +4462,17 @@ async fn eval_call(
         }
         let name = index_name(this, &eval(this, index, env.clone()).await?);
         let f = js_get(this, &obj_val, &name)?;
+        if optional && nullish(&f) {
+            return Ok(JsValue::Undefined);
+        }
+        if !callable(&f) {
+            return Err(JsError::js(format!(
+                "{}.{} is not a function (it is {}).",
+                callee_path(obj),
+                name,
+                this.repr(&f)
+            )));
+        }
         let args = eval_args(this, args, env.clone()).await?;
         let this_arg = match &obj_val {
             JsValue::Super(s) => s.this.clone(),
@@ -3688,6 +4483,9 @@ async fn eval_call(
     let f = eval(this, callee, env.clone()).await?;
     if optional && nullish(&f) {
         return Ok(JsValue::Undefined);
+    }
+    if !callable(&f) {
+        return Err(not_a_function(this, &f, callee));
     }
     let args = eval_args(this, args, env.clone()).await?;
     call_value(this, &f, args, JsValue::Undefined).await
@@ -3783,31 +4581,68 @@ async fn eval_class(
             env: env.clone(),
             async_: m.is_async,
             arrow: false,
+            generator: m.is_generator,
             super_info: super_info.clone(),
             prototype: RefCell::new(None),
+            props: RefCell::new(BTreeMap::new()),
         });
+        // A computed name is an expression evaluated once, as the class is
+        // defined -- `[Symbol.iterator]` is the case that matters, and it has
+        // to resolve to the same string the iteration protocol looks for.
+        let member_name = match &m.key {
+            Some(k) => this.repr(&eval(this, k, env.clone()).await?),
+            None => m.name.clone(),
+        };
         if let Some(kind) = &m.accessor {
             // `get`/`set` members define one accessor property between them,
             // on the prototype for an instance member and on the class itself
             // for a static one.
             let acc = if m.is_static {
-                accessor_slot(&mut statics, &m.name)
+                accessor_slot(&mut statics, &member_name)
             } else {
                 let mut proto = prototype.borrow_mut();
-                accessor_slot(&mut proto, &m.name)
+                accessor_slot(&mut proto, &member_name)
             };
             if kind == "get" {
                 *acc.get.borrow_mut() = Some(JsValue::Function(fn_));
             } else {
                 *acc.set.borrow_mut() = Some(JsValue::Function(fn_));
             }
-        } else if m.name == "constructor" && !m.is_static {
+        } else if member_name == "constructor" && !m.is_static {
             ctor_fn = Some(fn_);
         } else if m.is_static {
-            statics.insert(m.name.clone(), JsValue::Function(fn_));
+            statics.insert(member_name, JsValue::Function(fn_));
         } else {
-            prototype.borrow_mut().insert(m.name.clone(), JsValue::Function(fn_));
+            prototype.borrow_mut().insert(member_name, JsValue::Function(fn_));
         }
+    }
+    // Static fields are evaluated here, in source order, once. Instance fields
+    // are not: they belong to each object the class makes, so they are kept on
+    // the class and run by the constructor. See class_construct_on_obj.
+    for f in &node.fields {
+        if !f.is_static {
+            continue;
+        }
+        let key = match &f.key {
+            Some(k) => this.repr(&eval(this, k, env.clone()).await?),
+            None => f.name.clone(),
+        };
+        let v = match &f.value {
+            Some(e) => eval(this, e, env.clone()).await?,
+            None => JsValue::Undefined,
+        };
+        statics.insert(key, v);
+    }
+    let mut inst_fields = Vec::new();
+    for f in &node.fields {
+        if f.is_static {
+            continue;
+        }
+        let key = match &f.key {
+            Some(k) => this.repr(&eval(this, k, env.clone()).await?),
+            None => f.name.clone(),
+        };
+        inst_fields.push((key, f.value.clone()));
     }
     let cls = Rc::new(RefCell::new(JsClass {
         name: name.clone(),
@@ -3815,6 +4650,12 @@ async fn eval_class(
         ctor: ctor_fn,
         parent,
         statics: Rc::new(RefCell::new(statics)),
+        field_env: if inst_fields.is_empty() {
+            None
+        } else {
+            Some(env.clone())
+        },
+        fields: inst_fields,
     }));
     Ok(JsValue::Class(cls))
 }
@@ -4234,7 +5075,7 @@ async fn exec_inner(
                 if kind == "const" && expr.is_none() {
                     let name = match target {
                         DeclTarget::Name(n) => n.clone(),
-                        DeclTarget::Pattern(_) => "...".to_string(),
+                        _ => "...".to_string(),
                     };
                     return Err(JsError::js(format!(
                         "Missing initializer in const declaration '{name}'."
@@ -4260,6 +5101,14 @@ async fn exec_inner(
                             _ => Environment::set_const,
                         };
                         setter(&env, name, value);
+                    }
+                    // A declaration declares names. The parser only ever
+                    // builds a property target out of an assignment, so this
+                    // is unreachable rather than merely unsupported.
+                    DeclTarget::Member(_) => {
+                        return Err(JsError::js(
+                            "Invalid destructuring assignment target in a declaration",
+                        ))
                     }
                 }
             }
@@ -4327,18 +5176,18 @@ async fn exec_inner(
         } => exec_for(this, init, cond, update, body, label, env.clone()).await,
         Node::ForIn {
             var_kind,
-            name,
+            target,
             iterable,
             body,
             label,
-        } => exec_for_in(this, var_kind, name, iterable, body, label, env.clone()).await,
+        } => exec_for_in(this, var_kind, target, iterable, body, label, env.clone()).await,
         Node::ForOf {
             var_kind,
-            name,
+            target,
             iterable,
             body,
             label,
-        } => exec_for_of(this, var_kind, name, iterable, body, label, env.clone()).await,
+        } => exec_for_of(this, var_kind, target, iterable, body, label, env.clone()).await,
         Node::Return(v) => {
             let value = match v {
                 Some(e) => eval(this, e, env.clone()).await?,
@@ -4479,10 +5328,10 @@ fn bind_pattern(
     let value = value.clone();
     Box::pin(async move {
         if pattern.kind == "array" {
-            let items: Vec<JsValue> = match &value {
-                JsValue::Array(a) => a.borrow().clone(),
-                _ => vec![],
-            };
+            // An array pattern destructures anything that can be walked, not
+            // just an array: `const [a, b] = new Set(x)` and `const [first] =
+            // arguments` both mean what they look like.
+            let items: Vec<JsValue> = iterate(&this, &value).await?.unwrap_or_default();
             for (i, part) in pattern.parts.iter().enumerate() {
                 let (target, default) = match part {
                     PatternPart::Array { target, default } => (target, default),
@@ -4556,26 +5405,56 @@ fn bind_target(
                 Ok(())
             }
             DeclTarget::Pattern(p) => bind_pattern(&this, &p, &value, env, setter).await,
+            // The setter is deliberately ignored here: a property target
+            // cannot be declared, only assigned, so `var`/`let`/`const` never
+            // reach this arm and the write goes where an ordinary `=` would
+            // put it.
+            DeclTarget::Member(node) => {
+                let (obj, name) = lvalue(&this, &node, env.clone()).await?;
+                match &obj {
+                    None => env.assign(&name, value.clone())?,
+                    Some(o) => js_set(&this, o, &name, &value)?,
+                }
+                Ok(())
+            }
         }
     })
 }
 
-fn bind_loop_var(env: &Env, var_kind: &Option<String>, name: &str, value: JsValue) {
-    if let Some(kind) = var_kind {
-        match kind.as_str() {
-            "var" => env.set_var(name, value),
-            "let" => env.set_let(name, value),
-            _ => env.set_const(name, value),
+/// Bind one turn of a `for...of` or `for...in` loop.
+///
+/// `for (x of xs)` with no declaration keyword assigns to whatever `x` already
+/// is, which is why the no-keyword case goes through `assign` rather than
+/// declaring anything; a destructuring head is always a declaration in
+/// practice, and is treated as one.
+async fn bind_loop_target(
+    this: &Rc<Interpreter>,
+    env: &Env,
+    var_kind: &Option<String>,
+    target: &DeclTarget,
+    value: JsValue,
+) -> Result<(), JsError> {
+    let setter: fn(&Environment, &str, JsValue) = match var_kind.as_deref() {
+        Some("var") => Environment::set_var,
+        Some("const") => Environment::set_const,
+        Some(_) => Environment::set_let,
+        None => Environment::assign_loop_var,
+    };
+    match target {
+        DeclTarget::Name(name) => {
+            setter(env, name, value);
+            Ok(())
         }
-    } else {
-        let _ = env.assign(name, value);
+        DeclTarget::Pattern(p) => bind_pattern(this, p, &value, env.clone(), setter).await,
+        // `for (obj.k of xs)` is legal and does turn up in transpiler output.
+        DeclTarget::Member(_) => bind_target(this, target, &value, env.clone(), setter).await,
     }
 }
 
 async fn exec_for_in(
     this: &Rc<Interpreter>,
     var_kind: &Option<String>,
-    name: &str,
+    target: &DeclTarget,
     iterable: &Rc<Node>,
     body: &Rc<Node>,
     label: &Option<String>,
@@ -4583,7 +5462,12 @@ async fn exec_for_in(
 ) -> Result<(), JsError> {
     let obj = eval(this, iterable, env.clone()).await?;
     let keys: Vec<JsValue> = match &obj {
-        JsValue::Object(map) => map.borrow().keys().map(|k| JsValue::str(k.clone())).collect(),
+        JsValue::Object(map) => map
+            .borrow()
+            .keys()
+            .filter(|k| k.as_str() != "__proto__")
+            .map(|k| JsValue::str(k.clone()))
+            .collect(),
         JsValue::Instance(inst) => {
             let i = inst.borrow();
             let mut seen = std::collections::HashSet::new();
@@ -4592,10 +5476,16 @@ async fn exec_for_in(
                 keys.push(JsValue::str(k.clone()));
                 seen.insert(k.clone());
             }
+            // Inherited properties are enumerated too -- that is what makes
+            // `for (k in o)` the loop you have to write `hasOwnProperty` next
+            // to -- but not the two the engine put there itself. `constructor`
+            // is non-enumerable in a real engine and ours has no way to say
+            // so, and a `for...in` that hands back `constructor` breaks the
+            // copy loops that this pattern exists to write.
             let mut p = Some(i.proto.clone());
             while let Some(pp) = p {
                 for k in pp.borrow().keys() {
-                    if k != "__proto__" && !seen.contains(k) {
+                    if k != "__proto__" && k != "constructor" && !seen.contains(k) {
                         keys.push(JsValue::str(k.clone()));
                         seen.insert(k.clone());
                     }
@@ -4615,7 +5505,7 @@ async fn exec_for_in(
     };
     for key in keys {
         let child = Environment::new(Some(env.clone()));
-        bind_loop_var(&child, var_kind, name, key);
+        bind_loop_target(this, &child, var_kind, target, key).await?;
         match exec(this, body, child.clone()).await {
             Ok(()) => {}
             Err(e) => match loop_signal(e, label) {
@@ -4631,21 +5521,17 @@ async fn exec_for_in(
 async fn exec_for_of(
     this: &Rc<Interpreter>,
     var_kind: &Option<String>,
-    name: &str,
+    target: &DeclTarget,
     iterable: &Rc<Node>,
     body: &Rc<Node>,
     label: &Option<String>,
     env: Env,
 ) -> Result<(), JsError> {
     let obj = eval(this, iterable, env.clone()).await?;
-    let items: Vec<JsValue> = match &obj {
-        JsValue::Array(a) => a.borrow().clone(),
-        JsValue::Str(s) => s.chars().map(|c| JsValue::str(c.to_string())).collect(),
-        _ => vec![],
-    };
+    let items = iterate(this, &obj).await?.unwrap_or_default();
     for item in items {
         let child = Environment::new(Some(env.clone()));
-        bind_loop_var(&child, var_kind, name, item);
+        bind_loop_target(this, &child, var_kind, target, item).await?;
         match exec(this, body, child.clone()).await {
             Ok(()) => {}
             Err(e) => match loop_signal(e, label) {
