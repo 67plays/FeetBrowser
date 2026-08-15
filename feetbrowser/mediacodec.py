@@ -13,9 +13,9 @@ What is actually decoded to pixels:
   AVI (RIFF) with `MJPG`     Motion JPEG: every frame is a whole JPEG
   MOV/MP4 with `jpeg`/`mjpa` the same codec in QuickTime's container
   MOV/MP4 with `raw `/`png ` uncompressed and PNG-per-frame QuickTime video
-  MOV/MP4/AVI with `avc1`    H.264, I and P slices, by the Fortran decoder
-                             in `fortran/`; a stream with B slices is
-                             refused before anything is drawn
+  MOV/MP4/AVI with `avc1`    H.264, I, P and B slices, by the Fortran
+                             decoder in `fortran/`; a stream with SP or SI
+                             slices is refused before anything is drawn
   a bare `.mjpeg` stream      JPEGs end to end with no container at all
 
 Motion JPEG is the one that makes this a video player rather than a
@@ -27,10 +27,16 @@ below is the cheap half -- work out where each JPEG starts and ends, hand it
 over, and put the pixels where the compositor expects them.
 
 Everything else in this module *reads* the file and refuses honestly: a WebM
-carrying VP9, or an H.264 stream with B slices, is walked far enough to
+carrying VP9, or an H.264 stream with SP slices, is walked far enough to
 report its dimensions, duration and codec name, and then declines, because
 saying "1280x720, VP9, 4.0s, no decoder" is useful and pretending to play it
 is not. See docs/media.md.
+
+B frames also make decode order and presentation order two different
+orders, and the container is where they are put back together: `ctts` says
+how far each sample's presentation time sits from its decode time, and
+`VideoTrack` indexes everything by the order a viewer sees while decoding
+in the order the file is written.
 
 Three rules the parsers hold to, because the file came from a stranger:
 
@@ -621,24 +627,27 @@ class _Mjpeg(_Codec):
 class _H264(_Codec):
     """H.264/AVC, decoded by the Fortran decoder in ``fortran/``.
 
-    The decoder does I and P slices, so the useful question is not "is this
-    H.264" but "does this particular stream decode", and part of the answer
-    can only be had by decoding. The constructor takes the first keyframe,
-    runs it, and refuses the whole file with the decoder's own reason if it
-    does not come out. Opening a file that plays for two frames and then
-    stops would be worse than refusing it -- the poster and a sentence
-    beats a frozen picture.
+    The decoder does I, P and B slices, so the useful question is not "is
+    this H.264" but "does this particular stream decode", and part of the
+    answer can only be had by decoding. The constructor takes the first
+    keyframe, runs it, and refuses the whole file with the decoder's own
+    reason if it does not come out. Opening a file that plays for two
+    frames and then stops would be worse than refusing it -- the poster and
+    a sentence beats a frozen picture.
 
     Trial-decoding frame zero cannot see frame four hundred, though, and
-    the thing this decoder still cannot do -- B slices -- is a per-slice
-    property that an encoder is free to introduce anywhere. So every
-    sample's slice_type is read first. That costs two exp-Golomb fields per
-    NAL, needs no arithmetic decoding, and is the only way to know before
-    the poster goes up that the file finishes.
+    the things this decoder still cannot do -- SP and SI slices -- are a
+    per-slice property that an encoder is free to introduce anywhere. So
+    every sample's slice_type is read first. That costs two exp-Golomb
+    fields per NAL, needs no arithmetic decoding, and is the only way to
+    know before the poster goes up that the file finishes.
 
-    Stateful, and now it means something: P frames are differences against
-    the pictures before them, so `reset()` drops the decoder's reference
-    pictures and `VideoTrack.frame()` replays from the keyframe.
+    Stateful, and it means something: P and B frames are differences
+    against other pictures, so `reset()` drops the decoder's reference
+    pictures and `VideoTrack.frame()` replays from the keyframe. B frames
+    also arrive out of presentation order, which is the container's problem
+    rather than this class's: everything here is in decode order and
+    `VideoTrack` puts the pictures back in the order they are shown.
     """
 
     def __init__(self, width, height, extradata, data, samples):
@@ -650,12 +659,12 @@ class _H264(_Codec):
         except h264.H264Error as exc:
             raise MediaError("H.264: %s" % exc)
         kinds = h264.slice_types(_annexb_track(data, samples, extradata))
-        refused = [name for kind, name in ((1, "B"), (3, "SP"), (4, "SI"))
+        refused = [name for kind, name in ((3, "SP"), (4, "SI"))
                    if kind in kinds]
         if refused:
             raise MediaError(
-                "H.264: this track has %s slices, and the decoder does I and "
-                "P slices" % " and ".join(refused))
+                "H.264: this track has %s slices, and the decoder does I, P "
+                "and B slices" % " and ".join(refused))
         try:
             got_width, got_height, _rgba = self._decoder.decode(
                 _first_keyframe(data, samples))
@@ -909,13 +918,30 @@ class VideoTrack:
     """
 
     def __init__(self, data, info, packets, codec, frame_rate, keyframes,
-                 times=None):
+                 times=None, order=None):
         self._data = data
         self.info = info
         self._packets = packets            # (offset, length, keyframe)
         self._codec = codec
         self.frame_rate = frame_rate
         self._keyframes = keyframes
+        # Every index this class takes or returns is a position in
+        # presentation order -- the order a viewer sees. `_packets` is in
+        # decode order, which for a stream with B frames is a different
+        # order, and `_order[p]` is the packet shown p-th. None means the
+        # two orders are the same, which is every stream without B frames
+        # and so is worth not paying for.
+        self._order = list(order) if order else None
+        self._shown_at = None
+        if self._order is not None:
+            self._shown_at = [0] * len(self._order)
+            for position, packet in enumerate(self._order):
+                self._shown_at[packet] = position
+        # Pictures decoded but not yet asked for, by presentation position.
+        # A B stream produces them out of order and this is where they wait;
+        # it holds the reorder delay and nothing more, because everything
+        # already shown is dropped on the way out of `_picture`.
+        self._pending = {}
         # Per-frame presentation times, when the container carries them.
         # AVI does not -- it has one rate for the whole stream -- but an MP4's
         # `stts` is a list of durations and is allowed to vary, so a track
@@ -963,26 +989,44 @@ class VideoTrack:
             index = lo - 1
         return max(0, min(index, max(0, self.frame_count - 1)))
 
+    def _decode_index(self, index):
+        """Where the frame shown at `index` sits in decode order."""
+        if self._order is None:
+            return index
+        return self._order[index]
+
     def packet(self, index):
         if not 0 <= index < len(self._packets):
             raise MediaError("frame %d out of range (0..%d)"
                              % (index, len(self._packets) - 1))
-        offset, length, _key = self._packets[index]
+        return self._sample(self._decode_index(index))
+
+    def _sample(self, decode_index):
+        offset, length, _key = self._packets[decode_index]
         if length > MAX_FRAME_BYTES:
-            raise MediaError("frame %d is %d bytes" % (index, length))
+            raise MediaError("frame %d is %d bytes" % (decode_index, length))
         end = offset + length
         if end > len(self._data):
-            raise MediaError("frame %d runs past the end of the file" % index)
+            raise MediaError("frame %d runs past the end of the file"
+                             % decode_index)
         return self._data[offset:end]
 
     def is_keyframe(self, index):
         if not 0 <= index < len(self._packets):
             return False
-        return self._packets[index][2]
+        return self._packets[self._decode_index(index)][2]
 
     def keyframe_before(self, index):
+        """The latest frame at or before `index` that can be decoded cold.
+
+        In presentation order, like every other index here. That is the
+        right space for it even with B frames in the file: an IDR opens its
+        group of pictures in both orders at once, so no frame shown after
+        one is coded before it, and landing on it and playing forward loses
+        nothing that was going to be shown.
+        """
         for i in range(min(index, len(self._packets) - 1), -1, -1):
-            if self._packets[i][2]:
+            if self.is_keyframe(i):
                 return i
         return 0
 
@@ -994,17 +1038,8 @@ class VideoTrack:
         index."""
         if not 0 <= index < len(self._packets):
             raise MediaError("frame %d out of range" % index)
-        start = index
-        if index != self._cursor + 1:
-            start = self.keyframe_before(index)
-            self._codec.reset()
-            self._cursor = start - 1
-        rgba = None
-        for i in range(start, index + 1):
-            decoded = self._codec.decode(self.packet(i), self._packets[i][2])
-            if decoded is not None:
-                rgba = decoded
-            self._cursor = i
+        rgba = self._picture(index) if self._order is not None \
+            else self._in_order(index)
         if rgba is None:
             # A run of drop frames with nothing before them. Show black
             # rather than nothing at all.
@@ -1013,9 +1048,61 @@ class VideoTrack:
                           self.frame_duration(index),
                           self.width, self.height, rgba)
 
+    def _in_order(self, index):
+        """Decode frame `index` when decode order is presentation order."""
+        start = index
+        if index != self._cursor + 1:
+            start = self.keyframe_before(index)
+            self._codec.reset()
+            self._cursor = start - 1
+        rgba = None
+        for i in range(start, index + 1):
+            decoded = self._codec.decode(self._sample(i), self._packets[i][2])
+            if decoded is not None:
+                rgba = decoded
+            self._cursor = i
+        return rgba
+
+    def _picture(self, index):
+        """The same, for a stream whose two orders differ.
+
+        A B frame is coded after the frame it predicts forwards from, so
+        asking for the frame shown fourth can mean decoding the sixth, and
+        the fifth and sixth then come out of the buffer for free. Playing a
+        B stream straight through therefore still costs one packet per
+        frame; what it does not do is replay from the keyframe at every
+        second frame, which is what happens if you decode in presentation
+        order and pretend nothing is out of place.
+
+        A seek backwards past what is still buffered resets and replays
+        from the keyframe, exactly as `_in_order` does. That is the case
+        worth being careful about: after a seek the decoder holds reference
+        pictures from the old position, and a B frame decoded against those
+        is a plausible picture rather than an error, so the reset has to
+        happen on the way in and not be noticed later.
+        """
+        if index in self._pending:
+            return self._pending[index]
+        target = self._order[index]
+        if target <= self._cursor:
+            start = self._decode_index(self.keyframe_before(index))
+            self._codec.reset()
+            self._pending.clear()
+            self._cursor = start - 1
+        for i in range(self._cursor + 1, target + 1):
+            decoded = self._codec.decode(self._sample(i), self._packets[i][2])
+            self._cursor = i
+            if decoded is not None:
+                self._pending[self._shown_at[i]] = decoded
+        rgba = self._pending.get(index)
+        for shown in [p for p in self._pending if p < index]:
+            del self._pending[shown]
+        return rgba
+
     def reset(self):
         self._codec.reset()
         self._cursor = -1
+        self._pending = {}
 
 
 def _open_avi(data):
@@ -1229,6 +1316,7 @@ class _Mp4Track:
         self.depth = 24
         self.codec = ""
         self.stts = []              # (sample count, duration in ticks)
+        self.ctts = []              # (sample count, composition offset)
         self.sync = None            # 1-based sample numbers, or None for all
         self.stsc = []              # (first chunk, samples per chunk)
         self.sample_size = 0        # non-zero when every sample is that size
@@ -1311,6 +1399,23 @@ def _parse_stbl(stbl, track):
                 count = box.u32be()
                 delta = box.u32be()
                 track.stts.append((count, delta))
+        elif kind == "ctts":
+            # The composition offsets: how far each sample's presentation
+            # time sits from its decode time. A file without B frames has no
+            # `ctts` at all, which is why the rest of this reader could
+            # ignore it for as long as it did. Version 0 declares the offsets
+            # unsigned and version 1 signed; muxers wrote negative offsets
+            # into version 0 boxes for years before version 1 existed, and a
+            # 2^32-ish "duration" is unmistakably one of those, so read
+            # anything past the top of the signed range as negative rather
+            # than believing it.
+            box.skip(4)
+            for _ in range(_table_count(box, 8)):
+                count = box.u32be()
+                offset = box.u32be()
+                if offset >= 0x80000000:
+                    offset -= 0x100000000
+                track.ctts.append((count, offset))
         elif kind == "stss":
             box.skip(4)
             sync = set()
@@ -1439,7 +1544,12 @@ def _mp4_samples(track):
 
 
 def _mp4_times(track, count):
-    """Per-sample (pts, duration) in seconds, from `stts`."""
+    """Per-sample (pts, duration) in seconds, from `stts`.
+
+    In decode order, and equal to the presentation times only for a track
+    with no `ctts`. `_mp4_order` below is what turns these into the order
+    and the times a viewer sees.
+    """
     timescale = track.timescale or 600
     times = []
     ticks = 0
@@ -1456,6 +1566,61 @@ def _mp4_times(track, count):
         times.append((ticks / timescale, tail))
         ticks += tail * timescale
     return times
+
+
+def _mp4_order(track, times, count):
+    """Presentation order and presentation times, from `ctts`.
+
+    Returns `(order, times)` where `order[p]` is the decode-order sample
+    shown p-th, or `(None, times)` when the file says the two orders are
+    the same -- which is every file without B frames, and is why nothing
+    here existed until there was a decoder that could produce them.
+
+    A sample's composition time is its decode time plus its `ctts` offset,
+    and presentation order is those times sorted. The sort is stable, so
+    two samples that claim the same instant stay in decode order rather
+    than swapping on a detail of the sort; a file that does that is broken
+    either way and this at least makes it decode.
+
+    Durations are recomputed as the gap to the next frame shown rather than
+    carried across from `stts`, because `stts` durations are decode-order
+    gaps and a B frame's is not how long it is on screen. The last frame
+    keeps its `stts` duration -- there is no next frame to measure against
+    and its own is the only number anybody has.
+    """
+    if not track.ctts or count <= 0:
+        return None, times
+    timescale = track.timescale or 600
+    offsets = []
+    for run, offset in track.ctts:
+        if len(offsets) >= count:
+            break
+        offsets.extend([offset] * min(run, count - len(offsets)))
+    # A short `ctts` means the rest of the samples have no offset, which is
+    # what a muxer that stopped writing B frames partway leaves behind.
+    offsets.extend([0] * (count - len(offsets)))
+    composed = [times[i][0] + offsets[i] / timescale for i in range(count)]
+    order = sorted(range(count), key=lambda i: composed[i])
+    if order == list(range(count)):
+        # A `ctts` that shifts every sample by the same amount, which is how
+        # some muxers spell "the first frame starts at zero". It reorders
+        # nothing, so say so and let the caller keep the simple path.
+        return None, times
+    # Composition times need not start at zero -- a positive offset on every
+    # sample is one way of spelling "there is nothing before this" -- and the
+    # rest of the browser takes the first frame to be at t=0, so the whole
+    # timeline slides back to meet it. Edit lists, which are the proper way
+    # to say the same thing, are not read here either.
+    base = composed[order[0]]
+    shown = []
+    for p, i in enumerate(order):
+        pts = composed[i] - base
+        if p + 1 < count:
+            duration = composed[order[p + 1]] - composed[i]
+        else:
+            duration = times[i][1]
+        shown.append((pts, max(0.0, duration)))
+    return order, shown
 
 
 class _QuickTimeRaw(_Codec):
@@ -1576,6 +1741,7 @@ def _open_mp4(data, container="MP4"):
         raise _Unsupported(info)
     info.frame_count = len(samples)
     times = _mp4_times(video, len(samples))
+    order, times = _mp4_order(video, times, len(samples))
     if duration <= 0 and times:
         duration = times[-1][0] + times[-1][1]
         info.duration = duration
@@ -1601,8 +1767,14 @@ def _open_mp4(data, container="MP4"):
         raise _Unsupported(info)
     _check_size(width, height)
     info.supported = True
-    return VideoTrack(data, info, samples, decoder, frame_rate,
-                      [i for i, s in enumerate(samples) if s[2]], times=times)
+    keyframes = [i for i, s in enumerate(samples) if s[2]]
+    if order is not None:
+        shown_at = [0] * len(order)
+        for position, packet in enumerate(order):
+            shown_at[packet] = position
+        keyframes = sorted(shown_at[i] for i in keyframes)
+    return VideoTrack(data, info, samples, decoder, frame_rate, keyframes,
+                      times=times, order=order)
 
 
 def _probe_mp4(data, container="MP4"):

@@ -15,20 +15,27 @@ Fortran does it at 120 million. The rest of the codec followed the
 entropy layer across the boundary because splitting a decoder in half at
 the macroblock level would mean marshalling every coefficient.
 
-What decodes today: I and P slices, either entropy coder -- CABAC or
+What decodes today: I, P and B slices, either entropy coder -- CABAC or
 CAVLC -- 4:2:0 8-bit, Baseline, Main and High profile. Every intra
 prediction mode, both transform sizes, scaling matrices, quarter-sample
-motion compensation with weighted prediction, up to four reference
-frames, the deblocking filter. Not B slices, not interlace -- see the
-module docstring in ``fortran/h264api.f`` for the status codes each of
-those produces.
+motion compensation, explicit and implicit weighted prediction,
+bi-prediction, both spatial and temporal direct prediction, up to four
+reference frames, the deblocking filter. Not interlace, not SP or SI
+slices, and not a B slice under CAVLC -- see the module docstring in
+``fortran/h264api.f`` for the status codes each of those produces.
+
+B slices decode in decode order, which is not presentation order. This
+module hands back a picture per access unit and says nothing about when
+it should be shown -- only what its picture order count is, through
+``Decoder.poc``. Reordering is the container's business and lives in
+``mediacodec``, which has the composition offsets to do it with.
 
 The library holds one decoder's worth of state in COMMON blocks, which
 is to say a single global one. ``_LOCK`` is what stops two ``<video>``
 elements from interleaving their macroblocks; it is not an optimisation
 to remove later, it is load-bearing.
 
-P slices made that state persistent, which makes it sharper still: a
+Inter slices made that state persistent, which makes it sharper still: a
 frame is now decoded against the pictures the previous calls left behind,
 so a second ``Decoder`` touching the library does not merely slow the
 first one down, it invalidates it. ``_owner`` tracks whose pictures are
@@ -60,7 +67,7 @@ _INCLUDES = ("h264com.inc",)
 # The version H2VERS reports. A library left in the cache by an older
 # checkout has the old entry points and the old meanings, and calling it
 # would be worse than not having one.
-_ABI = 3
+_ABI = 4
 
 _LOCK = threading.Lock()
 _lib = None
@@ -154,7 +161,7 @@ def _open_library():
         _compile(fc, out)
     lib = ctypes.CDLL(out)
     for name in ("h264_version", "h264_reset", "h264_dims", "h264_decode",
-                 "h264_i420", "h264_rgba"):
+                 "h264_i420", "h264_rgba", "h264_poc"):
         getattr(lib, name).restype = None
     version = ctypes.c_int(0)
     lib.h264_version(ctypes.byref(version))
@@ -281,6 +288,7 @@ _STATUS = {
     -6: "the picture is larger than this decoder's fixed buffers",
     -7: "the SPS crops the picture away to nothing",
     -8: "the stream asks for more reference frames than this decoder keeps",
+    -9: "lossless coding (transform bypass), which x264 uses at --qp 0",
     -11: "a PPS arrived before any SPS",
     -12: "the PPS ran off the end of its own NAL unit",
     -13: "slice groups (FMO), which no browser stream uses",
@@ -295,7 +303,7 @@ _STATUS = {
     -33: "the NAL unit is larger than the decoder's buffer",
     -41: "a slice arrived before its SPS and PPS",
     -42: "pic_order_cnt_type 1, which no browser stream uses",
-    -43: "a B, SP or SI slice -- this decoder does I and P slices",
+    -43: "an SP or SI slice -- this decoder does I, P and B slices",
     -44: "the slice header ran off the end of its own NAL unit",
     -45: "the slice header gives an impossible quantiser",
     -46: "the slice starts past the end of the picture",
@@ -303,10 +311,12 @@ _STATUS = {
     -48: "an unknown cabac_init_idc",
     -49: "the slice gives an impossible reference list length",
     -50: "long-term references, which this decoder does not implement",
-    -51: "a P slice with no reference picture to predict from",
+    -51: "an inter slice with no reference picture to predict from",
     -52: "the slice reorders in a picture that is not in the buffer",
     -53: "the decoded picture buffer has no free slot",
     -54: "a partition points at a reference index with no picture behind it",
+    -55: "temporal direct prediction without direct_8x8_inference_flag",
+    -56: "a B slice coded with CAVLC, a combination this decoder refuses",
 }
 
 
@@ -420,6 +430,7 @@ class Decoder:
         self._length_size = 0
         self._headers = b""
         self._since_idr = []
+        self._poc = 0
         if extradata and extradata[:1] == b"\x01":
             self._headers, self._length_size = parameter_sets_from_avcc(
                 extradata)
@@ -434,6 +445,7 @@ class Decoder:
         global _owner
         with _LOCK:
             self._since_idr = []
+            self._poc = 0
             if _owner is self:
                 self._lib.h264_reset()
                 _owner = None
@@ -481,6 +493,20 @@ class Decoder:
             _owner = None
             raise
         self._since_idr.append(data)
+        poc = ctypes.c_int(0)
+        self._lib.h264_poc(ctypes.byref(poc))
+        self._poc = poc.value
+
+    @property
+    def poc(self):
+        """The picture order count of the last picture decoded.
+
+        A stream with B pictures hands them over out of order: this is the
+        key you sort on to get presentation order back. Zero before any
+        picture has been decoded, which is also an IDR's own count, so it
+        only means anything once you have decoded something.
+        """
+        return self._poc
 
     def decode(self, packet):
         """One access unit in, ``(width, height, rgba)`` out.

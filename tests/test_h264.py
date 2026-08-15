@@ -22,6 +22,7 @@ the toolchain still has a browser, it just has a browser that says "no
 decoder" for H.264, and the tests have to prove that path works too.
 """
 import os
+import re
 import sys
 import zlib
 
@@ -71,6 +72,24 @@ INTER_VECTORS = [
     ("cavlc-lowqp", 96, 64, 4, "huge levels: suffixLength and the escapes"),
     ("cavlc-chromadc", 128, 96, 8, "the 2x2 chroma DC table"),
     ("cavlc-8x8", 128, 96, 8, "CAVLC 8x8: four 4x4 blocks, four nC"),
+]
+
+# The B vectors. These are the first streams in this suite whose decode
+# order is not their presentation order, which is the whole point of them:
+# a B picture is coded after the future picture it predicts from and shown
+# before it. FFmpeg wrote its raw output in presentation order, so the test
+# below sorts what comes out of the decoder by picture order count before
+# comparing -- exactly the job a container does with its composition
+# offsets, done here with the decoder's own numbers so that a wrong POC is
+# a test failure and not a silently reordered success.
+B_VECTORS = [
+    ("b-basic", 128, 96, 12, "IBBP: one list-1 reference, no pyramid"),
+    ("b-pyramid", 128, 96, 16, "B pyramid: B pictures used as references"),
+    ("b-direct-spatial", 112, 80, 14, "spatial direct, 8.4.1.2.2"),
+    ("b-direct-temporal", 112, 80, 14,
+     "temporal direct on identical content, 8.4.1.2.3"),
+    ("b-weightb", 112, 80, 14, "implicit weighted bi-prediction, 8.4.2.3.2"),
+    ("b-skip", 128, 96, 14, "long runs of B_Skip over a still background"),
 ]
 
 
@@ -184,6 +203,55 @@ def test_every_inter_vector_is_pixel_exact_on_every_frame():
             assert got == want, "%s (%s) frame %d: %s" % (
                 name, what, i, _first_difference(got, want, width, height))
         print("  ok  %-12s %4dx%-4d %2d frames  %s"
+              % (name, width, height, frames, what))
+
+
+def test_every_b_vector_is_pixel_exact_on_every_frame():
+    """B pictures, compared frame for frame after reordering by POC.
+
+    The reordering is the only difference from the P test above, and it is
+    done the strict way: the picture order counts the decoder reports must
+    be distinct and must sort into exactly the presentation order FFmpeg
+    wrote, so a decoder that got the POCs wrong fails here even if every
+    sample it produced was right. Sorting the decoded pictures by anything
+    softer -- their own content, say -- would turn this test into one that
+    cannot fail.
+    """
+    if _skip():
+        return
+    for name, width, height, frames, what in B_VECTORS:
+        stream = _stream(name)
+        ref = _truth(name)
+        size = width * height * 3 // 2
+        assert len(ref) == frames * size, (
+            "%s: ground truth is %d bytes, not %d frames of %d"
+            % (name, len(ref), frames, size))
+        units = _access_units(stream)
+        assert len(units) == frames, (
+            "%s: %d access units, %d frames of ground truth"
+            % (name, len(units), frames))
+        decoder = h264.Decoder()
+        decoded = []
+        for i, unit in enumerate(units):
+            got_width, got_height, got = decoder.decode_i420(unit)
+            assert (got_width, got_height) == (width, height), (
+                "%s unit %d: decoded %dx%d, expected %dx%d"
+                % (name, i, got_width, got_height, width, height))
+            decoded.append((decoder.poc, i, got))
+        pocs = [poc for poc, _i, _p in decoded]
+        assert len(set(pocs)) == frames, (
+            "%s: %d access units but only %d distinct picture order counts %r"
+            % (name, frames, len(set(pocs)), pocs))
+        assert pocs != sorted(pocs), (
+            "%s: decode order and presentation order agree, so this vector "
+            "has no B pictures in it and is testing nothing: %r"
+            % (name, pocs))
+        for shown, (_poc, unit, got) in enumerate(sorted(decoded)):
+            want = ref[shown * size:(shown + 1) * size]
+            assert got == want, "%s (%s) frame %d (access unit %d): %s" % (
+                name, what, shown, unit,
+                _first_difference(got, want, width, height))
+        print("  ok  %-16s %4dx%-4d %2d frames  %s"
               % (name, width, height, frames, what))
 
 
@@ -379,6 +447,88 @@ def test_an_inter_coded_mp4_plays_all_the_way_through():
     print("  ok  IDR + 3 P frames decode, in order and seeked")
 
 
+def test_an_mp4_with_b_frames_comes_out_in_presentation_order():
+    """The container half of B frames, which is a separate bug from the
+    decoder half and fails in a way that looks like nothing much: the file
+    plays, every frame is a real frame, and the motion stutters back and
+    forth because frames are shown in the order they were coded.
+
+    So the check is against pixels and not against a picture merely being
+    there. `bframes.i420.z` is FFmpeg's decode of this exact MP4, in
+    presentation order, and every frame of it has to match sample for
+    sample after the RGB conversion -- which means `ctts` was read, the
+    samples were sorted by composition time, and the reorder buffer handed
+    them out in that order rather than in decode order.
+
+    Then the seek, twice over. Backwards past the reorder buffer has to
+    reset and replay; forwards into a frame that is still buffered has to
+    come out of the buffer rather than being decoded a second time. Both
+    have to produce the same bytes as playing straight through, because a
+    frame that depends on how you arrived at it is the whole failure mode
+    this is guarding."""
+    with open(os.path.join(FIXTURES, "bframes.mp4"), "rb") as handle:
+        data = handle.read()
+    info = mediacodec.probe(data)
+    assert info.codec == "avc1", info
+    assert (info.width, info.height) == (128, 96), info
+    if _skip():
+        assert not info.supported, "no decoder, but the file was accepted"
+        assert "H.264" in info.reason, info.reason
+        return
+    assert info.supported, "an H.264 MP4 with B frames was refused: %s" % (
+        info.reason,)
+    width, height, count = 128, 96, 12
+    track = mediacodec.open_video(data)
+    assert track.frame_count == count, track.frame_count
+    # The file is IBBP, so decode order is not presentation order and the
+    # track has to say so. If this is an identity mapping the test below
+    # still runs but proves nothing, which is the trap worth failing on.
+    assert track._order is not None and track._order != list(range(count)), (
+        "the track thinks decode order is presentation order: %r"
+        % (track._order,))
+    ref = _truth("bframes")
+    size = width * height * 3 // 2
+    luma = width * height
+    cw, ch = width // 2, height // 2
+    assert len(ref) == count * size, len(ref)
+    played = []
+    for i in range(count):
+        frame = track.frame(i)
+        played.append(bytes(frame.rgba))
+        for y in range(0, height, 7):
+            for x in range(0, width, 5):
+                yy = ref[i * size + y * width + x]
+                cb = ref[i * size + luma + (y // 2) * cw + x // 2] - 128
+                cr = ref[i * size + luma + cw * ch
+                         + (y // 2) * cw + x // 2] - 128
+                base = 298 * (yy - 16)
+                want = (max(0, min(255, (base + 409 * cr + 128) >> 8)),
+                        max(0, min(255, (base - 100 * cb - 208 * cr + 128)
+                                   >> 8)),
+                        max(0, min(255, (base + 516 * cb + 128) >> 8)))
+                at = (y * width + x) * 4
+                got = (frame.rgba[at], frame.rgba[at + 1], frame.rgba[at + 2])
+                assert got == want, (
+                    "frame %d (%d,%d): got %r, expected %r -- the frames are "
+                    "in the wrong order or decoded wrong" % (i, x, y, got,
+                                                             want))
+    # Times have to be presentation times too: a `ctts` read and then
+    # ignored leaves them in decode order and they stop being sorted.
+    times = [track.frame_time(i) for i in range(count)]
+    assert times == sorted(times), "presentation times run backwards: %r" % (
+        times,)
+    for jumps in ([5, 2, 11, 0, 7, 3], [11, 10, 9, 8, 1, 0], [3, 3, 4]):
+        track.reset()
+        for i in jumps:
+            assert bytes(track.frame(i).rgba) == played[i], (
+                "frame %d differs when reached by %r" % (i, jumps))
+    fresh = mediacodec.open_video(data)
+    for i in [7, 1, 7, 6, 2]:
+        assert bytes(fresh.frame(i).rgba) == played[i], (
+            "frame %d differs when seeked to without a reset" % i)
+    print("  ok  IBBP MP4: 12 frames in presentation order, and seeked")
+
+
 def test_a_machine_without_gfortran_still_has_a_browser():
     """The degradation path, forced. Nothing here may raise: an absent
     toolchain has to look like an unsupported codec, not like a crash."""
@@ -411,6 +561,125 @@ def test_a_machine_without_gfortran_still_has_a_browser():
         print("  ok  no toolchain: probed, refused, said why")
     finally:
         h264._loaded, h264._lib, h264._load_error = saved
+
+
+# Streams committed for what the decoder must *refuse*, so they have no
+# `.i420.z` beside them: there is no right picture to compare against, only
+# a right error. Both are combinations that decode to a plausible-looking
+# wrong picture if the refusal is missing, which is the failure mode worth
+# a fixture.
+REFUSALS = [
+    ("lossless", "lossless coding",
+     "x264 at --qp 0 sets qpprime_y_zero_transform_bypass_flag, and a "
+     "decoder that reads the flag and ignores it runs an inverse transform "
+     "over residuals that never had a forward one"),
+    ("b-cavlc", "CAVLC",
+     "B slices were built for CABAC and CAVLC for I and P, and their "
+     "overlap reads the wrong number of bits rather than failing: CAVLC's "
+     "mb_type table stops at the four P shapes and its sub_mb_type at four "
+     "rather than B's thirteen"),
+]
+
+
+def test_the_two_refusal_cases_are_refused_by_name():
+    """A refusal is a feature and gets a test like any other. Each of these
+    streams is well formed and decodable by FFmpeg; what is asserted is that
+    this decoder says so rather than producing a picture."""
+    if _skip():
+        return
+    for name, wanted, why in REFUSALS:
+        data = _stream(name)
+        decoder = h264.Decoder()
+        try:
+            for unit in _access_units(data):
+                decoder.decode_i420(unit)
+        except h264.H264Error as exc:
+            assert wanted in str(exc), (
+                "%s was refused, but for the wrong reason: %s" % (name, exc))
+            print("  ok  %-10s refused: %s" % (name, exc))
+            continue
+        raise AssertionError("%s decoded to a picture. %s" % (name, why))
+
+
+def test_no_fortran_routine_is_called_with_the_wrong_number_of_arguments():
+    """FORTRAN 77 has no prototypes, so a routine that grew an argument and
+    a caller that did not are a link that succeeds and a decoder that writes
+    through whatever was next on the stack. That is not a hypothetical: it
+    is how the CAVLC and B-slice branches met, and it segfaulted on the
+    second frame of `cavlc-p` rather than at the call.
+
+    This reads the sources rather than running anything, so it is the one
+    test here that is worth something on a machine with no gfortran."""
+    fortran = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "fortran")
+    declared, bad = {}, []
+    for name in sorted(os.listdir(fortran)):
+        if not name.endswith(".f"):
+            continue
+        for line in _folded(os.path.join(fortran, name)):
+            head = re.match(r"\s*(?:SUBROUTINE|(?:INTEGER|REAL|LOGICAL)\s+"
+                            r"FUNCTION)\s+(\w+)\s*(?:\(([^)]*)\))?", line)
+            if head:
+                args = (head.group(2) or "").strip()
+                declared[head.group(1).upper()] = (
+                    len(args.split(",")) if args else 0, name)
+    for name in sorted(os.listdir(fortran)):
+        if not name.endswith(".f"):
+            continue
+        for line in _folded(os.path.join(fortran, name)):
+            if re.match(r"\s*(?:SUBROUTINE|(?:INTEGER|REAL|LOGICAL)\s+"
+                        r"FUNCTION)\s", line):
+                continue
+            for call in re.finditer(r"\b(H2\w+)\s*\(", line):
+                routine = call.group(1).upper()
+                if routine not in declared:
+                    continue
+                count = _arity_at(line, call.end() - 1)
+                if count is None:
+                    continue
+                want, where = declared[routine]
+                if count != want:
+                    bad.append("%s calls %s with %d, declared with %d in %s"
+                               % (name, routine, count, want, where))
+    assert not bad, "argument count mismatches:\n  " + "\n  ".join(bad)
+    print("  ok  %d Fortran routines, every call site the declared arity"
+          % len(declared))
+
+
+def _folded(path):
+    """Fixed-form source with comments dropped, column 73 onwards cut off,
+    and continuation lines folded onto the statement they continue."""
+    out = []
+    with open(path) as handle:
+        for raw in handle:
+            line = raw.rstrip("\n")
+            if not line or line[0] in "Cc*!":
+                continue
+            line = line[:72]
+            if len(line) > 5 and line[5] not in (" ", "0"):
+                if out:
+                    out[-1] += line[6:]
+                continue
+            out.append(line)
+    return out
+
+
+def _arity_at(line, open_paren):
+    """Arguments in the call whose "(" is at `open_paren`, or None if the
+    parenthesis does not close on this statement."""
+    depth, count, anything = 0, 1, False
+    for char in line[open_paren:]:
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth == 0:
+                return count if anything else 0
+        elif char == "," and depth == 1:
+            count += 1
+        if depth == 1 and char not in "( \t":
+            anything = True
+    return None
 
 
 def main():

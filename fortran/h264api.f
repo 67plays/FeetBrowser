@@ -1,14 +1,15 @@
 C     The outside of the decoder: Annex B framing, and the handful of
 C     C-callable entry points that feetbrowser/h264.py loads with ctypes.
 C
-C     What decodes today: I and P slices, both entropy coders (CABAC and
-C     CAVLC), 4:2:0 8-bit, progressive, Baseline, Main and High profile.
-C     Every intra prediction mode, both transform sizes, scaling
-C     matrices, quarter-sample motion compensation, weighted prediction,
-C     up to four reference frames, and the deblocking filter.
+C     What decodes today: I, P and B slices, both entropy coders (CABAC
+C     and CAVLC), 4:2:0 8-bit, progressive, Baseline, Main and High
+C     profile.  Every intra prediction mode, both transform sizes,
+C     scaling matrices, quarter-sample motion compensation, explicit and
+C     implicit weighted prediction, bi-prediction, both direct modes, up
+C     to four reference frames, and the deblocking filter.
 C
 C     Refused, each by its own status code so that a report says which:
-C     * B, SP and SI slices                                     -43
+C     * SP and SI slices                                        -43
 C     * interlace                                                -4
 C     * chroma other than 4:2:0, or more than 8 bits             -3
 C     * slice groups                                            -13
@@ -16,12 +17,23 @@ C     * pic_order_cnt_type 1                                    -42
 C     * long-term references, and the four marking operations
 C       and the one reordering operation that name them         -50
 C     * more reference frames than MXREF                         -8
+C     * lossless coding, qpprime_y_zero_transform_bypass_flag     -9
+C     * temporal direct prediction with
+C       direct_8x8_inference_flag clear                         -55
+C     * a B slice coded with CAVLC, which no real stream is      -56
 C
-C     H2DECD keeps its state across calls, because a P slice predicts
-C     from the picture the previous call decoded.  Calling h264_reset
-C     between two frames of one stream does not slow the decoder down, it
-C     breaks it; the caller resets when the stream changes and not
-C     otherwise.
+C     H2DECD keeps its state across calls, because an inter slice
+C     predicts from the pictures the previous calls decoded.  Calling
+C     h264_reset between two frames of one stream does not slow the
+C     decoder down, it breaks it; the caller resets when the stream
+C     changes and not otherwise.
+C
+C     Pictures come out in decode order, which is not the order they are
+C     shown in once a stream has B slices in it.  h264_poc reports the
+C     picture order count of the last picture decoded and that is the
+C     whole of this side's involvement: putting the frames back in order
+C     needs the container's composition offsets and belongs where they
+C     are, in feetbrowser/mediacodec.py.
 C
 C     Everything crossing the boundary is an INTEGER or a byte array
 C     passed by reference.  Nothing is returned by value, nothing is a
@@ -122,7 +134,7 @@ C     misreads it.
       SUBROUTINE H2VERS(V) BIND(C, NAME='h264_version')
       IMPLICIT NONE
       INTEGER V
-      V = 3
+      V = 4
       RETURN
       END
 
@@ -157,6 +169,18 @@ C     not been one.
          W = OUTW
          H = OUTH
       END IF
+      RETURN
+      END
+
+C     The picture order count of the last picture decoded.  Decode order
+C     and presentation order are the same thing only until a stream uses
+C     B pictures; a caller that wants frames in the order a viewer sees
+C     them has to sort by this.  Meaningless before the first picture.
+      SUBROUTINE H2GPOC(P) BIND(C, NAME='h264_poc')
+      IMPLICIT NONE
+      INCLUDE 'h264com.inc'
+      INTEGER P
+      P = CURPOC
       RETURN
       END
 
@@ -268,10 +292,19 @@ C     second slice that recomputed them.
          END IF
          CALL H2WSCL
          RL0N = 0
+         RL1N = 0
+         COLSL = 0
          IF (SLTYPE .EQ. 0) THEN
 C     8.2.4, per slice and not per picture: two P slices of one picture
 C     may reorder the same set of references differently.
             CALL H2RLST(ST)
+            IF (ST .NE. 0) RETURN
+         ELSE IF (SLTYPE .EQ. 1) THEN
+C     8.2.4.2.3 and 8.2.4.2.4.  A B slice's two lists are built from the
+C     same references sorted by picture order count rather than by frame
+C     number, which is the whole reason a B slice needs a correct POC and
+C     a P slice can limp along with a wrong one.
+            CALL H2BLST(ST)
             IF (ST .NE. 0) RETURN
          END IF
          IF (ECMODE .EQ. 0) THEN
