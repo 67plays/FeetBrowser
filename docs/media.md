@@ -10,15 +10,18 @@ well-compressed web MP4 -- and not one with SP or SI slices, nor a B slice
 coded with CAVLC; see [H.264, in Fortran](#h264-in-fortran). Everything else
 is identified by name and refused in public.
 
-Audio now has both halves and not the join between them. The AAC-LC track of
-an ordinary web MP4 comes out as PCM samples in memory, exactly as a
-reference decoder produces them -- see [AAC, in Fortran](#aac-in-fortran) --
-and there is a platform output device on all three platforms, a lock-free
-ring, a polyphase resampler, a mixer with per-source gain and a master
-volume, and a monotonic audio clock, see [Audio output](#audio-output). What
-does not exist is the wire between them: nothing hands a decoded AAC track to
-a mixer source, and nothing synchronises it against the video clock, so
-loading a file still plays it silently.
+Audio has both halves and the join between them. The AAC-LC track of an
+ordinary web MP4 comes out as PCM samples in memory, exactly as a reference
+decoder produces them -- see [AAC, in Fortran](#aac-in-fortran) -- there is a
+platform output device on all three platforms, a lock-free ring, a polyphase
+resampler, a mixer with per-source gain and a master volume, and a monotonic
+audio clock, see [Audio output](#audio-output); and `feetbrowser/arch.py`
+pumps one into the other and hangs the pictures off the result, see
+[Sound and pictures together](#sound-and-pictures-together). An MP4 with an
+AAC-LC track plays with sound, and its frames are scheduled against the
+sound rather than against the wall clock. Every other container's audio is
+still named and refused: there is no MP3, no Vorbis and no Opus, and AVI's
+audio is not demuxed at all.
 
 Read this before adding a codec. The point of writing it down is that the
 hard parts here are not the codec; they are the seams the codec plugs into,
@@ -547,12 +550,71 @@ no Linux or Windows machine was available while they were written, and CI
 runners have no sound device to exercise the live half on either. Read them
 as carefully-written and unproven. The CoreAudio backend is the one that has
 actually made a noise.
+## Sound and pictures together
+
+`feetbrowser/arch.py`, the *arch*, because it carries the load between the
+heel and the toes. `mediacodec.py` says what frame 37 sounds like and
+`heel.py` says how samples reach a speaker; this is the only module in the
+tree that knows both, and it exists so that neither has to know the other.
+
+`AudioPlayer` is `media.VideoPlayer` in the other medium, deliberately down
+to the shape of the calls -- `play`, `pause`, `seek`, `position`, `pump`,
+`close`, `gain`, `muted` -- including the `threaded=False` plus `pump()`
+bargain, because the two are driven by one `<video>` element and an element
+that has to remember which half wants which spelling will get it wrong. A
+worker decodes ahead until the source has about half a second queued and
+then stops; a `<video>` in a background tab is not holding seconds of PCM.
+
+Three things in it are less obvious than they look.
+
+- **The position is the source's, not the device's.** See the warning under
+  [Audio output](#audio-output): `AudioClock.now()` is the device timeline
+  and `Source.position()` is the stream timeline. Only the second can have a
+  picture scheduled against it.
+- **A seek throws sound away and nothing else may.** `seek()` is
+  `Source.restart(t)`, which drops the queue and starts a new timeline --
+  right for a scrubber, wrong for a loop or a change of playback rate, where
+  the sound already decoded is still the sound that should be heard next.
+  Those push a boundary onto a `deque` instead, in `Source.position()`
+  coordinates, saying "when the playhead reaches here, media time is *that*
+  and runs at *this* rate from then on"; the boundary is popped as the
+  playhead crosses it.
+- **A frame whose channel count disagrees with the source's is not
+  written.** The source interleaves at a fixed channel count, so a stereo
+  frame written to a mono source is not quiet or wrong-eared, it is noise
+  for the rest of the file. Such a frame is counted in `channel_errors` and
+  its *duration* is written as silence, so everything after it still lands
+  in the right place.
+
+The sync needed no change to `Scheduler` at all. `Scheduler.position()` is
+`offset + (clock.now() - origin)`, so `media._AudioClock`, whose `now()` is
+the audio player's position, makes both terms cancel and the pictures land
+wherever the sound is. `VideoPlayer.attach_audio(player)` installs it and
+routes `play`, `pause` and `seek` to both sides -- the sound first, because
+`Scheduler.seek()` re-origins itself against the clock and a clock seeked
+afterwards leaves every picture out by exactly the size of the seek.
+
+`attach_audio` declines, leaving the video exactly as it was, when there is
+no audio track or the output is the null fallback. A video whose clock is a
+device nobody can hear is a video with a new way to stop, and a headless run
+must play its pictures the way it always did.
+
+`browser.py` builds an `AudioPlayer` alongside the `VideoPlayer` for every
+`<video>` whose file has sound, hands it the element's own `loop` and
+`muted`, and offers it to the video. Silence is never a failure there: a
+file with no audio track and a machine with no sound card both give a video
+that plays as it did before. The only thing said out loud is a track the
+container names and we have no decoder for. Every player on a page shares
+one `heel.Output`, opened the first time something actually has sound to
+play, because `Mixer` exists precisely so the second sound does not have to
+ask the sound card for a second exclusive stream and lose.
+
 ## AAC, in Fortran
 
 The audio half of an ordinary web MP4, decoded to PCM. It is in
 `fortran/inst*.f`, wrapped by `feetbrowser/aac.py`, and it is called the
-*instep* -- the arch that carries the weight. It shares nothing with the
-H.264 decoder next door but the build machinery: `IP*` routines and `/IP*/`
+*instep* -- the top of the foot, over the arch that carries the weight. It
+shares nothing with the H.264 decoder next door but the build machinery: `IP*` routines and `/IP*/`
 COMMON blocks against H.264's `H2*` and `/H2*/`, because Fortran has one
 global namespace and two decoders in one process have to stay out of each
 other's way.
@@ -777,19 +839,16 @@ every codec wants to be handed.
    last byte arrives. Worth doing now rather than later, because MJPEG over
    HTTP is a format we can already decode and cannot currently play at all:
    the stream never ends, so waiting for the last byte waits forever.
-6. **Join the two halves of the audio path, and then A/V sync.** Both ends
-   are built and neither knows about the other. `mediacodec.open_audio()`
-   gives an `AudioTrack` handing out 1024-sample frames of interleaved
-   float32 with timestamps; `heel.Source` takes interleaved float32 at a
-   rate and resamples it to the device's. The work is the pump between them
-   and the demuxers keeping the audio track they currently skip. Then A/V
-   sync, which is a small change rather than a design problem: give
-   `Scheduler` a clock reading `Source.position()` when there is a sound
-   track, and let the picture follow it. Read the note under
-   [Audio output](#audio-output) about which of the two clocks to use first;
-   the wrong one is off by a ring's depth plus the device's latency, which
-   over Bluetooth is most of a fifth of a second. After that, SBR, so that
-   low-bitrate HE-AAC streams play at all.
+6. **More than one container with sound in it, and then SBR.** The join is
+   done -- see [Sound and pictures together](#sound-and-pictures-together)
+   -- but only MP4 and MOV reach it, because `open_audio()` only demuxes
+   those. WebM's audio is identified and refused for want of a Vorbis or
+   Opus decoder, which is a codec-sized job; AVI's is refused for want of a
+   demuxer, which is not, and is the cheaper of the two. There is also no
+   fixture in the tree with a video track and an audio track in one file,
+   so the end-to-end path is proved a half at a time; a muxer in
+   `tests/media_fixtures.py` that writes both traks would close that. After
+   those, SBR, so that low-bitrate HE-AAC streams play at all.
 7. **Per-decoder H.264 state.** Both entropy coders and all three slice types
    are done, so what is left in `fortran/` is not a feature but the shape of
    the thing: the decoder's state is `COMMON`, which is to say there is one

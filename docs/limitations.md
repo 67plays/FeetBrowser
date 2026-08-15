@@ -86,12 +86,13 @@ then frozen, as are SP and SI slices. Beyond H.264 there is no VP8, VP9,
 AV1 or MPEG-4 ASP at all, so every WebM is identified and measured but not
 decoded, and an element carrying one draws a correctly sized box saying
 which codec it is and why it is not playing. YouTube and its neighbours do
-not work, for want of streaming rather than for want of a codec. There is
-also **no audio**
-anywhere in the browser: nothing in the project opens an output device on
-any platform, so a clip with a soundtrack plays silently. The design, the
-exact unsupported list and the ordered next steps are in
-[media.md](media.md).
+not work, for want of streaming rather than for want of a codec. **Sound is
+MP4 and MOV only**: an AAC-LC track plays, through our own decoder and our
+own output device, with the pictures scheduled against it rather than
+against the wall clock. Every other soundtrack is identified by name and
+plays silently -- there is no MP3, Vorbis or Opus decoder, and AVI's audio
+is not demuxed at all. The design, the exact unsupported list and the
+ordered next steps are in [media.md](media.md).
 
 **Doesn't (yet):** flexbox wrapping, `<textarea>`/`<select>` selection (beyond
 read-only), or the full ECMAScript feature set (see below). Shoes themes are
