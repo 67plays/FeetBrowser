@@ -49,10 +49,31 @@ def bitmapinfoheader(width, height, bit_count, compression, palette=None,
     return header + table
 
 
+def _auds_strl(format_tag=0x0055, channels=2, sample_rate=44100, length=0):
+    """A second `strl` describing a sound stream.
+
+    Enough of one to be read and named: a `strh` that says `auds` and a
+    `strf` that is a WAVEFORMATEX, whose first field is the format tag --
+    which is how AVI names a codec, a 16-bit number rather than a fourcc.
+    """
+    strh = (b"auds" + b"\x00\x00\x00\x00"
+            + struct.pack("<IHHIIIIIIIIhhhh", 0, 0, 0, 0, 1, sample_rate, 0,
+                          length, 0, 0, 0, 0, 0, 0, 0))
+    strf = struct.pack("<HHIIHHH", format_tag, channels, sample_rate,
+                       sample_rate * channels * 2, channels * 2, 16, 0)
+    return _list("strl", _chunk("strh", strh) + _chunk("strf", strf))
+
+
 def avi(frames, width, height, fps=25.0, bit_count=24, compression=0,
         palette=None, top_down=False, keyframes=None, handler="DIB ",
-        with_index=True, total_frames=None):
-    """A single-video-stream AVI over the given list of packet payloads."""
+        with_index=True, total_frames=None, audio=None):
+    """A single-video-stream AVI over the given list of packet payloads.
+
+    `audio` is a dict of `_auds_strl` arguments, and adds a sound stream's
+    headers -- headers only. No `##wb` chunks are written, because nothing
+    demuxes AVI audio and a fixture that pretended otherwise would be
+    describing a feature this repository does not have.
+    """
     micros = int(round(1000000.0 / fps))
     count = len(frames) if total_frames is None else total_frames
     avih = struct.pack("<IIIIIIIIIIIIII", micros, 0, 0, 0x10, count, 0, 1, 0,
@@ -66,8 +87,10 @@ def avi(frames, width, height, fps=25.0, bit_count=24, compression=0,
                           len(frames), 0, 0, 0, 0, 0, width, height))
     strf = bitmapinfoheader(width, height, bit_count, compression, palette,
                             top_down)
-    hdrl = _list("hdrl", _chunk("avih", avih)
-                 + _list("strl", _chunk("strh", strh) + _chunk("strf", strf)))
+    streams = _list("strl", _chunk("strh", strh) + _chunk("strf", strf))
+    if audio is not None:
+        streams += _auds_strl(**audio)
+    hdrl = _list("hdrl", _chunk("avih", avih) + streams)
 
     movi_body = b""
     entries = []
@@ -543,21 +566,160 @@ def _stts(durations):
                            for count, delta in runs))
 
 
+def _descriptor(tag, payload, long_length=False):
+    """One MPEG-4 descriptor: a tag, a length, a payload.
+
+    The length is seven bits a byte with the top bit meaning "another byte
+    follows", so the same number has four legal spellings. `long_length`
+    writes the four-byte one, which is what QuickTime writes and which a
+    reader that assumes a single byte gets wrong by three.
+    """
+    assert len(payload) < 128, "the fixture's descriptors are all short"
+    if long_length:
+        length = bytes((0x80, 0x80, 0x80, len(payload)))
+    else:
+        length = bytes((len(payload),))
+    return bytes((tag,)) + length + payload
+
+
+def esds(asc, object_type=0x40, long_lengths=False):
+    """An `esds` box carrying `asc` as its DecoderSpecificInfo.
+
+    The whole descriptor chain a real file has -- ES_Descriptor, then a
+    DecoderConfigDescriptor whose objectTypeIndication says which codec, then
+    the config the decoder is actually built from -- because the demuxer has
+    to walk all three and a fixture that skipped a layer would not test that.
+    """
+    dsi = _descriptor(0x05, asc, long_lengths)
+    config = (bytes((object_type,)) + b"\x15\x00\x00\x00"
+              + struct.pack(">II", 0, 0) + dsi)
+    dcd = _descriptor(0x04, config, long_lengths)
+    sl = _descriptor(0x06, b"\x02", long_lengths)
+    es = _descriptor(0x03, struct.pack(">HB", 1, 0) + dcd + sl, long_lengths)
+    return _box("esds", b"\x00\x00\x00\x00" + es)
+
+
+def audio_sample_entry(codec="mp4a", channels=2, sample_rate=44100, extra=b"",
+                       version=0):
+    """An AudioSampleEntry in QuickTime sound description version 0, 1 or 2.
+
+    Version 0 is what an MP4 muxer writes. The other two append fields before
+    the child boxes -- sixteen bytes and thirty-six -- so a parser that does
+    not know about them looks for `esds` in the middle of a number.
+    """
+    if version == 2:
+        # Version 2 pins the old fixed-point field at 1.0 and puts the real
+        # rate in a float64 further down, which is the only way the format
+        # can say 44100.0 exactly rather than nearly.
+        fixed = struct.pack(">HH", 1, 0)
+    else:
+        fixed = struct.pack(">HH", int(sample_rate) & 0xFFFF, 0)
+    body = (b"\x00" * 6                       # reserved
+            + struct.pack(">H", 1)            # data reference index
+            + struct.pack(">HHI", version, 0, 0)   # version, revision, vendor
+            + struct.pack(">HHHH", channels, 16, 0, 0)
+            + fixed)
+    assert len(body) == 28, len(body)
+    if version == 1:
+        body += struct.pack(">IIII", 1024, 0, 0, 2)
+    elif version == 2:
+        body += (struct.pack(">I", 72) + struct.pack(">d", float(sample_rate))
+                 + struct.pack(">I", channels) + b"\x7f\x00\x00\x00"
+                 + struct.pack(">IIII", 32, 1, 0, 1024))
+    body += extra
+    return struct.pack(">I", 8 + len(body)) + codec.encode("latin-1") + body
+
+
+def _soun_trak(offsets, sizes, sample_rate=44100, channels=2,
+               asc=b"\x12\x10", codec="mp4a", object_type=0x40,
+               timescale=None, durations=None, samples_per_chunk=1,
+               entry_version=0, in_wave=False, long_lengths=False):
+    """A `soun` trak over packets already placed in the file.
+
+    `offsets` are where those packets ended up, so the chunk table this
+    writes points at real bytes and a test can check the demuxer found them.
+    """
+    count = len(sizes)
+    if timescale is None:
+        timescale = sample_rate
+    if durations is None:
+        # 1024 samples a frame is what AAC codes, and the last frame of a
+        # real file is often shorter than the rest.
+        durations = [1024] * count
+    config = esds(asc, object_type, long_lengths) if asc is not None else b""
+    if in_wave and config:
+        # QuickTime hides the same box one level down, inside `wave`.
+        config = _box("wave", config)
+    stsd = _box("stsd", struct.pack(">II", 0, 1)
+                + audio_sample_entry(codec, channels, sample_rate, config,
+                                     entry_version))
+    chunk_offsets = [offsets[i] for i in range(count)
+                     if i % samples_per_chunk == 0]
+    stsc = _box("stsc", struct.pack(">II", 0, 1)
+                + struct.pack(">III", 1, samples_per_chunk, 1))
+    stsz = _box("stsz", struct.pack(">III", 0, 0, count)
+                + b"".join(struct.pack(">I", size) for size in sizes))
+    stco = _box("stco", struct.pack(">II", 0, len(chunk_offsets))
+                + b"".join(struct.pack(">I", o) for o in chunk_offsets))
+    tables = stsd + _stts(durations) + stsc + stsz + stco
+    mdhd = _box("mdhd", struct.pack(">BBBBIIIIHH", 0, 0, 0, 0, 0, 0,
+                                    timescale, sum(durations), 0x55C4, 0))
+    hdlr = _box("hdlr", struct.pack(">I", 0) + b"\x00\x00\x00\x00soun"
+                + b"\x00" * 12 + b"\x00")
+    smhd = _box("smhd", struct.pack(">IHH", 0, 0, 0))
+    minf = _box("minf", smhd + _box("stbl", tables))
+    tkhd = _box("tkhd", struct.pack(">BBBB", 0, 0, 0, 7)
+                + struct.pack(">IIIII", 0, 0, 2, 0, 0)
+                + b"\x00" * 52 + struct.pack(">II", 0, 0))
+    return _box("trak", tkhd + _box("mdia", mdhd + hdlr + minf))
+
+
+def mp4_audio(packets, brand=b"isom", movie_timescale=600, **kwargs):
+    """An MP4 whose only track is sound: real tables over real packets.
+
+    `mdat` comes before `moov`, as it does in `mov()` above and for the same
+    reason -- the offsets in `stco` then point into a part of the file that
+    was written before the table that describes it, which is where an offset
+    bug shows up.
+    """
+    ftyp = _box("ftyp", brand + struct.pack(">I", 512) + brand)
+    mdat = _box("mdat", b"".join(packets))
+    base = len(ftyp) + 8
+    offsets = []
+    running = base
+    for payload in packets:
+        offsets.append(running)
+        running += len(payload)
+    trak = _soun_trak(offsets, [len(p) for p in packets], **kwargs)
+    duration = sum(kwargs.get("durations") or [1024] * len(packets))
+    rate = kwargs.get("sample_rate", 44100)
+    ticks = int(duration * movie_timescale / (rate or 1))
+    mvhd = _box("mvhd", struct.pack(">BBBBIIII", 0, 0, 0, 0, 0, 0,
+                                    movie_timescale, ticks) + b"\x00" * 80)
+    return ftyp + mdat + _box("moov", mvhd + trak)
+
+
 def mov(frames, width, height, codec="jpeg", fps=25.0, depth=24,
         timescale=600, brand=b"qt  ", samples_per_chunk=1, sync=None,
-        wide_offsets=False, durations=None):
+        wide_offsets=False, durations=None, audio=None):
     """A QuickTime/ISO file over the given list of sample payloads.
 
     Real sample tables, and `mdat` is written before `moov` so the chunk
     offsets in `stco` are offsets into a file that is still being built --
     which is exactly the ordering that makes an offset bug visible.
+
+    `audio` adds a second, sound, track: a dict of `packets` plus whatever
+    `_soun_trak` takes. Its packets go into the same `mdat` after the video's,
+    which is where a demuxer that reads the wrong track's chunk table lands.
     """
     delta = int(round(timescale / fps))
     count = len(frames)
     if durations is None:
         durations = [delta] * count
+    audio = dict(audio) if audio else None
+    audio_packets = list(audio.pop("packets")) if audio else []
     ftyp = _box("ftyp", brand + struct.pack(">I", 512) + brand)
-    mdat_payload = b"".join(frames)
+    mdat_payload = b"".join(frames) + b"".join(audio_packets)
     mdat = _box("mdat", mdat_payload)
     # Samples live at their own offset inside mdat, whose payload starts
     # eight bytes into the box, which itself starts after ftyp.
@@ -602,6 +764,13 @@ def mov(frames, width, height, codec="jpeg", fps=25.0, depth=24,
                 + b"\x00" * 52
                 + struct.pack(">II", width << 16, height << 16))
     trak = _box("trak", tkhd + mdia)
+    if audio is not None:
+        audio_offsets = []
+        for payload in audio_packets:
+            audio_offsets.append(running)
+            running += len(payload)
+        trak += _soun_trak(audio_offsets,
+                           [len(p) for p in audio_packets], **audio)
     mvhd = _box("mvhd", struct.pack(">BBBBIIII", 0, 0, 0, 0, 0, 0, timescale,
                                     duration_ticks)
                 + b"\x00" * 80)
@@ -645,8 +814,13 @@ def _ebml_uint(element_id, value):
     return _ebml(element_id, raw)
 
 
-def webm(width, height, duration, codec="V_VP9", timecode_scale=1000000):
-    """Enough Matroska for the prober: Info duration and Tracks dimensions."""
+def webm(width, height, duration, codec="V_VP9", timecode_scale=1000000,
+         audio_codec=None):
+    """Enough Matroska for the prober: Info duration and Tracks dimensions.
+
+    `audio_codec` adds a second TrackEntry naming a sound codec, which is all
+    the audio prober reads out of a WebM -- there is no demuxer for it here.
+    """
     header = b"\x1a\x45\xdf\xa3" + struct.pack(">I", 5 | 0x10000000) \
         + b"\x42\x86\x81\x01\x00"
     info = _ebml(0x1549A966,
@@ -655,6 +829,8 @@ def webm(width, height, duration, codec="V_VP9", timecode_scale=1000000):
                                              duration * 1e9 / timecode_scale)))
     video = _ebml(0xE0, _ebml_uint(0xB0, width) + _ebml_uint(0xBA, height))
     entry = _ebml(0xAE, _ebml(0x86, codec.encode("latin-1")) + video)
+    if audio_codec is not None:
+        entry += _ebml(0xAE, _ebml(0x86, audio_codec.encode("latin-1")))
     tracks = _ebml(0x1654AE6B, entry)
     segment = _ebml(0x18538067, info + tracks)
     return header + segment

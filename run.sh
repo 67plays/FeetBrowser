@@ -7,20 +7,22 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-# The H.264 decoder is Fortran (see fortran/ and feetbrowser/h264.py), built
-# on demand by gfortran into a cache keyed on the sources. Building it here
-# rather than on the first <video> costs a second or two once per checkout and
-# saves a stall in the middle of a page. Everything about it is optional: no
-# gfortran, or a build that fails, means the browser reports H.264 as a codec
-# it does not have, which is what it did before this existed. So the output
-# goes nowhere and the exit status is ignored.
-warm_h264() {
+# The H.264 and AAC decoders are Fortran (see fortran/, feetbrowser/h264.py
+# and feetbrowser/aac.py), built on demand by gfortran into a cache keyed on
+# the sources. Building them here rather than on the first <video> costs a
+# second or two once per checkout and saves a stall in the middle of a page.
+# Everything about it is optional: no gfortran, or a build that fails, means
+# the browser reports H.264 and AAC as codecs it does not have, which is what
+# it did before this existed. So the output goes nowhere and the exit status
+# is ignored.
+warm_fortran() {
   command -v gfortran >/dev/null 2>&1 || return 0
-  "$1" -c "from feetbrowser import h264; h264.available()" >/dev/null 2>&1 || true
+  "$1" -c "import feetbrowser.h264 as v, feetbrowser.aac as a
+v.available(); a.available()" >/dev/null 2>&1 || true
 }
 
 if python3 -c "import feetbrowser_engine" 2>/dev/null; then
-  warm_h264 python3
+  warm_fortran python3
   exec python3 -m feetbrowser "$@"
 fi
 # Otherwise the venv is what runs the browser, so ask the venv -- and not
@@ -116,5 +118,5 @@ FAILED
   echo "FeetBrowser: engine built. Starting."
 fi
 
-warm_h264 .venv/bin/python
+warm_fortran .venv/bin/python
 exec .venv/bin/python -m feetbrowser "$@"
