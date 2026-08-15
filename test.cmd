@@ -75,13 +75,7 @@ rem one that skips everywhere else.
 %RUN% tests\test_x11.py || exit /b 1
 %RUN% tests\test_win32.py || exit /b 1
 %RUN% tests\test_units.py || exit /b 1
-rem test.sh runs this suite twice, once per JavaScript engine. Here it runs
-rem once: the Zig engine has never been built on Windows by anything in this
-rem repository, and a line that builds it for the first time inside a test
-rem script is not the way to find out whether it can be.
-set FEETBROWSER_JS=rust
 %RUN% tests\test_js.py || exit /b 1
-set FEETBROWSER_JS=
 %RUN% tests\test_shoes.py || exit /b 1
 rem A fixture page in, its pixels back out.
 %RUN% tests\test_e2e.py || exit /b 1

@@ -103,11 +103,9 @@ show their first frame and do not move.
 
 ## The JavaScript engine
 
-There are two, and `FEETBROWSER_JS` picks between them: `rust` (the default)
-and `zig`. They share the same Python-facing API and the same test suite.
-That variable and the rest of the environment are documented in
-[usage](usage.md#environment-variables). What follows is what the Zig engine
-leaves out; its design is written up in `docs/jszig.md`.
+The engine is the `feetbrowser_engine` extension module, whose interpreter,
+DOM bridge and renderer inner loops are compiled to Rust (see rust/). What
+follows is what it leaves out.
 
 **Syntax it will not parse.** ES modules — `import`/`export` are reported as
 "ES modules are not supported" rather than as a mystery syntax error, so a
