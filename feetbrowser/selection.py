@@ -38,6 +38,9 @@ selection there is a set of visual ranges rather than one, and nothing else
 in the renderer models RTL either.
 """
 
+import array
+
+from .asmselect import offset_scan
 from .htmlparser import Text
 from .layout import DrawText, _measure, _metrics
 
@@ -48,6 +51,14 @@ __all__ = ["Index", "Point", "Run", "Selection", "contrasting_text_color"]
 # punctuation, and a double-click on punctuation selects the punctuation run,
 # which is what every browser does.
 _WORD_EXTRA = "_'’"
+
+# The per-character advances of a run, remembered per (font, text) so a drag
+# that re-scans the same line over and over builds the advances once. Bounded
+# like the font memo tables in layout; a pathological line is not worth
+# caching, and the array is what the assembly kernel walks without copying.
+_ADVANCES_CACHE = {}
+_ADVANCES_MAX = 20_000
+_ADVANCES_LINE_MAX = 2_000
 
 
 def _is_word_char(ch):
@@ -111,17 +122,22 @@ class Run:
         decided where the glyphs went) -- nothing here assumes the face is
         monospaced, and a proportional face lands on the boundary a user
         aimed at. Nearest boundary rather than the one before, so clicking
-        the right half of a character puts the caret after it.
+        the right half of a character puts the caret after it. The boundary
+        walk itself is the assembly kernel from asmselect when this host has
+        one (per mouse event, over a cached advances array); otherwise it is
+        the identical Python loop.
         """
         text, font = self.text, self.font
-        pen = self.left
-        best, best_d = 0, abs(x - pen)
-        for i, ch in enumerate(text):
-            pen += _measure(font, ch)
-            distance = abs(x - pen)
-            if distance < best_d:
-                best, best_d = i + 1, distance
-        return best
+        if not text:
+            return 0
+        key = (font._ftbs_key, text)
+        try:
+            adv = _ADVANCES_CACHE[key]
+        except KeyError:
+            adv = array.array("d", (_measure(font, ch) for ch in text))
+            if len(_ADVANCES_CACHE) < _ADVANCES_MAX and len(text) <= _ADVANCES_LINE_MAX:
+                _ADVANCES_CACHE[key] = adv
+        return offset_scan(adv, x, self.left)
 
     def word_at(self, offset):
         """The (start, end) run-local range of the word around `offset`."""

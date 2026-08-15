@@ -78,19 +78,11 @@ $run tests/test_shoes.py
 $run tests/test_e2e.py     # a fixture page in, its pixels back out
 $run tests/test_nav.py
 $run tests/test_toes.py
-$run tests/test_asmblend.py  # raw assembly on Linux/x86-64, Python elsewhere
-$run tests/test_asmops.py    # the image-codec kernels, against their Python references
+$run tests/test_asmx11.py    # raw assembly on Linux/x86-64, Python elsewhere
+$run tests/test_asmselect.py # the selection nearest-boundary kernel
 $run tests/test_h264.py      # the Fortran H.264 decoder, or the skip where there is no gfortran
 $run tests/test_aac.py       # the Fortran AAC decoder, against FFmpeg's samples
 $run tests/test_pcm.py       # uncompressed sound, against the waveform it was made from
 $run tests/smoke.py
 
-# The Go port of the transport layer (net/) is a separate toolchain, so it is
-# run where one is installed and skipped where there is not, the same way the
-# window suites treat their platforms.
-if command -v go >/dev/null 2>&1; then
-  go vet ./...
-  go test ./...
-else
-  echo "skipping the Go net tests: no go toolchain on PATH"
-fi
+

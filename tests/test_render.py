@@ -400,12 +400,11 @@ def test_fill_rect_alpha_blends_halfway():
 
 def test_fill_rect_alpha_lands_in_the_right_rows_and_nowhere_else():
     """This is what is left of the span-kernel test after the fill moved to
-    Rust. The row-at-a-time asmblend path is gone -- the Rust fill covers the
+    Rust. The row-at-a-time assembly path is gone -- the Rust fill covers the
     whole rectangle in one crossing instead of one per row -- so what is worth
     checking is the same thing that test checked underneath the plumbing: the
     blend is exact, it covers every pixel of the rectangle, and it touches
-    nothing outside it. The kernels themselves are still exercised, directly
-    against their Python references, in tests/test_asmblend.py.
+    nothing outside it.
 
     Note the arithmetic: `// 255`, as the translate tables did. The assembly
     rounded by `>> 8`, which is one level darker at the top of the range.

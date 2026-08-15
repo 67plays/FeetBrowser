@@ -118,16 +118,11 @@ what they sound like:
   is the difference between a photo costing microseconds and milliseconds.
 
 The translucent fill used to have two Python implementations racing under it:
-a 256-entry translate table per channel, and, on Linux/x86-64, a call into the
-hand-written span kernels in `asmblend.py` once per row. Both were answers to
-the same question (how do you blend a run of bytes without a Python loop),
-and the Rust fill answers it by crossing the boundary once for the whole
-rectangle rather than once per row, so neither is on this path any more. The
-kernels are still there and still tested (`tests/test_asmblend.py` checks them
-against their Python references); nothing in the browser calls them now. One
-detail worth carrying forward: the assembly rounded by `>> 8` where the tables
-and the Rust round by `// 255`, so a translucent fill could land one level
-darker at the top of the range on Linux/x86-64 and nowhere else.
+a 256-entry translate table per channel, and, on Linux/x86-64, a call into a
+hand-written span kernel once per row. Both were answers to the same question
+(how do you blend a run of bytes without a Python loop), and the Rust fill
+answers it by crossing the boundary once for the whole rectangle rather than
+once per row, so neither is on this path any more.
 
 Antialiasing is a scanline sampler: 4× vertical subsampling with analytic
 horizontal coverage, accumulated with the nonzero winding rule, which is what
