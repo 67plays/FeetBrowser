@@ -52,13 +52,6 @@ downloadable artifacts. Install one into the interpreter you run the browser
 with — `pip install feetbrowser_engine-*.whl` — and `run.sh` finds the
 engine already importable and skips the build.
 
-There is a second JavaScript engine, written from scratch in Zig and loaded
-with `ctypes` rather than built into a venv. `FEETBROWSER_JS=zig ./run.sh`
-selects it; `rust` is the default. Both pass the same test suite, and the
-design of the Zig one is in [docs/jszig.md](docs/jszig.md). That variable and
-every other one the browser reads are documented in
-[docs/usage.md](docs/usage.md#environment-variables).
-
 The window itself is ours too. macOS gets one through AppKit, Linux one
 through Xlib, and Windows one through user32/gdi32 — all by ctypes, so there
 is nothing to install for any of them, and X11 covers Wayland desktops
@@ -91,7 +84,6 @@ To render a page to a PNG without opening a window:
 - [Usage & shortcuts](docs/usage.md)
 - [Architecture — how the engine works](docs/architecture.md)
 - [The rendering engine — fonts, rasteriser, pixels](docs/rendering.md)
-- [The Zig JavaScript engine](docs/jszig.md)
 - [Video — Motion JPEG, and what a real codec would need](docs/media.md)
 - [Extensions (Toes & ToeHub)](docs/toes.md)
 - [What it does and doesn't do](docs/limitations.md)

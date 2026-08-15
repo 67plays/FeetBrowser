@@ -208,27 +208,17 @@ lines, it converts a silent wrong answer into a visible failure, and it tells
 you how much of the real web actually needs lookaround before anyone commits
 to writing a regex engine.
 
-## maturin, pyo3, and the ctypes question
+## maturin and pyo3
 
-`maturin` is installed and invoked in three places: `run.sh:97-98`,
-`test.sh:47-48`, and `.github/actions/build/action.yml:72-73`. It exists to
+`maturin` is installed and invoked in three places: `run.sh:90-91`,
+`test.sh:52-53`, and `.github/actions/build/action.yml:72-73`. It exists to
 build `feetbrowser_engine` as a CPython extension module and install it into a
-virtualenv. Most of `run.sh`'s 120 lines are in service of that: locating the
+virtualenv. Most of `run.sh`'s 106 lines are in service of that: locating the
 extension, comparing its mtime against `rust/src`, creating the venv,
 unsealing a venv made before `--system-site-packages` was added, and printing
 the three different failure messages the process can produce.
 
-The Zig JavaScript engine, now on main, is the existence proof that this is not
-the only shape available. It builds with `cd zig && zig build` — `build.zig` is
-50 lines — and loads through plain `ctypes.CDLL`. No build tool, no extension
-module, no pyo3, no venv, and nothing tied to the Python version.
-Its FFI layer, `feetbrowser/jszig.py`, is 716 lines: 39 C functions, one
-24-byte tagged-union struct crossing the boundary, and five `CFUNCTYPE`
-callbacks so the engine can call back into Python for property reads, writes
-and calls.
-
-**So callbacks over ctypes are already a solved problem in this repository,
-and they are not what stands in the way.** What stands in the way is `dom.rs`.
+**What stands between this and a ctypes arrangement is `dom.rs`.**
 
 The pyo3 decorator count is small — 6 `#[pyclass]`, 6 `#[pymethods]`, 3
 `#[pyfunction]`, one `#[pymodule]` — and that count is misleading. `dom.rs` is
@@ -245,35 +235,22 @@ kind of JavaScript value the interpreter carries everywhere.
 
 None of that survives a ctypes boundary. `getattr`, refcounting, `PyDict`
 casts and constructing Python classes *are* the CPython C API, which is
-precisely what ctypes does not give you.
-
-Main now carries both arrangements side by side, which is the clearest look at
-the difference there is going to be: `jsdom_rust.py` is **214 lines** of shims
-that forward every `js_get`/`js_set` into `dom.rs`, while `jsdom_py.py` is
-**886 lines** that hold the entire DOM in Python and let the engine reach it
-through five generic callbacks on opaque handles. `jsdom.py`, 109 lines,
-picks between them. The Zig side is not a smaller version of the Rust design;
-it is a different one, and it is four times the Python.
-
-That also means half of what dropping pyo3 would cost is already paid.
-`jsdom_py.py` is the Python DOM `dom.rs` would have to be rewritten as — the
-700-1,100 lines this section used to estimate — and it is written, wired up
-and under test. What is left is porting `capi.zig`'s C ABI to Rust and writing
-a `jsrust.py` alongside `jszig.py`: **roughly 800-1,400 lines touched**, and
-the risk is not the FFI. It is that every DOM operation changes from "Rust
-reaches into a Python object" to "Rust asks Python through a handle table",
-which moves behaviour at the edges — identity, exception propagation, mutation
-ordering — and `tests/test_js.py` is the only thing standing between that and
-a class of quiet regressions. That suite now runs against both engines, which
-is exactly the check this change would need.
+precisely what ctypes does not give you. `jsdom_rust.py` is **214 lines** of
+shims that forward every `js_get`/`js_set` into `dom.rs`; dropping pyo3 means
+replacing those shims with a handle table — a Python DOM `dom.rs` would ask
+through callbacks on opaque handles — which is the 700-1,100 lines this
+section has long estimated, and the risk is not the FFI. It is that every DOM
+operation changes from "Rust reaches into a Python object" to "Rust asks
+Python through a handle table", which moves behaviour at the edges — identity,
+exception propagation, mutation ordering — and `tests/test_js.py` is the only
+thing standing between that and a class of quiet regressions.
 
 What it would return is real, and the last item is the strongest argument:
 
 - 8 crates, and `Cargo.toml` down to nothing at all if the other three go too.
-- `run.sh` from 120 lines to something near 50, and no virtualenv on a user's
-  machine. Today `run.sh` cannot start the browser without creating one for
-  the default engine; `FEETBROWSER_JS=zig` already skips it.
-- `test.sh` from 78 lines to about 50, with `.venv/bin/python` becoming
+- `run.sh` from 106 lines to something near 50, and no virtualenv on a user's
+  machine. Today `run.sh` cannot start the browser without creating one.
+- `test.sh` from 91 lines to about 50, with `.venv/bin/python` becoming
   `python3` throughout.
 - **CI Rust builds from 8 per run to 2.** The matrix covers six Python versions
   on Linux and two on macOS, and a pyo3 extension has to be compiled against
@@ -463,9 +440,8 @@ is not something this file can answer.
 
 **Verdict: optional, and currently dead weight.** The decision to make is
 whether a Go transport has a job in a Python browser — a subprocess, or a
-cdylib over ctypes the way the Zig engine goes — and to wire it in, or to
-delete it. Keeping it as it stands costs a toolchain in CI and guarantees
-continued drift.
+cdylib over ctypes — and to wire it in, or to delete it. Keeping it as it
+stands costs a toolchain in CI and guarantees continued drift.
 
 ## Suggested order
 
