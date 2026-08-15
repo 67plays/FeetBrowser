@@ -94,6 +94,9 @@ rem The Fortran AAC decoder, and the same arrangement about gfortran.
 %RUN% tests\test_aac.py || exit /b 1
 rem The Fortran MPEG Layer III decoder, and the same arrangement again.
 %RUN% tests\test_mp3.py || exit /b 1
+rem PCM, which needs no compiler anywhere: the fixtures are containers and
+rem the truth beside them, and the assertions are equalities.
+%RUN% tests\test_pcm.py || exit /b 1
 %RUN% tests\smoke.py || exit /b 1
 
 rem The Go port of the transport layer (net/) is a separate toolchain, so it is

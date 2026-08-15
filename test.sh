@@ -83,6 +83,7 @@ $run tests/test_asmops.py    # the image-codec kernels, against their Python ref
 $run tests/test_h264.py      # the Fortran H.264 decoder, or the skip where there is no gfortran
 $run tests/test_aac.py       # the Fortran AAC decoder, against FFmpeg's samples
 $run tests/test_mp3.py       # the Fortran MPEG Layer III decoder, likewise
+$run tests/test_pcm.py       # uncompressed sound, against the waveform it was made from
 $run tests/smoke.py
 
 # The Go port of the transport layer (net/) is a separate toolchain, so it is

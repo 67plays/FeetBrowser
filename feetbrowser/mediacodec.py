@@ -22,12 +22,21 @@ And what is decoded to sound:
 
   MOV/MP4 with `mp4a`        AAC-LC, by the Fortran decoder in `fortran/`,
                              handed back as interleaved 32-bit floats
+  MOV/MP4 with `sowt`,       uncompressed PCM: the sample entry says how
+  `twos`, `raw `, `in24`,    wide a sample is and which way round its bytes
+  `in32`, `fl32`, `fl64`     go, and that is the whole of the "codec"
+  and `lpcm`
+  AVI with WAVEFORMATEX      the same PCM, gathered out of the `##wb`
+  tag 1 or 3                 chunks the movi list interleaves it in
+  `.wav`                     the same PCM again, in the container that is
+                             nothing but a `fmt ` and a `data`
 
-That is one codec in two containers, and it is deliberately the whole list.
 `probe_audio` walks everything else far enough to say what it is -- the
 sample rate, the channel count, the duration and a name -- and then declines,
 for the same reason the video side declines VP9: "48 kHz stereo Opus, no
-decoder" is a useful sentence and silence is not.
+decoder" is a useful sentence and silence is not. ADPCM, mu-law and A-law
+are on that list and stay there: each of them is a real decoder, small but
+not nothing, and each is refused under its own name rather than under PCM's.
 
 Motion JPEG is the one that makes this a video player rather than a
 demonstration. It is here because the expensive half of it was already
@@ -67,7 +76,9 @@ the same idea one channel layout over: an index, a time, a duration, and
 the decoder already has.
 """
 
+import array
 import struct
+import sys
 
 from . import h264
 from . import imagecodec
@@ -882,6 +893,226 @@ class _Mp3:
         return out
 
 
+# The widths PCM arrives in, and nothing else is accepted. 20- and 22-bit
+# packings exist on paper; no muxer writes them and a decoder that guessed
+# would be inventing sound.
+PCM_WIDTHS = (8, 16, 24, 32, 64)
+
+# `array` promises minimum sizes rather than exact ones, so the typecodes are
+# measured instead of assumed. Getting this wrong is not a crash: it is a
+# byte-order bug, and a byte-order bug in PCM sounds like a file that plays.
+def _typecode(candidates, size):
+    for code in candidates:
+        if array.array(code).itemsize == size:
+            return code
+    raise MediaError("this build of Python has no %d-byte sample type" % size)
+
+
+_BIG_ENDIAN_HOST = sys.byteorder == "big"
+
+
+class _Pcm(_Codec):
+    """PCM, which is not a codec: it is a sample width and a byte order.
+
+    Nothing here is decoded. A packet is already the sound; the work is
+    reading it at the right width, with the right sign convention, the right
+    way round, and scaling it into the [-1, 1] floats the mixer takes. The
+    scale is 2 to the (width - 1) rather than that minus one, which is the
+    convention every audio stack uses and the only one under which the round
+    trip through an integer is exact: full-scale negative comes back as
+    exactly -1.0 and full-scale positive one step short of +1.0.
+
+    Unlike `_Aac` this carries no state between packets, which is why it sets
+    `stateless` -- `AudioTrack.frame()` reads that and answers an
+    out-of-order request by decoding the one block, instead of replaying the
+    file from the beginning to rebuild an overlap buffer that does not exist.
+    """
+
+    stateless = True
+
+    def __init__(self, channels, bits, signed, big_endian, floating):
+        if bits not in PCM_WIDTHS:
+            raise MediaError("%d-bit PCM: no decoder" % bits)
+        if floating and bits not in (32, 64):
+            raise MediaError("%d-bit floating-point PCM: no decoder" % bits)
+        self.channels = int(channels)
+        self.bits = int(bits)
+        self.width = bits // 8
+        self.frame_bytes = self.channels * self.width
+        self._signed = bool(signed)
+        self._floating = bool(floating)
+        self._big_endian = bool(big_endian)
+        self._swap = bool(big_endian) != _BIG_ENDIAN_HOST
+        self._scale = 1.0 / (1 << (bits - 1))
+        if floating:
+            self._code = _typecode(("f", "d"), self.width)
+        elif self.width == 3:
+            self._code = ""          # unpacked by hand; see `_convert`
+        elif signed:
+            self._code = _typecode(("b", "h", "i", "l", "q"), self.width)
+        else:
+            self._code = _typecode(("B", "H", "I", "L", "Q"), self.width)
+
+    def reset(self):
+        pass
+
+    def decode(self, packet):
+        """(PCM frames, channels, interleaved float32 bytes).
+
+        A packet is cut to a whole number of PCM frames before anything is
+        read. A trailing part-frame is a truncated file, and taking it would
+        put the next block's left channel in the right one for the rest of
+        the track.
+        """
+        usable = len(packet) - len(packet) % self.frame_bytes
+        if usable <= 0:
+            return 0, self.channels, b""
+        return (usable // self.frame_bytes, self.channels,
+                self._convert(packet[:usable]).tobytes())
+
+    def _convert(self, raw):
+        scale = self._scale
+        if self._floating:
+            values = array.array(self._code)
+            values.frombytes(raw)
+            if self._swap:
+                values.byteswap()
+            # Float PCM is already in [-1, 1] by definition, so 32-bit float
+            # in host order is the buffer we were going to build anyway.
+            if self.width == 4:
+                return values
+            return array.array("f", values)
+        if self.width == 3:
+            # There is no three-byte typecode, so 24-bit is the one width
+            # unpacked a sample at a time. It is also the one width nobody
+            # streams anything long in.
+            order = "big" if self._big_endian else "little"
+            signed = self._signed
+            return array.array("f", [
+                int.from_bytes(raw[i:i + 3], order, signed=signed) * scale
+                for i in range(0, len(raw), 3)])
+        values = array.array(self._code)
+        values.frombytes(raw)
+        if self._swap and self.width > 1:
+            values.byteswap()
+        if self._signed:
+            return array.array("f", [v * scale for v in values])
+        # Unsigned PCM is offset binary: silence is the middle of the range,
+        # not zero. This is 8-bit WAV and QuickTime's `raw `, and it is the
+        # one asymmetry in the whole format.
+        bias = 1 << (self.bits - 1)
+        return array.array("f", [(v - bias) * scale for v in values])
+
+    def __repr__(self):
+        if self._floating:
+            kind = "float"
+        else:
+            kind = "s" if self._signed else "u"
+        return ("<_Pcm %d%s %s %dch>"
+                % (self.bits, kind, "be" if self._big_endian else "le",
+                   self.channels))
+
+
+# One PCM "frame" as the rest of the browser sees it. PCM has no coded frame,
+# so the size is ours to pick, and the two numbers it has to sit between both
+# come from `arch.py`: `TARGET_QUEUE` is half a second of decoded sound and
+# `DECODE_BUDGET` is eight blocks per inline `pump()`, so a block under a
+# sixteenth of a second leaves `pump()` unable to fill the queue in one call,
+# while a block much over that is sound a seek has to throw away and latency
+# a pause cannot take back. A tenth of a second is comfortably inside both,
+# is four AAC frames' worth so the arch sees a familiar cadence, and keeps
+# the per-block Python overhead at ten calls a second rather than forty-three.
+PCM_BLOCK_SECONDS = 0.1
+
+# More than this many channels is refused rather than mixed. The resampler in
+# `heel.py` is pure Python and costs a filter pass per channel, and past eight
+# a file is a mastering session rather than a web page.
+MAX_PCM_CHANNELS = 8
+
+
+def _pcm_blocks(runs, frame_bytes, block_frames):
+    """Cut a PCM byte range list into blocks of whole PCM frames.
+
+    Uncompressed sound has no packet structure, so every container invents
+    one and none of them is a frame size worth playing. QuickTime's `stsz`
+    for a `sowt` track has one entry per *PCM frame* -- half a second of
+    44.1 kHz stereo is 22050 four-byte "samples" -- and AVI's `##wb` chunks
+    are however much sound fits beside one picture. Re-cutting them is
+    allowed here, and only here, because PCM carries nothing across a join:
+    the bytes either side of the cut mean exactly what they meant before it.
+
+    Ranges that are contiguous in the file are merged first, so a table of
+    22050 adjacent samples becomes one run and then a handful of blocks. A
+    run that does not hold a whole number of PCM frames has its tail dropped
+    rather than carried into the next run, because a byte of slip swaps the
+    channels for everything after it and that is worse than losing a sample.
+    """
+    merged = []
+    for entry in runs:
+        offset, length = entry[0], entry[1]
+        if length <= 0:
+            continue
+        if merged and merged[-1][0] + merged[-1][1] == offset:
+            merged[-1][1] += length
+        else:
+            merged.append([offset, length])
+    block_bytes = max(1, block_frames) * frame_bytes
+    blocks = []
+    for offset, length in merged:
+        length -= length % frame_bytes
+        while length > 0:
+            take = min(block_bytes, length)
+            blocks.append((offset, take, True))
+            offset += take
+            length -= take
+        if len(blocks) > MAX_FRAMES:
+            raise MediaError("PCM track is more than %d blocks" % MAX_FRAMES)
+    return blocks
+
+
+def _pcm_times(blocks, frame_bytes, sample_rate):
+    """Per-block (pts, duration) in seconds, and the total PCM frame count.
+
+    Counted rather than divided out of a header duration: the number of
+    frames actually in the file is the number that will be played, and a
+    `data` chunk cut short by a failed write is a real file we would
+    otherwise claim to be longer than it is.
+    """
+    times = []
+    played = 0
+    for _offset, length, _key in blocks:
+        frames = length // frame_bytes
+        times.append((played / sample_rate, frames / sample_rate))
+        played += frames
+    return times, played
+
+
+def _pcm_track(data, info, runs, layout):
+    """The last mile shared by MP4, AVI and WAV: cut, time, hand back.
+
+    `info` is filled in the rest of the way here -- frame count, duration and
+    `supported` -- because those three depend on how the bytes were cut, and
+    cutting them is this function's job.
+    """
+    bits, signed, big_endian, floating = layout
+    channels = int(info.channels)
+    rate = int(info.sample_rate)
+    if not 0 < channels <= MAX_PCM_CHANNELS:
+        raise MediaError("PCM with %d channels: no decoder" % channels)
+    if rate <= 0:
+        raise MediaError("PCM at %d Hz is not a sample rate" % rate)
+    codec = _Pcm(channels, bits, signed, big_endian, floating)
+    blocks = _pcm_blocks(runs, codec.frame_bytes,
+                         int(rate * PCM_BLOCK_SECONDS))
+    if not blocks:
+        raise MediaError("this PCM track holds no whole samples")
+    times, played = _pcm_times(blocks, codec.frame_bytes, float(rate))
+    info.frame_count = len(blocks)
+    info.duration = played / float(rate)
+    info.supported = True
+    return AudioTrack(data, info, blocks, codec, times=times)
+
+
 # The fourccs that mean H.264. `avc1` and `avc3` are the MP4 spellings and
 # differ only in where the parameter sets live -- in the `avcC` box for the
 # first, inline in the stream for the second, and the decoder takes both.
@@ -937,11 +1168,14 @@ KNOWN_UNDECODABLE_AUDIO = {
     "ec-3": "Dolby Digital Plus (E-AC-3): no decoder",
     ".mp3": "MP3: no decoder",
     "mp3 ": "MP3: no decoder",
-    "sowt": "16-bit PCM: no decoder",
-    "twos": "16-bit PCM: no decoder",
-    "lpcm": "uncompressed PCM: no decoder",
-    "raw ": "8-bit PCM: no decoder",
     "alac": "Apple Lossless: no decoder",
+    "ima4": ("IMA ADPCM: no decoder -- the samples are four-bit deltas "
+             "against a running predictor, which is a codec and not a "
+             "packing"),
+    "ulaw": ("mu-law: no decoder -- the samples are eight-bit companded and "
+             "need the expansion the standard defines, not a scale factor"),
+    "alaw": ("A-law: no decoder -- the samples are eight-bit companded and "
+             "need the expansion the standard defines, not a scale factor"),
     "Opus": "Opus: no decoder",
     "opus": "Opus: no decoder",
     "fLaC": "FLAC: no decoder",
@@ -1327,8 +1561,10 @@ class AudioTrack:
 
     The same shape as `VideoTrack`, deliberately, because the thing above
     them -- a scheduler holding a clock -- wants to ask both tracks the same
-    questions. A "frame" here is one coded AAC frame: 1024 samples per
-    channel, about 23 milliseconds, not one sample.
+    questions. A "frame" here is a block of sound rather than a sample: one
+    coded AAC frame, which is 1024 samples per channel and about 23
+    milliseconds, or for PCM whatever `_pcm_blocks` cut, which is a tenth of
+    a second.
     """
 
     def __init__(self, data, info, packets, codec, times=None, asc=b""):
@@ -1342,6 +1578,10 @@ class AudioTrack:
         # rate that would then be wrong at the end of every file.
         self._times = list(times) if times else None
         self._cursor = -1                  # last index handed to the codec
+        # A codec with nothing carried between packets makes this track
+        # random access. PCM says so; AAC cannot, because every frame's first
+        # half is the previous frame's transform tail.
+        self._stateless = bool(getattr(codec, "stateless", False))
         self.asc = asc                     # AudioSpecificConfig, verbatim
         self.sample_rate = info.sample_rate
         self.channels = info.channels
@@ -1396,11 +1636,15 @@ class AudioTrack:
         start from frame zero. The first frame after a `reset()` is the
         priming frame: it is decoded against silence and comes out
         attenuated, which is correct and is what every AAC decoder does.
+
+        A stateless codec is exempt, and that is the whole of what PCM buys
+        here: a block of samples is the same sound whichever order it is
+        asked for in, so a seek costs one block rather than the file so far.
         """
         if not 0 <= index < len(self._packets):
             raise MediaError("audio frame %d out of range" % index)
         start = index
-        if index != self._cursor + 1:
+        if index != self._cursor + 1 and not self._stateless:
             start = 0
             self._codec.reset()
             self._cursor = -1
@@ -1507,50 +1751,273 @@ def _open_avi(data):
                       [i for i, p in enumerate(ours) if p[2]])
 
 
-# WAVEFORMATEX format tags, which is how an AVI names an audio codec: a
-# 16-bit number rather than a fourcc. Only the ones worth naming are here --
-# 0x00FF and the two 0x16xx are the three spellings of AAC that muxers
-# actually wrote, and the last two cover the files most likely to turn up.
+# WAVEFORMATEX format tags, which is how an AVI and a WAV name an audio
+# codec: a 16-bit number rather than a fourcc. Only the ones worth naming are
+# here -- 0x00FF and the two 0x16xx are the three spellings of AAC that muxers
+# actually wrote, and the rest cover the files most likely to turn up.
+WAVE_PCM = 0x0001
+WAVE_IEEE_FLOAT = 0x0003
+WAVE_EXTENSIBLE = 0xFFFE
+
 WAVE_FORMAT_NAMES = {
-    0x0001: "PCM",
+    WAVE_PCM: "PCM",
     0x0002: "ADPCM",
+    WAVE_IEEE_FLOAT: "PCM float",
+    0x0006: "A-law",
+    0x0007: "mu-law",
+    0x0011: "IMA ADPCM",
     0x0055: "MP3",
     0x00FF: "AAC",
     0x1600: "AAC",
     0x1601: "AAC",
     0x2000: "AC-3",
+    WAVE_EXTENSIBLE: "extensible",
+}
+
+# The tail of a WAVE_FORMAT_EXTENSIBLE SubFormat GUID. The first two bytes of
+# the GUID are the format tag the file would have used if it could; the other
+# fourteen are this fixed suffix, and a GUID that does not end in it is some
+# vendor's own format rather than a tag in disguise.
+_KSDATAFORMAT_TAIL = (b"\x00\x00\x00\x00\x10\x00\x80\x00"
+                      b"\x00\xaa\x00\x38\x9b\x71")
+
+# Why we will not play the compressed things a WAVEFORMATEX can name. Each
+# gets its own sentence: "unsupported" is a useless thing to tell somebody
+# whose file will not play, and three of these four are refused for a reason
+# that is nothing to do with PCM being hard.
+WAVE_FORMAT_REASONS = {
+    0x0002: ("Microsoft ADPCM: no decoder -- the samples are four-bit deltas "
+             "against a running predictor, which is a codec and not a "
+             "packing"),
+    0x0011: ("IMA/DVI ADPCM: no decoder, for the same reason as Microsoft's "
+             "-- the samples are deltas against a predictor"),
+    0x0006: ("A-law: no decoder -- the samples are eight-bit companded and "
+             "need the expansion the standard defines, not a scale factor"),
+    0x0007: ("mu-law: no decoder -- the samples are eight-bit companded and "
+             "need the expansion the standard defines, not a scale factor"),
+    0x0055: "MP3: no decoder",
+    0x2000: "Dolby Digital (AC-3): no decoder",
 }
 
 
-def _probe_avi_audio(data):
-    """What an AVI's sound is, said honestly and then declined.
+class _WaveFormat:
+    """A WAVEFORMATEX, which is what both AVI and WAV use to name a codec."""
 
-    AVI audio is not demuxed here. The chunks are interleaved with the video
-    on a schedule the `strf` describes rather than a sample table, and
-    getting that wrong produces sound that drifts out of sync over minutes
-    rather than sound that is obviously broken -- so the choice is to read
-    the format header, say what the stream is, and stop.
+    __slots__ = ("tag", "channels", "sample_rate", "byte_rate", "block_align",
+                 "bits", "name")
+
+    def __init__(self):
+        self.tag = 0
+        self.channels = 0
+        self.sample_rate = 0
+        self.byte_rate = 0
+        self.block_align = 0
+        self.bits = 0
+        self.name = ""
+
+
+def _parse_wave_format(fmt):
+    """Read a WAVEFORMATEX. The same sixteen bytes in an AVI's `strf` and a
+    WAV's `fmt ` chunk, which is why this is one function and not two.
+
+    WAVE_FORMAT_EXTENSIBLE is the only complication and it is a small one:
+    the tag is 0xFFFE, the real tag is the first two bytes of a SubFormat
+    GUID at the end, and `wBitsPerSample` becomes the container width with
+    the number of bits actually carried in a `wValidBitsPerSample` beside the
+    GUID. FFmpeg writes it for anything above sixteen bits, so a WAV path
+    that does not read it fails on every 24-bit file there is.
     """
-    _micros, streams, _packets, _flags, _base = _parse_avi(data)
-    stream = None
-    for candidate in streams:
+    if len(fmt) < 16:
+        raise MediaError("a WAVEFORMATEX of %d bytes" % len(fmt))
+    reader = _Reader(fmt)
+    out = _WaveFormat()
+    out.tag = reader.u16le()
+    out.channels = reader.u16le()
+    out.sample_rate = reader.u32le()
+    out.byte_rate = reader.u32le()
+    out.block_align = reader.u16le()
+    out.bits = reader.u16le()
+    if out.tag == WAVE_EXTENSIBLE:
+        if reader.remaining() < 2 or reader.u16le() < 22:
+            raise MediaError("WAVE_FORMAT_EXTENSIBLE with no SubFormat")
+        valid = reader.u16le()
+        reader.skip(4)                       # dwChannelMask
+        guid = reader.take(16)
+        if guid[2:] != _KSDATAFORMAT_TAIL:
+            raise MediaError("a private WAVE_FORMAT_EXTENSIBLE SubFormat")
+        out.tag = struct.unpack("<H", guid[:2])[0]
+        # The container width is what is on disk and is the one to read at.
+        # `wValidBitsPerSample` says how many of those bits the encoder
+        # actually used, which changes the noise floor and not the layout, so
+        # it is checked for sanity and then not used.
+        if valid > out.bits:
+            raise MediaError("%d valid bits in a %d-bit sample"
+                             % (valid, out.bits))
+    out.name = WAVE_FORMAT_NAMES.get(out.tag, "0x%04X" % out.tag)
+    return out
+
+
+def _wave_pcm_layout(fmt, container):
+    """(bits, signed, big-endian, float) for a WAVEFORMATEX, or a refusal.
+
+    Both RIFF containers are little-endian throughout and neither has any
+    way to say otherwise, so the only questions are the width and whether
+    the samples are integers or floats.
+    """
+    if fmt.tag == WAVE_PCM:
+        if fmt.bits not in (8, 16, 24, 32):
+            raise MediaError("%d-bit PCM in %s: no decoder"
+                             % (fmt.bits, container))
+        # RIFF PCM has one asymmetry and it is not derivable from anything:
+        # eight-bit samples are unsigned offset binary and every wider width
+        # is two's complement. There is no flag for it; it is in the
+        # specification and so it is written out here.
+        return fmt.bits, fmt.bits > 8, False, False
+    if fmt.tag == WAVE_IEEE_FLOAT:
+        if fmt.bits not in (32, 64):
+            raise MediaError("%d-bit floating-point PCM in %s: no decoder"
+                             % (fmt.bits, container))
+        return fmt.bits, True, False, True
+    raise MediaError(WAVE_FORMAT_REASONS.get(
+        fmt.tag, "no decoder for %s in %s" % (fmt.name, container)))
+
+
+def _avi_audio_stream(data):
+    """The AVI's sound stream index, its header, and everything in `movi`."""
+    _micros, streams, packets, _flags, _base = _parse_avi(data)
+    for index, candidate in enumerate(streams):
         if candidate.kind == "auds":
-            stream = candidate
-            break
+            return index, candidate, packets
+    return -1, None, packets
+
+
+def _open_avi_audio(data):
+    """An `AudioTrack` over an AVI's `##wb` chunks, or a named refusal.
+
+    The sound in an AVI is not in a sample table; it is cut up and
+    interleaved with the pictures, a chunk at a time, so that a player
+    reading the file front to back has the sound for a picture before it has
+    the picture. Putting it back together is therefore the whole of the
+    demuxer: take this stream's chunks in file order, and their concatenation
+    is the stream. That works because it is PCM and only because it is PCM --
+    a chunk boundary in an uncompressed stream falls between two samples and
+    means nothing, where in a compressed one it is a packet boundary that the
+    codec has to be told about.
+
+    `dwLength` and `dwRate`/`dwScale` are read for the duration and then
+    overruled by the bytes that are actually there, in `_pcm_track`. A file
+    cut short mid-write is common and its header still describes the file
+    somebody meant to write.
+    """
+    index, stream, packets = _avi_audio_stream(data)
     if stream is None:
-        return AudioInfo("AVI", reason="this AVI has no audio stream")
+        raise _Unsupported(
+            AudioInfo("AVI", reason="this AVI has no audio stream"))
     info = AudioInfo("AVI")
-    if len(stream.format) >= 14:
-        header = _Reader(stream.format)
-        tag = header.u16le()
-        info.codec = WAVE_FORMAT_NAMES.get(tag, "0x%04X" % tag)
-        info.channels = header.u16le()
-        info.sample_rate = header.u32le()
+    try:
+        fmt = _parse_wave_format(stream.format)
+    except MediaError as exc:
+        info.reason = "this AVI's audio stream header is unreadable: %s" % exc
+        raise _Unsupported(info)
+    info.codec = fmt.name
+    info.channels = fmt.channels
+    info.sample_rate = fmt.sample_rate
     if stream.rate and stream.scale and stream.length:
         info.duration = stream.length * stream.scale / stream.rate
-    info.reason = ("%s in AVI: audio is demuxed out of MP4 and MOV only"
-                   % (info.codec or "the audio stream"))
-    return info
+
+    # The codec is decided before the chunks are counted, because a file we
+    # have no decoder for should be refused under the codec's name whether or
+    # not its `movi` list turned out to be empty. Only once it is sound we
+    # could have played does "there is none of it here" become the useful
+    # thing to say.
+    try:
+        layout = _wave_pcm_layout(fmt, "AVI")
+    except MediaError as exc:
+        info.reason = str(exc)
+        raise _Unsupported(info)
+
+    runs = [(offset, length, True)
+            for stream_id, kind, offset, length in packets
+            if stream_id == index and kind == "wb"]
+    if not runs:
+        info.reason = ("%s in AVI: the stream is declared but the movi list "
+                       "holds no %02dwb chunks, so there is no sound in this "
+                       "file to play" % (fmt.name, index))
+        raise _Unsupported(info)
+    try:
+        return _pcm_track(data, info, runs, layout)
+    except MediaError as exc:
+        info.reason = str(exc)
+        raise _Unsupported(info)
+
+
+def _probe_avi_audio(data):
+    try:
+        return _open_avi_audio(data).info
+    except _Unsupported as exc:
+        return exc.info
+
+
+# -- WAV ---------------------------------------------------------------------
+
+def _parse_wav(data):
+    """A RIFF walk to `fmt ` and `data`, which is the whole container.
+
+    Everything else a WAV can hold -- `LIST`/`INFO`, `fact`, `cue `, a
+    embedded playlist -- is metadata for something that is not us, and the
+    walker skips it by length like any other chunk. FFmpeg writes a `LIST`
+    between the two we want, so a parser that assumed `data` came straight
+    after `fmt ` would fail on the first file it met.
+    """
+    top = _Reader(data)
+    tag = top.fourcc()
+    size = top.u32le()
+    form = top.fourcc()
+    if tag != "RIFF" or form != "WAVE":
+        raise MediaError("not a WAV file")
+    body = _Reader(data, top.pos, min(len(data), 8 + max(size, 4)))
+    header = b""
+    payload = None
+    for kind, _list_type, chunk in _riff_chunks(body):
+        if kind == "fmt " and not header:
+            header = chunk.take(chunk.remaining())
+        elif kind == "data" and payload is None:
+            payload = (chunk.pos, chunk.remaining())
+    if not header:
+        raise MediaError("this WAV has no fmt chunk")
+    if payload is None:
+        raise MediaError("this WAV has no data chunk")
+    return _parse_wave_format(header), payload
+
+
+def _open_wav_audio(data):
+    """An `AudioTrack` over a `.wav`, or a named refusal.
+
+    A WAV is one `data` chunk and no packet structure at all, so the whole
+    of the demuxing is "where does `data` start and how long is it"; the
+    cutting into blocks is `_pcm_track`'s, exactly as it is for the other
+    two containers.
+    """
+    fmt, (offset, length) = _parse_wav(data)
+    info = AudioInfo("WAV", fmt.name, fmt.sample_rate, fmt.channels)
+    if length <= 0:
+        info.reason = "this WAV's data chunk is empty: there is no sound in it"
+        raise _Unsupported(info)
+    if fmt.sample_rate > 0 and fmt.byte_rate > 0:
+        info.duration = length / float(fmt.byte_rate)
+    try:
+        return _pcm_track(data, info, [(offset, length, True)],
+                          _wave_pcm_layout(fmt, "WAV"))
+    except MediaError as exc:
+        info.reason = str(exc)
+        raise _Unsupported(info)
+
+
+def _probe_wav_audio(data):
+    try:
+        return _open_wav_audio(data).info
+    except _Unsupported as exc:
+        return exc.info
 
 
 def _h264_reason(exc):
@@ -1703,6 +2170,17 @@ class _Mp4Track:
         self.channels = 0           # stsd, sound tracks only
         self.sample_rate = 0.0      # stsd, in hertz
         self.sample_size = 0        # stsd, bits per PCM sample
+        # The sound sample entry's own version, and the fields the later two
+        # add. They exist because a version 0 entry cannot describe
+        # uncompressed sound: `sample_size` is the only width in it and it is
+        # routinely a polite fiction. See `_mp4_pcm_layout`.
+        self.entry_version = 0
+        self.samples_per_packet = 0
+        self.bytes_per_packet = 0
+        self.bytes_per_frame = 0
+        self.bits_per_channel = 0   # version 2 only, and it does not lie
+        self.lpcm_flags = -1        # version 2 formatSpecificFlags, or -1
+        self.endian = -1            # `enda`: 1 little, 0 big, -1 unsaid
         self.object_type = 0        # esds objectTypeIndication
         self.codec = ""
         self.stts = []              # (sample count, duration in ticks)
@@ -1914,6 +2392,7 @@ def _parse_audio_sample_entry(entry, track):
     """
     entry.skip(8)                            # reserved, data reference index
     version = entry.u16be()
+    track.entry_version = version
     entry.skip(6)                            # revision, vendor
     track.channels = entry.u16be()
     track.sample_size = entry.u16be()
@@ -1922,15 +2401,23 @@ def _parse_audio_sample_entry(entry, track):
     fraction = entry.u16be()
     track.sample_rate = rate + fraction / 65536.0
     if version == 1:
-        # samples per packet, bytes per packet, bytes per frame, bytes per
-        # sample -- all four are about uncompressed audio and none of them
-        # tell us anything an AAC track has not already said.
-        entry.skip(16)
+        # These four say nothing an AAC track has not already said, and they
+        # are the only description an uncompressed one has: `bytes_per_packet`
+        # over `samples_per_packet` is the real width on disk, which is not
+        # `sample_size` above and not `bytes_per_sample` below.
+        track.samples_per_packet = entry.u32be()
+        track.bytes_per_packet = entry.u32be()
+        track.bytes_per_frame = entry.u32be()
+        entry.skip(4)                        # bytes per sample, uncompressed
     elif version == 2:
         entry.skip(4)                        # size of the struct that follows
         track.sample_rate = struct.unpack(">d", entry.take(8))[0]
         track.channels = entry.u32be()
-        entry.skip(20)                       # constant bits/bytes per packet
+        entry.skip(4)                        # always 0x7F000000
+        track.bits_per_channel = entry.u32be()
+        track.lpcm_flags = entry.u32be()
+        track.bytes_per_packet = entry.u32be()
+        track.samples_per_packet = entry.u32be()
     _parse_sample_extensions(entry, track)
 
 
@@ -2016,6 +2503,14 @@ def _parse_sample_extensions(entry, track, depth=1):
             track.extradata = bytes(box.data[box.pos:box.end])
         elif kind == "esds" and not track.extradata:
             _parse_esds(box, track)
+        elif kind == "enda" and box.remaining() >= 2:
+            # QuickTime's answer to "which way round is `in24`". The fourccs
+            # for the wider uncompressed formats are big-endian by
+            # definition, and this box is the only way a file can say
+            # otherwise -- FFmpeg writes `in24` plus `enda` 1 for
+            # `pcm_s24le`, so a reader that skips it plays every
+            # little-endian 24-bit file backwards, one byte at a time.
+            track.endian = box.u16be()
         elif kind == "wave" and depth < MAX_DEPTH:
             # QuickTime does not put `esds` beside the sample entry's other
             # children; it wraps it, and whatever else the codec brought,
@@ -2363,6 +2858,96 @@ def _probe_mp4(data, container="MP4"):
         return exc.info
 
 
+# QuickTime's uncompressed sound fourccs and what each one means on its own:
+# (bits, signed, big-endian, floating point). These are defaults and not
+# answers -- see `_mp4_pcm_layout`. `lpcm` has no entry because it has no
+# meaning without the sample entry that describes it, which is the whole
+# point of it existing.
+QUICKTIME_PCM = {
+    "sowt": (16, True, False, False),
+    "twos": (16, True, True, False),
+    "raw ": (8, False, False, False),
+    "in24": (24, True, True, False),
+    "in32": (32, True, True, False),
+    "fl32": (32, True, True, True),
+    "fl64": (64, True, True, True),
+}
+PCM_FOURCCS = tuple(QUICKTIME_PCM) + ("lpcm",)
+
+# `formatSpecificFlags` in a version 2 sound description: CoreAudio's
+# AudioStreamBasicDescription flags, only the four that describe the bytes.
+LPCM_FLOAT = 0x01
+LPCM_BIG_ENDIAN = 0x02
+LPCM_SIGNED = 0x04
+LPCM_NON_INTERLEAVED = 0x20
+
+
+def _mp4_pcm_layout(track):
+    """(bits, signed, big-endian, floating) for an uncompressed sound entry.
+
+    The fourcc is where this starts and not where it ends. A version 1 or 2
+    sound description carries the width and, in version 2, the byte order and
+    the sign convention explicitly, and where those disagree with the fourcc
+    it is the fourcc that is stale. Two disagreements are not hypothetical:
+
+      * A version 1 `in24` from FFmpeg has `sampleSize` 16 and
+        `bytesPerSample` 2, because both of those fields describe the
+        *canonical* uncompressed form of the sound -- what it becomes once
+        unpacked -- rather than the form on disk. The width actually in the
+        file is `bytesPerPacket` over `samplesPerPacket`, which is 3. Reading
+        `sampleSize` there does not give silence; it gives a plausible noise
+        at the wrong pitch, which is the worst kind of wrong.
+      * A version 1 or 0 `in24` is big-endian by its fourcc and little-endian
+        when an `enda` box beside it says 1, which is what FFmpeg writes for
+        `pcm_s24le`. The box wins.
+
+    `lpcm` is refused outside version 2 because outside version 2 there is
+    nothing to read: the fourcc means "the flags below say what this is" and
+    a version 0 entry has no flags.
+    """
+    codec = track.codec
+    bits, signed, big_endian, floating = QUICKTIME_PCM.get(
+        codec, (0, True, False, False))
+
+    if track.entry_version == 2:
+        flags = track.lpcm_flags
+        if flags < 0:
+            raise MediaError("%s: a version 2 sound description with no "
+                             "format flags" % codec)
+        if flags & LPCM_NON_INTERLEAVED:
+            raise MediaError("%s: non-interleaved PCM, which this player has "
+                             "nowhere to put" % codec)
+        bits = track.bits_per_channel
+        floating = bool(flags & LPCM_FLOAT)
+        big_endian = bool(flags & LPCM_BIG_ENDIAN)
+        signed = floating or bool(flags & LPCM_SIGNED)
+    elif track.entry_version == 1 and track.samples_per_packet > 0 \
+            and track.bytes_per_packet > 0:
+        if codec == "lpcm":
+            raise MediaError("lpcm: a version 1 sound description says how "
+                             "wide the samples are and not whether they are "
+                             "signed, floating point or big-endian")
+        bits = track.bytes_per_packet * 8 // track.samples_per_packet
+    elif codec == "lpcm":
+        raise MediaError("lpcm: a version %d sound description describes "
+                         "nothing about the samples in it"
+                         % track.entry_version)
+    elif track.sample_size in PCM_WIDTHS and not floating:
+        # A version 0 entry has one number and this is it. It is believed for
+        # the integer fourccs because `twos` at eight bits is a real file --
+        # QuickTime's own eight-bit signed -- and disbelieved for the float
+        # ones, where a width other than the fourcc's would be a contradiction
+        # rather than a variation.
+        bits = track.sample_size
+
+    if track.endian in (0, 1) and track.entry_version != 2:
+        big_endian = track.endian == 0
+    if bits not in PCM_WIDTHS:
+        raise MediaError("%s: %d-bit PCM, which is not a width we read"
+                         % (codec, bits))
+    return bits, signed, big_endian, floating
+
+
 def _audio_reason(codec, object_type):
     """What to say about a sound track we are not going to decode.
 
@@ -2414,6 +2999,19 @@ def _open_mp4_audio(data, container="MP4"):
     if duration <= 0 and times:
         duration = times[-1][0] + times[-1][1]
         info.duration = duration
+
+    if codec in PCM_FOURCCS:
+        # `stsz` for an uncompressed track is one entry per PCM frame, which
+        # is four bytes at a time for 44.1 kHz stereo, so the sample table is
+        # thrown away here and the byte ranges behind it are re-cut. Every
+        # number in `info` that came out of `stts` goes with it: the times
+        # above are per four-byte "sample" and mean nothing once the blocks
+        # are the size a player wants.
+        try:
+            return _pcm_track(data, info, samples, _mp4_pcm_layout(audio))
+        except MediaError as exc:
+            info.reason = str(exc)
+            raise _Unsupported(info)
 
     if codec != "mp4a" or audio.object_type not in AAC_OBJECT_TYPES:
         info.reason = _audio_reason(codec, audio.object_type)
@@ -2691,6 +3289,8 @@ def sniff(data):
         return ""
     if data[:4] == b"RIFF" and data[8:12] == b"AVI ":
         return "AVI"
+    if data[:4] == b"RIFF" and data[8:12] == b"WAVE":
+        return "WAV"
     if data[:3] == b"\xff\xd8\xff":
         return "MJPEG"
     if data[:4] == b"\x1a\x45\xdf\xa3":
@@ -2734,6 +3334,13 @@ def probe(data):
         return MediaInfo("MP3", codec="MP3",
                          reason="an MP3 is sound and nothing else: there is "
                                 "no picture in it")
+    if kind == "WAV":
+        # A WAV is a container we recognise, so this does not raise; it is
+        # just a container with no picture in it, which `probe_audio` is the
+        # one to ask about. Returning rather than raising is what lets a
+        # `<video src="x.wav">` say why it is showing nothing.
+        return MediaInfo("WAV", reason="a WAV file is sound and nothing "
+                                       "else: there is no picture in it")
     raise MediaError("not a media container we recognise")
 
 
@@ -2767,6 +3374,8 @@ def probe_audio(data):
         return _probe_mp4_audio(data, kind)
     if kind == "AVI":
         return _probe_avi_audio(data)
+    if kind == "WAV":
+        return _probe_wav_audio(data)
     if kind == "WebM":
         return _probe_webm_audio(data)
     if kind == "MJPEG":
@@ -2787,6 +3396,10 @@ def open_audio(data):
     kind = sniff(data)
     if kind in ("MP4", "MOV"):
         return _open_mp4_audio(data, kind)
+    if kind == "AVI":
+        return _open_avi_audio(data)
+    if kind == "WAV":
+        return _open_wav_audio(data)
     if kind == "MP3":
         return _open_mp3(data)
     raise _Unsupported(probe_audio(data))

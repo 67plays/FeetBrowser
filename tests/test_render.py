@@ -2350,7 +2350,15 @@ def test_probe_reports_mp4_and_webm_without_pretending_to_decode_them():
     assert info.codec == "V_VP9"
     assert not info.supported
 
-    for payload in (b"", b"not a video at all", b"RIFF\x04\x00\x00\x00WAVE"):
+    # A WAV is a container we now read, so it is recognised and comes back
+    # unsupported rather than raising: it is sound with no picture in it, and
+    # `<video src="x.wav">` deserves to be told that rather than "not a media
+    # container". `probe_audio` is the one with the answer for it.
+    info = mediacodec.probe(b"RIFF\x04\x00\x00\x00WAVE")
+    assert info.container == "WAV"
+    assert not info.supported and "no picture" in info.reason
+
+    for payload in (b"", b"not a video at all", b"RIFF\x04\x00\x00\x00AVI "):
         try:
             mediacodec.probe(payload)
         except mediacodec.MediaError:
