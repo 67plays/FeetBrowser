@@ -79,6 +79,7 @@ $run tests/test_nav.py
 $run tests/test_toes.py
 $run tests/test_asmblend.py  # raw assembly on Linux/x86-64, Python elsewhere
 $run tests/test_asmops.py    # the image-codec kernels, against their Python references
+$run tests/test_h264.py      # the Fortran H.264 decoder, or the skip where there is no gfortran
 $run tests/smoke.py
 
 # The Go port of the transport layer (net/) is a separate toolchain, so it is

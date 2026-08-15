@@ -29,6 +29,12 @@ first `run.cmd` stops at ``error: linker `link.exe` not found`` until the
 Visual Studio build tools are installed. See [usage.md](usage.md) for the
 exact download and the one workload to tick.
 
+`gfortran` is a second compiler the build can use, and unlike Rust it is
+optional in the real sense: the H.264 decoder in `fortran/` is compiled on
+demand and cached, and a machine without a Fortran compiler gets a browser
+that reports H.264 as a codec it does not have. Nothing else in the tree
+depends on it, and the test suite passes either way.
+
 The GNU toolchain is a real alternative rather than a dead end, which is worth
 saying because the opposite is usually assumed: official CPython is built with
 MSVC, but `pyo3-ffi` does not read MSVC's import libraries, it generates its
@@ -67,15 +73,20 @@ decodes and plays Motion JPEG (in an AVI, in a QuickTime `.mov`, or as a
 bare `.mjpeg` file of JPEGs end to end), along with uncompressed `BI_RGB`,
 run-length `BI_RLE8`, and QuickTime's `raw ` and `png `. It plays and pauses
 on a click, and `<video controls>` gets a real transport bar with a play
-button, a scrubber you can seek with and a time readout. What it cannot do is
-the format the web actually uses: there is no H.264, no VP8, VP9 or AV1, no
-MPEG-4 ASP, so most MP4s and every WebM are identified and measured but not
-decoded, and an element carrying one draws a correctly sized box saying which
-codec it is and why it is not playing. YouTube and its neighbours do not
-work, and are not close to working. There is also **no audio** anywhere in
-the browser: nothing in the project opens an output device on any platform,
-so a clip with a soundtrack plays silently. The design, the exact unsupported
-list and the ordered next steps are in [media.md](media.md).
+button, a scrubber you can seek with and a time readout. H.264 decodes too,
+but only as far as its decoder goes: `fortran/` is an I-frame decoder, exact
+to the sample against a reference one, with no P or B slices and no CAVLC
+yet. An ordinary web MP4 is one I frame followed by P frames, so it is
+refused up front rather than played for a frame and then frozen. What is
+still missing is therefore the format the web actually uses: no inter
+prediction, no VP8, VP9 or AV1, no MPEG-4 ASP, so most MP4s and every WebM
+are identified and measured but not decoded, and an element carrying one
+draws a correctly sized box saying which codec it is and why it is not
+playing. YouTube and its neighbours do not work. There is also **no audio**
+anywhere in the browser: nothing in the project opens an output device on
+any platform, so a clip with a soundtrack plays silently. The design, the
+exact unsupported list and the ordered next steps are in
+[media.md](media.md).
 
 **Doesn't (yet):** flexbox wrapping, `<textarea>`/`<select>` selection (beyond
 read-only), or the full ECMAScript feature set (see below). Shoes themes are
