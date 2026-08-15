@@ -911,16 +911,27 @@ every codec wants to be handed.
    last byte arrives. Worth doing now rather than later, because MJPEG over
    HTTP is a format we can already decode and cannot currently play at all:
    the stream never ends, so waiting for the last byte waits forever.
-6. **A second compressed audio codec, and then SBR.** Three containers now
-   reach the join -- MP4/MOV, AVI and `.wav` -- but only one compressed
-   format does. WebM's audio is identified and refused for want of a Vorbis
-   or Opus decoder, and MP3 for want of an MP3 decoder; all three are
-   codec-sized jobs rather than demuxer-sized ones, which is what makes them
-   the next thing rather than the easy thing. After those, SBR, so that
-   low-bitrate HE-AAC streams play at all. `tests/fixtures/pcm/pcm.avi` is
-   the file that closed the older gap on this list: until it existed there
-   was nothing in the tree with a video track and an audio track together,
-   so the end-to-end path was proved a half at a time.
+6. **A second compressed audio codec, and then SBR.** The join is done --
+   see [Sound and pictures together](#sound-and-pictures-together) -- and
+   three containers now reach it: MP4/MOV, AVI and `.wav`. But only one
+   *compressed* format does. WebM's audio is identified and refused for want
+   of a Vorbis or Opus decoder, and MP3 for want of an MP3 decoder; all
+   three are codec-sized jobs rather than demuxer-sized ones, which is what
+   makes them the next thing rather than the easy thing. After those, SBR,
+   so that low-bitrate HE-AAC streams play at all.
+
+   The end-to-end path is no longer proved a half at a time:
+   `media_fixtures.mp4_av()` writes both traks over real coded frames --
+   Motion JPEG pictures and the AAC packets out of a committed vector -- and
+   `test_one_file_with_both_codecs_in_it_plays_in_sync` drives one such file
+   through both decoders and the clock between them. `mov()` could always
+   write two traks, but every caller passed filler bytes as the audio, which
+   is enough to test a demuxer and not enough to test a decoder: a file built
+   that way probes as a supported 82-frame AAC track, decodes to nothing at
+   all, and hands the device two hundred kilobytes of silence.
+   `tests/fixtures/pcm/pcm.avi` is the same case in the other container: a
+   real picture track and a real sound track in one AVI, this time with the
+   sound uncompressed.
 7. **Per-decoder H.264 state.** Both entropy coders and all three slice types
    are done, so what is left in `fortran/` is not a feature but the shape of
    the thing: the decoder's state is `COMMON`, which is to say there is one
