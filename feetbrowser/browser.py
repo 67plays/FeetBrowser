@@ -4229,7 +4229,7 @@ class Browser:
         tab = self.active_tab
         btn(8, "‹", bool(tab and tab.history))
         btn(40, "›", bool(tab and tab.future))
-        btn(72, "⟳", bool(tab))
+        btn(72, "↻", bool(tab))
         btn(104, "⌂", bool(tab))
         marked = bool(tab and self._is_bookmarked(tab.url))
         btn(136 + self._toe_buttons_offset(), "★" if marked else "☆",
