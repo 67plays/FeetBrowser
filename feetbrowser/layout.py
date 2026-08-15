@@ -346,6 +346,170 @@ class DrawVideo:
             tags=tags)
 
 
+# The transport bar drawn over the bottom of a `<video controls>`. Sizes are
+# in device pixels and deliberately not scaled by anything: a control you
+# have to aim at is worse than one that always looks the same.
+CONTROLS_HEIGHT = 28
+CONTROLS_MIN_WIDTH = 120        # below this the bar has nowhere to put a groove
+CONTROLS_MIN_HEIGHT = 72        # below this it would cover the picture
+CONTROLS_PAD = 8
+GROOVE_HEIGHT = 4
+KNOB_RADIUS = 5
+
+
+def format_media_time(seconds):
+    """`m:ss`, or `h:mm:ss` once there is an hour of it. What every player
+    writes, and short enough to fit beside a scrubber on a small video."""
+    if seconds != seconds or seconds < 0:        # NaN from a duration of 0/0
+        seconds = 0.0
+    total = int(seconds)
+    if total >= 3600:
+        return "%d:%02d:%02d" % (total // 3600, (total // 60) % 60, total % 60)
+    return "%d:%02d" % (total // 60, total % 60)
+
+
+class DrawVideoControls:
+    """The play/pause button and scrubber over the foot of a `<video>`.
+
+    This one command paints several primitives, which none of the others do,
+    and the reason is that it is the only thing on the page whose *geometry*
+    changes without layout running again. A film advancing means the playhead
+    moves every frame, and the frame timer repaints the existing display list
+    rather than rebuilding it -- `DrawVideo` gets away with that because its
+    photo is rewritten in place, and a scrubber cannot, because where the
+    knob goes is a number rather than a buffer. So the bar reads the player
+    at execute() time and draws itself from that.
+
+    It is also why hit-testing lives here: the rectangles a click has to be
+    compared against are the same ones execute() draws, and having two copies
+    of that arithmetic is how a button ends up half a pixel from where it
+    looks.
+    """
+
+    def __init__(self, x1, y1, x2, y2, node=None, player=None, font=None):
+        self.top, self.left, self.bottom, self.right = y1, x1, y2, x2
+        self.node = node
+        self.player = player
+        self.font = font
+
+    def hit(self, x, y):
+        return (self.left <= x <= self.right
+                and self.top <= y <= self.bottom)
+
+    # -- geometry, shared by the painter and the hit test -------------------
+
+    def button_rect(self):
+        size = self.bottom - self.top
+        return (self.left, self.top, self.left + size, self.bottom)
+
+    def groove_rect(self):
+        """The scrubber's track: from the right of the button to the left of
+        the time readout, which is measured rather than guessed so a clip an
+        hour long does not have its digits drawn over."""
+        left = self.left + (self.bottom - self.top) + CONTROLS_PAD
+        right = self.right - CONTROLS_PAD - self._time_width()
+        middle = (self.top + self.bottom) / 2
+        return (left, middle - GROOVE_HEIGHT / 2,
+                max(left + 1, right), middle + GROOVE_HEIGHT / 2)
+
+    def _time_width(self):
+        if self.font is None:
+            return 0
+        return _measure(self.font, self._time_text()) + CONTROLS_PAD
+
+    def _time_text(self):
+        player = self.player
+        if player is None:
+            return "0:00"
+        duration = getattr(player.info, "duration", 0.0) if player.info else 0.0
+        return "%s / %s" % (format_media_time(player.position()),
+                            format_media_time(duration))
+
+    def _fraction(self):
+        player = self.player
+        duration = getattr(player.info, "duration", 0.0) \
+            if player is not None and player.info else 0.0
+        if not duration:
+            return 0.0
+        return max(0.0, min(1.0, player.position() / duration))
+
+    # -- what a click on it means -------------------------------------------
+
+    def action_at(self, x, y):
+        """("toggle", None), ("seek", seconds), or None for a click that the
+        bar swallows without doing anything."""
+        player = self.player
+        if player is None:
+            return None
+        bx0, _by0, bx1, _by1 = self.button_rect()
+        if bx0 <= x <= bx1:
+            return ("toggle", None)
+        gx0, _gy0, gx1, _gy1 = self.groove_rect()
+        # The whole height of the bar counts as the groove. A four-pixel
+        # target is not a target, and there is nothing else along that strip
+        # to hit by accident.
+        if gx0 - KNOB_RADIUS <= x <= gx1 + KNOB_RADIUS and gx1 > gx0:
+            duration = getattr(player.info, "duration", 0.0) \
+                if player.info else 0.0
+            fraction = max(0.0, min(1.0, (x - gx0) / (gx1 - gx0)))
+            return ("seek", fraction * duration)
+        return None
+
+    # -- painting ------------------------------------------------------------
+
+    def execute(self, scroll, canvas, tags=()):
+        top = self.top - scroll
+        bottom = self.bottom - scroll
+        try:
+            canvas.create_rectangle(self.left, top, self.right, bottom,
+                                    width=0, fill="#000000", stipple="gray50",
+                                    tags=tags)
+            self._draw_button(canvas, top, bottom, tags)
+            self._draw_groove(canvas, scroll, tags)
+            if self.font is not None:
+                canvas.create_text(self.right - CONTROLS_PAD,
+                                   (top + bottom) / 2, text=self._time_text(),
+                                   font=self.font, fill="#ffffff", anchor="e",
+                                   tags=tags)
+        except CanvasError:
+            pass
+
+    def _draw_button(self, canvas, top, bottom, tags):
+        x0, _y0, x1, _y1 = self.button_rect()
+        cx = (x0 + x1) / 2
+        cy = (top + bottom) / 2
+        size = min(x1 - x0, bottom - top) * 0.42
+        if self.player is not None and self.player.playing:
+            bar = size * 0.34
+            canvas.create_rectangle(cx - size * 0.55, cy - size,
+                                    cx - size * 0.55 + bar, cy + size,
+                                    width=0, fill="#ffffff", tags=tags)
+            canvas.create_rectangle(cx + size * 0.55 - bar, cy - size,
+                                    cx + size * 0.55, cy + size,
+                                    width=0, fill="#ffffff", tags=tags)
+        else:
+            canvas.create_polygon(cx - size * 0.6, cy - size,
+                                  cx + size * 0.85, cy,
+                                  cx - size * 0.6, cy + size,
+                                  fill="#ffffff", tags=tags)
+
+    def _draw_groove(self, canvas, scroll, tags):
+        x0, y0, x1, y1 = self.groove_rect()
+        if x1 <= x0:
+            return
+        y0 -= scroll
+        y1 -= scroll
+        canvas.create_rectangle(x0, y0, x1, y1, width=0, fill="#ffffff",
+                                stipple="gray50", tags=tags)
+        played = x0 + (x1 - x0) * self._fraction()
+        if played > x0:
+            canvas.create_rectangle(x0, y0, played, y1, width=0,
+                                    fill="#ffffff", tags=tags)
+        canvas.create_oval(played - KNOB_RADIUS, (y0 + y1) / 2 - KNOB_RADIUS,
+                           played + KNOB_RADIUS, (y0 + y1) / 2 + KNOB_RADIUS,
+                           fill="#ffffff", outline="", tags=tags)
+
+
 def _video_attr(node, name):
     """A `<video>` width/height attribute as a positive int, or 0.
 
@@ -359,6 +523,27 @@ def _video_attr(node, name):
     except (TypeError, ValueError):
         return 0
     return value if 0 < value <= 10000 else 0
+
+
+def _video_controls(node, left, top, width, height):
+    """A `DrawVideoControls` for this element, or None.
+
+    Two reasons to say None, and both are the same reason a real browser
+    gives: the page did not ask for controls, or the box is too small to put
+    them in without covering the film. HTML makes the attribute the whole
+    switch -- a `<video>` without it is a picture, not a player -- and the
+    click-anywhere-to-toggle behaviour is what such an element still has.
+    """
+    if not isinstance(node, Element) or "controls" not in node.attributes:
+        return None
+    player = getattr(node, "video_player", None)
+    if player is None or player.track is None:
+        return None
+    if width < CONTROLS_MIN_WIDTH or height < CONTROLS_MIN_HEIGHT:
+        return None
+    return DrawVideoControls(left, top + height - CONTROLS_HEIGHT,
+                             left + width, top + height, node, player,
+                             get_font(11, "normal", "roman"))
 
 
 def _video_label(node, player):
@@ -2942,10 +3127,13 @@ class BlockLayout(LayoutBox):
             elif item.kind == "video":
                 y = baseline - item.ascent
                 if item.photo is not None:
+                    left = item.x + offset
                     self.display_list.append(DrawVideo(
-                        item.x + offset, y,
-                        item.x + offset + item.w, y + item.h,
+                        left, y, left + item.w, y + item.h,
                         item.photo, item.node))
+                    bar = _video_controls(item.node, left, y, item.w, item.h)
+                    if bar is not None:
+                        self.display_list.append(bar)
                     continue
                 # No decodable picture: a dark box with the reason in it, at
                 # the size the element would have had.
