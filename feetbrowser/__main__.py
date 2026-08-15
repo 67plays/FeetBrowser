@@ -22,9 +22,56 @@ options:
   --toe-disable <name>     disable an installed toe
   --new-toe <name>         scaffold a new toe
   --toe-docs               print the Toes documentation
+  --check-video [stream.264 [truth.i420.z]]
+                   say whether this build can decode H.264, and prove it
 
 If no URL is given the browser opens the welcome page.
 """
+
+
+def check_video(args):
+    """--check-video: can this build decode video, and does it decode right?
+
+    The interesting caller is the packaging: run inside a built application,
+    this is the difference between an app that plays video and one that only
+    looks like it does. A bundle that shipped no decoder starts, renders, and
+    says nothing at all until somebody opens a video -- so the packaging asks
+    here instead, once, at build time.
+
+    With a stream it decodes one; with the I420 a reference decoder produced
+    from that stream it compares the pictures byte for byte, because a
+    decoder that loads and returns rubbish has passed no test worth having.
+    """
+    import os
+    from . import h264
+
+    reason = h264.unavailable_reason()
+    if reason is not None:
+        print("video: no H.264 decoder: %s" % reason)
+        return 1
+    print("video: H.264 decoder ready, from %s" % h264.library_path())
+    if not args:
+        return 0
+    with open(args[0], "rb") as handle:
+        stream = handle.read()
+    try:
+        width, height, picture = h264.Decoder().decode_i420(stream)
+    except h264.H264Error as exc:
+        print("video: %s did not decode: %s" % (args[0], exc))
+        return 1
+    print("video: decoded %s: %dx%d, %d bytes of I420"
+          % (os.path.basename(args[0]), width, height, len(picture)))
+    if len(args) < 2:
+        return 0
+    import zlib
+    with open(args[1], "rb") as handle:
+        truth = zlib.decompress(handle.read())
+    if picture != truth:
+        print("video: the picture does not match %s (%d bytes against %d)"
+              % (os.path.basename(args[1]), len(picture), len(truth)))
+        return 1
+    print("video: the picture is identical to the reference decoder's")
+    return 0
 
 
 def main():
@@ -73,6 +120,8 @@ def main():
     if flag == "--toe-docs":
         toes.toe_docs()
         return
+    if flag == "--check-video":
+        sys.exit(check_video(args[1:]))
     # Anything else is a URL passed to the browser.
     from .browser import main as browser_main
     sys.exit(browser_main() or 0)

@@ -81,6 +81,30 @@ jobs:
           maturin build --release --manifest-path rust/Cargo.toml --out dist
           Get-ChildItem dist
 
+      # gfortran, for the H.264 decoder. It is a build tool exactly like cargo
+      # -- what ships is our own Fortran, compiled, with the compiler's
+      # runtime linked in statically -- and the runner image is not promised
+      # to have one, so it is asked for by name rather than hoped for. A
+      # bundle built without it would be a browser that cannot play video and
+      # says so only to the user, so build.ps1 fails rather than skips.
+      - name: gfortran
+        run: |
+          $found = (Get-Command gfortran -ErrorAction SilentlyContinue).Source
+          if (-not $found) {
+            $found = @('C:\Strawberry\c\bin\gfortran.exe',
+                       'C:\msys64\mingw64\bin\gfortran.exe') |
+                     Where-Object { Test-Path $_ } | Select-Object -First 1
+          }
+          if (-not $found) {
+            choco install mingw -y --no-progress
+            $found = (Get-ChildItem 'C:\ProgramData\mingw64' -Recurse -Filter gfortran.exe `
+                        -ErrorAction SilentlyContinue | Select-Object -First 1).FullName
+          }
+          if (-not $found) { throw "no gfortran on this runner and none could be installed" }
+          & $found --version
+          # build.ps1 prefers this over anything it would find for itself.
+          "FEETBROWSER_GFORTRAN=$found" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
       - name: Assemble
         run: ./packaging/windows/build.ps1 -OutDir build/windows
 
@@ -157,11 +181,22 @@ jobs:
       # script without checking the repository out. That is not tidiness: a
       # checkout is the one thing that would put the project's own sources on
       # the machine that is supposed to prove it does not need them.
+      #
+      # The two H.264 fixtures travel with it, staged into one directory so
+      # the artifact keeps them beside the script: they are 1.2 KB together,
+      # and without them the video check can only prove the decoder loads,
+      # not that the picture it produces is the right one.
+      - name: Stage the verification script and its fixtures
+        run: |
+          New-Item -ItemType Directory -Force -Path verify-kit\h264 | Out-Null
+          Copy-Item packaging\windows\verify-bundle.ps1 verify-kit
+          Copy-Item tests\fixtures\h264\mb1.264, tests\fixtures\h264\mb1.i420.z verify-kit\h264
+
       - name: Upload the verification script
         uses: actions/upload-artifact@v4
         with:
           name: verify-script
-          path: packaging/windows/verify-bundle.ps1
+          path: verify-kit
           if-no-files-found: error
 
   verify:

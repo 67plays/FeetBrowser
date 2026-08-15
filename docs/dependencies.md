@@ -412,9 +412,18 @@ compiler on the build side, and even that is conditional.
 
 `feetbrowser/h264.py` shells out to whatever `gfortran` it can find,
 compiles the sources into a shared library in the temporary directory named
-after a hash of them, and loads it with `ctypes`. There is no build step in
-`run.sh`, no target in CI that has to succeed, and nothing in
-`rust/Cargo.toml` or `pyproject.toml` that mentions it. Missing compiler,
+after a hash of them and of the compiler, and loads it with `ctypes`. There
+is no build step in `run.sh`, no target in CI that has to succeed, and
+nothing in `rust/Cargo.toml` or `pyproject.toml` that mentions it.
+
+The packaged applications are the exception, and they have to be: a user has
+no gfortran, so a bundle that carried only the sources carried no video at
+all. Each of the three packaging scripts compiles the decoder on the build
+machine through `python3 -m feetbrowser.h264 --build`, ships the result
+inside the package, and checks with `otool -L`, `ldd` or a stripped `PATH`
+that gfortran's runtime went in with it rather than being left behind as a
+dependency on the build machine. So gfortran is a build-time requirement for
+packaging on all three platforms, and a run-time requirement nowhere. Missing compiler,
 failed compile or an ABI mismatch all resolve to `h264.available()` being
 false, at which point an H.264 file is named and refused the way it was
 before the decoder was written. `tests/test_h264.py` asserts that path by
@@ -427,9 +436,11 @@ table lookups and shifts, benchmarked at 119.7 Mbin/s in Fortran against
 153.7 in C. Close enough that the deciding factor was the rest of this
 file: Fortran arrives with no crates to audit.
 
-**Verdict: optional, and cheap.** `apt install gfortran` on the Linux CI
-runner; the macOS and Windows runners already have one, so nothing to
-install there, and no runtime dependency on any of them.
+**Verdict: optional to run, required to package.** `dnf install
+gcc-gfortran` in the AppImage container, `brew install gcc` on both macOS
+runners, and MinGW-w64 on the Windows one. No runtime dependency on any of
+them: what ships is the compiled library, and the compiler's own runtime is
+linked into it statically.
 
 ## Go
 

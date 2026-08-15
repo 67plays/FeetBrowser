@@ -1,11 +1,18 @@
 """H.264 video decoding, in Fortran, loaded through ctypes.
 
 The decoder itself is in ``fortran/`` -- fixed-form FORTRAN 77, about seven
-thousand lines of it, compiled on demand by gfortran into a shared library
-that this module loads and calls. Nothing here decodes anything; this is
-the part that finds a compiler, keeps the build cached, converts between
-the two shapes an H.264 stream comes in, and gets out of the way when the
-machine has no Fortran on it.
+thousand lines of it, compiled by gfortran into a shared library that this
+module loads and calls. Nothing here decodes anything; this is the part
+that finds the library, converts between the two shapes an H.264 stream
+comes in, and gets out of the way when the machine has no Fortran on it.
+
+Where the library comes from depends on who is running. From a checkout it
+is compiled on demand and cached in the temporary directory, keyed by the
+sources and the compiler. In a packaged application there is no compiler,
+so the packaging compiles it on the build machine and ships it inside this
+package under the name ``prebuilt_name()`` -- see ``build_library``, which
+is the one entry point all three packagers use.
+>>>>>>> d6003a3 (Ship the H.264 decoder in the packaged applications)
 
 Why Fortran: the arithmetic decoder in clause 9.3 is a serial dependency
 chain -- one table lookup, one subtract, one compare, per *bit* -- and a
@@ -107,11 +114,14 @@ def _library_suffix():
 
 
 def _digest():
-    """A hash over every source, so a changed decoder rebuilds itself.
+    """A hash over the ABI and every source, so a changed decoder rebuilds.
 
-    The compiler's identity goes in too. The same sources built by two
-    gfortrans are two different libraries, and a cache that cannot tell
-    them apart hands the wrong one to whichever runs second.
+    Nothing about the machine goes in, deliberately: the same sources hash
+    the same everywhere, which is what lets the packaging build a library
+    on one machine, name it after this digest, and have _open_library find
+    it on another. Which gfortran built a given file is a separate
+    question, answered by _compiler_id for the cache and by the h264_version
+    check for anything that gets loaded.
     """
     sha = hashlib.sha256()
     sha.update(("abi%d" % _ABI).encode("ascii"))
@@ -121,20 +131,60 @@ def _digest():
     return sha.hexdigest()[:16]
 
 
-def _compile(fc, out):
-    """Build the shared library, or raise. Called at most once per machine
-    per version of the sources."""
+def _compiler_id(fc):
+    """Which gfortran this is, in eight hex digits.
+
+    The same sources built by two gfortrans are two different libraries --
+    different runtime, different instruction set, different bugs -- and a
+    cache in a shared temporary directory that cannot tell them apart hands
+    the wrong one to whichever process runs second.
+    """
+    sha = hashlib.sha256()
+    for flag in ("--version", "-dumpmachine"):
+        try:
+            done = subprocess.run([fc, flag], capture_output=True)
+        except OSError:
+            return "unknown0"
+        sha.update(done.stdout)
+    return sha.hexdigest()[:8]
+
+
+# What a library has to be built with to be *shipped* rather than used where
+# it was built: gfortran's own runtime linked in, instead of left behind as
+# three dependencies on a compiler installation the user does not have.
+# -static-libquadmath is GCC 10 and later and older gfortrans reject the flag
+# outright, hence a second attempt without it -- and hence the linkage checks
+# in the packaging scripts, which is where a dangling libquadmath would
+# otherwise ship. -march=native is left out for the same reason the rest is
+# in: the machine that runs this is not the machine that built it.
+_PORTABLE = ("-static-libgfortran", "-static-libgcc")
+_SHIP_ATTEMPTS = (list(_PORTABLE) + ["-static-libquadmath"], list(_PORTABLE))
+
+# From a checkout: tuned for this machine, because it will only ever run on
+# this machine, and dropped if the compiler will not have it (gfortran on
+# Apple silicon rejects -march=native outright).
+_LOCAL_ATTEMPTS = (["-march=native"], [])
+
+
+def _compile(fc, out, attempts=_LOCAL_ATTEMPTS):
+    """Build the shared library at `out`, or raise.
+
+    `attempts` is a list of extra-flag lists, tried in order until one
+    compiles: the compiler is the only authority on what it accepts.
+    """
     tmp = out + ".%d.tmp" % os.getpid()
-    # -march=native is worth having and is not portable: gfortran on Apple
-    # silicon rejects it outright, and a binary built with it on one machine
-    # is not safe to run on another. So it is tried and dropped, rather than
-    # detected -- the compiler is the only authority on what it accepts.
     base = ["-O3", "-shared", "-fPIC", "-std=legacy", "-fno-align-commons",
             "-I", _FORTRAN, "-o", tmp]
+    if platform.system() == "Darwin":
+        # Otherwise the library records its own bare filename as its install
+        # name, which resolves against nothing once it is inside a bundle --
+        # and packaging/macos/verify.sh rejects it, correctly.
+        base += ["-Wl,-install_name,@loader_path/" + os.path.basename(out)]
     sources = [os.path.join(_FORTRAN, name) for name in _SOURCES]
-    for extra in (["-march=native"], []):
+    last = None
+    for extra in attempts:
         try:
-            subprocess.run([fc] + base + extra + sources, check=True,
+            subprocess.run([fc] + base + list(extra) + sources, check=True,
                            stdout=subprocess.DEVNULL,
                            stderr=subprocess.PIPE)
         except subprocess.CalledProcessError as exc:
@@ -144,31 +194,89 @@ def _compile(fc, out):
             raise H264Error("could not run %s: %s" % (fc, exc))
         os.replace(tmp, out)
         return
-    detail = (last.stderr or b"").decode("utf8", "replace").strip()
+    detail = (last.stderr or b"").decode("utf8", "replace").strip() if last else ""
     raise H264Error("gfortran could not build the decoder: %s"
                     % (detail.splitlines()[-1] if detail else "no output"))
 
 
-def _open_library():
+def prebuilt_name():
+    """What a library built by the packaging has to be called.
+
+    The digest is the whole guarantee. It comes from the sources in
+    ``fortran/``, which ship beside the package in every bundle exactly as
+    they sit beside it in a checkout, so a file under this name was built
+    from precisely the decoder this Python code was written against. Change
+    a line of Fortran or the ABI and the name changes with it: a stale
+    prebuilt is not preferred over the sources, it is simply not found.
+    """
+    return "_h264_%s%s" % (_digest(), _library_suffix())
+
+
+def prebuilt_path():
+    """Where a bundled prebuilt library lives -- inside the package, next to
+    this file, so that whatever copied the package copied the decoder too."""
+    return os.path.join(_HERE, prebuilt_name())
+
+
+def build_library(out, fc=None):
+    """Compile the decoder for shipping, into `out`. Returns `out`.
+
+    This is what packaging/{macos,linux,windows} call, and the only caller
+    there is. Keeping the flags here rather than in three scripts is what
+    stops what a library is built with from drifting away from what the
+    loader expects of it.
+    """
     if not os.path.isdir(_FORTRAN):
         raise H264Error("the fortran/ directory is missing from this checkout")
-    fc = _find_gfortran()
+    if fc is None:
+        fc = _find_gfortran()
     if fc is None:
         raise H264Error("no gfortran on PATH")
-    out = os.path.join(tempfile.gettempdir(),
-                       "feetbrowser_h264_%s%s" % (_digest(), _library_suffix()))
-    if not os.path.exists(out):
-        _compile(fc, out)
-    lib = ctypes.CDLL(out)
+    directory = os.path.dirname(os.path.abspath(out))
+    if not os.path.isdir(directory):
+        os.makedirs(directory)
+    _compile(fc, out, _SHIP_ATTEMPTS)
+    return out
+
+
+def _load(path):
+    """Open a built library and check it is the one we think it is."""
+    lib = ctypes.CDLL(path)
     for name in ("h264_version", "h264_reset", "h264_dims", "h264_decode",
                  "h264_i420", "h264_rgba", "h264_poc"):
         getattr(lib, name).restype = None
     version = ctypes.c_int(0)
     lib.h264_version(ctypes.byref(version))
     if version.value != _ABI:
-        raise H264Error("the built decoder reports ABI %d, expected %d"
-                        % (version.value, _ABI))
+        raise H264Error("the decoder at %s reports ABI %d, expected %d"
+                        % (path, version.value, _ABI))
     return lib
+
+
+def _open_library():
+    if not os.path.isdir(_FORTRAN):
+        raise H264Error("the fortran/ directory is missing from this checkout")
+    # A library the packaging built and shipped beside this file. Preferred
+    # over compiling, because in a bundle there is no compiler to fall back
+    # on -- and a shipped library that will not load is worth saying out
+    # loud, so its failure is only swallowed if there is a gfortran to try.
+    shipped = prebuilt_path()
+    failure = None
+    if os.path.exists(shipped):
+        try:
+            return _load(shipped)
+        except (H264Error, OSError) as exc:
+            failure = H264Error("the bundled decoder %s did not load: %s"
+                                % (prebuilt_name(), exc))
+    fc = _find_gfortran()
+    if fc is None:
+        raise failure or H264Error("no gfortran on PATH")
+    out = os.path.join(tempfile.gettempdir(),
+                       "feetbrowser_h264_%s_%s%s"
+                       % (_digest(), _compiler_id(fc), _library_suffix()))
+    if not os.path.exists(out):
+        _compile(fc, out)
+    return _load(out)
 
 
 def _library():
@@ -192,6 +300,17 @@ def _library():
 def available():
     """True when this machine can decode H.264."""
     return _library() is not None
+
+
+def library_path():
+    """Which file the decoder was loaded from, or None if there is none.
+
+    A bundled library and one a compiler made thirty seconds ago behave
+    identically, which is exactly why a check that video works has to be
+    able to say which of the two answered.
+    """
+    lib = _library()
+    return getattr(lib, "_name", None) if lib is not None else None
 
 
 def unavailable_reason():
@@ -571,16 +690,53 @@ def probe(extradata=b""):
 
 
 __all__ = ["Decoder", "H264Error", "available", "unavailable_reason", "probe",
-           "annexb_from_avcc", "parameter_sets_from_avcc", "slice_types"]
+           "annexb_from_avcc", "parameter_sets_from_avcc", "slice_types",
+           "build_library", "prebuilt_name", "prebuilt_path", "library_path"]
+
+
+_USAGE = """usage: python3 -m feetbrowser.h264 [--name | --build PATH [--fc GFORTRAN] | FILE...]
+
+  --name          print the filename a prebuilt library must have
+  --build PATH    compile the decoder for shipping, into PATH
+  --fc GFORTRAN   which compiler --build should use
+  FILE...         decode a .264 stream and say what came out
+"""
+
+
+def _cli(argv):                                 # pragma: no cover
+    """The packaging's entry point, and a way to ask this module a question
+    without a browser in the way."""
+    if argv and argv[0] == "--help":
+        sys.stdout.write(_USAGE)
+        return 0
+    if argv and argv[0] == "--name":
+        print(prebuilt_name())
+        return 0
+    if argv and argv[0] == "--build":
+        rest = argv[1:]
+        if not rest:
+            sys.stderr.write(_USAGE)
+            return 2
+        out, fc = rest[0], None
+        if rest[1:2] == ["--fc"]:
+            fc = rest[2] if len(rest) > 2 else None
+        try:
+            build_library(out, fc)
+        except H264Error as exc:
+            sys.stderr.write("%s\n" % exc)
+            return 1
+        print(out)
+        return 0
+    if not available():
+        sys.stderr.write("no decoder: %s\n" % unavailable_reason())
+        return 1
+    for path in argv:
+        with open(path, "rb") as handle:
+            blob = handle.read()
+        w, h, planes = Decoder().decode_i420(blob)
+        print("%s: %dx%d, %d bytes of I420" % (path, w, h, len(planes)))
+    return 0
+
 
 if __name__ == "__main__":                      # pragma: no cover
-    # Decode a .264 or .mp4 named on the command line and say what came out.
-    # Not a test; a way to ask this module a question without a browser.
-    if available():
-        for path in sys.argv[1:]:
-            with open(path, "rb") as handle:
-                blob = handle.read()
-            w, h, planes = Decoder().decode_i420(blob)
-            print("%s: %dx%d, %d bytes of I420" % (path, w, h, len(planes)))
-    else:
-        print("no decoder: %s" % unavailable_reason())
+    sys.exit(_cli(sys.argv[1:]))

@@ -11,11 +11,16 @@
 # Info.plist, and every tool used here -- pkgutil, install_name_tool, lipo,
 # codesign, iconutil, hdiutil, security -- ships with macOS. What the build
 # machine needs beyond that is a C compiler (the Command Line Tools, which
-# building the Rust engine already requires) and a Rust toolchain with both
-# Apple targets installed.
+# building the Rust engine already requires), a Rust toolchain with both
+# Apple targets installed, and a gfortran for the H.264 decoder (brew install
+# gcc). gfortran only ever targets the machine it is on, so the other
+# architecture's half of the decoder has to be built on the other
+# architecture and handed over -- see step 6.
 #
 #   packaging/macos/build.sh              build the .app and the .dmg
 #   FEETBROWSER_SKIP_DMG=1 ...build.sh    stop after the .app
+#   FEETBROWSER_H264_X86_64=/path/to/lib  the x86_64 decoder, built elsewhere
+#   FEETBROWSER_H264_ARM64=/path/to/lib   the arm64 one, likewise
 #
 # Everything lands in packaging/macos/build (working files, including a cache
 # of the downloaded CPython) and packaging/macos/dist (the .app and .dmg).
@@ -283,7 +288,110 @@ find "$applib/feetbrowser" -name __pycache__ -type d -exec rm -rf {} +
 mkdir -p "$applib/toes"
 cp "$root/toes/README.md" "$applib/toes/"
 
-# -- 6. certificates ---------------------------------------------------------
+# -- 6. the H.264 decoder ----------------------------------------------------
+#
+# fortran/ is 5800 lines of FORTRAN 77 that feetbrowser/h264.py compiles with
+# gfortran the first time a video plays. That works from a checkout, where
+# there is a compiler; it cannot work in a shipped app, where there is not.
+# Left alone the app starts, renders, and says "[video: H.264: no gfortran on
+# PATH]" the first time anyone opens a video -- which no developer ever sees,
+# because developers run from a checkout.
+#
+# So the library is built here, by a gfortran only this machine needs, and
+# ships inside the package under the name h264.py will look for. The sources
+# ship as well, beside the package like toes/ -- 250K, and the name h264.py
+# looks for is a hash of them, so the two cannot come apart. See
+# prebuilt_name() for why that is the whole guarantee.
+#
+# Both architectures, like everything else in here. The build machine's
+# gfortran only targets its own, so the other half comes from
+# FEETBROWSER_H264_<ARCH> when it is set -- that is how the workflow hands
+# the x86_64 slice over from the Intel runner -- and otherwise from any
+# gfortran on PATH that targets it.
+
+say "the H.264 decoder"
+ditto "$root/fortran" "$applib/fortran"
+h264name=$(PYTHONPATH="$applib" "$pybin" -m feetbrowser.h264 --name)
+
+# The first gfortran on PATH that targets $1, or nothing. gfortran calls
+# arm64 aarch64, hence the second pattern.
+gfortran_for() {
+  local arch="$1" candidate machine
+  for candidate in "${2:-}" gfortran gfortran-15 gfortran-14 gfortran-13 \
+                   gfortran-12 gfortran-11; do
+    [ -n "$candidate" ] || continue
+    command -v "$candidate" >/dev/null 2>&1 || continue
+    machine=$("$candidate" -dumpmachine 2>/dev/null || true)
+    case "$machine" in
+      "$arch"-*)  printf '%s\n' "$candidate"; return 0 ;;
+      aarch64-*)  [ "$arch" = arm64 ] && { printf '%s\n' "$candidate"; return 0; } ;;
+    esac
+  done
+  return 1
+}
+
+for arch in arm64 x86_64; do
+  case $arch in
+    arm64)  min=$MIN_MACOS_ARM;  prebuilt="${FEETBROWSER_H264_ARM64:-}"
+            hint="${FEETBROWSER_GFORTRAN_ARM64:-}" ;;
+    x86_64) min=$MIN_MACOS_X86;  prebuilt="${FEETBROWSER_H264_X86_64:-}"
+            hint="${FEETBROWSER_GFORTRAN_X86_64:-}" ;;
+  esac
+  mkdir -p "$work/h264/$arch"
+  slice="$work/h264/$arch/$h264name"
+  if [ -n "$prebuilt" ]; then
+    [ -f "$prebuilt" ] || { echo "FEETBROWSER_H264_* names $prebuilt, which does not exist" >&2; exit 1; }
+    # Named after the digest, so a slice built from other sources cannot be
+    # lipo'd in silently: it would not be called this.
+    [ "$(basename "$prebuilt")" = "$h264name" ] || {
+      echo "$prebuilt is not $h264name -- it was built from different sources" >&2
+      exit 1
+    }
+    cp "$prebuilt" "$slice"
+  else
+    fc=$(gfortran_for "$arch" "$hint") || {
+      echo "no gfortran on PATH targets $arch" >&2
+      echo "install one, or point FEETBROWSER_H264_$(echo "$arch" | tr a-z A-Z) at a slice built elsewhere" >&2
+      exit 1
+    }
+    echo "$arch: $("$fc" -dumpmachine) ($fc)"
+    MACOSX_DEPLOYMENT_TARGET=$min PYTHONPATH="$applib" \
+      "$pybin" -m feetbrowser.h264 --build "$slice" --fc "$fc" >/dev/null
+  fi
+  # gfortran writes the path to its own runtime into the library as an
+  # LC_RPATH -- on this machine, a directory under whoever's Homebrew Cellar
+  # built it -- and it does so even when that runtime was linked in
+  # statically and there is nothing left to go looking for. Nothing needs
+  # them and they name the build machine, which verify.sh fails a bundle for,
+  # correctly. So they go. (-nodefaultrpaths would prevent them at the link
+  # step and is GCC 12 and later on Darwin only; deleting them afterwards
+  # works with any compiler that produced the slice, including one that
+  # arrived from the other runner.)
+  while IFS= read -r rp; do
+    [ -n "$rp" ] || continue
+    install_name_tool -delete_rpath "$rp" "$slice" 2>/dev/null || true
+    echo "  dropped rpath $rp"
+  done < <(otool -l "$slice" | awk '/LC_RPATH/{want=1; next} want && $1=="path"{print $2; want=0}')
+
+  # The one failure that would otherwise be found by a user: gfortran's
+  # runtime left as a dependency on a compiler installation nobody but the
+  # build machine has. -static-libgfortran and friends are meant to prevent
+  # it; this is where that claim is checked rather than assumed. verify.sh
+  # applies the same rule to the lipo'd result, and to every other Mach-O.
+  bad=$(otool -L "$slice" | tail -n +2 | awk '{print $1}' \
+        | grep -v -e '^/usr/lib/' -e '^/System/' -e '^@loader_path/' || true)
+  [ -z "$bad" ] || {
+    echo "the $arch decoder depends on something outside the bundle:" >&2
+    echo "$bad" >&2
+    exit 1
+  }
+done
+
+lipo -create "$work/h264/arm64/$h264name" "$work/h264/x86_64/$h264name" \
+  -output "$applib/feetbrowser/$h264name"
+lipo -info "$applib/feetbrowser/$h264name"
+
+# -- 7. certificates ---------------------------------------------------------
 #
 # A bundled CPython has no trust store. python.org's OpenSSL looks under the
 # framework's own etc/openssl, which ships empty -- that is what the
@@ -301,7 +409,7 @@ roots=$(grep -c 'BEGIN CERTIFICATE' "$contents/Resources/certs/cacert.pem")
 [ "$roots" -gt 50 ] || { echo "only $roots roots in the trust store" >&2; exit 1; }
 echo "$roots root certificates"
 
-# -- 7. the icon -------------------------------------------------------------
+# -- 8. the icon -------------------------------------------------------------
 #
 # Drawn by the browser's own rasteriser, running on the interpreter that is
 # about to ship, against the extension that is about to ship. If the icon
@@ -312,7 +420,7 @@ PYTHONPATH="$applib" "$pybin" "$here/icon.py" "$work/FeetBrowser.iconset"
 iconutil -c icns "$work/FeetBrowser.iconset" \
   -o "$contents/Resources/FeetBrowser.icns"
 
-# -- 8. the launcher ---------------------------------------------------------
+# -- 9. the launcher ---------------------------------------------------------
 #
 # Compiled once per architecture, because the two have different oldest
 # supported systems, and lipo'd together afterwards.
@@ -343,7 +451,7 @@ install_name_tool -change \
 # The headers were only needed to compile the launcher.
 rm -rf "$pyroot/include" "$pyroot/Headers" "$framework/Headers"
 
-# -- 9. the plist ------------------------------------------------------------
+# -- 10. the plist ------------------------------------------------------------
 
 say "Info.plist"
 cat > "$contents/Info.plist" <<PLIST
@@ -376,7 +484,7 @@ cat > "$contents/Info.plist" <<PLIST
 PLIST
 printf 'APPL????' > "$contents/PkgInfo"
 
-# -- 10. compile, sign, check ------------------------------------------------
+# -- 11. compile, sign, check ------------------------------------------------
 
 say "byte-compiling"
 # The bundle is read-only on a mounted disk image and must not be written to
@@ -427,7 +535,7 @@ if [ -n "${FEETBROWSER_SKIP_DMG:-}" ]; then
   exit 0
 fi
 
-# -- 11. the disk image ------------------------------------------------------
+# -- 12. the disk image ------------------------------------------------------
 
 say "disk image"
 dmgroot="$work/dmg"

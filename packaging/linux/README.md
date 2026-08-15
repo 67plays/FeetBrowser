@@ -52,6 +52,9 @@ FeetBrowser.AppDir/
   usr/lib/python3.12/                 its standard library
       site-packages/feetbrowser/      this repository's package
       site-packages/feetbrowser_engine/  the Rust extension
+      site-packages/feetbrowser/_h264_<digest>.so
+                                      the H.264 decoder, compiled
+      site-packages/fortran/          the Fortran it was built from
   usr/lib/*.so.*                      the private libraries CPython needs:
                                       libssl, libcrypto, libffi, ...
   usr/lib/feetbrowser/launcher.py     bundled-font wiring, then __main__
@@ -343,7 +346,10 @@ being tested).
 It then checks, in order: the file runs and prints its version; a live
 `https://` page fetches and renders; a local fixture page renders with no font
 package installed; a page with a PNG and a GIF on it renders, which is the
-compiled engine decoding them; and `tests/x11_shot.py`, the repository's own
+compiled engine decoding them; `--check-video` decodes an H.264 frame and
+compares it with the reference picture, on a machine with no gfortran on it
+(the test refuses to run if there is one, because it would then prove
+nothing); and `tests/x11_shot.py`, the repository's own
 end-to-end window check, opens a real window on the Xvfb server, paints a
 page into it, reads the pixels back with `XGetImage` and fails unless the red,
 green and blue swatches are all present and land in that order across the

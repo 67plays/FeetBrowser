@@ -295,17 +295,33 @@ enough that the language stopped being the interesting variable. It is also
 the only compiled language in this tree that arrives with no crates, no
 package manager and no lock file, which is the standing constraint here.
 
-**How it is built and loaded.** `h264.py` finds a `gfortran`, compiles the
-eleven sources into a shared library in the temporary directory under a name
-keyed on a hash of those sources, and loads it with `ctypes`. The hash is
-what makes the cache safe: edit a `.f` file and the next run builds a
-different library rather than loading the old one. Nothing about this is
+**How it is built and loaded.** In a packaged application the library is
+already there: the packaging compiled it on the build machine and put it
+inside the package as `_h264_<digest>.dll`/`.dylib`/`.so`, with `fortran/`
+shipped beside the package. `h264.py` prefers it, and the digest is the whole
+check -- it is a hash of the shipped sources and the ABI number, recomputed at
+load, so a library built from a different decoder is not loaded in error, it
+is not found. The `h264_version` check still runs on it.
+
+Failing that -- which is to say, from a checkout -- `h264.py` finds a
+`gfortran`, compiles the eleven sources into a shared library in the
+temporary directory under a name keyed on a hash of those sources *and of the
+compiler*, and loads it with `ctypes`. The hash is what makes the cache safe:
+edit a `.f` file, or build with a different gfortran, and the next run builds
+a different library rather than loading the old one. Nothing about this is
 required. No compiler, a compiler that fails, or a library that reports the
 wrong ABI version all end in `h264.available()` returning false, and a file
 carrying H.264 is then named and refused exactly as it was before any of this
 existed. `run.sh` and `run.cmd` warm the cache at startup so the first
 `<video>` on a page does not stall for the build, and both ignore whether it
 worked.
+
+`python3 -m feetbrowser --check-video [stream.264 [truth.i420.z]]` asks a
+build whether it can decode, and with the fixtures from
+`tests/fixtures/h264/` makes it prove it. It exists because the answer used
+to be "no" in every shipped copy of the browser and "yes" on every machine
+that could have noticed. The packaging scripts run it inside the artifact
+they just built, with `PATH` cut back to the system directories.
 
 The decoder's state lives in `COMMON` blocks, which is to say there is one
 decoder in the process no matter how many `Decoder` objects Python holds. The
