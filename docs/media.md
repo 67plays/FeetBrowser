@@ -19,9 +19,10 @@ audio clock, see [Audio output](#audio-output); and `feetbrowser/arch.py`
 pumps one into the other and hangs the pictures off the result, see
 [Sound and pictures together](#sound-and-pictures-together). An MP4 with an
 AAC-LC track plays with sound, and its frames are scheduled against the
-sound rather than against the wall clock. Every other container's audio is
-still named and refused: there is no MP3, no Vorbis and no Opus, and AVI's
-audio is not demuxed at all.
+sound rather than against the wall clock. Uncompressed sound plays too, in
+all three of the containers that carry it -- MP4/MOV, AVI and `.wav` -- see
+[PCM](#pcm). What is left is still named and refused: there is no MP3, no
+Vorbis, no Opus, no ADPCM and no mu-law or A-law.
 
 Read this before adding a codec. The point of writing it down is that the
 hard parts here are not the codec; they are the seams the codec plugs into,
@@ -751,17 +752,75 @@ by any fixture, because FFmpeg's encoder never emits it. And the decoder
 refuses more than two channels rather than downmixing, so a 5.1 soundtrack
 is silent rather than folded.
 
+## PCM
+
+The other kind of sound, and it is not a codec. A PCM packet already *is*
+the waveform; the work is reading it at the right width, with the right
+sign convention, the right way round, and scaling it into the [-1, 1]
+floats the mixer takes. `_Pcm` in `mediacodec.py` is that, and it is forty
+lines because there is nothing else to it.
+
+**What plays.** In MP4 and MOV: `sowt` and `twos` (16-bit, the two byte
+orders), `raw ` (unsigned 8-bit), `in24`, `in32`, `fl32`, `fl64`, and
+`lpcm`. In AVI: WAVEFORMATEX tag 1 and tag 3, gathered out of the `##wb`
+chunks the `movi` list interleaves between the pictures. And `.wav` itself,
+which is a container this now reads: a RIFF walk to `fmt ` and `data`, the
+same WAVEFORMATEX parse as AVI's, and one range of bytes.
+
+**The fourcc is where it starts and not where it ends.** A QuickTime sound
+sample entry has three versions and the later two carry the width, the byte
+order and the sign convention explicitly. Where they disagree with the
+fourcc, the fourcc is the stale one, and the disagreements are not
+hypothetical: FFmpeg writes a version 1 `in24` whose `sampleSize` is 16 and
+whose samples are 24 bits wide, because `sampleSize` and `bytesPerSample`
+describe the canonical *unpacked* form rather than what is on disk -- the
+real width is `bytesPerPacket` over `samplesPerPacket`. It writes the same
+`in24` fourcc with an `enda` box saying 1 for little-endian audio, which is
+the only signal anywhere that the bytes are the other way round. And a
+version 2 entry's fourcc is `lpcm`, which says nothing at all: the width is
+in `constBitsPerChannel` and the sign, the byte order and floating-pointness
+are bits in `formatSpecificFlags`. `_mp4_pcm_layout` is where all of that is
+resolved, and the comment on it names each case.
+
+**Blocks are ours to choose.** Uncompressed sound has no coded frame, so
+every container invents one and none of them is a size worth playing: a
+QuickTime `stsz` for a `sowt` track has one entry per PCM frame -- 22050
+four-byte "samples" for half a second of 44.1 kHz stereo -- and an AVI's
+`##wb` chunks are however much sound fits beside one picture. `_pcm_blocks`
+merges the file-contiguous ranges and re-cuts them at a tenth of a second,
+which it is allowed to do only because PCM carries nothing across a join.
+The tenth is bounded on both sides by `arch.py`: below `TARGET_QUEUE /
+DECODE_BUDGET` the player cannot fill its queue in one `pump()`, and much
+above it a block is latency a pause cannot take back and sound a seek must
+throw away.
+
+**It is also the first random-access track.** `_Pcm` sets `stateless`, and
+`AudioTrack.frame()` reads that and answers an out-of-order request by
+decoding the one block. AAC cannot: every frame's first half is the previous
+frame's transform tail, so a seek there replays from the start.
+
+**What is refused, by name.** ADPCM (Microsoft's and IMA's), mu-law and
+A-law each get their own sentence rather than a shared "unsupported",
+because each is a real decoder we have not written and none of them becomes
+PCM by being read harder -- two are companded through a curve and two are
+deltas against a running predictor. QuickTime's `ima4`, `ulaw` and `alaw`
+sit in the same table.
+
+Nothing above changes anything downstream. `AudioTrack` was already the
+interface, so `arch.py`, `heel.py` and `media.py` are untouched by this and
+do not know PCM exists.
+
 ## What is not supported
 
 Bluntly, because a foundation that overstates itself is worse than none:
 
-- **MP4 is the only container with sound in it.** An MP4 with an AAC-LC
-  track plays, in sync -- see [Sound and pictures
-  together](#sound-and-pictures-together). Nothing else does. AVI and WebM
-  audio streams are named by `probe_audio` and not decoded: WebM for want
-  of a Vorbis or Opus decoder, AVI for want of a demuxer that reaches its
-  audio. MP3 is absent entirely. The `<audio>` element is not implemented
-  at all, so sound arrives only alongside a picture.
+- **Sound still only arrives alongside a picture.** The `<audio>` element
+  is not implemented at all, so a `.wav` or a soundtrack has to be the audio
+  half of a `<video>` to be heard. MP4 with AAC-LC plays in sync, and so
+  does uncompressed PCM in MP4/MOV, AVI and `.wav` -- see [Sound and
+  pictures together](#sound-and-pictures-together) and [PCM](#pcm). WebM's
+  audio is named by `probe_audio` and not decoded, for want of a Vorbis or
+  Opus decoder. MP3 is absent entirely, as are ADPCM, mu-law and A-law.
 - **No user-facing volume or mute.** `VideoPlayer.set_volume()` and
   `AudioPlayer.muted` exist and are tested; nothing in the GUI calls them,
   and `volume` and `muted` are not scriptable from JavaScript yet.
@@ -852,16 +911,16 @@ every codec wants to be handed.
    last byte arrives. Worth doing now rather than later, because MJPEG over
    HTTP is a format we can already decode and cannot currently play at all:
    the stream never ends, so waiting for the last byte waits forever.
-6. **More than one container with sound in it, and then SBR.** The join is
-   done -- see [Sound and pictures together](#sound-and-pictures-together)
-   -- but only MP4 and MOV reach it, because `open_audio()` only demuxes
-   those. WebM's audio is identified and refused for want of a Vorbis or
-   Opus decoder, which is a codec-sized job; AVI's is refused for want of a
-   demuxer, which is not, and is the cheaper of the two. There is also no
-   fixture in the tree with a video track and an audio track in one file,
-   so the end-to-end path is proved a half at a time; a muxer in
-   `tests/media_fixtures.py` that writes both traks would close that. After
-   those, SBR, so that low-bitrate HE-AAC streams play at all.
+6. **A second compressed audio codec, and then SBR.** Three containers now
+   reach the join -- MP4/MOV, AVI and `.wav` -- but only one compressed
+   format does. WebM's audio is identified and refused for want of a Vorbis
+   or Opus decoder, and MP3 for want of an MP3 decoder; all three are
+   codec-sized jobs rather than demuxer-sized ones, which is what makes them
+   the next thing rather than the easy thing. After those, SBR, so that
+   low-bitrate HE-AAC streams play at all. `tests/fixtures/pcm/pcm.avi` is
+   the file that closed the older gap on this list: until it existed there
+   was nothing in the tree with a video track and an audio track together,
+   so the end-to-end path was proved a half at a time.
 7. **Per-decoder H.264 state.** Both entropy coders and all three slice types
    are done, so what is left in `fortran/` is not a feature but the shape of
    the thing: the decoder's state is `COMMON`, which is to say there is one
@@ -963,6 +1022,30 @@ noise shaping and all eight scalefactor band layouts -- so that a
 regenerated vector cannot quietly stop proving anything.
 `tests/fixtures/aac/make_aac_vectors.sh` is the offline tool that made them,
 and like its H.264 counterpart it is not run by `test.sh`.
+
+`tests/test_pcm.py` goes back to exactness, because PCM can. Eighteen
+fixtures in `tests/fixtures/pcm/` are one quarter-second of two tones -- a
+different one per channel, so a channel swap fails as loudly as a byte swap
+-- written out by a real muxer into every container, width and byte order
+the PCM path claims to read, and the source waveform ships beside them as
+`tone.s16le.z`. Every conversion between them is exact by construction: s16
+to s24 and s32 are shifts, s16 to float is a divide by 32768, and the
+decoder scales an n-bit sample by 2^-(n-1). So thirteen of the fixtures must
+decode to *bit-identical* floats and the assertion is equality rather than a
+tolerance. The three 8-bit files are the exception and have their own truth
+file, because requantising to eight bits is a real loss.
+
+That matters more here than the arithmetic makes it sound. A wrong byte
+order, a wrong sign convention or a width guessed from a stale fourcc does
+not raise and does not fall silent; it produces samples that look like
+sound, plot like sound and are not the sound in the file. So the suite
+carries a negative control: `twos.mov` read little-endian instead of big
+comes back the right length, in range, and wrong -- and one float of the
+truth, nudged by a single ulp, is asserted to be caught. A test that only
+counted samples would pass both.
+
+`tests/fixtures/pcm/make_pcm_vectors.sh` made all of them, offline, and is
+not run by `test.sh` either.
 
 The whole suite skips cleanly where there is no `gfortran`, and one test in
 each of the two Fortran suites forces that state on a machine that has one:
