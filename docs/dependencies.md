@@ -27,8 +27,10 @@ will need, but they describe finished work rather than open questions.
 
 The build side is heavier than the run side, and that is where most of the
 cost actually is: Rust with five crates, `maturin` and a virtualenv to install
-the extension into, `pyflakes` for lint, and a Go toolchain for a package the
-browser does not call.
+the extension into, `pyflakes` for lint, a Go toolchain for a package the
+browser does not call, and `gfortran` for the H.264 decoder. The last of
+those is the only compiler here that is genuinely optional at runtime; see
+[Fortran](#fortran) below.
 
 ## The Rust crates
 
@@ -399,6 +401,35 @@ them `BLE001` and 3 `E402`. Neither is a pyflakes code, and pyflakes has no
 suppression mechanism, so **all 41 are inert** under the linter that actually
 runs. They are annotations for tools this project does not use, and today they
 are self-documenting comments and nothing more.
+
+## Fortran
+
+`fortran/` is nine fixed-form FORTRAN 77 sources and one include file: the
+H.264 decoder, described in [media.md](media.md#h264-in-fortran). It has no
+dependencies of any kind (no library, no package manager, no lock file,
+nothing linked but `libc`), so the only entry it earns in this file is a
+compiler on the build side, and even that is conditional.
+
+`feetbrowser/h264.py` shells out to whatever `gfortran` it can find,
+compiles the sources into a shared library in the temporary directory named
+after a hash of them, and loads it with `ctypes`. There is no build step in
+`run.sh`, no target in CI that has to succeed, and nothing in
+`rust/Cargo.toml` or `pyproject.toml` that mentions it. Missing compiler,
+failed compile or an ABI mismatch all resolve to `h264.available()` being
+false, at which point an H.264 file is named and refused the way it was
+before the decoder was written. `tests/test_h264.py` asserts that path by
+forcing it, so it is a tested behaviour rather than an intention, and the
+whole suite passes on a machine with no Fortran toolchain.
+
+The choice of language is worth one line, because it is the obvious question:
+the CABAC decode-decision loop is a dependent chain of integer compares,
+table lookups and shifts, benchmarked at 119.7 Mbin/s in Fortran against
+153.7 in C. Close enough that the deciding factor was the rest of this
+file: Fortran arrives with no crates to audit.
+
+**Verdict: optional, and cheap.** `apt install gfortran` on the Linux CI
+runner; the macOS and Windows runners already have one, so nothing to
+install there, and no runtime dependency on any of them.
 
 ## Go
 

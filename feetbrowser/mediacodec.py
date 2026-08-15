@@ -46,6 +46,7 @@ decoded frame goes to the screen without a conversion step.
 
 import struct
 
+from . import h264
 from . import imagecodec
 from .imagecodec import MAX_PIXELS
 
@@ -614,6 +615,75 @@ class _Mjpeg(_Codec):
         return rgba
 
 
+class _H264(_Codec):
+    """H.264/AVC, decoded by the Fortran decoder in ``fortran/``.
+
+    Phase one of that decoder is I frames only, so the useful question is
+    not "is this H.264" but "does this particular stream decode", and the
+    only honest way to answer it is to decode a frame. That is what the
+    constructor does: it takes the first keyframe, runs it, and refuses
+    the whole file with the decoder's own reason if it does not come out.
+    Opening a file that plays for two frames and then stops would be worse
+    than refusing it -- the poster and a sentence beats a frozen picture.
+
+    Which is also why the sync flags are read before anything is decoded.
+    Every ordinary web MP4 starts with an I frame and continues with P
+    frames, so trial-decoding frame zero would say yes to a file that then
+    freezes on frame one. A track whose every sample is a sync sample is
+    the shape this decoder can finish, and it is the shape an all-intra
+    encode has; anything else is refused up front and named.
+
+    Stateless between frames, because there is nothing yet that is not a
+    keyframe. When inter prediction arrives this class grows a reference
+    picture and `reset()` starts meaning something.
+    """
+
+    def __init__(self, width, height, extradata, data, samples):
+        _check_size(width, height)
+        self.width = width
+        self.height = height
+        inter = sum(1 for _o, _l, keyframe in samples if not keyframe)
+        if inter:
+            raise MediaError(
+                "H.264: %d of this track's %d frames are inter-coded, and "
+                "the decoder does I frames only"
+                % (inter, len(samples)))
+        try:
+            self._decoder = h264.Decoder(extradata)
+            got_width, got_height, _rgba = self._decoder.decode(
+                _first_keyframe(data, samples))
+        except h264.H264Error as exc:
+            raise MediaError("H.264: %s" % exc)
+        # The container and the sequence parameter set can disagree about
+        # the picture size, and when they do the SPS is the one that made
+        # the pixels. Refusing is right: everything downstream sized itself
+        # from the container, and silently handing it a different shape of
+        # buffer is how a compositor learns to crash.
+        if (got_width, got_height) != (width, height):
+            raise MediaError("H.264: the stream is %dx%d but the container "
+                             "says %dx%d" % (got_width, got_height,
+                                             width, height))
+
+    def reset(self):
+        pass
+
+    def decode(self, packet, keyframe):
+        if not packet:
+            return None
+        try:
+            _width, _height, rgba = self._decoder.decode(packet)
+        except h264.H264Error as exc:
+            raise MediaError("H.264 frame: %s" % exc)
+        return rgba
+
+
+# The fourccs that mean H.264. `avc1` and `avc3` are the MP4 spellings and
+# differ only in where the parameter sets live -- in the `avcC` box for the
+# first, inline in the stream for the second, and the decoder takes both.
+# The rest are what AVI muxers wrote before anybody agreed.
+H264_FOURCCS = ("avc1", "avc3", "H264", "h264", "X264", "x264", "AVC1")
+
+
 # fourccs that mean "Motion JPEG". AVI and QuickTime each accumulated their
 # own spellings over twenty years and the files are still out there, so they
 # are all here; `dmb1` is Matrox's, `AVRn` Avid's, `MJPG`/`jpeg` the two
@@ -632,9 +702,6 @@ MJPEG_DEFAULT_FPS = 25.0
 # can say "XVID" instead of "unknown", and the next contributor can see
 # exactly where a decoder plugs in.
 KNOWN_UNDECODABLE = {
-    "H264": "H.264: a from-scratch decoder is a multi-month project",
-    "h264": "H.264: a from-scratch decoder is a multi-month project",
-    "avc1": "H.264: a from-scratch decoder is a multi-month project",
     "XVID": "MPEG-4 ASP: no decoder",
     "DIVX": "MPEG-4 ASP: no decoder",
     "VP80": "VP8: no decoder",
@@ -1009,6 +1076,14 @@ def _open_avi(data):
         if bit_count != 8:
             raise MediaError("BI_RLE8 with %d bits per pixel" % bit_count)
         codec = _Rle8(width, height, palette, top_down)
+    elif codec_name in H264_FOURCCS:
+        # AVI carries H.264 as Annex B in the chunk, with no configuration
+        # box anywhere, so there is no extradata to hand over.
+        try:
+            codec = _H264(width, height, b"", data, ours)
+        except MediaError as exc:
+            info.reason = _h264_reason(exc)
+            raise _Unsupported(info)
     else:
         info.reason = KNOWN_UNDECODABLE.get(
             codec_name, "no decoder for %s" % codec_name)
@@ -1016,6 +1091,37 @@ def _open_avi(data):
     info.supported = True
     return VideoTrack(data, info, ours, codec, frame_rate,
                       [i for i, p in enumerate(ours) if p[2]])
+
+
+def _h264_reason(exc):
+    """Whatever went wrong, said with the codec's name in front of it.
+
+    Three things raise on the way to an H.264 track: the decoder, which
+    names itself already; the sample-table reader; and the helper below
+    that fetches the first keyframe. The last two have no business knowing
+    which codec they are fetching for. The `<video>` element shows this one
+    sentence and nothing else, so it has to name the codec exactly once --
+    not never, and not twice.
+    """
+    text = str(exc)
+    return text if text.startswith("H.264") else "H.264: %s" % text
+
+
+def _first_keyframe(data, samples):
+    """The bytes of the first sample a decoder could start from.
+
+    Both containers describe a frame the same way once their tables are
+    joined up -- offset, length, keyframe -- so one helper serves both.
+    A file whose first keyframe points outside itself is truncated, and
+    saying so here is better than handing a decoder a short buffer.
+    """
+    for offset, length, keyframe in samples:
+        if not keyframe:
+            continue
+        if offset < 0 or length <= 0 or offset + length > len(data):
+            raise MediaError("the first keyframe is outside the file")
+        return data[offset:offset + length]
+    raise MediaError("no keyframe in this video track")
 
 
 class _Unsupported(MediaError):
@@ -1089,6 +1195,7 @@ class _Mp4Track:
         self.sample_size = 0        # non-zero when every sample is that size
         self.sizes = []
         self.chunks = []            # chunk offsets into the file
+        self.extradata = b""        # avcC and the like, verbatim
 
 
 def _parse_mp4(data):
@@ -1234,7 +1341,19 @@ def _parse_stsd(stsd, track):
             entry.skip(14)                   # resolutions, reserved, frames
             entry.skip(32)                   # compressor name (Pascal string)
             track.depth = entry.u16be()
+            entry.skip(2)                    # pre_defined, always -1
+            # Whatever boxes follow the sample entry are the codec's own
+            # configuration. `avcC` is the one that matters here: an H.264
+            # sample carries no SPS or PPS of its own in MP4, they live in
+            # this box, and without it the samples are undecodable.
+            _parse_sample_extensions(entry, track)
         stsd.skip(body)
+
+
+def _parse_sample_extensions(entry, track):
+    for kind, box in _boxes(entry, 1):
+        if kind == "avcC" and not track.extradata:
+            track.extradata = bytes(box.data[box.pos:box.end])
 
 
 def _mp4_samples(track):
@@ -1408,6 +1527,13 @@ def _open_mp4(data, container="MP4"):
             codec, "no decoder for %s" % (codec or "this file's video codec"))
         if codec in MJPEG_FOURCCS or codec in ("raw ", "png "):
             info.reason = str(exc)
+        # "no decoder for avc1" would be a lie now that there is one, and the
+        # lie sends the reader off looking for a codec instead of at the
+        # sample table that actually broke. Name the codec, then say what
+        # went wrong with the file -- the same shape of message the formats
+        # above have always given.
+        if codec in H264_FOURCCS:
+            info.reason = _h264_reason(exc)
         raise _Unsupported(info)
     info.frame_count = len(samples)
     times = _mp4_times(video, len(samples))
@@ -1424,6 +1550,12 @@ def _open_mp4(data, container="MP4"):
         decoder = _QuickTimeRaw(width, height, video.depth)
     elif codec == "png ":
         decoder = _PngFrames(width, height)
+    elif codec in H264_FOURCCS:
+        try:
+            decoder = _H264(width, height, video.extradata, data, samples)
+        except MediaError as exc:
+            info.reason = _h264_reason(exc)
+            raise _Unsupported(info)
     else:
         info.reason = KNOWN_UNDECODABLE.get(
             codec, "no decoder for %s" % (codec or "this file's video codec"))

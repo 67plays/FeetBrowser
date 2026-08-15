@@ -1,3 +1,10 @@
 # Batch files are run by cmd.exe, which wants CRLF, and they are only
 # ever used on Windows. Everything else keeps LF whatever the checkout.
 *.cmd text eol=crlf
+
+# The H.264 test vectors and the pictures a reference decoder made from
+# them. A newline translated anywhere in either is a decoder bug that
+# only appears on one platform, so neither is ever text.
+*.264 binary
+*.i420.z binary
+*.mp4 binary

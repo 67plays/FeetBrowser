@@ -84,6 +84,9 @@ rem A fixture page in, its pixels back out.
 rem No assembler here, so this checks the pure-Python fallback.
 %RUN% tests\test_asmblend.py || exit /b 1
 %RUN% tests\test_asmops.py || exit /b 1
+rem The Fortran H.264 decoder. Windows has no gfortran unless someone put one
+rem there, so this usually checks that the browser survives not having one.
+%RUN% tests\test_h264.py || exit /b 1
 %RUN% tests\smoke.py || exit /b 1
 
 rem The Go port of the transport layer (net/) is a separate toolchain, so it is

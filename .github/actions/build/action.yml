@@ -32,12 +32,19 @@ runs:
     # No Tk and no Xvfb for most of the suite: rendering is our own and runs
     # with no display. The one outside requirement is a system font, which
     # macOS and Windows ship and a bare Linux image does not.
-    - name: Install fonts
+    #
+    # gfortran is here for the H.264 decoder, which is Fortran compiled on
+    # demand -- see feetbrowser/h264.py. It is a build-time requirement and
+    # never a runtime one: without it the browser reports H.264 as an
+    # undecodable codec and everything else works, which is a path the
+    # suite tests on purpose. Installing it here means CI checks the
+    # decoder rather than the skip.
+    - name: Install fonts and gfortran
       if: runner.os == 'Linux'
       shell: bash
       run: |
         sudo apt-get update
-        sudo apt-get install -y fonts-dejavu-core fonts-liberation
+        sudo apt-get install -y fonts-dejavu-core fonts-liberation gfortran
 
     - name: Install an X server
       if: runner.os == 'Linux' && inputs.xvfb == 'true'

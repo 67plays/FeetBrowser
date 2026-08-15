@@ -129,6 +129,10 @@ rust/
   font.rs        TrueType tables, cmap, metrics, outlines, flattening
   image.rs       PNG / GIF / PNM decoders and nearest-neighbour resize
   pyutil.rs      shared argument conversions (bytes, coordinates, strings)
+fortran/         the H.264 decoder: NAL/SPS/PPS, CABAC, intra prediction,
+                 the inverse transforms, deblocking and YUV->RGBA. Compiled
+                 on demand by feetbrowser/h264.py and loaded with ctypes; the
+                 browser works without a Fortran compiler. See docs/media.md.
 toes/            user-installed toes (gitignored; empty on a fresh checkout)
 tests/
   test_render.py offline tests for fonts, rasteriser, image codecs, canvas
