@@ -195,11 +195,11 @@ path degrades to the ordinary socket/TLS client, which is what happens on any
 machine without it today. Verified rather than assumed: the acceptance test
 navigates and renders with it absent.
 
-`asmblend.py` compiles `asm/spanblend.S` at import time if a C compiler is on
+`asmlib.py` compiles `asm/x11pack.S` at import time if a C compiler is on
 `PATH`, and returns pure-Python kernels when there is none. A user's machine
-has no compiler, so the fallback is what runs, and nothing in the renderer
-calls those kernels any more anyway. It writes only to `TMPDIR`, never inside
-the bundle.
+has no compiler, so the fallback is what runs; the kernels only matter on an
+X server whose TrueColor visual is depth 15 or 16, which almost nobody meets.
+It writes only to `TMPDIR`, never inside the bundle.
 
 The mounted image is read-only. `PYTHONDONTWRITEBYTECODE=1` is set and every
 `.pyc` is compiled in at build time, so imports are a mapped read rather than

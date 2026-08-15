@@ -82,8 +82,8 @@ rem A fixture page in, its pixels back out.
 %RUN% tests\test_nav.py || exit /b 1
 %RUN% tests\test_toes.py || exit /b 1
 rem No assembler here, so this checks the pure-Python fallback.
-%RUN% tests\test_asmblend.py || exit /b 1
-%RUN% tests\test_asmops.py || exit /b 1
+%RUN% tests\test_asmx11.py || exit /b 1
+%RUN% tests\test_asmselect.py || exit /b 1
 rem The Fortran H.264 decoder. Windows has no gfortran unless someone put one
 rem there, so this usually checks that the browser survives not having one.
 %RUN% tests\test_h264.py || exit /b 1
