@@ -7,6 +7,10 @@ mod dom;
 // path until then.
 mod domtree;
 mod font;
+// The WHATWG tokeniser and tree builder (Phase 2). Like `domtree`, it is
+// compiled and tested but not yet on the live path; `feetbrowser/htmlparser.py`
+// stays in charge until Phase 3 rewires the browser onto it.
+mod html;
 mod image;
 mod interp;
 mod parser;

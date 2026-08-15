@@ -228,16 +228,46 @@ pub struct DoctypeData {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NodeData {
     Document,
+    /// A `DocumentFragment`. Carries no data of its own; it exists to be a
+    /// root that is not a document.
+    ///
+    /// Added in Phase 2, which needs two of them: the scratch root the HTML
+    /// fragment parsing algorithm parses into, and a `<template>` element's
+    /// `content`. Unlike a `Document`, a fragment *is* insertable as a child
+    /// — the template's contents fragment is stored as the template element's
+    /// only child, which is how the tree builder reaches it and how the
+    /// html5lib test format renders it (as a `content` line).
+    Fragment,
     Doctype(DoctypeData),
     Element(ElementData),
     Text(String),
     Comment(String),
+    /// A `ProcessingInstruction`, e.g. `<?module-handler data>`.
+    ///
+    /// Long-standing HTML behaviour turns `<?...>` into a comment; a 2026
+    /// revision of §13.2.5 gives well-formed ones a node of their own, which
+    /// is what the html5lib fixtures now expect. Placement is identical to a
+    /// comment's in every insertion mode.
+    ProcessingInstruction(PiData),
+}
+
+/// A processing instruction's payload.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PiData {
+    /// The name immediately after `<?`, e.g. `module-handler`.
+    pub target: String,
+    /// Everything between the target and the closing `?>` or `>`.
+    pub data: String,
 }
 
 impl NodeData {
-    /// Can this kind of node hold children? Only documents and elements can.
+    /// Can this kind of node hold children? Only documents, fragments and
+    /// elements can.
     pub fn can_have_children(&self) -> bool {
-        matches!(self, NodeData::Document | NodeData::Element(_))
+        matches!(
+            self,
+            NodeData::Document | NodeData::Fragment | NodeData::Element(_)
+        )
     }
 
     pub fn is_element(&self) -> bool {
@@ -252,10 +282,12 @@ impl NodeData {
     pub fn node_type(&self) -> u16 {
         match self {
             NodeData::Element(_) => 1,
+            NodeData::ProcessingInstruction(_) => 7,
             NodeData::Text(_) => 3,
             NodeData::Comment(_) => 8,
             NodeData::Document => 9,
             NodeData::Doctype(_) => 10,
+            NodeData::Fragment => 11,
         }
     }
 }
@@ -525,6 +557,17 @@ impl Dom {
         self.push(NodeData::Comment(text.into()))
     }
 
+    pub fn create_processing_instruction(
+        &mut self,
+        target: impl Into<String>,
+        data: impl Into<String>,
+    ) -> NodeId {
+        self.push(NodeData::ProcessingInstruction(PiData {
+            target: target.into(),
+            data: data.into(),
+        }))
+    }
+
     pub fn create_doctype(
         &mut self,
         name: impl Into<String>,
@@ -541,10 +584,16 @@ impl Dom {
     /// An additional, detached `Document` node.
     ///
     /// Phase 2's fragment-parsing algorithm needs a scratch root that is not
-    /// the main document. See the note in the module-level docs about
-    /// `DocumentFragment`.
+    /// the main document. Since Phase 2 also added [`NodeData::Fragment`],
+    /// [`Dom::create_fragment`] is now the better answer for that particular
+    /// job; this stays for anything that genuinely wants a second document.
     pub fn create_document(&mut self) -> NodeId {
         self.push(NodeData::Document)
+    }
+
+    /// A detached `DocumentFragment`.
+    pub fn create_fragment(&mut self) -> NodeId {
+        self.push(NodeData::Fragment)
     }
 
     // -- links -------------------------------------------------------------
@@ -1166,6 +1215,13 @@ impl Dom {
                 }
                 out.push(']');
             }
+            NodeData::Fragment => {
+                out.push_str("#fragment[");
+                for c in self.children(id) {
+                    self.debug_into(c, out);
+                }
+                out.push(']');
+            }
             NodeData::Doctype(d) => {
                 out.push_str("<!DOCTYPE ");
                 out.push_str(&d.name);
@@ -1194,6 +1250,13 @@ impl Dom {
                 out.push_str("<!--");
                 out.push_str(t);
                 out.push_str("-->");
+            }
+            NodeData::ProcessingInstruction(p) => {
+                out.push_str("<?");
+                out.push_str(&p.target);
+                out.push(' ');
+                out.push_str(&p.data);
+                out.push('>');
             }
         }
     }
