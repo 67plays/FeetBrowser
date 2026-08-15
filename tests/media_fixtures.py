@@ -779,6 +779,27 @@ def mov(frames, width, height, codec="jpeg", fps=25.0, depth=24,
     return ftyp + mdat + moov
 
 
+def mp4_av(frames, width, height, packets, asc=b"\x12\x10", fps=25.0,
+           sample_rate=44100, channels=2, codec="jpeg", **kwargs):
+    """An MP4 with a picture track and a sound track, both of them real.
+
+    `mov()` has been able to write two traks for a while, but every caller so
+    far has passed filler bytes as the audio packets, because all they needed
+    was a second sample table to get the offsets wrong in. This is the same
+    file with packets a decoder will actually accept, which is what it takes
+    to drive one file through both codecs and the clock between them -- the
+    case that was otherwise only ever proved a half at a time.
+
+    Pass `packets` and `asc` from a committed AAC vector via
+    `aac.adts_frames()`; that keeps the fixture independent of the MP4
+    demuxer it is used to test.
+    """
+    return mov(frames, width, height, codec=codec, fps=fps, brand=b"isom",
+               audio={"packets": list(packets), "asc": asc,
+                      "sample_rate": sample_rate, "channels": channels},
+               **kwargs)
+
+
 def quicktime_raw_frame(width, height, pixel, depth=24):
     """One `raw ` sample: top-down, and RGB rather than the DIB's BGR."""
     out = bytearray()
