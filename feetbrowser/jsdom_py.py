@@ -520,6 +520,14 @@ class JSElement:
             self.node.attributes["value"] = \
                 "" if value is None or value is UNDEFINED else str(value)
             self._flag["dirty"] = True
+        elif name in ("src", "href"):
+            # Same round-trip for the URL attributes scripts assign
+            # (`img.src = ...`, `a.href = ...`): js_get falls back to the
+            # attribute dictionary, so the write has to land there too, or a
+            # script-created <img> renders as "[img]" with no src at all.
+            self.node.attributes[name] = \
+                "" if value is None or value is UNDEFINED else str(value)
+            self._flag["dirty"] = True
         # style writes are no-ops; mutations go through JSElementStyle.
 
     # -- native methods -------------------------------------------------

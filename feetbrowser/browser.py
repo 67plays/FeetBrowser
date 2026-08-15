@@ -619,6 +619,8 @@ class Tab:
         self.js_logs = []
         self.net_errors = []
         self._image_failures = deque()
+        self._image_queue = []
+        self._image_results = deque()
         self._js_log_cursor = 0
         self._js_interp = None
         self._js_doc = None
@@ -679,8 +681,15 @@ class Tab:
         # Keep the rules around so JS mutations can re-style the tree.
         self._last_rules = rules
 
-        # Resolve <img src> to absolute URLs now so the layout's cache lookup
-        # keys (absolute) always match what load_images() fetches.
+        self._absolutize_media_srcs()
+        self.render()
+        self._run_scripts()
+
+    def _absolutize_media_srcs(self):
+        """Resolve <img>/<video> src attributes to absolute URLs so the
+        layout's cache lookup keys (absolute) always match what load_images()
+        fetches. Run on the initial build and again after a JS mutation,
+        which can create media elements after the first scan."""
         for node in tree_to_list(self.nodes, []):
             if isinstance(node, Element) and node.tag == "video" \
                     and not node.attributes.get("src"):
@@ -694,11 +703,9 @@ class Tab:
                     and node.attributes.get("src"):
                 try:
                     node.attributes["src"] = str(
-                        resolve_from.resolve(node.attributes["src"]))
+                        self.base_url.resolve(node.attributes["src"]))
                 except Exception:  # noqa: BLE001 - bad src renders placeholder
                     pass
-        self.render()
-        self._run_scripts()
 
     def render(self):
         self._sync_selects()
@@ -925,6 +932,11 @@ class Tab:
         fresh_title = get_title(self.nodes)
         if fresh_title:
             self.title = fresh_title
+        # A script may have created media elements after the first scan; make
+        # their src absolute (layout keys its image cache on absolute URLs)
+        # and fetch the ones we do not have yet.
+        self._absolutize_media_srcs()
+        self._fetch_js_added_images()
         self.render()
 
     # -- JS host APIs (fetch, XMLHttpRequest) ------------------------------
@@ -1096,12 +1108,38 @@ class Tab:
         asynchronously (off the UI thread), re-rendering as each arrives."""
         self._image_root = root
         self._image_done = done
-        self._image_queue = []
-        # Background threads stash raw bytes here; the UI thread drains the
-        # deque on a timer so the canvas and its photos are only ever touched on the
-        # main thread. deque append/popleft are atomic under the GIL.
-        self._image_results = deque()
-        seen = set()
+        # Re-entrant: a script may already have queued fetches
+        # (_fetch_js_added_images) before the load path calls this. Keep them
+        # in flight rather than dropping them (settle() would think the page
+        # was done) or starting their threads again (the same URL fetched
+        # twice) -- only the genuinely new sources get threads here.
+        in_flight = dict(self._image_queue)
+        new = list(self._missing_images(in_flight))
+        self._image_queue = list(in_flight.items()) + new
+        if not self._image_queue:
+            if done:
+                done()
+            return
+        if root is None:
+            # No UI loop (tests / headless): fetch and decode synchronously so
+            # results are available immediately and deterministically.
+            for key, url in new:
+                try:
+                    _headers, data, ctype = url.request_bytes()
+                except Exception:  # noqa: BLE001 - keep placeholder on failure
+                    data, ctype = None, None
+                self._decode_and_finish(key, data, ctype)
+            return
+        for key, url in new:
+            threading.Thread(
+                target=self._fetch_image, args=(key, url), daemon=True).start()
+
+    def _missing_images(self, skip=()):
+        """Yield ``(key, url)`` for every <img> source that is neither decoded
+        nor on its way: not in the image cache and not in `skip` (keys already
+        being fetched). Shared by the initial scan (load_images) and the
+        re-scan after a script adds elements (_fetch_js_added_images)."""
+        skip = set(skip)
         if self.nodes is None:
             return
         for node in tree_to_list(self.nodes, []):
@@ -1115,26 +1153,35 @@ class Tab:
             except Exception:  # noqa: BLE001 - bad src shouldn't kill the page
                 continue
             key = str(url)
-            if key in self.image_cache or key in seen:
+            if key in self.image_cache or key in skip:
                 continue
-            seen.add(key)
-            self._image_queue.append((key, url))
-        if not self._image_queue:
-            if done:
-                done()
+            skip.add(key)
+            yield key, url
+
+    def _fetch_js_added_images(self):
+        """Fetch <img> sources a script created after the page's first scan.
+
+        Scripts build their own content (a banner strip, say) by creating
+        <img> elements after load_images() has already run, and those must be
+        fetched like any other. Sources already cached or already being
+        fetched are skipped; new ones join _image_queue so pending_images()
+        and settle() keep accounting for them, and the same synchronous /
+        threaded split as load_images() applies."""
+        in_flight = {key for key, _ in self._image_queue}
+        queued = list(self._missing_images(in_flight))
+        if not queued:
             return
-        if root is None:
-            # No UI loop (tests / headless): fetch and decode synchronously so
-            # results are available immediately and deterministically.
-            while self._image_queue:
-                key, url = self._image_queue[0]
+        for key, url in queued:
+            self._image_queue.append((key, url))
+        if not self._gui_mode():
+            for key, _url in queued:
                 try:
-                    _headers, data, ctype = url.request_bytes()
+                    _headers, data, ctype = _url.request_bytes()
                 except Exception:  # noqa: BLE001 - keep placeholder on failure
                     data, ctype = None, None
                 self._decode_and_finish(key, data, ctype)
             return
-        for key, url in self._image_queue:
+        for key, url in queued:
             threading.Thread(
                 target=self._fetch_image, args=(key, url), daemon=True).start()
 
