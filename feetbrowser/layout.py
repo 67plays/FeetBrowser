@@ -309,6 +309,10 @@ class DrawImage:
         self.photo = photo
         self.node = node  # source <img>, for hit-testing links
 
+    def hit(self, x, y):
+        return (self.left <= x <= self.right
+                and self.top <= y <= self.bottom)
+
     def execute(self, scroll, canvas, tags=()):
         canvas.create_image(
             self.left, self.top - scroll, anchor="nw", image=self.photo,
@@ -318,10 +322,10 @@ class DrawImage:
 class DrawVideo:
     """The current frame of a `<video>`.
 
-    Separate from `DrawImage` for two reasons, neither cosmetic. It carries a
-    `hit()`, so a click on the picture reaches the element and can play or
-    pause it -- `DrawImage` deliberately has none, and giving it one would
-    change what clicking every image on every page does. And its `photo` is a
+    Separate from `DrawImage` for one reason, not the hit-testing one:
+    both answer `hit()`, so a click on either reaches its element and can
+    play or pause a video or follow an `<a>` around an image. What
+    `DrawVideo` carries that `DrawImage` does not is a `photo` that is a
     buffer the player rewrites in place rather than a decoded file, so the
     command stays valid across frames and the retained canvas item is not
     rebuilt sixty times a second.

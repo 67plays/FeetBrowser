@@ -1338,6 +1338,115 @@ def test_settle_waits_for_images_a_finished_document_asked_for():
         shutil.rmtree(work, ignore_errors=True)
 
 
+def test_browse_page_thumbnails_with_query_urls_render():
+    """safebooru's post list: absolute JPEG `<img>` URLs with a query
+    string, wrapped in flex cells.
+
+    The regression this guards is the safebooru.org browse page, whose
+    thumbnails are all `.../thumbnail_<hash>.jpg?<post_id>`. The query is
+    part of the URL the layout keys its image cache on, so a URL
+    round-trip that dropped it would turn every photo back into an
+    "[img]" placeholder; so would an engine built before native JPEG
+    support, which draws the homepage PNG and quietly no JPEG at all --
+    exactly the page as safebooru serves it.
+    """
+    import http.server
+    import threading
+
+    from feetbrowser.browser import Browser
+    from feetbrowser.layout import DrawImage
+
+    photo = open(os.path.join(_FIXTURES, "photo.jpg"), "rb").read()
+    thumbs = "".join(
+        f'<span class="thumb"><a href="/index.php?page=post&s=view&id={i}">'
+        f'<img src="/thumbnails/999/thumbnail_{i}.jpg?{i}" border="0"></a>'
+        f'</span>'
+        for i in range(6))
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path.startswith("/thumbnails/"):
+                body, ctype = photo, "image/jpeg"
+            else:
+                body = (b'<!doctype html><style>'
+                        b'div.image-list{display:flex;flex-flow:wrap}'
+                        b'.thumb{width:200px;height:200px}</style>'
+                        b'<div class="image-list">' + thumbs.encode() +
+                        b'</div>')
+                ctype = "text/html"
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        browser = Browser()
+        browser.new_tab("http://127.0.0.1:%d/index.php?page=post&s=list"
+                        % server.server_address[1])
+        tab = browser.tabs[0]
+        assert browser.settle(20.0), "thumbnails should have arrived"
+        drawn = [c for c in tab.display_list if isinstance(c, DrawImage)]
+        assert len(drawn) == 6, \
+            f"wanted 6 thumbnails drawn, found {len(drawn)}"
+        for c in drawn:
+            assert (c.photo.width(), c.photo.height()) == (320, 224), \
+                "each thumbnail decodes to the real photograph"
+    finally:
+        server.shutdown()
+
+
+def test_a_scrolled_page_never_paints_over_the_chrome():
+    """Scrolling, then a page re-render, must not bury the nav bar.
+
+    The canvas paints in insertion order, so page commands re-executed after
+    the chrome was drawn paint on top of it. Once the page is scrolled, its
+    full-viewport background rectangles start above the window top and span
+    the whole chrome strip -- so a page-layer repaint on its own (the 120ms
+    coalescer, which fires when a background image arrives) used to white out
+    the tabs and address bar. _draw_page now re-asserts the chrome over the
+    page, and this proves the tab strip survives the exact sequence.
+    """
+    import shutil
+    import tempfile
+    from feetbrowser.browser import Browser
+
+    work = tempfile.mkdtemp(prefix="fb-chrome-")
+    try:
+        page = os.path.join(work, "page.html")
+        with open(page, "w") as handle:
+            handle.write('<!doctype html><style>div{background:#ff0000;'
+                         'height:5000px}</style><div><p>hi</p></div>')
+        browser = Browser()
+        browser.window.geometry("900x700")
+        browser.canvas.resize(900, 700)
+        browser._apply_resize()
+        browser.new_tab("file://" + page)
+        browser.settle(20.0)
+        tab = browser.tabs[0]
+        chrome = browser.chrome_height()
+        # Scroll the red page up under the chrome, then re-render and let the
+        # 120ms coalescer repaint the page alone -- the sequence that follows
+        # a scroll while background images are still arriving.
+        tab.set_scroll(400)
+        tab.render()
+        browser._repaint_tick()
+        surface = browser.canvas.render()
+        tab_bar = tuple(canvasmod.color(browser.c("tab_bar"))[:3])
+        red = (255, 0, 0)
+        assert _pixel(surface, 400, 5) == tab_bar, \
+            "the tab strip was painted over by the scrolled page"
+        assert _pixel(surface, 400, chrome - 3) != red, \
+            "the chrome strip shows page content instead of chrome"
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
 # -- the scrollbar, dragged ------------------------------------------------
 #
 # The bar is painted onto the same canvas as everything else and is not a
