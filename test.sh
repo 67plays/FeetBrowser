@@ -2,11 +2,9 @@
 # Run the FeetBrowser test suite.
 #
 # The renderer draws into its own framebuffer, so no display and no toolkit is
-# needed. There are two JavaScript engines and the suite builds both: the Zig
-# one is a dynamic library loaded with ctypes, the Rust one is a CPython
-# extension maturin builds into the local venv. The JS suite then runs against
-# each in turn, because two engines behind one contract are only worth having
-# if both are held to it.
+# needed. The JavaScript engine is the Rust one: a CPython extension maturin
+# builds into the local venv, and the JS suite runs against it like every
+# other suite.
 #
 # Four suites step outside all that: test_cocoa.py, test_x11.py and
 # test_win32.py open real windows wherever their platform has one and skip
@@ -43,13 +41,6 @@ elif grep -qi '^include-system-site-packages *= *false' .venv/pyvenv.cfg 2>/dev/
   python3 -m venv --system-site-packages .venv
 fi
 
-# The Zig engine: a compiler and nothing else. `zig build` is a no-op when
-# nothing under zig/ has moved, and rebuilds when it has, so the library next
-# to the tests is always the one the sources describe. A stale libfeetjs is
-# the same trap as a stale extension module below.
-(cd zig && zig build)
-(cd zig && zig build test)
-
 # The Rust engine, in the venv the rest of the suite runs from, rebuilt
 # whenever rust/ has moved on since. Importing it successfully is not enough.
 # An extension compiled from an older tree runs perfectly well and fails the
@@ -81,8 +72,7 @@ $run tests/test_cocoa.py   # opens real windows on macOS, skips elsewhere
 $run tests/test_x11.py     # opens real windows under X11, skips elsewhere
 $run tests/test_win32.py   # opens real windows on Windows, skips elsewhere
 $run tests/test_units.py
-FEETBROWSER_JS=zig $run tests/test_js.py
-FEETBROWSER_JS=rust $run tests/test_js.py
+$run tests/test_js.py
 $run tests/test_shoes.py
 $run tests/test_e2e.py     # a fixture page in, its pixels back out
 $run tests/test_nav.py

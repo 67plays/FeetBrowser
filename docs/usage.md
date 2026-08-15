@@ -101,20 +101,19 @@ for images to load, and writes a PNG.
 
 ## Environment variables
 
-The browser reads four variables of its own, and none of them has to be set
+The browser reads two variables of its own, and neither of them has to be set
 for it to work: every one has a default that is the right answer on a normal
-machine. Three of them exist because the browser has two of some things — two
-window backends, two JavaScript engines — and a choice that is only ever made
-at build time cannot be tested both ways; the fourth names a directory whose
-right answer is different on every platform. A fifth, the standard `DISPLAY`,
-is not ours but decides whether the X11 window can open, so it is described
-here too.
+machine. One of them exists because the browser has two of some things — two
+window backends — and a choice that is only ever made at build time cannot be
+tested both ways; the other names a directory whose right answer is different
+on every platform. A third, the standard `DISPLAY`, is not ours but decides
+whether the X11 window can open, so it is described here too.
 
-The first three are read as text, stripped of surrounding whitespace and
-lowercased, so `Zig` and ` zig ` are the same as `zig`. Each is read once and
-the choice is then fixed for the life of the process; changing one from inside
-a running browser does nothing. The fourth is a path, so it is taken as
-written apart from a leading `~`.
+The first is read as text, stripped of surrounding whitespace and lowercased,
+so `X11` and ` x11 ` are the same as `x11`. It is read once and the choice is
+then fixed for the life of the process; changing it from inside a running
+browser does nothing. The second is a path, so it is taken as written apart
+from a leading `~`.
 
 There is nothing here that picks a renderer. There is one — our own font
 engine, rasteriser and event loop — and every window backend, and the
@@ -149,50 +148,6 @@ An unrecognised value is the exception to that, and not a helpful one: it
 matches no backend, so every backend is skipped and the browser runs headless
 without complaining. `FEETBROWSER_DISPLAY=wayland` therefore opens no window
 and says nothing about it.
-
-### `FEETBROWSER_JS`
-
-Which JavaScript engine runs the page's scripts, from
-`feetbrowser/jsengine.py`.
-
-| value | effect |
-| --- | --- |
-| `rust` | the `feetbrowser_engine` extension module (the default) |
-| `zig` | our own engine, a dynamic library loaded with `ctypes` |
-
-Only `zig` is tested for by name; every other value, recognised or not, gets
-the Rust engine. The two are held to the same test suite rather than being a
-primary and a fallback — see [the JavaScript engine](limitations.md#the-javascript-engine)
-for what the Zig one leaves out.
-
-The choice is resolved the first time something asks for an interpreter, not
-at import, so importing the browser neither builds nor loads an engine.
-
-`run.sh` reads this variable too, and it changes what the script has to
-build: the default path builds the Rust extension into a local `.venv` and
-runs the browser from there, while `FEETBROWSER_JS=zig` runs `zig build` and
-then the system `python3`, needing no venv and no extension module.
-
-`run.cmd` does not read it. It builds the Rust extension and starts the
-browser from the venv, which is the default either way. Nothing here has
-ever built the Zig engine on Windows — CI builds it on the Linux jobs only —
-so rather than have the Windows script offer a path nobody has walked, it
-offers the one that is tested.
-
-### `FEETBROWSER_JS_LIB`
-
-Where the Zig engine's shared library is, from `feetbrowser/jszig.py`. It is
-only consulted when that engine is the one selected.
-
-Unset or empty, the library is looked for next to the sources it is built
-from — `zig/zig-out/lib/libfeetjs.so`, or `libfeetjs.dylib` on macOS and
-`feetjs.dll` on Windows — which is exactly where `zig build` puts it. Set, it
-is used as the path verbatim, for running against a library built somewhere
-else.
-
-A path that does not exist is an error either way, and the message names the
-missing file and suggests running `zig build` or falling back to
-`FEETBROWSER_JS=rust`. There is no search of the system library path.
 
 ### `FEETBROWSER_DOWNLOAD_DIR`
 
