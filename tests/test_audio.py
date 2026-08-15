@@ -30,7 +30,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import media_fixtures
-from feetbrowser import alsa, arch, browser, coreaudio, heel, media, \
+from feetbrowser import aac, alsa, arch, browser, coreaudio, heel, media, \
     mediacodec, winmm
 
 
@@ -1567,6 +1567,121 @@ def test_the_pictures_are_scheduled_against_the_sound():
     assert video.scheduler.current.index != video.scheduler.due_index(), \
         ("a second of offset in the sound went unnoticed, so the assertion "
          "above proves nothing")
+    video.close()
+    audio.close()
+    output.close()
+
+
+AAC_FIXTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "fixtures", "aac")
+
+
+def _real_aac_packets(name="lowrate", repeats=6):
+    """The coded frames of a committed AAC vector, and its config.
+
+    Taken apart with `aac.adts_frames()` rather than with our MP4 demuxer, so
+    that a fixture built out of them is not built by the code it is about to
+    be used to test. Repeating the run is what makes the clip long enough to
+    measure a drift over; the samples that come back are still real decoded
+    AAC, which is the part that matters here.
+    """
+    with open(os.path.join(AAC_FIXTURES, name + ".aac"), "rb") as handle:
+        blob = handle.read()
+    packets = []
+    rest = blob
+    for head, length in aac.adts_frames(blob):
+        packets.append(rest[head:length])
+        rest = rest[length:]
+    return packets * repeats, aac.asc_from_adts(blob)
+
+
+def _av_clip(seconds=1.9, fps=25.0, width=16, height=12):
+    """One MP4 with both tracks real: Motion JPEG pictures whose red channel
+    counts the frames, and AAC the Fortran decoder will actually decode."""
+    packets, asc = _real_aac_packets()
+    per_frame = 1024 / 44100.0
+    packets = packets[:max(1, int(round(seconds / per_frame)))]
+    count = max(1, int(round(len(packets) * per_frame * fps)))
+    frames = [media_fixtures.jpeg(width, height,
+                                  (lambda i: lambda x, y: (i * 5 % 256, 60,
+                                                           120))(i))
+              for i in range(count)]
+    return media_fixtures.mp4_av(frames, width, height, packets, asc=asc,
+                                 fps=fps)
+
+
+def test_one_file_with_both_codecs_in_it_plays_in_sync():
+    """The end-to-end case the suite could not make before: a single file,
+    both halves decoded by our own code, and the pictures scheduled against
+    the samples that came out of the sound decoder.
+
+    Everything else in this section proves a half. `_clip()` is pictures with
+    a `FakeAudioTrack` beside it, which is the clock without the codec; the
+    AAC tests are the codec without the clock. This is the one that fails if
+    the two are wired together wrongly -- if the arch reports the device
+    timeline instead of the stream's, or the demuxer hands the audio track
+    the video track's chunk offsets, both files would still pass every other
+    test in the tree.
+    """
+    if not aac.available():
+        print("  skipping: %s" % aac.unavailable_reason())
+        return
+    data = _av_clip()
+    # One file, and both probes have to find their own track in it.
+    picture = mediacodec.probe(data)
+    sound = mediacodec.probe_audio(data)
+    assert picture.supported and sound.supported, (picture, sound)
+    eq((sound.sample_rate, sound.channels), (44100, 2))
+
+    device = Capture(44100, 2)
+    output = _audible(device)
+    audio = arch.AudioPlayer(data=data, output=output, threaded=False)
+    assert not audio.error, audio.error
+    assert not audio.silent, "a file with an AAC track came back silent"
+    video = media.VideoPlayer(data=data, threaded=False, decode_budget=8)
+    assert not video.error, video.error
+    assert video.attach_audio(audio), "the sound should be driving"
+    assert isinstance(video.scheduler.clock, media._AudioClock)
+
+    video.seek(0.02)                    # inside a picture, not on its seam
+    video.play()
+    audio.pump(200)
+    device.pump(output.ring.backlog)    # the silence start() primed with
+
+    shown = []
+    for step in range(1, 16):
+        _drive(output, 4410, block=441)          # exactly 100 ms of sound
+        close(audio.position(), 0.02 + step * 0.1, 1e-3,
+              "the decoded sound drifted from its own timeline")
+        video.tick()
+        audio.pump(200)
+        current = video.scheduler.current
+        assert current is not None, "nothing on screen at step %d" % step
+        eq(current.index, video.scheduler.due_index(),
+           "step %d: the picture is not the one the sound is due" % step)
+        shown.append(current.index)
+    eq(shown, sorted(shown), "the pictures went backwards")
+    assert shown[-1] > shown[0], "the pictures never advanced"
+    eq(video.stats()["starved"], 0, "the pictures could not keep up")
+    eq(video.stats()["decode_errors"], 0)
+    eq(audio.decode_errors, 0, "a committed AAC vector failed to decode")
+    assert audio.decoded > 0, "nothing was decoded, so nothing was proved"
+
+    # The bytes the device was handed are the decoder's, not silence: a file
+    # that demuxed and then played nothing would satisfy every timing
+    # assertion above.
+    assert device.taken.count(0) < len(device.taken), \
+        "the device was handed nothing but silence"
+
+    # The control, the same one the fake-clock test uses. Offset the sound's
+    # timeline and the picture must stop being the one that is due.
+    pos, media_at, rate = audio._segments[0]
+    audio._segments[0] = (pos, media_at + 1.0, rate)
+    _drive(output, 4410, block=441)
+    video.tick()
+    assert video.scheduler.current.index != video.scheduler.due_index(), \
+        ("a second of offset in the sound went unnoticed, so the assertions "
+         "above prove nothing")
     video.close()
     audio.close()
     output.close()

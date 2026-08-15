@@ -857,11 +857,18 @@ every codec wants to be handed.
    -- but only MP4 and MOV reach it, because `open_audio()` only demuxes
    those. WebM's audio is identified and refused for want of a Vorbis or
    Opus decoder, which is a codec-sized job; AVI's is refused for want of a
-   demuxer, which is not, and is the cheaper of the two. There is also no
-   fixture in the tree with a video track and an audio track in one file,
-   so the end-to-end path is proved a half at a time; a muxer in
-   `tests/media_fixtures.py` that writes both traks would close that. After
-   those, SBR, so that low-bitrate HE-AAC streams play at all.
+   demuxer, which is not, and is the cheaper of the two. After those, SBR,
+   so that low-bitrate HE-AAC streams play at all.
+
+   The end-to-end path is no longer proved a half at a time:
+   `media_fixtures.mp4_av()` writes both traks over real coded frames --
+   Motion JPEG pictures and the AAC packets out of a committed vector -- and
+   `test_one_file_with_both_codecs_in_it_plays_in_sync` drives one such file
+   through both decoders and the clock between them. `mov()` could always
+   write two traks, but every caller passed filler bytes as the audio, which
+   is enough to test a demuxer and not enough to test a decoder: a file built
+   that way probes as a supported 82-frame AAC track, decodes to nothing at
+   all, and hands the device two hundred kilobytes of silence.
 7. **Per-decoder H.264 state.** Both entropy coders and all three slice types
    are done, so what is left in `fortran/` is not a feature but the shape of
    the thing: the decoder's state is `COMMON`, which is to say there is one
