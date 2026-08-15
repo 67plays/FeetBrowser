@@ -71,8 +71,8 @@ deblocking, six intra prediction modes, quarter-pel motion compensation)
 before the patent question is even asked. So the choice was between formats
 that are genuinely writable in readable Python: animated GIF, MJPEG,
 container parsing on its own, and an uncompressed or RLE codec in a simple
-container. Animated GIF belongs to the image decoder and is being rewritten
-by someone else right now; MJPEG needed a JPEG decoder, which at the time was
+container. Animated GIF belongs to the image decoder, and has since been
+built there rather than here; MJPEG needed a JPEG decoder, which at the time was
 also somebody else's live work and has since landed. Container parsing on its
 own puts nothing on screen. What is left is AVI carrying `BI_RGB` and
 `BI_RLE8`: a container simple enough to parse exactly (RIFF is
@@ -901,9 +901,15 @@ every codec wants to be handed.
    slideshow into playback, and it needs no design decisions.
 2. **Add a YUV plane path and a Rust YUV-to-RGBA converter**, before a codec
    that needs it arrives rather than after.
-3. **Animated GIF through the same player.** The frames already exist in the
-   image decoder; this is a `_Codec` adapter and a layout rule, and it gives
-   `<img src=x.gif>` real timing instead of a first frame.
+3. ~~**Animated GIF through the same player.**~~ Done, and not through this
+   player: it turned out to want no player at all. The decoder returns every
+   frame with its delay and `canvas.PhotoImage` steps through them off the
+   tick that was already running for video, because the draw path blits
+   whatever `photo.rgba` currently is -- so nothing in layout, the display
+   list or the element tree had to learn that an image moves, and a GIF stays
+   an `<img>` rather than acquiring a playhead and controls it has no use
+   for. See
+   [Animation lives in PhotoImage](rendering.md#animation-lives-in-photoimage-not-in-layout).
 4. **`HTMLMediaElement` on the DOM bridge**: `play`, `pause`,
    `currentTime`, `duration`, `paused`, `ended`, and the `timeupdate` and
    `ended` events. Cheap, and it is what makes video scriptable.

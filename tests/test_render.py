@@ -819,6 +819,366 @@ def test_decode_gif_rejects_absurd_geometry():
              "a frame placed 60000 pixels off canvas should be rejected")
 
 
+# -- animated GIF ----------------------------------------------------------
+
+_GIF_FIXTURES = os.path.join(_FIXTURES, "gif")
+
+# What each committed animation is for, and what the file says about itself.
+# Delays are milliseconds as the file asked for them, before any clamp; the
+# loop count is the NETSCAPE2.0 one, -1 where the file carries no such block.
+_GIF_VECTORS = {
+    "frames": ((8, 6), [50, 120, 70, 30], 0),
+    "offset": ((8, 6), [50, 120, 70, 30], 0),
+    "trans": ((8, 6), [80, 80, 80], 2),
+    "dispose": ((8, 6), [60, 60, 60, 60], 0),
+    "interlace": ((8, 6), [60, 60], 0),
+    "still": ((8, 6), [0], -1),
+    "ffmpeg": ((8, 6), [100, 100, 100, 100], 0),
+}
+
+
+def _gif_vector(name):
+    """A committed animation and the frames an independent decoder got out
+    of it -- ImageMagick 7's `-coalesce`, zlib'd, every frame back to back.
+    See tests/fixtures/gif/make_gif_vectors.sh for why that tool and not
+    FFmpeg."""
+    with open(os.path.join(_GIF_FIXTURES, name + ".gif"), "rb") as handle:
+        data = handle.read()
+    with open(os.path.join(_GIF_FIXTURES, name + ".rgba.z"), "rb") as handle:
+        truth = zlib.decompress(handle.read())
+    return data, truth
+
+
+def _pixels_match(ours, truth):
+    """Bit-identical, except that two fully transparent pixels are equal
+    whatever colour is recorded underneath them.
+
+    That is not a loosened threshold, it is the only comparison the data
+    supports: nothing observes the colour of a pixel with alpha zero, and the
+    two decoders leave different ones there after a disposal. Everything with
+    any opacity at all must match exactly, which is what the negative control
+    below leans on."""
+    if len(ours) != len(truth):
+        return "length %d, expected %d" % (len(ours), len(truth))
+    for i in range(0, len(ours), 4):
+        mine, theirs = bytes(ours[i:i + 4]), bytes(truth[i:i + 4])
+        if mine == theirs or (mine[3] == 0 and theirs[3] == 0):
+            continue
+        return "pixel %d is %s, expected %s" % (i // 4, tuple(mine),
+                                                tuple(theirs))
+    return ""
+
+
+def _animated_gif(screen, palette, frames, loops=None):
+    """Build an animated GIF with a named palette and hand-placed frames.
+
+    The committed vectors are what real encoders write; this is for the cases
+    no encoder will write on request -- a delay of zero, a canvas built to be
+    a bomb -- and for reading a fixture back as sixteen numbers.
+    """
+    def lzw(indices, min_code):
+        """Every pixel as its own literal code: legal, and the smallest
+        encoder a conforming decoder has to read. The table still has to be
+        counted along with, because the decoder widens its codes when the
+        table fills, and an encoder that does not is how a hand-built GIF
+        comes out looking almost right."""
+        clear, end = 1 << min_code, (1 << min_code) + 1
+        out, acc, bits = bytearray(), 0, 0
+
+        def emit(code, size):
+            nonlocal acc, bits
+            acc |= code << bits
+            bits += size
+            while bits >= 8:
+                out.append(acc & 0xFF)
+                acc >>= 8
+                bits -= 8
+
+        width, table, prev = min_code + 1, end + 1, False
+        emit(clear, width)
+        for value in indices:
+            emit(value, width)
+            if prev:
+                table += 1
+                if table == (1 << width) and width < 12:
+                    width += 1
+            prev = True
+        emit(end, width)
+        if bits:
+            out.append(acc & 0xFF)
+        return bytes(out)
+
+    def blocks(payload):
+        out = bytearray()
+        while payload:
+            chunk, payload = payload[:255], payload[255:]
+            out.append(len(chunk))
+            out += chunk
+        return bytes(out) + b"\x00"
+
+    screen_w, screen_h = screen
+    # Two is the smallest LZW minimum code size the format allows, whatever
+    # the palette would otherwise need.
+    bits = max(2, (len(palette) // 3 - 1).bit_length())
+    table = palette + bytes(3 * ((1 << bits) - len(palette) // 3))
+    out = bytearray(b"GIF89a")
+    out += struct.pack("<HHBBB", screen_w, screen_h, 0x80 | (bits - 1), 0, 0)
+    out += table
+    if loops is not None:
+        out += (b"\x21\xFF\x0BNETSCAPE2.0\x03\x01"
+                + struct.pack("<H", loops) + b"\x00")
+    for frame in frames:
+        gflags = (frame.get("dispose", 0) << 2) | (1 if "clear" in frame else 0)
+        out += b"\x21\xF9\x04" + bytes([gflags])
+        out += struct.pack("<H", frame.get("delay", 0))
+        out += bytes([frame.get("clear", 0), 0])
+        out += b"\x2C" + struct.pack("<HHHHB", frame.get("left", 0),
+                                     frame.get("top", 0), frame["w"],
+                                     frame["h"], 0)
+        out += bytes([bits]) + blocks(lzw(frame["indices"], bits))
+    return bytes(out + b"\x3B")
+
+
+def _frame_pixels(rgba, width, x, y):
+    o = (y * width + x) * 4
+    return tuple(rgba[o:o + 4])
+
+
+def test_animated_gif_matches_an_independent_decoder():
+    """Seven animations from two encoders, every frame of every one of them
+    against what ImageMagick composited, pixel for pixel."""
+    for name, (size, delays, loops) in sorted(_GIF_VECTORS.items()):
+        data, truth = _gif_vector(name)
+        width, height, frames, count = imagecodec.decode_gif_frames(data)
+        assert (width, height) == size, f"{name}: size {width}x{height}"
+        assert count == loops, f"{name}: loop count {count}"
+        assert [d for _rgba, d in frames] == delays, f"{name}: delays"
+        stride = width * height * 4
+        assert len(truth) == len(frames) * stride, (
+            f"{name}: {len(frames)} frames, truth has {len(truth) // stride}")
+        for i, (rgba, _delay) in enumerate(frames):
+            why = _pixels_match(rgba, truth[i * stride:(i + 1) * stride])
+            assert not why, f"{name} frame {i}: {why}"
+
+
+def test_the_gif_vectors_would_catch_a_decoder_that_did_nothing():
+    """A threshold proves nothing about a file whose frames are all the same
+    picture. Each vector has to move, and the ones that exist for disposal
+    and transparency have to end up with pixels that only those produce."""
+    for name in sorted(_GIF_VECTORS):
+        if name == "still":
+            continue
+        _data, truth = _gif_vector(name)
+        stride = 8 * 6 * 4
+        first = truth[:stride]
+        rest = [truth[i:i + stride] for i in range(stride, len(truth), stride)]
+        assert any(f != first for f in rest), f"{name}: nothing ever changes"
+    _data, truth = _gif_vector("dispose")
+    stride = 8 * 6 * 4
+    got = [truth[i:i + stride] for i in range(0, len(truth), stride)]
+    appeared = [i for i in range(1, len(got))
+                if any(got[i][j + 3] == 0 and got[i - 1][j + 3] == 255
+                       for j in range(0, stride, 4))]
+    assert appeared, (
+        "somewhere in the disposal vector a pixel has to go from opaque back "
+        "to transparent -- that is the only thing disposal-to-background "
+        "does, and a decoder that ignored disposal would never produce it")
+    _data, truth = _gif_vector("trans")
+    assert any(truth[i + 3] == 0 for i in range(0, stride, 4)), (
+        "the transparency vector should have transparent pixels in it")
+
+
+def test_a_gif_frame_smaller_than_its_screen_is_composited_onto_it():
+    """`offset.gif` is `frames.gif` after an optimiser: frames three pixels
+    tall, placed at an offset, each meaning "and the rest is as it was".
+    That is what nearly every animated GIF on the web looks like, and a
+    decoder that hands back the sub-image rather than the screen returns a
+    different picture at a different size."""
+    data, _truth = _gif_vector("offset")
+    width, height, frames, _loops = imagecodec.decode_gif_frames(data)
+    assert (width, height) == (8, 6)
+    assert len(frames) == 4
+    for i, (rgba, _delay) in enumerate(frames):
+        assert len(rgba) == 8 * 6 * 4, f"frame {i} is not screen sized"
+    # The file really does store them small: the second image descriptor is
+    # a 4x3 block at an offset, not the whole screen.
+    descriptors = []
+    for i in range(len(data) - 10):
+        if data[i] == 0x2C:
+            descriptors.append(struct.unpack("<HHHH", data[i + 1:i + 9]))
+    assert any(d[2:] != (8, 6) for d in descriptors[1:]), (
+        "the fixture should carry sub-screen frames, else it proves nothing")
+    # Row 5 is untouched ground in every frame: the optimiser never stored
+    # it after the first, so it can only be there by compositing.
+    for i, (rgba, _delay) in enumerate(frames):
+        assert _frame_pixels(rgba, 8, 0, 5)[3] == 255, (
+            f"frame {i} lost the part of the screen it never redrew")
+
+
+def test_gif_disposal_puts_back_what_it_promised():
+    """The three disposal methods, hand-built so each pixel is nameable.
+
+    Frame 2 leaves its rectangle behind. Frame 3 says "restore to
+    background", so frame 4 must find that rectangle transparent again.
+    Frame 4 says "restore to previous", so frame 5 must find what frame 3
+    left, not what frame 4 drew.
+    """
+    red, green, blue, white = 0, 1, 2, 3
+    data = _animated_gif((4, 2), bytes([255, 0, 0, 0, 255, 0,
+                                        0, 0, 255, 255, 255, 255]), [
+        {"w": 4, "h": 2, "delay": 5,
+         "indices": [red] * 4 + [green] * 4},
+        {"w": 2, "h": 1, "delay": 5, "indices": [blue, blue]},
+        {"w": 2, "h": 1, "left": 2, "top": 1, "delay": 5, "dispose": 2,
+         "indices": [white, white]},
+        {"w": 1, "h": 1, "left": 0, "top": 1, "delay": 5, "dispose": 3,
+         "indices": [white]},
+        {"w": 1, "h": 1, "left": 3, "top": 0, "delay": 5, "indices": [white]},
+    ], loops=0)
+    _w, _h, frames, _loops = imagecodec.decode_gif_frames(data)
+    assert len(frames) == 5
+    kept = frames[1][0]
+    assert _frame_pixels(kept, 4, 0, 0) == (0, 0, 255, 255), (
+        "an undisposed frame draws over what was there")
+    assert _frame_pixels(kept, 4, 2, 0) == (255, 0, 0, 255), (
+        "and leaves the rest of the screen alone")
+    disposed = frames[3][0]
+    assert _frame_pixels(disposed, 4, 2, 1) == (0, 0, 0, 0), (
+        '"restore to background" has to leave the rectangle transparent')
+    assert _frame_pixels(frames[3][0], 4, 0, 1) == (255, 255, 255, 255), (
+        "frame 4 draws its own pixel before anything is disposed")
+    restored = frames[4][0]
+    assert _frame_pixels(restored, 4, 0, 1) == (0, 255, 0, 255), (
+        '"restore to previous" has to put back what frame 4 covered')
+    assert _frame_pixels(restored, 4, 3, 0) == (255, 255, 255, 255), (
+        "and frame 5's own pixel is still drawn")
+
+
+def test_a_transparent_index_lets_the_frame_before_it_through():
+    data = _animated_gif((2, 1), bytes([255, 0, 0, 0, 255, 0]), [
+        {"w": 2, "h": 1, "indices": [0, 1]},
+        {"w": 2, "h": 1, "clear": 0, "indices": [0, 0]},
+    ], loops=0)
+    _w, _h, frames, _loops = imagecodec.decode_gif_frames(data)
+    assert _frame_pixels(frames[1][0], 2, 0, 0) == (255, 0, 0, 255)
+    assert _frame_pixels(frames[1][0], 2, 1, 0) == (0, 255, 0, 255), (
+        "a pixel of the transparent index must not overwrite the one under it")
+
+
+def test_a_still_gif_is_a_one_frame_animation():
+    """A caller should not have to know which it has before it asks, and the
+    still entry point has to agree with the first frame of the animated one."""
+    data, truth = _gif_vector("still")
+    width, height, frames, loops = imagecodec.decode_gif_frames(data)
+    assert (width, height, len(frames), loops) == (8, 6, 1, -1)
+    assert bytes(frames[0][0]) == truth
+    assert imagecodec.decode_gif(data) == (width, height, frames[0][0])
+    assert imagecodec.decode(data) == (width, height, frames[0][0])
+
+
+def test_decoding_every_frame_of_a_gif_is_bounded():
+    """Every frame of an animation is a screen-sized copy, so the cost is the
+    canvas times the frame count and neither number alone. A large screen and
+    a long run of one-pixel frames is a few hundred bytes on the wire and a
+    third of a gigabyte in hand, which is a decompression bomb with a palette
+    on it."""
+    palette = bytes([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12])
+    screen = 2000, 2000  # 16 MB a frame; MAX_INFLATED buys sixteen of them
+    tiny = {"w": 1, "h": 1, "delay": 1, "indices": [0]}
+    data = _animated_gif(screen, palette, [dict(tiny) for _ in range(17)],
+                         loops=0)
+    assert len(data) < 4096, "the bomb should be small on the wire"
+    try:
+        imagecodec.decode_gif_frames(data)
+    except imagecodec.ImageError as exc:
+        assert "expands too far" in str(exc), str(exc)
+    else:
+        raise AssertionError("17 frames of a 16 MB canvas should be refused")
+    # Sixteen of them is under the ceiling and still decodes, so the guard is
+    # a ceiling and not a blanket refusal of anything with a big canvas.
+    ok = _animated_gif(screen, palette, [dict(tiny) for _ in range(16)],
+                       loops=0)
+    width, height, frames, _loops = imagecodec.decode_gif_frames(ok)
+    assert (width, height, len(frames)) == (2000, 2000, 16)
+    # And the still decoder reads the bomb regardless: it stops at one frame.
+    width, height, _rgba = imagecodec.decode(data)
+    assert (width, height) == (2000, 2000)
+
+
+def test_photoimage_advances_a_gif_on_the_delays_it_carries():
+    data, _truth = _gif_vector("frames")
+    photo = canvasmod.PhotoImage(data=data)
+    assert photo.animated and photo.width() == 8 and photo.height() == 6
+    first = bytes(photo.rgba)
+    # The clock starts when something first asks, not when the file decoded.
+    assert not photo.advance(1000.0), "the first call only starts the clock"
+    assert bytes(photo.rgba) == first
+    assert not photo.advance(1000.04), "40 ms is not the 50 ms frame 1 asked"
+    assert photo.advance(1000.06), "50 ms is"
+    assert photo.frame_index == 1 and bytes(photo.rgba) != first
+    assert not photo.advance(1000.1), "frame 2 is 120 ms long"
+    assert photo.advance(1000.18) and photo.frame_index == 2
+    assert photo.advance(1000.25) and photo.frame_index == 3
+    assert photo.advance(1000.28) and photo.frame_index == 0, "round again"
+    # Each frame was shown for the time it asked for and no longer: the
+    # deadline moves on by the delay, not to the moment it happened to be
+    # noticed, so a tick that arrives late does not stretch the animation.
+    assert photo.advance(1000.33) and photo.frame_index == 1
+
+
+def test_a_gif_that_asked_for_a_finite_number_of_loops_stops_asking():
+    """`trans.gif` was written with ImageMagick's `-loop 3` and carries a
+    NETSCAPE2.0 count of 2, which is the extension's own arithmetic: the
+    count is the repeats *after* the first pass. Three passes, then it holds
+    its last frame and stops costing repaints."""
+    data, _truth = _gif_vector("trans")
+    photo = canvasmod.PhotoImage(data=data)
+    assert photo.loop_count == 2
+    now = 500.0
+    photo.advance(now)
+    seen = 0
+    for _ in range(200):
+        now += 0.08
+        if photo.advance(now):
+            seen += 1
+    assert photo.frame_index == len(photo.frames) - 1, (
+        "it should come to rest on the last frame, not the first")
+    assert photo.finished and not photo.animated
+    assert seen == 3 * len(photo.frames) - 1, (
+        f"three passes of three frames, less the one it started on: {seen}")
+
+
+def test_a_gif_asking_for_no_delay_at_all_is_slowed_to_what_browsers_show():
+    """Files written with a delay of zero are everywhere and are almost
+    always an accident. No browser has honoured one since the 1990s."""
+    data = _animated_gif((2, 1), bytes([255, 0, 0, 0, 255, 0]), [
+        {"w": 2, "h": 1, "delay": 0, "indices": [0, 1]},
+        {"w": 2, "h": 1, "delay": 1, "indices": [1, 0]},
+    ], loops=0)
+    _w, _h, frames, _loops = imagecodec.decode_gif_frames(data)
+    assert [d for _rgba, d in frames] == [0, 10], (
+        "the decoder reports what the file said")
+    photo = canvasmod.PhotoImage(data=data)
+    assert photo.delays == (canvasmod.DEFAULT_GIF_DELAY_MS,
+                            canvasmod.DEFAULT_GIF_DELAY_MS), (
+        "and the animation is what decides not to believe it")
+    photo.advance(0.0)
+    assert not photo.advance(0.05), "50 ms is not a frame"
+    assert photo.advance(0.11), "100 ms is"
+
+
+def test_an_animation_that_fell_behind_does_not_walk_every_frame_it_missed():
+    """A tab that was not ticked for an hour -- asleep, or behind a modal --
+    comes back to a frame, not to an hour of frames."""
+    data, _truth = _gif_vector("frames")
+    photo = canvasmod.PhotoImage(data=data)
+    photo.advance(0.0)
+    started = time.monotonic()
+    assert photo.advance(3600.0)
+    assert time.monotonic() - started < 0.5, "one tick, not an hour of them"
+    assert 0 <= photo.frame_index < len(photo.frames)
+
+
 def test_decode_pnm_rejects_malformed_headers():
     _rejects(b"P6", "a header with nothing after it should be rejected")
     _rejects(b"P6\n2 1\n", "a missing maxval should be rejected")
@@ -1365,6 +1725,55 @@ def test_settle_waits_for_images_a_finished_document_asked_for():
         browser.draw()
         assert _count_pixels(browser.canvas.render(),
                              IMAGE_RGB) == IMAGE_SIZE * IMAGE_SIZE
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def test_an_animated_gif_in_a_page_moves_and_does_not_keep_the_page_busy():
+    """The whole path, from `<img src=...gif>` to different pixels on screen.
+
+    Two things have to be true at once. The picture has to change when the
+    browser ticks -- which it can do without layout hearing about it, because
+    the draw blits whatever `photo.rgba` currently is. And an animation must
+    never count as outstanding work: a GIF looping for ever is the ordinary
+    case, and a browser that called that "still loading" would hang every
+    screenshot and every settle() on the internet's least important pixels.
+    """
+    import base64
+    import shutil
+    import tempfile
+    from feetbrowser.browser import Browser
+
+    data, _truth = _gif_vector("frames")
+    src = "data:image/gif;base64," + base64.b64encode(data).decode()
+    work = tempfile.mkdtemp(prefix="fb-gif-")
+    try:
+        path = os.path.join(work, "page.html")
+        with open(path, "w") as handle:
+            handle.write("<!doctype html><title>gif</title>"
+                         f"<p><img src='{src}'>")
+        browser = Browser()
+        browser.new_tab("file://" + path)
+        tab = browser.tabs[0]
+        assert browser.settle(20.0), "settle should not have timed out"
+        assert tab.image_cache, "the GIF should have decoded"
+        photo = next(iter(tab.image_cache.values()))
+        assert photo.animated and len(photo.frames) == 4
+        browser.draw()
+        before = bytes(browser.canvas.render().pixels)
+
+        assert not browser.busy(), (
+            "an animation is not outstanding work, however long it runs")
+        # The tick is on the browser's clock, so wait out the longest delay
+        # rather than reaching into the photo's.
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline and not tab.tick_images():
+            time.sleep(0.01)
+        assert photo.frame_index != 0, "the tick should have moved it on"
+        browser.draw()
+        assert bytes(browser.canvas.render().pixels) != before, (
+            "and moving on should have changed what is painted")
+        assert not browser.busy(), "still not outstanding work"
     finally:
         shutil.rmtree(work, ignore_errors=True)
 

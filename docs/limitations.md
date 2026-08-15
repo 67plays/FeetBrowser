@@ -125,8 +125,9 @@ than a placeholder because it looks like it worked;
 Within JPEG the modes that are refused rather than approximated are
 arithmetic coding, CMYK and YCCK, 12-bit samples, and the lossless and
 hierarchical frame types. Progressive JPEG does decode. EXIF orientation is
-ignored, so a photograph that relies on it appears rotated. Animated GIFs
-show their first frame and do not move.
+ignored, so a photograph that relies on it appears rotated. Animated GIFs do
+animate: every frame, the disposal method, transparency and the loop count,
+on the same tick that drives video.
 
 ## The JavaScript engine
 
