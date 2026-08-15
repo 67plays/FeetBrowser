@@ -10,13 +10,15 @@ well-compressed web MP4 -- and not one with SP or SI slices, nor a B slice
 coded with CAVLC; see [H.264, in Fortran](#h264-in-fortran). Everything else
 is identified by name and refused in public.
 
-Sound now leaves the machine. There is a platform output device on all three
-platforms, a lock-free ring, a polyphase resampler, a mixer with per-source
-gain and a master volume, and a monotonic audio clock -- see
-[Audio output](#audio-output). What there is not is anything that produces
-samples to put in it: no audio codec is decoded yet, so no file you can load
-plays with sound. The output half is finished and measured; the decoder half
-is not written.
+Audio now has both halves and not the join between them. The AAC-LC track of
+an ordinary web MP4 comes out as PCM samples in memory, exactly as a
+reference decoder produces them -- see [AAC, in Fortran](#aac-in-fortran) --
+and there is a platform output device on all three platforms, a lock-free
+ring, a polyphase resampler, a mixer with per-source gain and a master
+volume, and a monotonic audio clock, see [Audio output](#audio-output). What
+does not exist is the wire between them: nothing hands a decoded AAC track to
+a mixer source, and nothing synchronises it against the video clock, so
+loading a file still plays it silently.
 
 Read this before adding a codec. The point of writing it down is that the
 hard parts here are not the codec; they are the seams the codec plugs into,
@@ -106,6 +108,22 @@ browser. Everything in it is a pure function of a `bytes` object.
   `reset()`. When `frame(i)` is not the sequential next one it rewinds to
   `keyframe_before(i)` and replays. Sequential playback costs one decode per
   frame; a seek costs the distance back to the keyframe.
+- `probe_audio(data)` and `open_audio(data)` are the same pair for sound,
+  returning an `AudioInfo` (container, codec, sample rate, channels,
+  duration, coded frame count, `supported`, `reason`) and an `AudioTrack`.
+  Deliberately a separate pair rather than more fields on `MediaInfo`: a
+  file can have a video track we play and an audio track we can only name,
+  and one answer for both would have to be wrong about one of them. A file
+  with no sound at all comes back as an `AudioInfo` saying so rather than as
+  an error.
+- `AudioTrack` is the shape of `VideoTrack`, because the thing above them --
+  a scheduler holding a clock -- wants to ask both the same questions.
+  `frame(i)` returns an `AudioFrame` (index, pts, duration, sample rate,
+  channels, and interleaved float32 bytes); one "frame" is one coded AAC
+  frame, 1024 samples per channel, about 23 milliseconds. There is no
+  keyframe in AAC -- every frame carries a whole spectrum but its first half
+  is the previous frame's transform tail -- so an out-of-order `frame(i)`
+  replays from the start of the track rather than from a sync sample.
 
 Every read goes through a `_Reader` that bounds-checks, and every walk is
 capped: `MAX_FRAMES`, `MAX_CHUNKS`, `MAX_FRAME_BYTES`, `MAX_DEPTH`, plus
@@ -529,18 +547,145 @@ no Linux or Windows machine was available while they were written, and CI
 runners have no sound device to exercise the live half on either. Read them
 as carefully-written and unproven. The CoreAudio backend is the one that has
 actually made a noise.
+## AAC, in Fortran
+
+The audio half of an ordinary web MP4, decoded to PCM. It is in
+`fortran/inst*.f`, wrapped by `feetbrowser/aac.py`, and it is called the
+*instep* -- the arch that carries the weight. It shares nothing with the
+H.264 decoder next door but the build machinery: `IP*` routines and `/IP*/`
+COMMON blocks against H.264's `H2*` and `/H2*/`, because Fortran has one
+global namespace and two decoders in one process have to stay out of each
+other's way.
+
+**Exactly what it does.** ADTS framing and MP4's `AudioSpecificConfig` out
+of an `esds` box, including the backward-compatible SBR sync word and the
+`program_config_element` that an implicit channel configuration needs;
+`raw_data_block` with its SCE, CPE, LFE, CCE, DSE, PCE and FIL elements;
+`ics_info`, section data, the three scalefactor difference chains, pulse
+data, TNS and spectral data; all eleven spectral Huffman codebooks and
+codebook 11's escape sequence; inverse quantisation; mid/side and intensity
+stereo; perceptual noise substitution; temporal noise shaping; all four
+window sequences (ONLY_LONG, LONG_START, EIGHT_SHORT with grouping, and
+LONG_STOP) in both the sine and KBD window shapes; the inverse MDCT; and
+windowed overlap-add out to float samples in [-1, 1]. Mono and stereo.
+
+**The transform.** An AAC frame is 1024 inverse-MDCT outputs per channel or
+eight interleaved 128-point ones, forty-three times a second, and the
+definition of the transform is an O(N^2) sum that costs about a thousand
+times what it needs to. So the long transform is a DCT-IV done as a
+512-point complex FFT with the -pi(l + 1/8)/M twiddle on both sides and the
+standard's fold applied to the result, and the short one is the same thing
+at 64 points. The O(N^2) definition is written out as well, in `IPIMDS`, and
+nothing calls it to decode anything: it is there so that
+`test_the_fast_imdct_computes_the_transform_it_claims_to` can hold the fast
+path to the formula it claims to compute rather than to itself. They agree
+to 3.4e-13 relative at 1024 points.
+
+Measured on this machine, one core: 0.49 seconds of 44.1 kHz stereo decodes
+in 1.0 millisecond, which is about 500x realtime, or 20 microseconds per
+frame per channel against the 23 milliseconds a frame plays for. That is the
+number that matters, because what will consume this is a mixer on a
+deadline.
+
+**Ground truth.** `tests/fixtures/aac` holds fourteen ADTS streams and,
+beside each, the exact float samples FFmpeg 7.1 decoded it to,
+zlib-compressed. They cover a pure tone, broadband noise, a stereo file the
+encoder really does code in mid/side, a transient that forces all four
+window sequences, 32 kbit/s stereo under bit starvation, 320 kbit/s where
+the quantised coefficients run into the thousands and codebook 11's escape
+reaches eight leading ones, all eight scalefactor band layouts the standard
+defines (8, 16, 24, 32, 44.1, 48, 64 and 96 kHz), and one stream from a
+different encoder entirely, for temporal noise shaping. Between them they
+exercise every one of the eleven codebooks.
+
+Those last two groups are there because of what was missing. Four of the
+eight band tables had no vector at all, and the TNS filter could be deleted
+outright without changing one sample of anything: FFmpeg's encoder set
+`tns_data_present` in two channel-frames out of 203 and signalled no filters
+in both. Coverage a threshold cannot see is coverage that is not there, so
+`test_the_tools_and_the_layouts_are_all_actually_reached` now asserts it
+directly, and the TNS vector comes from Apple's AudioToolbox encoder --
+which is macOS-only, and so the one vector `make_aac_vectors.sh` cannot
+regenerate everywhere. Nothing at test time needs any encoder.
+
+AAC is not a bit-exact specification -- the standard defines the transform
+in real arithmetic -- so the comparison is numerical, and the numbers are:
+worst case across all fourteen vectors, a maximum absolute sample error of
+3.6e-07, an RMS error of 3.4e-08 and an SNR of 137.9 dB. FFmpeg's own
+float32 output quantises at 6e-08 near full scale, so that is a handful of
+ulps and not a disagreement about decoding. The test asserts 1e-06, 1e-07
+and 130 dB. For scale, with the tools deleted one at a time: no TNS is
+29 dB, and a noise seed one bit out is 2e-04 in the first frame of a tone.
+
+A threshold at the end of a pipeline can hide a bug in the middle of it, so
+the stages that can be compared exactly are. Every frame of every vector is
+consumed to the bit -- the number of bits read equals the number the ADTS
+header promised, which no wrong codeword length in any codebook can leave
+true. Dequantisation is recomputed in Python from the decoder's own
+quantised values and scalefactors and agrees to the last bit. The windows
+are checked against their closed forms and against Princen-Bradley.
+
+**Noise substitution is a deliberate copy.** A PNS band carries an energy
+and no coefficients: the decoder is told to put noise of that loudness
+there, and *which* noise is left to the decoder. There is no correct answer,
+which means there is also no way to compare a PNS band against a reference
+decoder unless both draw the same numbers. So `IPRAND` reproduces FFmpeg's
+generator and its seed exactly, and this is the one place in the project
+where the implementation was chosen to match another program rather than a
+standard. Without it these vectors would agree everywhere except in the
+bands that happen to be noise-substituted, which is most bands of a quiet
+tone, and the SNR would fall from 138 dB to about 72 -- which is what it
+did, for a day, before the seed was right.
+
+**Why Fortran.** The same reason as H.264, and the licence's condition 6,
+but the shape of the code is different: this is floating-point kernels over
+contiguous arrays -- an FFT butterfly, a windowed overlap-add, a Levinson
+step-up -- which is the workload Fortran compilers have been aimed at for
+fifty years, and it benchmarks within a small factor of C without any of it
+being written cleverly.
+
+**How it is built and loaded.** Exactly as `h264.py` does it: find a
+gfortran, compile the five sources into a shared library named after a hash
+of them, load it with `ctypes`, check the ABI integer, and remember the
+failure if any of that does not happen. No compiler means
+`aac.available()` is false and an AAC track is named and refused in public,
+which is the same contract every other unplayable file gets.
+
+The state is in COMMON, so there is one decoder in the process. Audio makes
+that sharper than video did: there is no keyframe in AAC and every frame's
+first half is the previous frame's windowed transform tail, so a decoder
+cannot start clean anywhere. Rather than replaying the stream the way
+`h264.Decoder` replays access units, each `aac.Decoder` saves its own 2048
+doubles of overlap out of the library and puts them back when it finds
+another instance has been at it in between. Two `<audio>` elements are then
+slow and correct rather than fast and clicking.
+
+**What it is not.** No SBR, so no HE-AAC; no Parametric Stereo; no Main
+profile prediction; no LTP; no SSR gain control; no coupling channels; no
+LFE; nothing above two channels; no 960-sample frames. None of those is
+stubbed or half-written -- each is recognised and refused with a status code
+and a sentence of its own, because a decoder that silently ignores SBR
+produces something that sounds like a bad phone line and a decoder that
+ignores PS produces mono.
+
+Two smaller gaps worth naming. Pulse data is implemented and is not covered
+by any fixture, because FFmpeg's encoder never emits it. And the decoder
+refuses more than two channels rather than downmixing, so a 5.1 soundtrack
+is silent rather than folded.
 
 ## What is not supported
 
 Bluntly, because a foundation that overstates itself is worse than none:
 
-- **No audio *decoder*.** Nothing in the project turns a compressed audio
-  stream into samples. AAC, MP3, Vorbis and Opus are all absent, AVI and MP4
-  audio tracks are still skipped by the demuxers, and no `<video>` element
-  makes a noise. Everything downstream of "here are some samples" is
-  finished -- device, ring, resampler, mixer, clock, and the whole of it
-  measured -- so this is now one missing piece rather than a missing
-  subsystem. See [Audio output](#audio-output).
+- **No file has ever made a noise.** Both halves exist and nothing joins
+  them. AAC-LC decodes to PCM (see [AAC, in Fortran](#aac-in-fortran)) and
+  the output stack plays PCM (see [Audio output](#audio-output)), and no
+  code hands the first to the second: `AudioTrack` produces samples with
+  timestamps and nothing consumes them, so a page with a `<video>` element
+  on it is still silent. The `<audio>` element is not implemented at all.
+  AVI and WebM audio streams are named by `probe_audio` and not decoded --
+  the decoder is wired to MP4 only, because MP4 is where AAC is. MP3,
+  Vorbis and Opus are absent entirely.
 - **No A/V synchronisation.** The clock video should follow exists and is
   duck-compatible with `media.Clock`, but nothing has been wired to it:
   `VideoPlayer` still runs off `SystemClock`. Handing a `Scheduler` a
@@ -548,6 +693,11 @@ Bluntly, because a foundation that overstates itself is worse than none:
   the file has an audio track is not done, and doing it correctly means
   following `Source.position()` rather than the device clock -- see
   [Audio output](#audio-output).
+- **AAC-LC only.** HE-AAC (SBR), HE-AAC v2 (Parametric Stereo), Main
+  profile, LTP, SSR, coupling channels, LFE, more than two channels and
+  960-sample frames are each refused by name with a status code of their
+  own. SBR is the one worth knowing about: a low-bitrate web stream is
+  often HE-AAC, and it is refused rather than played at half its bandwidth.
 - **No inter-frame codec other than H.264.** I, P and B slices decode, under
   either entropy coder, which is what an ordinary well-compressed web MP4 is;
   but there is no VP8, VP9, AV1 or MPEG-4 ASP at all. A stream with SP or SI
@@ -627,17 +777,19 @@ every codec wants to be handed.
    last byte arrives. Worth doing now rather than later, because MJPEG over
    HTTP is a format we can already decode and cannot currently play at all:
    the stream never ends, so waiting for the last byte waits forever.
-6. **An audio decoder, and then A/V sync.** The output half of this item is
-   done: `heel.py` plus a CoreAudio, an ALSA and a waveOut backend, with the
-   resampler measured and the clock published. What is left is the two ends.
-   An audio codec -- AAC is what an MP4 has -- feeding a `heel.Source`, and
-   the demuxers keeping the audio track they currently skip. Then A/V sync,
-   which is now a small change rather than a design problem: give `Scheduler`
-   a clock reading `Source.position()` when there is a sound track, and let
-   the picture follow it. Read the note under
+6. **Join the two halves of the audio path, and then A/V sync.** Both ends
+   are built and neither knows about the other. `mediacodec.open_audio()`
+   gives an `AudioTrack` handing out 1024-sample frames of interleaved
+   float32 with timestamps; `heel.Source` takes interleaved float32 at a
+   rate and resamples it to the device's. The work is the pump between them
+   and the demuxers keeping the audio track they currently skip. Then A/V
+   sync, which is a small change rather than a design problem: give
+   `Scheduler` a clock reading `Source.position()` when there is a sound
+   track, and let the picture follow it. Read the note under
    [Audio output](#audio-output) about which of the two clocks to use first;
    the wrong one is off by a ring's depth plus the device's latency, which
-   over Bluetooth is most of a fifth of a second.
+   over Bluetooth is most of a fifth of a second. After that, SBR, so that
+   low-bitrate HE-AAC streams play at all.
 7. **Per-decoder H.264 state.** Both entropy coders and all three slice types
    are done, so what is left in `fortran/` is not a feature but the shape of
    the thing: the decoder's state is `COMMON`, which is to say there is one
@@ -722,10 +874,29 @@ and says what each encoder option is for; it is not run by `test.sh` and
 ffmpeg is not a dependency of anything. The fixtures are committed so the
 suite runs offline and on a machine with no encoder.
 
-The whole suite skips cleanly where there is no `gfortran`, and one test
-forces that state on a machine that has one: it takes the loaded library
-away and asserts that `probe()`, `MediaInfo` and `open_video()` behave the
-way they did before the decoder existed. That test is the reason the
+`tests/test_aac.py` is the same arrangement for audio, with one difference
+that matters. H.264 is bit-exact and is compared byte for byte; AAC is not,
+so the PCM comparison is numerical and the threshold is the measured error
+with a small margin rather than a round number chosen to pass -- 1e-06
+maximum absolute error against a worst measured 3.6e-07, and a 130 dB floor
+against a worst measured 137.9 dB. Because a threshold at the end can hide a
+bug in the middle, the stages that can be compared exactly are compared
+exactly and not through the samples: every frame is consumed to the bit, the
+dequantiser is recomputed in Python coefficient by coefficient and agrees to
+the last bit, the fast IMDCT is held against the standard's summation
+written out in the test, and the windows against their closed forms. There
+are also tests that the fixtures still exercise what they were chosen for --
+mid/side, intensity, noise substitution, all four window sequences, temporal
+noise shaping and all eight scalefactor band layouts -- so that a
+regenerated vector cannot quietly stop proving anything.
+`tests/fixtures/aac/make_aac_vectors.sh` is the offline tool that made them,
+and like its H.264 counterpart it is not run by `test.sh`.
+
+The whole suite skips cleanly where there is no `gfortran`, and one test in
+each of the two Fortran suites forces that state on a machine that has one:
+it takes the loaded library away and asserts that `probe()`, `probe_audio()`,
+`MediaInfo`, `AudioInfo`, `open_video()` and `open_audio()` behave the way
+they did before the decoders existed. Those tests are the reason the
 degradation path is a claim rather than a hope.
 
 Audio has its own suite, `tests/test_audio.py`, and its own version of that

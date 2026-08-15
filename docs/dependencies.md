@@ -28,7 +28,7 @@ will need, but they describe finished work rather than open questions.
 The build side is heavier than the run side, and that is where most of the
 cost actually is: Rust with five crates, `maturin` and a virtualenv to install
 the extension into, `pyflakes` for lint, a Go toolchain for a package the
-browser does not call, and `gfortran` for the H.264 decoder. The last of
+browser does not call, and `gfortran` for the H.264 and AAC decoders. The last of
 those is the only compiler here that is genuinely optional at runtime; see
 [Fortran](#fortran) below.
 
@@ -404,37 +404,50 @@ are self-documenting comments and nothing more.
 
 ## Fortran
 
-`fortran/` is nine fixed-form FORTRAN 77 sources and one include file: the
-H.264 decoder, described in [media.md](media.md#h264-in-fortran). It has no
-dependencies of any kind (no library, no package manager, no lock file,
-nothing linked but `libc`), so the only entry it earns in this file is a
-compiler on the build side, and even that is conditional.
+`fortran/` is fixed-form FORTRAN 77 and holds two decoders that share
+nothing but the build machinery: eleven sources and an include file for
+H.264, five and an include file for AAC-LC, described in
+[media.md](media.md#h264-in-fortran) and
+[media.md](media.md#aac-in-fortran). Neither has dependencies of any kind
+(no library, no package manager, no lock file, nothing linked but `libc`),
+so the only entry they earn in this file is a compiler on the build side,
+and even that is conditional.
 
-`feetbrowser/h264.py` shells out to whatever `gfortran` it can find,
-compiles the sources into a shared library in the temporary directory named
-after a hash of them and of the compiler, and loads it with `ctypes`. There
-is no build step in `run.sh`, no target in CI that has to succeed, and
-nothing in `rust/Cargo.toml` or `pyproject.toml` that mentions it.
+`feetbrowser/h264.py` and `feetbrowser/aac.py` each shell out to whatever
+`gfortran` they can find, compile their own sources into a shared library in
+the temporary directory named after a hash of them and of the compiler, and
+load it with `ctypes`. There is no build step in `run.sh`, no target in CI
+that has to succeed, and nothing in `rust/Cargo.toml` or `pyproject.toml`
+that mentions it.
 
 The packaged applications are the exception, and they have to be: a user has
 no gfortran, so a bundle that carried only the sources carried no video at
-all. Each of the three packaging scripts compiles the decoder on the build
-machine through `python3 -m feetbrowser.h264 --build`, ships the result
+all. Each of the three packaging scripts compiles the video decoder on the
+build machine through `python3 -m feetbrowser.h264 --build`, ships the result
 inside the package, and checks with `otool -L`, `ldd` or a stripped `PATH`
 that gfortran's runtime went in with it rather than being left behind as a
 dependency on the build machine. So gfortran is a build-time requirement for
-packaging on all three platforms, and a run-time requirement nowhere. Missing compiler,
-failed compile or an ABI mismatch all resolve to `h264.available()` being
-false, at which point an H.264 file is named and refused the way it was
-before the decoder was written. `tests/test_h264.py` asserts that path by
-forcing it, so it is a tested behaviour rather than an intention, and the
-whole suite passes on a machine with no Fortran toolchain.
+packaging on all three platforms, and a run-time requirement nowhere. The
+sound decoder is not shipped that way yet and still compiles on demand,
+which means a packaged build has pictures and no sound; that is the next
+thing the packaging scripts want.
 
-The choice of language is worth one line, because it is the obvious question:
-the CABAC decode-decision loop is a dependent chain of integer compares,
-table lookups and shifts, benchmarked at 119.7 Mbin/s in Fortran against
-153.7 in C. Close enough that the deciding factor was the rest of this
-file: Fortran arrives with no crates to audit.
+Missing compiler, failed compile or an ABI mismatch all resolve to
+`h264.available()` or `aac.available()` being false, at which point the file
+is named and refused the way it was before the decoders were written.
+`tests/test_h264.py` and `tests/test_aac.py` assert that path by forcing it,
+so it is a tested behaviour rather than an intention, and the whole suite
+passes on a machine with no Fortran toolchain.
+
+The choice of language is worth one line each, because it is the obvious
+question. The CABAC decode-decision loop is a dependent chain of integer
+compares, table lookups and shifts, benchmarked at 119.7 Mbin/s in Fortran
+against 153.7 in C. The AAC side is the opposite shape -- floating-point
+kernels over contiguous arrays, which is the workload Fortran compilers have
+been aimed at for fifty years -- and decodes
+44.1 kHz stereo at about 500x realtime on one core. Close enough in both
+cases that the deciding factor was the rest of this file: Fortran arrives
+with no crates to audit.
 
 **Verdict: optional to run, required to package.** `dnf install
 gcc-gfortran` in the AppImage container, `brew install gcc` on both macOS
