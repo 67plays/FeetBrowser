@@ -52,8 +52,12 @@ def check_video(args):
     print("video: H.264 decoder ready, from %s" % h264.library_path())
     if not args:
         return 0
-    with open(args[0], "rb") as handle:
-        stream = handle.read()
+    try:
+        with open(args[0], "rb") as handle:
+            stream = handle.read()
+    except OSError as exc:
+        print("video: cannot read %s: %s" % (args[0], exc.strerror or exc))
+        return 1
     try:
         width, height, picture = h264.Decoder().decode_i420(stream)
     except h264.H264Error as exc:
@@ -64,8 +68,12 @@ def check_video(args):
     if len(args) < 2:
         return 0
     import zlib
-    with open(args[1], "rb") as handle:
-        truth = zlib.decompress(handle.read())
+    try:
+        with open(args[1], "rb") as handle:
+            truth = zlib.decompress(handle.read())
+    except (OSError, zlib.error) as exc:
+        print("video: cannot read %s: %s" % (args[1], exc))
+        return 1
     if picture != truth:
         print("video: the picture does not match %s (%d bytes against %d)"
               % (os.path.basename(args[1]), len(picture), len(truth)))
