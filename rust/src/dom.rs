@@ -6,6 +6,13 @@
 //! `children`, `is_focused`, `style`, text nodes, ...) exactly as `jsdom.py`
 //! did, so the Python layout/rendering code keeps working unchanged.
 //!
+//! That is deliberate, and measured. Moving the live document into the arena
+//! would let these functions read it directly, but the Python side reads DOM
+//! nodes ~1.2 million times per style+layout pass on a real page against the
+//! JS engine's single digits, so it would trade a handful of crossings for a
+//! million. See the header of `materialize.rs` for the numbers and for the
+//! in-place-mutation problem that makes the swap unsound as well as slow.
+//!
 //! Exposed to Python as `dom_get(kind, target, name)`, `dom_set(...)`,
 //! `dom_call(...)`. The Python classes in `jsdom.py` are thin shims whose
 //! `js_get`/`js_set` delegate here, and native methods are returned as
@@ -708,22 +715,14 @@ fn set_inner_html(
     } else {
         str_of(py, value)?
     };
-    let htmlparser = py.import("feetbrowser.htmlparser")?;
-    let parser_cls = htmlparser.getattr("HTMLParser")?;
-    let parser = parser_cls.call1((html,))?;
-    let root = parser.call_method0("parse")?;
-    let mut source: Option<Bound<'_, PyList>> = None;
-    for n in iter_elements(py, &root)? {
-        let nb = n.bind(py);
-        if node_tag(nb) == "body" {
-            source = Some(nb.getattr("children")?.cast_into::<PyList>()?);
-            break;
-        }
-    }
-    let source = match source {
-        Some(s) => s,
-        None => root.getattr("children")?.cast_into::<PyList>()?,
-    };
+    // Parse in the context of the element being assigned to, not as a whole
+    // document. That is what the spec's fragment algorithm is for, and it is
+    // the difference between `row.innerHTML = "<td>x"` producing a cell and
+    // producing nothing: a document parse has no open <table>, so the cell is
+    // dropped before it is ever inserted.
+    let context = node_tag(node);
+    let context = if context.is_empty() { "body" } else { &context };
+    let source = crate::materialize::fragment_children(py, &html, context)?;
     for c in source.iter() {
         c.setattr("parent", node)?;
     }

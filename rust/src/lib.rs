@@ -1,18 +1,19 @@
 mod ast;
 mod css;
 mod dom;
-// The arena-backed DOM that replaces the `dom` proxy above. It is compiled
-// and tested from Phase 1, but nothing is wired onto it until the HTML tree
-// builder (Phase 2) and the interpreter (Phase 3) land; `dom` stays the live
-// path until then.
+// The arena the tree builder parses into. It is the browser's parse-time
+// representation; the laid-out document itself stays as Python objects, for
+// the reasons measured in `materialize.rs`.
 mod domtree;
 mod font;
-// The WHATWG tokeniser and tree builder (Phase 2). Like `domtree`, it is
-// compiled and tested but not yet on the live path; `feetbrowser/htmlparser.py`
-// stays in charge until Phase 3 rewires the browser onto it.
+// The WHATWG tokeniser and tree builder. This is the browser's HTML parser:
+// `feetbrowser/htmlparser.py` now calls it and keeps only the node types.
 mod html;
 mod image;
 mod interp;
+// Hands the arena tree to Python as `htmlparser.Element`/`Text` objects, which
+// is what makes the tree builder above the browser's real parser.
+mod materialize;
 mod parser;
 mod pybind;
 mod pyutil;
@@ -37,6 +38,10 @@ fn feetbrowser_engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(dom::dom_get, m)?)?;
     m.add_function(wrap_pyfunction!(dom::dom_set, m)?)?;
     m.add_function(wrap_pyfunction!(dom::dom_call, m)?)?;
+
+    // -- html parsing --
+    m.add_function(wrap_pyfunction!(materialize::parse_html, m)?)?;
+    m.add_function(wrap_pyfunction!(materialize::parse_fragment_html, m)?)?;
 
     // -- image codecs --
     m.add("ImageError", py.get_type::<image::ImageError>())?;

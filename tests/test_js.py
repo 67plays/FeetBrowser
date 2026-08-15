@@ -150,6 +150,47 @@ def test_js_inner_html_set():
     assert "hi" in texts, f"innerHTML markup not rendered: {texts}"
 
 
+def test_js_inner_html_parses_in_context():
+    """innerHTML parses as a fragment in the target element's context.
+
+    A <td> is only legal once the tree builder is inside a table, so parsing
+    "<td>cell</td>" as a whole document drops the cell and keeps the bare
+    text. Assigning it to a <tr> has to keep the cell.
+    """
+    tab = _make_tab(
+        '<table><tr id="r"></tr></table>'
+        '<script>document.getElementById("r").innerHTML = "<td>cell</td>";'
+        '</script>')
+    row = None
+    for n in tree_to_list(tab.nodes, []):
+        if isinstance(n, Element) and n.attributes.get("id") == "r":
+            row = n
+    assert row is not None, "row went missing"
+    tags = [c.tag for c in row.children if isinstance(c, Element)]
+    assert tags == ["td"], f"expected a <td> child, got {tags}"
+    assert "cell" in _texts(tab), "cell text not rendered"
+
+
+def test_js_inserted_stylesheet_applies():
+    """A <style> element created by a script has to reach the cascade.
+
+    The restyle after a JS mutation used to reuse the rule list gathered at
+    parse time, so a sheet inserted afterwards -- how most component
+    libraries ship their CSS -- was collected into the DOM and then ignored.
+    """
+    tab = _make_tab(
+        '<p id="t">st</p>'
+        '<script>'
+        'var s = document.createElement("style");'
+        's.textContent = "#t { color: red }";'
+        'document.getElementsByTagName("head")[0].appendChild(s);'
+        '</script>')
+    st = [c for c in _drawtexts(tab) if c.text == "st"]
+    assert st, "no 'st' text node rendered"
+    assert st[0].color == "red", \
+        f"script-inserted stylesheet did not apply: {st[0].color}"
+
+
 def test_js_style_mutation():
     tab = _make_tab(
         '<p style="color: black">st</p>'

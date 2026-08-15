@@ -319,10 +319,16 @@ def test_dechunk_safety():
 
 def test_implicit_p_close():
     dom = HTMLParser("<p>alpha<div>beta</div></p>").parse()
+    # The first <p> is the one the markup opened. The trailing </p> has no
+    # open p to close by then -- the <div> already closed it -- and the spec
+    # says an unmatched </p> opens and immediately closes an empty one, so
+    # there is a second, empty <p> after the div. Taking the last <p> here
+    # would measure that one.
     p = None
     for n in tree_to_list(dom, []):
         if isinstance(n, Element) and n.tag == "p":
             p = n
+            break
     assert p is not None
     ptext = "".join(c.text for c in p.children if isinstance(c, Text))
     eq(ptext, "alpha", "block opened inside <p> closes it")
@@ -2220,7 +2226,9 @@ def test_a_container_query_stays_off():
     eq(_reds(html, css), [], "the wide variant did not apply")
     dom = HTMLParser(html).parse()
     style(dom, CSSParser(css).parse())
-    eq(dom.children[0].children[0].children[0].style["color"], "green",
+    p = next(n for n in tree_to_list(dom, [])
+             if isinstance(n, Element) and n.tag == "p")
+    eq(p.style["color"], "green",
        "and the unconditional rule still holds")
     # @supports and @layer are still flattened: a page that wraps its whole
     # stylesheet in a layer has to keep working.

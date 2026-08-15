@@ -1,7 +1,7 @@
 """The FeetBrowser GUI and the load pipeline that ties every stage together.
 
 Pipeline per navigation:
-    URL.request -> HTMLParser -> collect stylesheets -> CSSParser + cascade
+    URL.request -> htmlparser.parse -> collect stylesheets -> CSSParser + cascade
     -> DocumentLayout -> display list -> paint on a canvas.
 
 Chrome (tabs, address bar, back/forward, scrollbar) is drawn by hand onto the
@@ -23,7 +23,8 @@ import urllib.parse
 from collections import deque
 
 from .net import URL, open_stream
-from .htmlparser import HTMLParser, Text, Element
+from .htmlparser import Text, Element
+from .htmlparser import parse as parse_html
 from .cssparser import CSSParser, style, parse_inline, set_viewport, \
     media_matches, get_viewport
 from .layout import DocumentLayout, paint_tree, get_font, _measure, \
@@ -335,6 +336,12 @@ class Tab:
         # mutations can be re-styled, and the live interpreter reused across
         # script runs and click-handler dispatch.
         self._last_rules = None
+        # The <style>/<link> set `_last_rules` was built from, and the parsed
+        # bodies of sheets already fetched. Together they let a restyle after
+        # a JS mutation notice a newly inserted sheet without re-fetching the
+        # ones that were already there.
+        self._rule_sources = None
+        self._sheet_cache = {}
         self._js_interp = None
         self._js_doc = None
         # Deferred JS/meta-refresh navigation, honored after the current
@@ -634,6 +641,11 @@ class Tab:
         self._js_log_cursor = 0
         self._js_interp = None
         self._js_doc = None
+        # A new document means a new cascade; the old page's sheets must not
+        # leak into it.
+        self._last_rules = None
+        self._rule_sources = None
+        self._sheet_cache = {}
         self._pending_nav = None
         self._js_fetch_results.clear()
         self._js_xhr_results.clear()
@@ -647,7 +659,7 @@ class Tab:
         if self.browser:
             body = toes.rewrite(self.browser.toe_contexts, url, body)
 
-        self.nodes = HTMLParser(body).parse()
+        self.nodes = parse_html(body)
         self.title = get_title(self.nodes) or str(url)
 
         # <base href> (if any) overrides where relative URLs resolve from.
@@ -659,33 +671,7 @@ class Tab:
         # zero-delay one before we bother styling/laying out this page.
         self._check_meta_refresh()
 
-        # Gather stylesheets: UA + toe-injected + <style> + <link rel=stylesheet>.
-        rules = list(DEFAULT_STYLE_SHEET)
-        if self.browser:
-            injected = toes.extra_css(self.browser.toe_contexts, url)
-            if injected:
-                try:
-                    rules.extend(CSSParser(injected).parse())
-                except Exception:  # noqa: BLE001 - a broken sheet shouldn't stop the page
-                    pass
-        for sheet in inline_styles(self.nodes, []):
-            try:
-                sheet = _expand_imports(sheet, resolve_from, log=self._add_error)
-                rules.extend(CSSParser(sheet).parse())
-            except Exception:  # noqa: BLE001 - a broken sheet shouldn't stop the page
-                pass
-        for href in find_links(self.nodes, []):
-            sheet_url = None
-            try:
-                sheet_url = resolve_from.resolve(href)
-                _h, css_body, _c = sheet_url.request()
-                css_body = _expand_imports(css_body, sheet_url,
-                                           log=self._add_error)
-                rules.extend(CSSParser(css_body).parse())
-            except Exception as e:  # noqa: BLE001 - skip stylesheets that fail
-                self._add_error(
-                    f"CSS {sheet_url or href} ({type(e).__name__})")
-                continue
+        rules = self._gather_rules(url, resolve_from)
 
         style(self.nodes, rules)
         # Keep the rules around so JS mutations can re-style the tree.
@@ -694,6 +680,65 @@ class Tab:
         self._absolutize_media_srcs()
         self.render()
         self._run_scripts()
+
+    def _stylesheet_sources(self):
+        """What the cascade is currently built from: every <style> element's
+        text and every <link rel=stylesheet> href, in document order.
+
+        This is the cache key for `_gather_rules`. A script that inserts a
+        <style> or a <link> changes it; a script that only moves nodes around
+        or edits text does not, and re-fetching every linked sheet on every
+        such mutation would put a network round trip behind `el.textContent =
+        x`.
+        """
+        return (tuple(inline_styles(self.nodes, [])),
+                tuple(find_links(self.nodes, [])))
+
+    def _gather_rules(self, url, resolve_from):
+        """Collect the cascade: UA + toe-injected + <style> + <link>.
+
+        Linked sheets are fetched, so results are memoised against
+        `_stylesheet_sources()` and the fetched bodies against their URL.
+        """
+        sources = self._stylesheet_sources()
+        if self._last_rules is not None and sources == self._rule_sources:
+            return self._last_rules
+
+        rules = list(DEFAULT_STYLE_SHEET)
+        if self.browser:
+            injected = toes.extra_css(self.browser.toe_contexts, url)
+            if injected:
+                try:
+                    rules.extend(CSSParser(injected).parse())
+                except Exception:  # noqa: BLE001 - a broken sheet shouldn't stop the page
+                    pass
+        for sheet in sources[0]:
+            try:
+                sheet = _expand_imports(sheet, resolve_from, log=self._add_error)
+                rules.extend(CSSParser(sheet).parse())
+            except Exception:  # noqa: BLE001 - a broken sheet shouldn't stop the page
+                pass
+        for href in sources[1]:
+            sheet_url = None
+            try:
+                sheet_url = resolve_from.resolve(href)
+                key = str(sheet_url)
+                if key in self._sheet_cache:
+                    rules.extend(self._sheet_cache[key])
+                    continue
+                _h, css_body, _c = sheet_url.request()
+                css_body = _expand_imports(css_body, sheet_url,
+                                           log=self._add_error)
+                parsed = CSSParser(css_body).parse()
+                self._sheet_cache[key] = parsed
+                rules.extend(parsed)
+            except Exception as e:  # noqa: BLE001 - skip stylesheets that fail
+                self._add_error(
+                    f"CSS {sheet_url or href} ({type(e).__name__})")
+                continue
+
+        self._rule_sources = sources
+        return rules
 
     def _absolutize_media_srcs(self):
         """Resolve <img>/<video> src attributes to absolute URLs so the
@@ -937,6 +982,14 @@ class Tab:
             merged.update(overrides)
             node.attributes["style"] = "; ".join(
                 f"{k}: {v}" for k, v in merged.items())
+        # Re-gather before restyling. A script that inserts a <style> or a
+        # <link rel=stylesheet> -- which is how most component libraries ship
+        # their CSS -- adds rules that are not in `_last_rules`, so restyling
+        # with the stored list alone would silently ignore the new sheet.
+        # `_gather_rules` returns the stored list unchanged when the set of
+        # sheets has not moved, so the common mutation costs one comparison.
+        if self.base_url is not None:
+            self._last_rules = self._gather_rules(self.base_url, self.base_url)
         if self._last_rules is not None:
             style(self.nodes, self._last_rules)
         fresh_title = get_title(self.nodes)
