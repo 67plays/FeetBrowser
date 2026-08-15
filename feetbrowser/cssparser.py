@@ -297,9 +297,165 @@ def _strip_comments(value):
     return "".join(out)
 
 
-_ATTR_SEL_RE = re.compile(
-    r"\[\s*([-_A-Za-z0-9]+)\s*"
-    r"(?:([~|^$*]?=)\s*(?:\"([^\"]*)\"|'([^']*)'|([^\]\s]+))\s*)?\]")
+# -- escaped identifiers (CSS Syntax sec. 4.3.7) --------------------------
+#
+# `.md\:flex`, `.w-1\/2`, `.p-\[10px\]`: a utility-class stylesheet is mostly
+# identifiers containing characters that are punctuation to the selector
+# grammar, written with a backslash to say "this is a name character, not
+# syntax". Matching a name with a plain `[-_A-Za-z0-9]+` does not merely fail
+# on those -- it matches the prefix, so `.hover\:bg-red` silently becomes
+# `.hover`, a selector that is wrong rather than absent and matches whatever
+# else on the page happens to be called that. Everything below consumes
+# escapes instead, so the name that comes out is the name the author wrote.
+
+_HEX = "0123456789abcdefABCDEF"
+_WS = " \t\r\n\f"
+_MAX_CODEPOINT = 0x10FFFF
+
+
+def _consume_escape(text, i):
+    """Consume the escape sequence at `text[i] == '\\\\'`.
+
+    Returns `(character, next_index)`. A backslash at end-of-input, and a hex
+    escape naming U+0000, a surrogate or a code point past the Unicode
+    maximum, all yield U+FFFD -- the spec's answer, and the one that keeps a
+    malformed sheet parsing.
+    """
+    n = len(text)
+    j = i + 1
+    if j >= n:
+        return "\ufffd", j
+    if text[j] not in _HEX:
+        return text[j], j + 1
+    start = j
+    while j < n and j - start < 6 and text[j] in _HEX:
+        j += 1
+    code = int(text[start:j], 16)
+    # One whitespace character after the digits is a delimiter, not content:
+    # it is how `\2c ` says "the escape ended here". A CRLF counts as one.
+    if j < n and text[j] in _WS:
+        if text[j] == "\r" and j + 1 < n and text[j + 1] == "\n":
+            j += 1
+        j += 1
+    if code == 0 or 0xD800 <= code <= 0xDFFF or code > _MAX_CODEPOINT:
+        return "\ufffd", j
+    return chr(code), j
+
+
+def _is_name_char(ch):
+    """A CSS name character: ASCII alphanumerics, `-`, `_`, and anything
+    non-ASCII (the spec's rule, which is what lets a class be named in a
+    language that is not English)."""
+    return ch == "-" or ch == "_" or ch.isalnum() or ord(ch) >= 0x80
+
+
+def _consume_name(text, i):
+    """Consume an identifier at `i`, unescaping as it goes.
+
+    Returns `(name, next_index)`, or `(None, i)` when there is no name here.
+    """
+    out = []
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "\\":
+            char, i = _consume_escape(text, i)
+            out.append(char)
+        elif _is_name_char(ch):
+            out.append(ch)
+            i += 1
+        else:
+            break
+    if not out:
+        return None, i
+    return "".join(out), i
+
+
+def _skip_sel_ws(text, i):
+    while i < len(text) and text[i] in _WS:
+        i += 1
+    return i
+
+
+def _split_top_level(text, sep=","):
+    """Split a selector list on `sep`, leaving escapes alone.
+
+    `\\2c ` inside an arbitrary-value class name is a comma the author spelled
+    as a name character; splitting on it cuts a selector in half.
+    """
+    parts, buf = [], []
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "\\":
+            _char, end = _consume_escape(text, i)
+            buf.append(text[i:end])
+            i = end
+        elif ch == sep:
+            parts.append("".join(buf))
+            buf = []
+            i += 1
+        else:
+            buf.append(ch)
+            i += 1
+    parts.append("".join(buf))
+    return parts
+
+
+_ATTR_OPS = "~|^$*"
+
+
+def _attr_selector(text, i):
+    """Parse `[attr]`, `[attr=value]` and the `~= |= ^= $= *=` forms at `i`.
+
+    Returns `(AttrSelector, end_index)`, or `(None, i)` when this is not one.
+    Both the name and an unquoted value are identifiers as far as escaping
+    goes -- `[data-x=a\\/b]` is one value, not a value and then a stray slash.
+    """
+    n = len(text)
+    j = _skip_sel_ws(text, i + 1)
+    name, j = _consume_name(text, j)
+    if name is None:
+        return None, i
+    j = _skip_sel_ws(text, j)
+    op = value = None
+    if j < n and text[j] != "]":
+        if text[j] == "=":
+            op, j = "=", j + 1
+        elif text[j] in _ATTR_OPS and j + 1 < n and text[j + 1] == "=":
+            op, j = text[j:j + 2], j + 2
+        else:
+            return None, i
+        j = _skip_sel_ws(text, j)
+        if j < n and text[j] in "\"'":
+            quote, j = text[j], j + 1
+            out = []
+            while j < n and text[j] != quote:
+                if text[j] == "\\":
+                    char, j = _consume_escape(text, j)
+                    out.append(char)
+                else:
+                    out.append(text[j])
+                    j += 1
+            if j >= n:
+                return None, i
+            value, j = "".join(out), j + 1
+        else:
+            out = []
+            while j < n and text[j] != "]" and text[j] not in _WS:
+                if text[j] == "\\":
+                    char, j = _consume_escape(text, j)
+                    out.append(char)
+                else:
+                    out.append(text[j])
+                    j += 1
+            if not out:
+                return None, i
+            value = "".join(out)
+        j = _skip_sel_ws(text, j)
+    if j >= n or text[j] != "]":
+        return None, i
+    return AttrSelector(name.lower(), op, value), j + 1
 
 
 class CSSParser:
@@ -391,29 +547,21 @@ class CSSParser:
         while i < n:
             c = text[i]
             if c == ".":
-                m = re.match(r"\.[-_A-Za-z0-9]+", text[i:])
-                if not m:
+                name, i = _consume_name(text, i + 1)
+                if name is None:
                     return None
-                parts.append(ClassSelector(m.group(0)[1:]))
-                i += m.end()
+                parts.append(ClassSelector(name))
             elif c == "#":
-                m = re.match(r"#[-_A-Za-z0-9]+", text[i:])
-                if not m:
+                name, i = _consume_name(text, i + 1)
+                if name is None:
                     return None
-                parts.append(IdSelector(m.group(0)[1:]))
-                i += m.end()
+                parts.append(IdSelector(name))
             elif c == "[":
-                m = _ATTR_SEL_RE.match(text, i)
-                if not m:
+                sel, end = _attr_selector(text, i)
+                if sel is None:
                     return None
-                value = m.group(3)
-                if value is None:
-                    value = m.group(4)
-                if value is None:
-                    value = m.group(5)
-                parts.append(AttrSelector(m.group(1).lower(), m.group(2),
-                                          value))
-                i = m.end()
+                parts.append(sel)
+                i = end
             elif c == ":":
                 sel, end = self._pseudo_selector(text, i)
                 if sel is None:
@@ -424,10 +572,11 @@ class CSSParser:
             elif c == "*":
                 parts.append(TagSelector("*"))
                 i += 1
-            elif re.match(r"[A-Za-z]", c):
-                m = re.match(r"[-_A-Za-z0-9]+", text[i:])
-                parts.append(TagSelector(m.group(0).lower()))
-                i += m.end()
+            elif c == "\\" or c.isalpha() or ord(c) >= 0x80:
+                name, i = _consume_name(text, i)
+                if name is None:
+                    return None
+                parts.append(TagSelector(name.lower()))
             else:
                 return None
         if not parts:
@@ -486,7 +635,7 @@ class CSSParser:
         if arg is None or not arg.strip():
             return None
         sels = []
-        for part in arg.split(","):
+        for part in _split_top_level(arg):
             sel = self.selector(part.strip())
             if sel is None:
                 return None
@@ -501,7 +650,20 @@ class CSSParser:
         tokens = []
         buf = []
         depth = 0
-        for ch in text:
+        i, n = 0, len(text)
+        while i < n:
+            ch = text[i]
+            if ch == "\\":
+                # An escaped character is part of a name, whatever it is: the
+                # `>` in `.\[\&\>li\]\:mt-2` is three glyphs of a class name,
+                # not a child combinator, and the `[` beside it is not a
+                # bracket to count either. Carried through raw so the escape
+                # is still there for _consume_name to read.
+                _char, end = _consume_escape(text, i)
+                buf.append(text[i:end])
+                i = end
+                continue
+            i += 1
             if ch in "([":
                 depth += 1
                 buf.append(ch)
@@ -562,9 +724,14 @@ class CSSParser:
             if self.s[self.i] == "@":
                 self._handle_at_rule(rules)
                 continue
-            # Read selector text up to '{'.
+            # Read selector text up to '{'. A backslash-escaped brace is a
+            # name character in a selector, not the start of a block: taking
+            # it for one loses the rest of the sheet, not just this rule.
             start = self.i
             while self.i < len(self.s) and self.s[self.i] not in "{}":
+                if self.s[self.i] == "\\":
+                    _char, self.i = _consume_escape(self.s, self.i)
+                    continue
                 self.i += 1
             if self.i >= len(self.s) or self.s[self.i] == "}":
                 self.i += 1
@@ -573,7 +740,7 @@ class CSSParser:
             self.literal("{")
             decls = self.body()
             self.literal("}")
-            for one in sel_text.split(","):
+            for one in _split_top_level(sel_text):
                 sel = self.selector(one.strip())
                 if sel is not None:
                     rules.append((sel, decls))
