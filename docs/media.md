@@ -7,7 +7,15 @@ QuickTime, and as a bare stream of JPEGs), as do uncompressed and RLE AVI and
 QuickTime's `raw ` and `png `. H.264 plays as far as its decoder goes, which
 is every frame of a stream of I and P slices -- an ordinary web MP4 -- and
 not one with B slices; see [H.264, in Fortran](#h264-in-fortran). Everything
-else is identified by name and refused in public. There is no audio at all.
+else is identified by name and refused in public.
+
+Sound now leaves the machine. There is a platform output device on all three
+platforms, a lock-free ring, a polyphase resampler, a mixer with per-source
+gain and a master volume, and a monotonic audio clock -- see
+[Audio output](#audio-output). What there is not is anything that produces
+samples to put in it: no audio codec is decoded yet, so no file you can load
+plays with sound. The output half is finished and measured; the decoder half
+is not written.
 
 Read this before adding a codec. The point of writing it down is that the
 hard parts here are not the codec; they are the seams the codec plugs into,
@@ -298,13 +306,191 @@ another instance has been at the library in between. The history is bounded
 by the stream's keyframe interval rather than by its length, and
 `test_two_decoders_interleaved_do_not_corrupt_each_other` is the proof.
 
+## Audio output
+
+Everything downstream of "here are some PCM samples". Named `heel`, because
+it is the part of a foot that makes a noise, and because LICENSE condition 3
+says so.
+
+Nothing here decodes anything. A `Source` is a rate, a channel count and a
+stream of samples; where they came from is not this code's business. That
+line is deliberate -- it is what let the output stack be written, measured
+and finished while no audio codec exists.
+
+### The pieces
+
+- `feetbrowser/heel.py`: the pure engine, and nearly all of it.
+  - `Ring` is a single-producer, single-consumer byte ring over one
+    preallocated ctypes buffer, with no lock in it. Two monotonically
+    increasing byte counters; the producer alone writes one and the consumer
+    alone writes the other, so a stale read of the other side's counter is
+    always stale in the safe direction. The counters are Python integers and
+    do not wrap.
+  - `Resampler` is polyphase windowed-sinc: upsample by L, low-pass at the
+    lower of the two Nyquist frequencies, decimate by M, with the filter
+    decomposed into L branches so that no multiplication by a stuffed zero
+    is ever performed. 64 taps, Kaiser window at beta 9, each branch
+    normalised to unity gain. State carries across calls, so
+    `process(a) + process(b)` is sample-for-sample `process(a + b)` -- which
+    is what makes it usable against a decoder handing over whatever a packet
+    happened to contain. Rate pairs that do not reduce to a small ratio are
+    approximated by continued fractions.
+  - `Mixer` and `Source`: several sounds at once, summed in floating point,
+    per-source `gain`, one master `volume`, clamped exactly once at the end.
+    Resampling and channel mapping happen on the *writing* side, because the
+    decoder thread has a packet's worth of slack and the mixer thread has two
+    milliseconds.
+  - `AudioClock` is frames the device has actually consumed. `now()` returns
+    seconds and is duck-compatible with `media.Clock`, so a `Scheduler` takes
+    one with no adapter. **Video follows audio, never the reverse**: a
+    dropped picture costs one frame nobody sees, and a gap in sound is a
+    click everybody hears.
+
+    There are two clocks here and picking the wrong one is the mistake
+    waiting to be made. `AudioClock.now()` is the *device's* timeline: how
+    much the hardware has swallowed since the stream started. It is the right
+    thing to measure underruns against and the wrong thing to hang a picture
+    on, because it does not know when a particular stream started, does not
+    move backwards over a seek, and counts frames that are still in a buffer
+    somewhere rather than in the air. `Source.position()` is the *stream's*
+    timeline and is the one `<video>` wants: it takes off the ring's backlog
+    and the device's own reported latency, so it is seconds of that source
+    the listener has actually heard. On the machine this was written on, over
+    Bluetooth, the two differ by 171 ms -- about four frames of video, which
+    is well past the point where a viewer sees lips out of step.
+  - `open_output()` is the entry point and never raises. On a machine with
+    no sound card it returns an `Output` over a `NullDevice` that consumes
+    in real time and throws the samples away, with `silent` true and
+    `reason` set to a sentence fit to show a user. That is not a test stub:
+    a browser on a headless box still has to play a video at the right
+    speed. `available()` and `unavailable_reason()` follow `h264.py` --
+    probed once, and the answer remembered, so a container with no
+    `/dev/snd` is not asked about it once per packet.
+- `feetbrowser/coreaudio.py`, `alsa.py`, `winmm.py`: one per platform,
+  ctypes against the system library, the same shape as `cocoa.py`, `x11.py`
+  and `win32.py`. Each knows how to take bytes out of a ring and nothing
+  else at all.
+
+### Rules for the realtime side
+
+On macOS the device callback runs on a CoreAudio thread with a deadline of a
+couple of milliseconds. Six rules, and every one of them is about *not*
+doing something: the callback never blocks on a lock, never waits for data
+(an empty ring is silence and a counter, not an error path), never raises
+(the body is wrapped and the failure stashed for the main thread), allocates
+nothing that can grow (the payload moves by `memmove` between two buffers
+that existed before the stream started), does no work that belongs to
+somebody else (no mixing, gain, conversion or resampling on that thread),
+and nothing is freed while the device is running. They are written out in
+full at the top of `heel.py`.
+
+The GIL is the thing that cannot be designed away: calling a Python function
+at all means taking it, CoreAudio's deadline is about 2 ms and CPython's
+switch interval is 5. So the callback is made as short as it can be and the
+ring is 4096 frames -- 85 ms -- deep, which is how late the mixer thread is
+allowed to be. A design where the callback does real work in Python clicks
+whenever the browser lays out a page, and no amount of making the callback
+faster recovers it.
+
+Linux and Windows do not need most of that and get it anyway. Neither ALSA
+nor `waveOut` requires a callback on a foreign thread: both are driven from
+an ordinary Python thread that blocks on the device and pulls from the same
+ring, using the same `read_into`, with the same short-read handling.
+
+### Platforms
+
+| | binding | driven by | notes |
+|---|---|---|---|
+| macOS | AudioToolbox / CoreAudio | an `AURenderCallback` on CoreAudio's realtime thread | takes the hardware's own rate rather than asking it to convert |
+| Linux | `libasound.so.2` | a thread of ours blocking in `snd_pcm_writei` | opens `default`, so PulseAudio or PipeWire is what it actually reaches; `FEETBROWSER_ALSA_DEVICE` overrides |
+| Windows | `winmm.dll` (`waveOut`) | a thread of ours, woken by `CALLBACK_EVENT` | 16-bit samples; see below |
+
+`waveOut` rather than WASAPI, and the reason is ctypes rather than taste.
+WASAPI is COM and only COM, so through ctypes every call is a hand-counted
+vtable slot -- and a mis-numbered slot is not an exception, it is an access
+violation on a machine nobody working on this has, in a subsystem whose
+failure mode is already "silence, and you cannot tell why". `waveOut` is a
+flat C API of eight functions, is implemented over WASAPI shared mode by the
+OS on Windows 10 and 11, and costs exclusive mode and some latency. A
+browser tab has no business taking a device exclusively, and the latency is
+a fixed offset, which is the one kind of error a sync loop does not mind.
+The interface a backend has to satisfy is three methods -- `start(ring,
+clock)`, `stop()`, `close()` -- and seven attributes, so replacing this file
+with a WASAPI one later changes nothing above it.
+
+### Measured
+
+Resampler, against an analytically generated tone, measured with an
+exact-bin DFT (the frequency chosen so that a whole number of cycles fits
+the analysis window; a tone between two bins leaks into every other bin and
+gives you a number in the sixties however good the filter is):
+
+| | 93.8 Hz | 1 kHz | 5 kHz | 10 kHz | 15 kHz | 19 kHz |
+|---|---|---|---|---|---|---|
+| 44.1 -> 48 kHz, SNR | 123.9 dB | 110.2 | 108.3 | 105.4 | 106.2 | 99.1 |
+| 44.1 -> 48 kHz, worst spur | -125.3 dBc | -110.0 | -108.2 | -105.2 | -105.9 | -99.8 |
+
+48 -> 44.1 kHz is 107.6 dB at 915 Hz, 105.7 at 9.2 kHz and 99.7 at 17.5 kHz,
+worst spur -101 to -110 dBc. Passband gain is flat to within 0.0001 dB
+across the band, and DC through 44.1 -> 48 comes back as 1.0 to within
+2e-16.
+
+That is what 64 taps buys, and the number was chosen by measuring rather
+than by taste: at 19 kHz, 32 taps gives 44.7 dB and 16 taps gives 17.2 dB
+with a whole decibel of level error. There is a test that measures exactly
+that and fails if the shipped filter ever stops beating a short one. Cost is
+about 9% of one core for 64 taps of mono at 48 kHz on this laptop, which is
+affordable in pure Python only because the inner loop is
+`sum(map(mul, coeffs, history[a:b]))` and runs in C.
+
+Verified audible on macOS by wrapping the render callback with a spy that
+reads the bytes back out of CoreAudio's own buffer *after* the memmove and
+analyses them: 2.496 s consumed at 48 kHz with zero underruns and zero
+invented silence, a 440 Hz sine at the amplitude asked for to within 0.02%,
+mono correctly duplicated to both channels, and no discontinuity across any
+of 39 buffer seams.
+
+### Testing sound without a sound card
+
+`tests/test_audio.py`, split the way `tests/test_x11.py` is. The pure half
+is the ring (wraparound, underrun, overrun, partial frames, and a real
+two-thread producer/consumer test that checks every byte of a known
+sequence), the filter design, the resampler, the formats, the mixer, the
+clock, and the whole pipeline end to end against a device that keeps what it
+consumed so the mixed bytes can be measured. It runs everywhere, including
+in a container with no sound. The live half opens the real backend, plays
+two hundred milliseconds of something quiet and checks the device consumed
+it in the time it should have; where there is no device it prints why and
+skips. `FEETBROWSER_AUDIO=null` forces the silent path, which is how CI and
+a bug report ask for it.
+
+### Not tested
+
+The ALSA and `waveOut` backends have never been run. Their pure helpers are
+tested everywhere, including the structure sizes `waveOut` depends on, but
+no Linux or Windows machine was available while they were written, and CI
+runners have no sound device to exercise the live half on either. Read them
+as carefully-written and unproven. The CoreAudio backend is the one that has
+actually made a noise.
+
 ## What is not supported
 
 Bluntly, because a foundation that overstates itself is worse than none:
 
-- **No audio.** Not decoded, not parsed, not mixed, not synchronised. AVI
-  audio streams are skipped. This is not a small omission: A/V sync is its
-  own engineering problem, and nothing here is designed around it yet.
+- **No audio *decoder*.** Nothing in the project turns a compressed audio
+  stream into samples. AAC, MP3, Vorbis and Opus are all absent, AVI and MP4
+  audio tracks are still skipped by the demuxers, and no `<video>` element
+  makes a noise. Everything downstream of "here are some samples" is
+  finished -- device, ring, resampler, mixer, clock, and the whole of it
+  measured -- so this is now one missing piece rather than a missing
+  subsystem. See [Audio output](#audio-output).
+- **No A/V synchronisation.** The clock video should follow exists and is
+  duck-compatible with `media.Clock`, but nothing has been wired to it:
+  `VideoPlayer` still runs off `SystemClock`. Handing a `Scheduler` a
+  `heel.AudioClock` works today and is tested; making `<video>` do it when
+  the file has an audio track is not done, and doing it correctly means
+  following `Source.position()` rather than the device clock -- see
+  [Audio output](#audio-output).
 - **No B slices in H.264, and no other inter-frame codec.** I and P slices
   decode; a stream with B slices is refused by name before anything is
   drawn, and there is no VP8, VP9, AV1 or MPEG-4 ASP at all. B frames are
@@ -321,9 +507,12 @@ Bluntly, because a foundation that overstates itself is worse than none:
   frame. No range requests, no progressive start, no HLS or DASH. An MJPEG
   camera stream over HTTP, which never ends, therefore cannot be played even
   though its frames are the format that does.
-- **Controls are play/pause and a scrubber.** No volume: there is nothing
-  to make quieter. No fullscreen, no poster frame, no playback rate, no
-  buffered ranges, no keyboard focus or shortcuts, no captions.
+- **Controls are play/pause and a scrubber.** Still no volume slider, but
+  the reason has changed: there is now something to make quieter
+  (`Output.volume`, and a per-source `gain` under it), and what is missing
+  is the widget and the mute state, not the machinery. No fullscreen, no
+  poster frame, no playback rate, no buffered ranges, no keyboard focus or
+  shortcuts, no captions.
 - **No JavaScript media API.** No `HTMLMediaElement` on the DOM bridge:
   `play()`, `pause()`, `currentTime`, `timeupdate` and friends do not exist.
   `autoplay`, `muted` and `preload` are ignored; `loop` is honoured.
@@ -379,11 +568,17 @@ agree, and a reorder buffer belongs in `VideoTrack.frame()`.
    last byte arrives. Worth doing now rather than later, because MJPEG over
    HTTP is a format we can already decode and cannot currently play at all:
    the stream never ends, so waiting for the last byte waits forever.
-6. **Audio.** A decoder, a resampler, a platform output device on three
-   platforms, and A/V sync against the same clock. This is the largest item
-   on the list by a wide margin and should be planned on its own. Nothing in
-   the project outputs a sample today (there is no CoreAudio, ALSA or
-   WASAPI binding anywhere in it), so this starts from zero.
+6. **An audio decoder, and then A/V sync.** The output half of this item is
+   done: `heel.py` plus a CoreAudio, an ALSA and a waveOut backend, with the
+   resampler measured and the clock published. What is left is the two ends.
+   An audio codec -- AAC is what an MP4 has -- feeding a `heel.Source`, and
+   the demuxers keeping the audio track they currently skip. Then A/V sync,
+   which is now a small change rather than a design problem: give `Scheduler`
+   a clock reading `Source.position()` when there is a sound track, and let
+   the picture follow it. Read the note under
+   [Audio output](#audio-output) about which of the two clocks to use first;
+   the wrong one is off by a ring's depth plus the device's latency, which
+   over Bluetooth is most of a fifth of a second.
 7. **B slices in the H.264 decoder.** P slices are done, so this is now the
    shortest route to the rest of the web's video: a second reference list,
    bi-prediction with its own rounding, direct modes (spatial and temporal,
@@ -458,3 +653,8 @@ forces that state on a machine that has one: it takes the loaded library
 away and asserts that `probe()`, `MediaInfo` and `open_video()` behave the
 way they did before the decoder existed. That test is the reason the
 degradation path is a claim rather than a hope.
+
+Audio has its own suite, `tests/test_audio.py`, and its own version of that
+last idea: `FEETBROWSER_AUDIO=null` forces a machine with a working sound
+card to behave like one without. See
+[Testing sound without a sound card](#testing-sound-without-a-sound-card).
