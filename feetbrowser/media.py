@@ -38,9 +38,15 @@ tests -- and for the headless paths that have no event loop to be blocked --
 budget, which is also how a decoder that cannot keep up is simulated
 deterministically.
 
-There is no audio here, and no audio anywhere in this branch: no output
-device, no clock derived from one, no A/V sync. A real player syncs video to
-the audio clock, and `Clock` is the seam where that would go.
+`Clock` is also the seam where the sound goes. A real player syncs video to
+the audio clock and never the reverse -- a dropped picture costs one frame
+and most people will not see it, a gap in the sound is a click and everybody
+hears every one of them -- and because `position()` here is
+`_offset + (clock.now() - _origin)`, a clock that already reports media time
+makes both of those terms cancel and needs no other change at all. That clock
+is `_AudioClock`, `attach_audio()` installs it, and `arch.AudioPlayer` is
+what it reads. Without one, or with an output device nobody can hear, none of
+this module behaves any differently from the day it had no audio in it.
 """
 
 import threading
@@ -79,6 +85,34 @@ class SystemClock(Clock):
 
     def now(self):
         return time.monotonic()
+
+
+class _AudioClock(Clock):
+    """An audio player's media position, wearing a clock's face.
+
+    The whole of A/V sync, and it is four lines because `Scheduler` was
+    written to make it four lines. `Scheduler.position()` is
+    `_offset + (clock.now() - _origin)`; `_origin` is whatever this returned
+    when playback started and `_offset` is the media time at that instant, so
+    a clock reporting media time cancels them both and the scheduler is left
+    asking the sound where it is.
+
+    What it must read is `heel.Source.position()`, which
+    `AudioPlayer.position()` is derived from -- the *stream* timeline, with
+    the ring backlog and the device latency already taken off. The other
+    audio clock in the tree, `heel.AudioClock.now()`, is the device timeline:
+    a fine number, an entirely wrong one to put here, and wrong in a way that
+    raises nothing and sounds perfect. It would put every picture a buffer's
+    depth ahead of its sound for the length of the film.
+    """
+
+    __slots__ = ("player",)
+
+    def __init__(self, player):
+        self.player = player
+
+    def now(self):
+        return self.player.position()
 
 
 class ManualClock(Clock):
@@ -277,6 +311,11 @@ class VideoPlayer:
                                    track.frame_rate if track else 0.0,
                                    clock=clock, loop=loop,
                                    index_at=track.index_at if track else None)
+        # The clock to go back to if the sound is ever detached. Kept rather
+        # than rebuilt, because a caller who passed a ManualClock in expects
+        # to still be driving after it takes the audio away again.
+        self._own_clock = self.scheduler.clock
+        self.audio = None
         self.display_size = (self.width, self.height)
         if track is not None:
             self.photo = PhotoImage(width=track.width, height=track.height)
@@ -331,15 +370,83 @@ class VideoPlayer:
     def position(self):
         return self.scheduler.position()
 
+    # -- the sound ----------------------------------------------------------
+
+    def attach_audio(self, player):
+        """Schedule the pictures against `player`'s sound instead of a clock.
+
+        `player` is anything with `start(position)`, `stop()`, `seek(seconds)`,
+        `set_gain(gain)`, `set_rate(rate)` and `position()` --
+        `arch.AudioPlayer` in the browser, a handful of lines in a test.
+        Returns True when the sound is now driving.
+
+        It declines in the two cases where following the sound would be worse
+        than ignoring it: a file whose pictures we cannot decode anyway, and
+        a player that says it is `silent`, which is a file with no sound in it
+        or an output device nobody can hear. Following a device nobody can
+        hear buys nothing and hands the video a new way to stop, so in both
+        cases the clock stays exactly what it was and this module behaves
+        exactly as it did before there was any audio in the tree.
+        """
+        if player is None or self.track is None or getattr(player, "silent",
+                                                           False):
+            return self.detach_audio()
+        where = self.scheduler.position()
+        self.audio = player
+        self.scheduler.clock = _AudioClock(player)
+        # Put the sound in the same state the picture is in, at the same
+        # place, before anything reads the new clock.
+        if self.scheduler.playing:
+            player.start(where)
+        else:
+            player.stop()
+        self.seek(where)
+        return True
+
+    def detach_audio(self):
+        """Go back to the clock this player was made with. Always False, so
+        that `if not player.attach_audio(x)` reads the way it should."""
+        # Read the playhead while the clock that has been driving it is still
+        # installed. The two clocks are not on the same scale -- one is media
+        # time and the other is whatever the caller passed in -- so asking
+        # after the swap is asking the wrong one.
+        where = self.scheduler.position()
+        if self.audio is not None:
+            self.audio.stop()
+        self.audio = None
+        self.scheduler.clock = self._own_clock
+        self.scheduler._offset = where
+        self.scheduler._origin = self.scheduler.clock.now()
+        return False
+
+    def set_volume(self, gain):
+        """Loudness, 0.0 to 1.0. Silently fine with there being no sound."""
+        if self.audio is None:
+            return False
+        self.audio.set_gain(gain)
+        return True
+
+    # -- transport, continued -----------------------------------------------
+
     def play(self):
         if self.track is None:
             return False
+        if self.audio is not None and not self.scheduler.playing:
+            # The sound starts first, and from where the picture is paused,
+            # so that the clock `scheduler.play()` is about to read already
+            # reports the position it is about to resume from. That is what
+            # makes `_offset` and `_origin` cancel; see `_AudioClock`.
+            self.audio.start(self.scheduler.position())
         self.scheduler.play()
         self._start_worker()
         return True
 
     def pause(self):
+        # The scheduler first: it reads the clock to work out where it
+        # stopped, and the clock is the sound.
         self.scheduler.pause()
+        if self.audio is not None:
+            self.audio.stop()
         return True
 
     def toggle(self):
@@ -354,6 +461,11 @@ class VideoPlayer:
     def seek(self, seconds):
         if self.track is None:
             return False
+        if self.audio is not None:
+            # Before the scheduler, which re-origins itself against the
+            # clock, and the clock is the sound: seeking it afterwards would
+            # leave the pictures scheduled against where the sound used to be.
+            self.audio.seek(seconds)
         self.scheduler.seek(seconds)
         target = self.scheduler.due_index()
         with self._lock:
@@ -393,7 +505,13 @@ class VideoPlayer:
         self._thread.start()
 
     def close(self):
-        """Stop the worker. Idempotent; safe from any thread."""
+        """Stop the worker. Idempotent; safe from any thread.
+
+        The attached audio player is stopped but not closed: this player did
+        not open it and does not own the device behind it.
+        """
+        if self.audio is not None:
+            self.audio.stop()
         self._stop.set()
         self._wake.set()
         thread = self._thread

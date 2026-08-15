@@ -27,8 +27,11 @@ import threading
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from feetbrowser import alsa, coreaudio, heel, winmm
+import media_fixtures
+from feetbrowser import alsa, arch, browser, coreaudio, heel, media, \
+    mediacodec, winmm
 
 
 def eq(a, b, msg=""):
@@ -567,7 +570,6 @@ def test_the_clock_counts_invented_silence_separately():
 def test_the_clock_is_what_a_media_scheduler_wants():
     """Duck-compatible with media.Clock on purpose, so that A/V sync can be
     handed one with no adapter at all."""
-    from feetbrowser import media
     clock = heel.AudioClock(48000)
     scheduler = media.Scheduler(10.0, 25.0, clock=clock)
     assert scheduler.clock is clock, "media took a clock and kept another"
@@ -1191,6 +1193,620 @@ def test_every_backend_reports_availability_without_raising():
         assert isinstance(reason, str), "%s gave %r" % (module, reason)
         if answer:
             eq(reason, "", "%s is available and complaining" % module)
+
+
+# -- the arch: playing a decoded stream, and the pictures that follow it ----
+#
+# No codec anywhere in here. `FakeAudioTrack` answers exactly the questions
+# `mediacodec.AudioTrack` answers and puts the frame's own index into its
+# samples, so "which part of the file came out of the speaker" is a question
+# the bytes the device was handed answer by themselves. The AAC decoder has
+# its own suite; what these are about is the wire between it and the heel,
+# and a wire is best tested with a signal you chose.
+
+
+class FakeAudioTrack:
+    """An `AudioTrack` over a constant, without a codec near it.
+
+    Frame `i` is `(i + 1) / 1000.0` in every sample, so a captured buffer
+    says which frames were played, in what order, and where the silence was.
+    `channels_at` makes one frame come back with a channel count that
+    disagrees with the stream's, which is a real thing a broken file does and
+    the one thing that must never reach the interleaver.
+    """
+
+    def __init__(self, count=200, sample_rate=48000, channels=1,
+                 per_frame=1024, channels_at=None):
+        self.sample_rate = sample_rate
+        self.channels = channels
+        self.per_frame = per_frame
+        self.sample_count = count
+        self.duration = count * per_frame / float(sample_rate)
+        self.channels_at = dict(channels_at or {})
+        self.container = "fake"
+        self.codec_name = "pcm"
+        self.asc = b""
+        self.reads = []
+        self.info = mediacodec.AudioInfo("fake", "pcm", sample_rate, channels,
+                                         self.duration, count, True)
+
+    def frame_time(self, index):
+        return index * self.per_frame / float(self.sample_rate)
+
+    def frame_duration(self, index):
+        return self.per_frame / float(self.sample_rate)
+
+    def index_at(self, seconds):
+        index = int(seconds * self.sample_rate) // self.per_frame
+        return max(0, min(index, self.sample_count - 1))
+
+    def packet(self, index):
+        return b""
+
+    def frame(self, index):
+        if not 0 <= index < self.sample_count:
+            raise mediacodec.MediaError("audio frame %d out of range" % index)
+        self.reads.append(index)
+        channels = self.channels_at.get(index, self.channels)
+        value = (index + 1) / 1000.0
+        return mediacodec.AudioFrame(
+            index, self.frame_time(index), self.frame_duration(index),
+            self.sample_rate, channels,
+            heel.pack([value] * (self.per_frame * channels), heel.FLOAT32))
+
+    def reset(self):
+        pass
+
+
+def _player(output, track=None, **kwargs):
+    return arch.AudioPlayer(track=track or FakeAudioTrack(), output=output,
+                            threaded=False, **kwargs)
+
+
+def _audible(device, ring_frames=4800):
+    """An unthreaded output over `device` that claims to be real hardware.
+
+    `Capture` is a `NullDevice` subclass -- that is how it gets the whole
+    device contract in twenty lines -- so `Output` calls it silent, and the
+    sync path declines to follow a device nobody can hear. In these tests it
+    stands in for a sound card, and this is where it says so.
+    """
+    output = heel.Output(device, ring_frames=ring_frames, threaded=False)
+    output.silent = False
+    return output
+
+
+def _rig(ring_frames=4800, **kwargs):
+    """A capture device, an unthreaded output and a player already playing,
+    with the silence `start()` primes the ring with already played out.
+
+    Priming is not optional -- a device started against an empty ring clicks
+    -- so every one of these tests would otherwise begin by measuring a ring
+    depth of silence. Draining it here is what makes the numbers below the
+    file's own times and not the device's.
+    """
+    device = Capture(48000, 2)
+    output = _audible(device, ring_frames)
+    player = _player(output, **kwargs)
+    player.play()
+    device.pump(output.ring.backlog)
+    eq(player.position(), 0.0, "the file has not started yet")
+    return device, output, player
+
+
+def test_a_file_we_cannot_decode_still_makes_a_player_that_says_why():
+    """`<video src=x>` with an AC-3 track should play its pictures and say it
+    is silent, not fail to load."""
+    player = arch.AudioPlayer(data=b"not a media file at all",
+                              threaded=False)
+    assert player.track is None, "it decoded something that is not a file"
+    assert not player.playable
+    assert player.silent, "no track is as silent as it gets"
+    eq(player.play(), False, "a player with no track claimed to play")
+    eq(player.pause(), False)
+    eq(player.seek(1.0), False)
+    eq(player.position(), 0.0)
+    assert not player.ended
+    assert player.status(), "a broken player should still describe itself"
+    player.close()
+
+
+def test_the_player_decodes_ahead_and_then_stops_decoding():
+    """Half a second ahead, and not a two-hour podcast on the heap."""
+    device, output, player = _rig(target_queue=0.25)
+    player.pump(1000)
+    eq(player.decoded, 12, "it decoded past the target")
+    close(player.queued_seconds(), 0.256, 1e-9, "twelve frames is 256 ms")
+    eq(player.pump(1000), 0, "a full queue decoded anyway")
+    _drive(output, 4800, block=480)                 # play 100 ms of it
+    assert player.pump(1000) > 0, "it did not top the queue back up"
+    close(player.queued_seconds(), 0.256, 0.03, "the ceiling moved")
+    player.close()
+    output.close()
+
+
+def test_the_position_is_the_streams_timeline_and_not_the_devices():
+    """The mistake that ruins everything quietly.
+
+    `heel.AudioClock.now()` is the *device* timeline: how much sound the
+    hardware has taken since it was switched on. It was running before this
+    file started, it keeps running while the file is paused, and it does not
+    go back when the file is seeked. `Source.position()` -- which is what
+    `AudioPlayer.position()` is built on -- is the *stream* timeline, with
+    the ring backlog and the device latency taken off and measured from the
+    last seek. Scheduling pictures against the first one raises nothing,
+    sounds perfect, and puts every picture in the wrong place.
+    """
+    device = Capture(48000, 2)
+    output = _audible(device)
+    player = _player(output)
+    output.start()
+    _drive(output, 48000)                   # a second of nothing at all
+    close(output.clock.now(), 1.0, 1e-9, "the device clock did not run")
+    device.pump(output.ring.backlog)
+    player.play()
+    eq(player.position(), 0.0, "a file starts where the file starts")
+    player.pump(100)
+    _drive(output, 4800, block=480)         # 100 ms of the file
+    close(player.position(), 0.1, 1e-6, "the stream timeline")
+    assert output.clock.now() - player.position() > 1.0, \
+        "the device has been running a second longer than the file has"
+    player.close()
+    output.close()
+
+
+def test_pausing_stops_the_sound_and_stops_the_position():
+    device, output, player = _rig()
+    player.pump(100)
+    _drive(output, 4800, block=480)
+    close(player.position(), 0.1, 1e-6)
+    player.pause()
+    eq(player.queued_seconds(), 0.0, "a pause left sound queued to play")
+    close(player.position(), 0.1, 1e-6, "a paused file moved")
+    _drive(output, 48000, block=480)        # a second of the device running
+    close(player.position(), 0.1, 1e-6, "a paused file moved with the device")
+    player.play()
+    device.pump(output.ring.backlog)    # the silence mixed while it was paused
+    player.pump(100)
+    _drive(output, 2400, block=480)
+    close(player.position(), 0.15, 1e-6, "it did not resume where it stopped")
+    player.close()
+    output.close()
+
+
+def test_a_seek_starts_the_timeline_where_it_was_asked_to():
+    """And lands inside a frame, not at the front of one. AAC frames are 21
+    milliseconds here, and a scrubber that snaps to them is a scrubber that
+    is wrong by up to a frame every time it is used."""
+    device, output, player = _rig()
+    player.seek(1.5)
+    eq(player.position(), 1.5, "the seek did not land where it was sent")
+    start = len(device.taken)
+    player.pump(100)
+    _drive(output, 4800, block=480)
+    close(player.position(), 1.6, 1e-6, "the new timeline runs wrong")
+    # 1.5 s is 320 samples into frame 70, so the sound at the seek is frame
+    # 70's -- and only the 704 samples of it that had not been played yet.
+    # Snapping to the front of the frame instead would put the seam 320
+    # samples late and everything after it with it.
+    got = heel.floats_from_float32(bytes(device.taken[start:]))
+    close(got[0], 0.071, 1e-6, "the seek did not land in frame 70")
+    close(got[703 * 2], 0.071, 1e-6, "frame 70 ended early")
+    close(got[704 * 2], 0.072, 1e-6,
+          "the head of frame 70 was replayed rather than dropped")
+    player.close()
+    output.close()
+
+
+def test_muting_silences_the_sound_without_stopping_the_clock():
+    """A muted `<video>` still has to play its pictures at the right speed,
+    so the decoder keeps running and only the gain moves."""
+    device, output, player = _rig()
+    player.muted = True
+    start = len(device.taken)
+    player.pump(100)
+    _drive(output, 4800, block=480)
+    close(player.position(), 0.1, 1e-6, "muting stopped the clock")
+    eq(set(heel.floats_from_float32(bytes(device.taken[start:]))), {0.0},
+       "a muted player was audible")
+    player.muted = False
+    player.pump(100)
+    _drive(output, 4800, block=480)
+    close(player.position(), 0.2, 1e-6)
+    assert max(heel.floats_from_float32(bytes(device.taken[start:]))) > 0.0, \
+        "unmuting did not bring the sound back"
+    eq(player.gain, 1.0, "muting should not have forgotten the volume")
+    player.close()
+    output.close()
+
+
+def test_a_frame_whose_channels_disagree_is_recorded_rather_than_played():
+    """Not quiet, and not wrong-eared: noise, and noise for the rest of the
+    file, because every frame after it is interleaved off by one. It is
+    counted, and its *duration* goes in as silence so that everything after
+    it is still in the right place."""
+    track = FakeAudioTrack(count=6, channels=1, channels_at={3: 2})
+    device, output, player = _rig(track=track)
+    start = len(device.taken)
+    player.pump(100)
+    _drive(output, 6 * 1024, block=512)
+    eq(player.channel_errors, 1, "the bad frame was not noticed")
+    assert "channels" in player.error, player.error
+    got = heel.floats_from_float32(bytes(device.taken[start:]))
+    assert 0.004 not in got, "the bad frame reached the interleaver"
+    eq(set(got[3 * 1024 * 2:4 * 1024 * 2]), {0.0},
+       "the bad frame's slot is not silence")
+    close(got[2 * 1024 * 2], 0.003, 1e-6, "the frame before it moved")
+    close(got[4 * 1024 * 2], 0.005, 1e-6, "the frame after it moved")
+    player.close()
+    output.close()
+
+
+def test_a_loop_is_not_a_seek_and_keeps_the_sound_it_already_has():
+    """A loop is a boundary in the map from the stream's timeline to the
+    file's, not a jump. Throwing the queue away at the wrap -- which is what
+    reusing `seek()` here would do -- empties the source at exactly the
+    moment it is being read, and a gap in the sound is a click everybody
+    hears."""
+    track = FakeAudioTrack(count=10)                 # 0.2133 s of file
+    device, output, player = _rig(track=track, loop=True)
+    start = len(device.taken)
+    player.pump(200)
+    assert player.loops >= 1, "half a second of a fifth of a second"
+    assert player.queued_seconds() > 0.4, \
+        "the wrap threw sound away: %.3f s left" % player.queued_seconds()
+    _drive(output, 4800, block=480)
+    close(player.position(), 0.1, 1e-6)
+    _drive(output, 4800, block=480)
+    close(player.position(), 0.2, 1e-6, "still inside the first time round")
+    player.pump(200)
+    _drive(output, 1440, block=480)                  # 0.23 s of stream
+    close(player.position(), 0.23 - track.duration, 1e-6,
+          "media time did not wrap when the playhead crossed the boundary")
+    eq(output.clock.underruns, 0, "the loop left a hole in the sound")
+    got = heel.floats_from_float32(bytes(device.taken[start:]))
+    assert 0.0 not in got, "the loop played silence where it should have "\
+                           "played the head of the file again"
+    player.close()
+    output.close()
+
+
+def test_a_playback_rate_change_is_not_a_seek_either():
+    """Same rule, same reason. What changes is the map, and it changes from
+    the far end of what has been decoded rather than from the playhead, so
+    the half second already in the queue plays at the rate it was decoded
+    for."""
+    device, output, player = _rig()
+    player.pump(200)
+    queued = player.queued_seconds()
+    boundary = player._pos_end
+    assert player.set_rate(2.0), "the rate did not change"
+    eq(player.queued_seconds(), queued, "changing the rate threw sound away")
+    eq(player.set_rate(2.0), False, "the same rate is not a change")
+    _drive(output, 19200, block=480)                 # 0.4 s, before the seam
+    assert 0.4 < boundary, "the test is not measuring what it thinks it is"
+    close(player.position(), 0.4, 1e-6,
+          "sound decoded before the change played at the new rate")
+    player.pump(200)
+    _drive(output, 19200, block=480)                 # 0.8 s, past the seam
+    close(player.position(), boundary + (0.8 - boundary) * 2.0, 1e-6,
+          "the new rate did not start at the seam")
+    player.close()
+    output.close()
+
+
+def test_a_rate_of_zero_or_less_is_refused_rather_than_dividing_by_it():
+    device, output, player = _rig()
+    for bad in (0.0, -1.0):
+        try:
+            player.set_rate(bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("a rate of %r was accepted" % bad)
+    eq(player.rate, 1.0)
+    player.close()
+    output.close()
+
+
+# -- A/V sync: the pictures follow the sound --------------------------------
+
+def _clip(count=100, width=8, height=6, fps=10.0):
+    """An uncompressed AVI whose frame `i` is the flat colour (i, 0, 0), so
+    that which picture is on screen is a question the screen answers."""
+    frames = [media_fixtures.rgb24_frame(width, height,
+                                         lambda x, y, i=i: (i, 0, 0))
+              for i in range(count)]
+    return media_fixtures.avi(frames, width, height, fps=fps)
+
+
+def test_the_pictures_are_scheduled_against_the_sound():
+    """The load-bearing one. A known audio timeline in, and the question is
+    which picture is due -- not whether the two objects can be connected.
+
+    The last third is the control. The same assertions are made again with a
+    second of offset put into the sound's timeline by hand, and they have to
+    go the other way; assertions that pass against a deliberately broken
+    clock are not assertions about the clock.
+    """
+    device = Capture(48000, 2)
+    output = _audible(device)
+    audio = _player(output, track=FakeAudioTrack(count=400))
+    video = media.VideoPlayer(data=_clip(count=100, fps=10.0),
+                              threaded=False, decode_budget=8)
+    assert video.attach_audio(audio), "the sound should be driving"
+    assert isinstance(video.scheduler.clock, media._AudioClock)
+    # Half a frame in, so that every measurement below lands in the middle of
+    # a picture rather than on the seam between two of them.
+    video.seek(0.05)
+    video.play()
+    audio.pump(200)
+    device.pump(output.ring.backlog)        # the silence start() primed with
+    close(video.position(), 0.05, 1e-6, "the picture is not where the sound is")
+
+    shown = []
+    for step in range(1, 21):
+        _drive(output, 4800, block=480)     # exactly 100 ms of sound
+        close(audio.position(), 0.05 + step * 0.1, 1e-6, "the sound drifted")
+        video.tick()
+        audio.pump(200)
+        current = video.scheduler.current
+        assert current is not None, "nothing on screen at step %d" % step
+        eq(current.index, video.scheduler.due_index(),
+           "step %d: the picture is not the one the sound is due" % step)
+        shown.append(current.index)
+    eq(shown, list(range(1, 21)), "the pictures did not follow the sound")
+    eq(video.stats()["starved"], 0, "the pictures could not keep up")
+
+    # The control. One second of offset, which is ten pictures and more than
+    # the decode queue can hide.
+    pos, media_at, rate = audio._segments[0]
+    audio._segments[0] = (pos, media_at + 1.0, rate)
+    _drive(output, 4800, block=480)
+    video.tick()
+    assert video.scheduler.current.index != video.scheduler.due_index(), \
+        ("a second of offset in the sound went unnoticed, so the assertion "
+         "above proves nothing")
+    video.close()
+    audio.close()
+    output.close()
+
+
+def test_a_video_with_no_sound_is_exactly_the_video_it_was():
+    """Nothing in the sync path is allowed to reach a file with no audio in
+    it, or a machine with no device."""
+    clock = media.ManualClock()
+    video = media.VideoPlayer(data=_clip(count=20, fps=10.0), clock=clock,
+                              threaded=False, decode_budget=8)
+    assert video.audio is None
+    assert video.scheduler.clock is clock, "something replaced the clock"
+    video.play()
+    shown = []
+    for step in range(20):
+        clock.set(step * 0.1)
+        if video.tick():
+            shown.append(video.scheduler.current.index)
+    eq(shown, list(range(20)))
+    eq(video.stats()["dropped"], 0)
+    close(video.position(), 1.9, 1e-9, "the clock is the position")
+    video.close()
+
+
+def test_a_device_nobody_can_hear_is_not_allowed_to_drive_the_pictures():
+    """The paced null device keeps perfect time, which is exactly why it is
+    tempting. It is also what a machine gets when its sound card has just
+    been unplugged, and a video whose clock is a device nobody can hear is a
+    video with a new way to stop. So the offer is declined and the clock the
+    player was made with keeps the picture moving, as it always did."""
+    clock = media.ManualClock()
+    output = heel.open_output(backend="null", threaded=False)
+    audio = _player(output)
+    assert audio.silent, "the null backend should say it is silent"
+    video = media.VideoPlayer(data=_clip(count=20, fps=10.0), clock=clock,
+                              threaded=False, decode_budget=8)
+    eq(video.attach_audio(audio), False, "a silent device took the clock")
+    assert video.audio is None
+    assert video.scheduler.clock is clock, "the clock was replaced anyway"
+    video.play()
+    clock.set(0.55)
+    eq(video.scheduler.due_index(), 5, "the manual clock is not driving")
+    for _ in range(3):
+        video.tick()
+    eq(video.scheduler.current.index, 5, "the pictures stopped moving")
+    video.close()
+    audio.close()
+    output.close()
+
+
+def test_detaching_the_sound_hands_the_pictures_back_to_their_own_clock():
+    device = Capture(48000, 2)
+    output = _audible(device)
+    audio = _player(output)
+    clock = media.ManualClock()
+    video = media.VideoPlayer(data=_clip(count=100, fps=10.0), clock=clock,
+                              threaded=False, decode_budget=8)
+    assert video.attach_audio(audio)
+    video.play()
+    audio.pump(200)
+    device.pump(output.ring.backlog)
+    _drive(output, 4800, block=480)
+    close(video.position(), 0.1, 1e-6, "the sound is not driving")
+    eq(video.detach_audio(), False, "detach_audio should answer False")
+    assert video.audio is None
+    assert video.scheduler.clock is clock, "it kept a clock we did not give it"
+    close(video.position(), 0.1, 1e-6, "the playhead jumped on detaching")
+    clock.advance(0.5)
+    close(video.position(), 0.6, 1e-9, "the manual clock is not driving")
+    assert not audio.playing, "detaching left the sound running"
+    video.close()
+    audio.close()
+    output.close()
+
+
+def test_a_seek_moves_the_sound_before_it_re_origins_the_pictures():
+    """`Scheduler.seek()` re-origins itself against the clock, and the clock
+    is the sound. Seeking the sound afterwards leaves every picture scheduled
+    against where the sound used to be -- by exactly the size of the seek."""
+    device = Capture(48000, 2)
+    output = _audible(device)
+    audio = _player(output, track=FakeAudioTrack(count=400))
+    video = media.VideoPlayer(data=_clip(count=100, fps=10.0),
+                              threaded=False, decode_budget=8)
+    assert video.attach_audio(audio)
+    video.play()
+    audio.pump(200)
+    device.pump(output.ring.backlog)
+    video.seek(4.05)
+    close(video.position(), 4.05, 1e-6, "the seek did not take the pictures")
+    close(audio.position(), 4.05, 1e-6, "the seek did not take the sound")
+    audio.pump(200)
+    _drive(output, 4800, block=480)
+    close(video.position(), 4.15, 1e-6, "the pictures did not resume")
+    video.tick()
+    eq(video.scheduler.current.index, video.scheduler.due_index(),
+       "the picture after a seek is not the one the sound is due")
+    eq(video.scheduler.current.index, 41)
+    video.close()
+    audio.close()
+    output.close()
+
+
+# -- the browser: a <video> element asking for its own sound ----------------
+
+KEY = "http://example.invalid/clip.avi"
+
+
+class _TabStub:
+    """The parts of a `Tab` that building a player out of bytes touches.
+
+    A whole `Tab` wants a window, a network stack and a laid-out page. The
+    real `Tab._finish_video` and `Tab._attach_video_audio` are then called
+    unbound against this, so what is under test is the shipping code and not
+    a paraphrase of it.
+    """
+
+    def __init__(self):
+        self.audio_players = []
+        self.video_players = []
+        self.errors = []
+        self.browser = None
+        self._video_queue = []
+        self._video_nodes = {}
+
+    _attach_video_audio = browser.Tab._attach_video_audio
+
+    def _add_error(self, text):
+        self.errors.append(text)
+
+    def finish(self, data, node):
+        """Take delivery of a downloaded file, as the download thread's
+        drain does. Returns the `VideoPlayer` built for it."""
+        self._video_nodes[KEY] = [node]
+        self._video_queue.append(KEY)
+        browser.Tab._finish_video(self, KEY, data)
+        return self.video_players[-1] if self.video_players else None
+
+
+class _ElementStub:
+    """A `<video>` node, as far as building a player cares: its attributes."""
+
+    def __init__(self, **attributes):
+        self.attributes = dict(attributes)
+
+
+def test_a_video_element_with_no_sound_is_left_exactly_as_it_was():
+    """The common case, and the one that must not regress: an AVI with no
+    audio stream. No device is opened, nothing is said, and the pictures are
+    still driven by the clock they were built with."""
+    tab, node = _TabStub(), _ElementStub()
+    video = tab.finish(_clip(count=20, fps=10.0), node)
+    assert video is not None, "the pictures did not survive the attempt"
+    eq(tab.errors, [], "silence is not an error")
+    eq(tab.audio_players, [], "a soundless video kept an audio player")
+    assert video.audio is None, "a soundless video was given a soundtrack"
+    assert video.scheduler.clock is video._own_clock, \
+        "a soundless video had its clock taken away"
+    assert video.first_frame() or video.scheduler.current is not None, \
+        "the first picture never appeared"
+    video.close()
+
+
+def test_a_soundtrack_we_cannot_decode_is_said_out_loud():
+    """An AVI that names an MP3 stream we have no decoder for. The pictures
+    still play; the page says why they are silent."""
+    tab, node = _TabStub(), _ElementStub()
+    frames = [media_fixtures.rgb24_frame(8, 6, lambda x, y, i=i: (i, 0, 0))
+              for i in range(20)]
+    data = media_fixtures.avi(frames, 8, 6, fps=10.0,
+                              audio={"format_tag": 0x0055, "channels": 2,
+                                     "sample_rate": 44100, "length": 441000})
+    video = tab.finish(data, node)
+    assert video is not None, "an undecodable soundtrack took the pictures too"
+    eq(tab.audio_players, [], "we cannot decode MP3")
+    eq(len(tab.errors), 1, "a track we could name and not play went unsaid")
+    assert tab.errors[0].startswith("AUDIO "), tab.errors[0]
+    assert video.audio is None
+    assert video.scheduler.clock is video._own_clock
+    video.close()
+
+
+def test_the_browser_hands_a_video_the_sound_that_came_with_it():
+    """The wire itself. What `arch.AudioPlayer` decodes is tested above; what
+    is tested here is that the element's own attributes reach it, that the
+    tab keeps hold of it, and that the pictures end up on its clock."""
+    device = Capture(48000, 2)
+    output = _audible(device)
+    made = []
+    # Bound before the patch goes in, or the stand-in calls itself.
+    real = arch.AudioPlayer
+
+    def fake_player(data=None, loop=False):
+        player = real(track=FakeAudioTrack(count=400), output=output,
+                      threaded=False, loop=loop)
+        made.append(player)
+        return player
+
+    tab = _TabStub()
+    node = _ElementStub(loop="", muted="")
+    arch.AudioPlayer = fake_player
+    try:
+        video = tab.finish(_clip(count=20, fps=10.0), node)
+    finally:
+        arch.AudioPlayer = real
+    eq(len(made), 1, "the element did not ask for a player")
+    audio = made[0]
+    eq(tab.audio_players, [audio], "the player built is not the one attached")
+    assert audio.loop, "the element's loop did not reach the sound"
+    assert audio.muted, "the element's muted did not reach the sound"
+    eq(tab.audio_players, [audio], "the tab did not keep hold of the sound")
+    assert node.audio_player is audio, "the element cannot find its own sound"
+    assert video.audio is audio, "the video was not told about the sound"
+    assert isinstance(video.scheduler.clock, media._AudioClock), \
+        "the pictures are still on the wall clock"
+    eq(tab.errors, [], "a soundtrack that worked was complained about")
+    video.close()
+    audio.close()
+    output.close()
+
+
+def test_a_tab_that_goes_away_lets_go_of_its_sound():
+    """`stop_videos()` is what a navigation calls. A daemon decode thread
+    still filling a ring for a page nobody is on is a leak that makes a
+    noise."""
+    tab = _TabStub()
+    device = Capture(48000, 2)
+    output = _audible(device)
+    audio = _player(output, track=FakeAudioTrack(count=400))
+    audio.play()
+    tab.audio_players.append(audio)
+    tab.video_players = []
+    tab._video_queue = []
+    tab._video_nodes = {}
+    browser.Tab.stop_videos(tab)
+    eq(tab.audio_players, [], "the tab is still holding its audio players")
+    assert not audio.playing, "the sound is still playing after the page went"
+    assert audio.source is None, "the source outlived the page"
+    output.close()
 
 
 # -- the live half ---------------------------------------------------------

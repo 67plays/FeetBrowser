@@ -1128,6 +1128,13 @@ class Output:
     # -- volume, which is the mixer's ---------------------------------------
 
     @property
+    def closed(self):
+        """Whether `close()` has been called. A closed output is finished:
+        it cannot be started again, and a caller holding one has to open a
+        new one rather than wait for this to come back."""
+        return self._closed
+
+    @property
     def volume(self):
         """Master volume, 0.0 to 1.0. Applied once, at the mix."""
         return self.mixer.volume
