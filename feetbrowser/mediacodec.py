@@ -13,6 +13,9 @@ What is actually decoded to pixels:
   AVI (RIFF) with `MJPG`     Motion JPEG: every frame is a whole JPEG
   MOV/MP4 with `jpeg`/`mjpa` the same codec in QuickTime's container
   MOV/MP4 with `raw `/`png ` uncompressed and PNG-per-frame QuickTime video
+  MOV/MP4/AVI with `avc1`    H.264, I and P slices, by the Fortran decoder
+                             in `fortran/`; a stream with B slices is
+                             refused before anything is drawn
   a bare `.mjpeg` stream      JPEGs end to end with no container at all
 
 Motion JPEG is the one that makes this a video player rather than a
@@ -23,11 +26,11 @@ a frame costs a couple of percent of one frame's worth of time. The codec
 below is the cheap half -- work out where each JPEG starts and ends, hand it
 over, and put the pixels where the compositor expects them.
 
-Everything else in this module *reads* the file and refuses honestly: an MP4
-carrying H.264, or a WebM carrying VP9, is walked far enough to report its
-dimensions, duration and codec name, and then declines, because saying
-"1280x720, H.264, 4.0s, no decoder" is useful and pretending to play it is
-not. See docs/media.md.
+Everything else in this module *reads* the file and refuses honestly: a WebM
+carrying VP9, or an H.264 stream with B slices, is walked far enough to
+report its dimensions, duration and codec name, and then declines, because
+saying "1280x720, VP9, 4.0s, no decoder" is useful and pretending to play it
+is not. See docs/media.md.
 
 Three rules the parsers hold to, because the file came from a stranger:
 
@@ -618,40 +621,48 @@ class _Mjpeg(_Codec):
 class _H264(_Codec):
     """H.264/AVC, decoded by the Fortran decoder in ``fortran/``.
 
-    Phase one of that decoder is I frames only, so the useful question is
-    not "is this H.264" but "does this particular stream decode", and the
-    only honest way to answer it is to decode a frame. That is what the
-    constructor does: it takes the first keyframe, runs it, and refuses
-    the whole file with the decoder's own reason if it does not come out.
-    Opening a file that plays for two frames and then stops would be worse
-    than refusing it -- the poster and a sentence beats a frozen picture.
+    The decoder does I and P slices, so the useful question is not "is this
+    H.264" but "does this particular stream decode", and part of the answer
+    can only be had by decoding. The constructor takes the first keyframe,
+    runs it, and refuses the whole file with the decoder's own reason if it
+    does not come out. Opening a file that plays for two frames and then
+    stops would be worse than refusing it -- the poster and a sentence
+    beats a frozen picture.
 
-    Which is also why the sync flags are read before anything is decoded.
-    Every ordinary web MP4 starts with an I frame and continues with P
-    frames, so trial-decoding frame zero would say yes to a file that then
-    freezes on frame one. A track whose every sample is a sync sample is
-    the shape this decoder can finish, and it is the shape an all-intra
-    encode has; anything else is refused up front and named.
+    Trial-decoding frame zero cannot see frame four hundred, though, and
+    the thing this decoder still cannot do -- B slices -- is a per-slice
+    property that an encoder is free to introduce anywhere. So every
+    sample's slice_type is read first. That costs two exp-Golomb fields per
+    NAL, needs no arithmetic decoding, and is the only way to know before
+    the poster goes up that the file finishes.
 
-    Stateless between frames, because there is nothing yet that is not a
-    keyframe. When inter prediction arrives this class grows a reference
-    picture and `reset()` starts meaning something.
+    Stateful, and now it means something: P frames are differences against
+    the pictures before them, so `reset()` drops the decoder's reference
+    pictures and `VideoTrack.frame()` replays from the keyframe.
     """
 
     def __init__(self, width, height, extradata, data, samples):
         _check_size(width, height)
         self.width = width
         self.height = height
-        inter = sum(1 for _o, _l, keyframe in samples if not keyframe)
-        if inter:
-            raise MediaError(
-                "H.264: %d of this track's %d frames are inter-coded, and "
-                "the decoder does I frames only"
-                % (inter, len(samples)))
         try:
             self._decoder = h264.Decoder(extradata)
+        except h264.H264Error as exc:
+            raise MediaError("H.264: %s" % exc)
+        kinds = h264.slice_types(_annexb_track(data, samples, extradata))
+        refused = [name for kind, name in ((1, "B"), (3, "SP"), (4, "SI"))
+                   if kind in kinds]
+        if refused:
+            raise MediaError(
+                "H.264: this track has %s slices, and the decoder does I and "
+                "P slices" % " and ".join(refused))
+        try:
             got_width, got_height, _rgba = self._decoder.decode(
                 _first_keyframe(data, samples))
+            # The trial decode has left an IDR in the reference list; drop
+            # it so that frame zero is decoded once, from a clean decoder,
+            # by whoever asks for frame zero.
+            self._decoder.reset()
         except h264.H264Error as exc:
             raise MediaError("H.264: %s" % exc)
         # The container and the sequence parameter set can disagree about
@@ -665,7 +676,7 @@ class _H264(_Codec):
                                              width, height))
 
     def reset(self):
-        pass
+        self._decoder.reset()
 
     def decode(self, packet, keyframe):
         if not packet:
@@ -1105,6 +1116,34 @@ def _h264_reason(exc):
     """
     text = str(exc)
     return text if text.startswith("H.264") else "H.264: %s" % text
+
+
+def _annexb_track(data, samples, extradata):
+    """Every sample of an H.264 track as one run of Annex B bytes.
+
+    Only ever handed to `h264.slice_types`, which reads two fields out of
+    each slice header, so this deliberately does not care about access unit
+    boundaries. A sample that points outside the file is skipped rather
+    than complained about: `_first_keyframe` is the check for that, and it
+    gives a better sentence.
+    """
+    length_size = 0
+    if extradata[:1] == b"\x01" and len(extradata) > 4:
+        length_size = (extradata[4] & 3) + 1
+    out = []
+    for offset, length, _keyframe in samples:
+        if offset < 0 or length <= 0 or offset + length > len(data):
+            continue
+        if length > MAX_FRAME_BYTES:
+            continue
+        sample = data[offset:offset + length]
+        if length_size:
+            try:
+                sample = h264.annexb_from_avcc(sample, length_size)
+            except h264.H264Error:
+                continue
+        out.append(sample)
+    return b"".join(out)
 
 
 def _first_keyframe(data, samples):

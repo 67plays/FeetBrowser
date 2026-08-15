@@ -36,15 +36,15 @@ C     normalisation for this QP, then shift by the QP's sixth.
 
 C     8.5.13.1 for an 8x8 block.  The same shape with six where four was,
 C     because the 8x8 transform has two more bits of gain in it.
-      SUBROUTINE H2DQ8(LEV, QP, BLK)
+      SUBROUTINE H2DQ8(LEV, WH, QP, BLK)
       IMPLICIT NONE
       INCLUDE 'h264com.inc'
-      INTEGER LEV(0:63), QP, BLK
+      INTEGER LEV(0:63), WH, QP, BLK
       INTEGER I, M, S, LS
       M = MOD(QP, 6)
       S = QP / 6
       DO 10 I = 0, 63
-         LS = W8(I + 1, 1) * NADJ8(M, I)
+         LS = W8(I + 1, WH) * NADJ8(M, I)
          IF (S .GE. 6) THEN
             CO8(I + 1, BLK) = ISHFT(LEV(I) * LS, S - 6)
          ELSE
@@ -97,7 +97,7 @@ C     coefficients and the transform is a 2x2 Hadamard.
       IMPLICIT NONE
       INCLUDE 'h264com.inc'
       INTEGER LEV(0:63), C
-      INTEGER F(4), I, M, S, LS, QP
+      INTEGER F(4), I, M, S, LS, QP, WH
       F(1) = LEV(0) + LEV(1) + LEV(2) + LEV(3)
       F(2) = LEV(0) - LEV(1) + LEV(2) - LEV(3)
       F(3) = LEV(0) + LEV(1) - LEV(2) - LEV(3)
@@ -106,7 +106,14 @@ C     coefficients and the transform is a 2x2 Hadamard.
       IF (C .EQ. 2) QP = QPCR
       M = MOD(QP, 6)
       S = QP / 6
-      LS = W4(1, C + 1) * NADJ4(M, 0)
+C     Six scaling lists, in the order 8-317 puts them: intra Y, Cb, Cr
+C     then inter Y, Cb, Cr.  An inter macroblock that reached for the
+C     intra list would be wrong only when the stream carries scaling
+C     matrices at all, which is why this is easy to get wrong and hard to
+C     notice.
+      WH = C + 1
+      IF (CINTR .EQ. 0) WH = C + 4
+      LS = W4(1, WH) * NADJ4(M, 0)
       DO 10 I = 1, 4
          DCC(I, C) = SHIFTA(ISHFT(F(I) * LS, S), 5)
    10 CONTINUE
@@ -214,28 +221,34 @@ C     easy; above-right is the awkward one, because in z-order the block
 C     above and to the right has sometimes been decoded already and
 C     sometimes has not.  Comparing the two z-order numbers answers that
 C     without a table: if it comes earlier, it exists.
+C
+C     IAVA..IAVD and not AVLA..AVLD: an intra macroblock in a P slice
+C     coded with constrained_intra_pred_flag set may not predict from a
+C     neighbour that was itself inter coded, and IAV* is the availability
+C     that rule leaves.  In an I picture the two are the same four
+C     numbers.
       SUBROUTINE H2AVL4(I)
       IMPLICIT NONE
       INCLUDE 'h264com.inc'
       INTEGER I, BX, BY
       BX = BLKX(I) / 4
       BY = BLKY(I) / 4
-      PTOK = AVLB
+      PTOK = IAVB
       IF (BY .GT. 0) PTOK = 1
-      PLOK = AVLA
+      PLOK = IAVA
       IF (BX .GT. 0) PLOK = 1
       IF (BX .GT. 0 .AND. BY .GT. 0) THEN
          PDOK = 1
       ELSE IF (BX .GT. 0) THEN
-         PDOK = AVLB
+         PDOK = IAVB
       ELSE IF (BY .GT. 0) THEN
-         PDOK = AVLA
+         PDOK = IAVA
       ELSE
-         PDOK = AVLD
+         PDOK = IAVD
       END IF
       IF (BY .EQ. 0) THEN
-         PTROK = AVLB
-         IF (BX .EQ. 3) PTROK = AVLC
+         PTROK = IAVB
+         IF (BX .EQ. 3) PTROK = IAVC
       ELSE IF (BX .EQ. 3) THEN
          PTROK = 0
       ELSE IF (ZORD(BX + 1, BY - 1) .LT. I) THEN
@@ -256,23 +269,23 @@ C     just decoded, and the bottom right has nothing above-right at all.
       INTEGER K, BX, BY
       BX = MOD(K, 2)
       BY = K / 2
-      PTOK = AVLB
+      PTOK = IAVB
       IF (BY .GT. 0) PTOK = 1
-      PLOK = AVLA
+      PLOK = IAVA
       IF (BX .GT. 0) PLOK = 1
       IF (BX .GT. 0 .AND. BY .GT. 0) THEN
          PDOK = 1
       ELSE IF (BX .GT. 0) THEN
-         PDOK = AVLB
+         PDOK = IAVB
       ELSE IF (BY .GT. 0) THEN
-         PDOK = AVLA
+         PDOK = IAVA
       ELSE
-         PDOK = AVLD
+         PDOK = IAVD
       END IF
       IF (K .EQ. 0) THEN
-         PTROK = AVLB
+         PTROK = IAVB
       ELSE IF (K .EQ. 1) THEN
-         PTROK = AVLC
+         PTROK = IAVC
       ELSE IF (K .EQ. 2) THEN
          PTROK = 1
       ELSE
@@ -297,9 +310,9 @@ C     predicts the whole macroblock first and only then adds residual.
       BY = CMBY * 16
 
       IF (CI16 .NE. 0) THEN
-         PTOK = AVLB
-         PLOK = AVLA
-         PDOK = AVLD
+         PTOK = IAVB
+         PLOK = IAVA
+         PDOK = IAVD
          PTROK = 0
          CALL H2GATH(PY, MXW, BX, BY, 16, 0)
          CALL H2P16(CPRED, P16)
@@ -370,25 +383,80 @@ C     block, in the raster order of the blocks rather than their z-order.
       RETURN
       END
 
-C     One chroma plane of one macroblock.  Chroma is always predicted
-C     8x8 as a whole, whatever the luma did, so there is no interleaving
-C     to do here.
-      SUBROUTINE H2RCH(P, C)
+C     Add the luma residual of the macroblock being decoded to a
+C     prediction that is already complete, and store the result.
+C
+C     Intra prediction cannot use this, because each of its blocks
+C     predicts from the reconstructed samples of the last one and so has
+C     to be added as it goes.  Inter prediction has no such dependency:
+C     the whole 16x16 comes out of a picture that was finished frames
+C     ago, so predicting everything and then adding everything is not
+C     only allowed, it is the only order that lets the four partitions be
+C     interpolated independently.
+      SUBROUTINE H2ADDY(PRD)
+      IMPLICIT NONE
+      INCLUDE 'h264com.inc'
+      INTEGER PRD(0:15,0:15)
+      INTEGER RES(0:63)
+      INTEGER BX, BY, I, K, X, Y, X0, Y0, R, V
+      BX = CMBX * 16
+      BY = CMBY * 16
+      IF (T8FLG .NE. 0) THEN
+         DO 40 K = 0, 3
+            X0 = MOD(K, 2) * 8
+            Y0 = (K / 2) * 8
+            IF (CNZ(4 * K + 1) .GT. 0) THEN
+               CALL H2IT8(CO8(1, K + 1), RES)
+            ELSE
+               DO 10 I = 0, 63
+                  RES(I) = 0
+   10          CONTINUE
+            END IF
+            DO 30 Y = 0, 7
+               R = (BY + Y0 + Y) * MXW + BX + X0
+               DO 20 X = 0, 7
+                  V = PRD(X0 + X, Y0 + Y) + RES(Y * 8 + X)
+                  PY(R + X + 1) = MAX(0, MIN(255, V))
+   20          CONTINUE
+   30       CONTINUE
+   40    CONTINUE
+      ELSE
+         DO 80 I = 0, 15
+            X0 = BLKX(I)
+            Y0 = BLKY(I)
+            IF (CNZ(I + 1) .GT. 0) THEN
+               CALL H2IT4(COEF(1, I + 1), RES)
+            ELSE
+               DO 50 K = 0, 15
+                  RES(K) = 0
+   50          CONTINUE
+            END IF
+            DO 70 Y = 0, 3
+               R = (BY + Y0 + Y) * MXW + BX + X0
+               DO 60 X = 0, 3
+                  V = PRD(X0 + X, Y0 + Y) + RES(Y * 4 + X)
+                  PY(R + X + 1) = MAX(0, MIN(255, V))
+   60          CONTINUE
+   70       CONTINUE
+   80    CONTINUE
+      END IF
+      RETURN
+      END
+
+C     The same for one chroma plane.  The DC coefficient comes from the
+C     2x2 Hadamard of 8.5.11 whether the macroblock was intra or inter,
+C     so a block with no AC coefficients at all can still have a residual.
+      SUBROUTINE H2ADDC(P, C, PRD)
       IMPLICIT NONE
       INCLUDE 'h264com.inc'
       INTEGER P(*), C
-      INTEGER PRD(0:7,0:7), RES(0:63)
+      INTEGER PRD(0:7,0:7)
+      INTEGER RES(0:63)
       INTEGER STR, CX, CY, I, K, X, Y, X0, Y0, B, R, V
       STR = MXW / 2
       CX = CMBX * 8
       CY = CMBY * 8
-      PTOK = AVLB
-      PLOK = AVLA
-      PDOK = AVLD
-      PTROK = 0
-      CALL H2GATH(P, STR, CX, CY, 8, 0)
-      CALL H2PCH(CCPM, PRD)
-      DO 50 I = 0, 3
+      DO 40 I = 0, 3
          B = 16 + 4 * (C - 1) + I + 1
          X0 = MOD(I, 2) * 4
          Y0 = (I / 2) * 4
@@ -407,6 +475,26 @@ C     to do here.
                P(R + X + 1) = MAX(0, MIN(255, V))
    20       CONTINUE
    30    CONTINUE
-   50 CONTINUE
+   40 CONTINUE
+      RETURN
+      END
+
+C     One chroma plane of one macroblock.  Chroma is always predicted
+C     8x8 as a whole, whatever the luma did, so there is no interleaving
+C     to do here.
+      SUBROUTINE H2RCH(P, C)
+      IMPLICIT NONE
+      INCLUDE 'h264com.inc'
+      INTEGER P(*), C
+      INTEGER PRD(0:7,0:7)
+      INTEGER STR
+      STR = MXW / 2
+      PTOK = IAVB
+      PLOK = IAVA
+      PDOK = IAVD
+      PTROK = 0
+      CALL H2GATH(P, STR, CMBX * 8, CMBY * 8, 8, 0)
+      CALL H2PCH(CCPM, PRD)
+      CALL H2ADDC(P, C, PRD)
       RETURN
       END

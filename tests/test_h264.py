@@ -4,7 +4,10 @@ Every `.i420.z` in `tests/fixtures/h264` is exactly what FFmpeg 7.1 decoded
 the stream beside it to, zlib-compressed because a QCIF frame is 38016 bytes
 of very compressible test pattern. FFmpeg is not involved in running these
 tests and is not a dependency of anything: it produced the fixtures once,
-offline, and what ships is the numbers it produced.
+offline, and what ships is the numbers it produced. The inter-coded vectors
+carry every frame of their stream, not just the first, and
+`tests/fixtures/h264/make_inter_vectors.sh` is the offline tool that made
+them.
 
 The comparison is exact. H.264 is a bit-exact specification in the YUV
 domain -- two conforming decoders produce identical samples, not similar
@@ -29,7 +32,8 @@ from feetbrowser import h264, mediacodec
 FIXTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                         "fixtures", "h264")
 
-# Every stream with ground truth, and what makes it worth its bytes.
+# Every intra-only stream with ground truth, and what makes it worth its
+# bytes. One picture each, so `decode_i420` is handed the whole file.
 VECTORS = [
     ("mb1-noloop", 16, 16, "one macroblock, deblocking off"),
     ("mb1", 16, 16, "one macroblock, deblocking on"),
@@ -42,6 +46,26 @@ VECTORS = [
     ("tiny-crop", 66, 50, "cropping on both axes at once"),
 ]
 
+# The inter-coded vectors: an IDR and then P frames, every frame compared.
+# Made by tests/fixtures/h264/make_inter_vectors.sh, which says what each
+# encoder option is for; the one-line note here is what a failure means.
+#
+# Checking only frame zero of these would prove nothing at all -- frame zero
+# is an IDR and was already covered by the list above -- so the test walks
+# every access unit and compares every one. A decoder with a wrong motion
+# vector predictor is usually still right for a while: the error appears in
+# one macroblock and then spreads by prediction, so the frame it first shows
+# up in is the interesting number and the last frame is the one that catches
+# a slow drift.
+INTER_VECTORS = [
+    ("p-basic", 128, 96, 8, "an IDR and seven P frames, 16x16 partitions"),
+    ("p-skip", 128, 96, 10, "P_Skip over most of a still background"),
+    ("p-sub8x8", 128, 96, 8, "P_8x8 down to 4x4 sub-partitions, 8x8 transform"),
+    ("p-multiref", 112, 80, 10, "four reference frames, ref_idx_l0 in use"),
+    ("p-edge", 112, 80, 10, "the picture pans off its own edges"),
+    ("p-weightp", 112, 80, 10, "weighted prediction across a fade"),
+]
+
 
 def _stream(name):
     with open(os.path.join(FIXTURES, name + ".264"), "rb") as handle:
@@ -51,6 +75,33 @@ def _stream(name):
 def _truth(name):
     with open(os.path.join(FIXTURES, name + ".i420.z"), "rb") as handle:
         return zlib.decompress(handle.read())
+
+
+def _access_units(data):
+    """Split an Annex B stream into one chunk per picture.
+
+    A `.264` file is a run of NAL units with no framing above them, and the
+    decoder takes one access unit per call, so somebody has to cut it up. In
+    the browser that somebody is the container -- an MP4 stores one sample
+    per frame and never asks this question -- which is why the rule here is
+    the crude one and lives in the tests: a chunk ends at the end of a
+    coded-slice NAL. That is only true because these fixtures have one slice
+    per picture, which `qcif-slices` deliberately is not and which is why
+    that vector is in the intra list, decoded whole.
+    """
+    units, current, start = [], b"", data.find(b"\x00\x00\x01")
+    while start >= 0:
+        nxt = data.find(b"\x00\x00\x01", start + 3)
+        end = len(data) if nxt < 0 else nxt
+        kind = data[start + 3] & 0x1F if start + 3 < len(data) else 0
+        current += data[start:end]
+        if kind in (1, 5):
+            units.append(current)
+            current = b""
+        start = nxt
+    if current:
+        units.append(current)
+    return units
 
 
 def _skip():
@@ -100,6 +151,61 @@ def test_every_vector_is_pixel_exact():
         assert got == ref, "%s (%s): %s" % (
             name, what, _first_difference(got, ref, width, height))
         print("  ok  %-14s %4dx%-4d %s" % (name, width, height, what))
+
+
+def test_every_inter_vector_is_pixel_exact_on_every_frame():
+    if _skip():
+        return
+    for name, width, height, frames, what in INTER_VECTORS:
+        stream = _stream(name)
+        ref = _truth(name)
+        size = width * height * 3 // 2
+        assert len(ref) == frames * size, (
+            "%s: ground truth is %d bytes, not %d frames of %d"
+            % (name, len(ref), frames, size))
+        units = _access_units(stream)
+        assert len(units) == frames, (
+            "%s: %d access units, %d frames of ground truth"
+            % (name, len(units), frames))
+        decoder = h264.Decoder()
+        for i, unit in enumerate(units):
+            got_width, got_height, got = decoder.decode_i420(unit)
+            assert (got_width, got_height) == (width, height), (
+                "%s frame %d: decoded %dx%d, expected %dx%d"
+                % (name, i, got_width, got_height, width, height))
+            want = ref[i * size:(i + 1) * size]
+            assert got == want, "%s (%s) frame %d: %s" % (
+                name, what, i, _first_difference(got, want, width, height))
+        print("  ok  %-12s %4dx%-4d %2d frames  %s"
+              % (name, width, height, frames, what))
+
+
+def test_two_decoders_interleaved_do_not_corrupt_each_other():
+    """The one hazard that inter prediction introduced. There is a single
+    decoder in the process -- the Fortran's state is in COMMON -- and a P
+    frame is a difference against pictures that decoder is still holding.
+    Two `<video>` elements on one page decode alternately, so `Decoder`
+    replays its own history when it finds another instance has been at the
+    library. Every frame of both streams must still come out exactly right,
+    which is a strictly harder claim than either stream passing alone."""
+    if _skip():
+        return
+    first, second = INTER_VECTORS[0], INTER_VECTORS[3]
+    streams = []
+    for name, width, height, _frames, _what in (first, second):
+        streams.append((name, width, height, width * height * 3 // 2,
+                        _access_units(_stream(name)), _truth(name),
+                        h264.Decoder()))
+    for i in range(max(len(s[4]) for s in streams)):
+        for name, width, height, size, units, ref, decoder in streams:
+            if i >= len(units):
+                continue
+            _w, _h, got = decoder.decode_i420(units[i])
+            want = ref[i * size:(i + 1) * size]
+            assert got == want, "%s frame %d, interleaved: %s" % (
+                name, i, _first_difference(got, want, width, height))
+    print("  ok  %s and %s decoded a frame at a time in turn"
+          % (first[0], second[0]))
 
 
 def test_cavlc_is_refused_and_says_so():
@@ -207,29 +313,45 @@ def test_mp4_plays_through_the_container_layer():
     print("  ok  MP4 -> avcC -> Annex B -> RGBA, %dx%d" % (176, 144))
 
 
-def test_an_inter_coded_mp4_is_refused_before_it_can_freeze():
-    """The shape every video on the web has, and the one phase one does not
-    decode: an IDR followed by P frames. Its first frame decodes perfectly,
-    which is exactly the trap -- accepting the file on that evidence would
-    put one picture on screen and then hold it there for the rest of the
-    clip, with the element reporting no error at all. The sync flags say so
-    before any of it is decoded, so the file is refused and named."""
+def test_an_inter_coded_mp4_plays_all_the_way_through():
+    """The shape every video on the web has: an IDR followed by P frames.
+    This file used to be the refusal case, and the refusal was honest --
+    frame zero decoded perfectly and every frame after it would have been
+    the same picture held on screen. Now it plays, and the test that proves
+    it has to ask for the last frame, because asking for the first one
+    proves exactly what the old refusal was guarding against.
+
+    It also asks for frame 1 after frame 3, out of order. That is the seek
+    path: `VideoTrack.frame()` has to notice the jump, reset the decoder and
+    replay from the keyframe, and a P frame decoded from the wrong reference
+    picture is a picture, not an error."""
     with open(os.path.join(FIXTURES, "interframe.mp4"), "rb") as handle:
         data = handle.read()
     info = mediacodec.probe(data)
     assert info.codec == "avc1", info
     assert (info.width, info.height) == (64, 48), info
-    assert not info.supported, "an inter-coded stream was accepted"
-    assert "H.264" in info.reason, info.reason
-    if not _skip():
-        assert "inter-coded" in info.reason, info.reason
-    try:
-        mediacodec.open_video(data)
-    except mediacodec.MediaError:
-        pass
-    else:
-        raise AssertionError("open_video accepted an inter-coded stream")
-    print("  ok  IDR + 3 P frames refused: %s" % info.reason)
+    if _skip():
+        assert not info.supported, "no decoder, but the file was accepted"
+        assert "H.264" in info.reason, info.reason
+        return
+    assert info.supported, "an inter-coded H.264 file was refused: %s" % (
+        info.reason,)
+    track = mediacodec.open_video(data)
+    assert track.frame_count == 4, track.frame_count
+    frames = [track.frame(i).rgba for i in range(track.frame_count)]
+    for i, rgba in enumerate(frames):
+        assert len(rgba) == 64 * 48 * 4, (i, len(rgba))
+    # Four identical pictures would mean the P frames decoded to nothing,
+    # which is what a decoder that silently ignores residual and motion
+    # produces, and it is the failure this file was chosen to catch. It is
+    # also exactly what the old refusal was protecting the viewer from, so
+    # the assertion is on the picture and not on the absence of an error.
+    assert frames[0] != frames[-1], (
+        "the last frame is the first frame: the P frames decoded to nothing")
+    assert len(set(frames)) >= 2, "every frame came out the same"
+    assert track.frame(1).rgba == frames[1], (
+        "frame 1 came out differently when seeked to than when played to")
+    print("  ok  IDR + 3 P frames decode, in order and seeked")
 
 
 def test_a_machine_without_gfortran_still_has_a_browser():
