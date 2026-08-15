@@ -1113,19 +1113,35 @@ LIVE = not LIVE_REASON
 
 def live_a_real_device_consumes_frames_in_real_time():
     """The one thing only hardware can show: that the device pulls from the
-    ring at the rate its own crystal runs at. Two hundred milliseconds of a
-    tone quiet enough not to startle anybody, and then the clock is compared
-    against the wall."""
+    ring at the rate its own crystal runs at. A quarter second of a tone quiet
+    enough not to startle anybody, and then the clock is compared against the
+    wall.
+
+    Both ends of the window are taken after the device is already running, and
+    that is the whole care in this test. ``start()`` is not instant -- it hands
+    the format to the operating system, which finds a device, may resample and
+    then schedules a thread -- and on a busy machine with no sound card
+    attached, which is to say on CI, the gap between asking and the first
+    callback has been measured at over 200 ms. Timing from before ``start()``
+    charges all of that to the crystal and fails a device that is keeping
+    perfect time; it is a start-up latency test wearing a rate test's name.
+    So: wait for the first frame, then measure a window inside the run."""
     output = heel.open_output()
     assert not output.silent, "available() said yes and open_output said no"
     source = output.add_source(44100, channels=1, gain=0.2, name="live")
-    source.write(heel.tone(0.4, 440.0, 44100, 1, amplitude=0.2), fmt="float")
-    started = time.monotonic()
+    source.write(heel.tone(1.0, 440.0, 44100, 1, amplitude=0.2), fmt="float")
     output.start()
+    deadline = time.monotonic() + 1.0
+    while not output.clock.frames and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert output.clock.frames, "the device never asked for a sample"
+    started = time.monotonic()
+    base = output.clock.now()
+    before = output.clock.underruns
     time.sleep(0.25)
     elapsed = time.monotonic() - started
-    played = output.clock.now()
-    underruns = output.clock.underruns
+    played = output.clock.now() - base
+    underruns = output.clock.underruns - before
     failure = output.device.failure
     output.close()
     eq(failure, None, "the device thread recorded a failure")
