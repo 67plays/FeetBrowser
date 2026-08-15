@@ -1,10 +1,10 @@
-"""ToeHub — FeetBrowser's toe marketplace.
+"""ToeHub: FeetBrowser's toe marketplace.
 
 The ToeHub is built into the browser core so that extensions are always
 installed *on demand* rather than bundled. It pulls a catalog
 (`index.json`) from a configurable toe repository over the browser's own
 HTTP stack, then installs / uninstalls / toggles toes in the local `toes/`
-folder with live re-discovery — no restart needed.
+folder with live re-discovery, no restart needed.
 
 Pages served (via the built-in handle hook):
     toehub://                  the hub: available + installed toes
@@ -75,10 +75,6 @@ def fetch_catalog():
 def installed_toes():
     """Names of toes currently installed locally."""
     return [t.name for t in toes.discover_toes()]
-
-
-def disabled_toes():
-    return toes.disabled_toes()
 
 
 def install_toe(name, catalog_toes, browser=None):
@@ -360,10 +356,24 @@ def _url_escape(s):
             .replace("&", "%26").replace("?", "%3F"))
 
 
+def _installed_rows(installed, disabled):
+    """HTML rows for the currently installed toes, with their actions."""
+    return "".join(
+        f'<div class="box {"disabled" if n in disabled else "installed"}">'
+        f'<b>{n}</b>'
+        + (f' — <a href="toehub://enable/{n}">enable</a>'
+           if n in disabled else
+           f' — <a href="toehub://disable/{n}">disable</a>')
+        + f' · <a href="toehub://config/{n}">config</a>'
+        + f' · <a href="toehub://manual/{n}">manual</a>'
+        + f' · <a href="toehub://uninstall/{n}">uninstall</a></div>'
+        for n in sorted(installed))
+
+
 def _hub_page():
     catalog, repo = fetch_catalog()
     installed = set(installed_toes())
-    disabled = disabled_toes()
+    disabled = toes.disabled_toes()
     rows = []
     if not catalog:
         rows.append("<div class='box'>Could not reach the toe catalog. "
@@ -396,16 +406,7 @@ def _hub_page():
                           "installed.</span> Pick one above and give the "
                           "browser some feet.</div>")
     else:
-        installed_html = "".join(
-            f'<div class="box {"disabled" if n in disabled else "installed"}">'
-            f'<b>{n}</b>'
-            + (f' — <a href="toehub://enable/{n}">enable</a>'
-               if n in disabled else
-               f' — <a href="toehub://disable/{n}">disable</a>')
-            + f' · <a href="toehub://config/{n}">config</a>'
-            + f' · <a href="toehub://manual/{n}">manual</a>'
-            + f' · <a href="toehub://uninstall/{n}">uninstall</a></div>'
-            for n in sorted(installed))
+        installed_html = _installed_rows(installed, disabled)
     return f"""<!doctype html>
 <html><head><title>ToeHub</title><style>{HUB_STYLE}</style></head>
 <body>
@@ -423,22 +424,13 @@ def _hub_page():
 
 def _gallery_page():
     installed = installed_toes()
-    disabled = disabled_toes()
+    disabled = toes.disabled_toes()
     if not installed:
         rows = ("<div class='box'><span class='k'>No toes installed.</span> "
                 "Visit <a href='toe://hub'>the hub</a> to grow some "
                 "feet.</div>")
     else:
-        rows = "".join(
-            f'<div class="box {"disabled" if n in disabled else "installed"}">'
-            f'<b>{n}</b>'
-            + (f' — <a href="toehub://enable/{n}">enable</a>'
-               if n in disabled else
-               f' — <a href="toehub://disable/{n}">disable</a>')
-            + f' · <a href="toehub://config/{n}">config</a>'
-            + f' · <a href="toehub://manual/{n}">manual</a>'
-            + f' · <a href="toehub://uninstall/{n}">uninstall</a></div>'
-            for n in sorted(installed))
+        rows = _installed_rows(installed, disabled)
     return f"""<!doctype html>
 <html><head><title>The toe gallery</title><style>{HUB_STYLE}</style></head>
 <body>
@@ -456,7 +448,7 @@ def _hello_page():
 <body>
 <h1>toe://hello</h1>
 <div class="box">The framework is here and it's gripping. But no toes are
-installed yet — the browser is barefoot.</div>
+installed yet: the browser is barefoot.</div>
 <p class="dim">Open <a href="toe://hub">the hub</a> to install toes, or
 <a href="toe://gallery">the gallery</a> to see what's already gripping.</p>
 </body></html>

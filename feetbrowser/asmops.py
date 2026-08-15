@@ -18,7 +18,7 @@ back to identical pure-Python implementations so nothing else breaks.
 import os
 import ctypes
 
-from .asmblend import load_assembly
+from .asmblend import _as_dst, _as_src, load_assembly
 
 _ASM = os.path.join(os.path.dirname(os.path.abspath(__file__)), "asm", "pixelops.S")
 
@@ -48,22 +48,16 @@ if os.path.exists(_ASM):
             + [ctypes.POINTER(ctypes.c_uint), ctypes.c_size_t]
 
 
-def _as_dst(buf, n):
-    if isinstance(buf, ctypes.Array) and buf._type_ is ctypes.c_ubyte:
-        return buf
-    return (ctypes.c_ubyte * n).from_buffer(buf)
-
-
-def _as_src(buf, n):
-    if isinstance(buf, ctypes.Array) and buf._type_ is ctypes.c_ubyte:
-        return buf
-    return (ctypes.c_ubyte * n).from_buffer_copy(buf)
-
 
 def _as_xmap(xmap, n):
     if isinstance(xmap, ctypes.Array) and xmap._type_ is ctypes.c_uint:
         return xmap
     return (ctypes.c_uint * n)(*xmap)
+
+
+def using_assembly():
+    """True when the raw assembly kernels are active, not the fallback."""
+    return _lib is not None
 
 
 def unfilter_line(line, prev, n, bpp, ftype):
@@ -157,10 +151,6 @@ def resize_row(dst, src, xmap, n):
         dst[d + 2] = src[s + 2]
         dst[d + 3] = src[s + 3]
 
-
-def using_assembly():
-    """True when the raw assembly kernels are active, not the fallback."""
-    return _lib is not None
 
 
 __all__ = ["unfilter_line", "palette_expand", "grey_expand",

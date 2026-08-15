@@ -49,7 +49,7 @@ Fifty-six of the 57 are reachable from those five. The odd one out is `syn`,
 which no package in the lock file lists as a dependency: it is a stale entry,
 and `cargo update` would drop it.
 
-### chrono — 30 of the 57 crates, for one line of real work
+### chrono: 30 of the 57 crates, for one line of real work
 
 `chrono` backs JS `Date`. It brings in the entire `wasm-bindgen` family, six
 `windows-*` crates, `iana-time-zone`, `core-foundation-sys` and
@@ -57,7 +57,7 @@ and `cargo update` would drop it.
 
 What it is actually used for is smaller than that suggests. `Date` is 255
 lines across `stdlib.rs:1161-1291` and `interp.rs:2047-2170`, and it is 26
-read-only methods — eighteen getters, two formatter bodies, three statics —
+read-only methods (eighteen getters, two formatter bodies, three statics),
 with **none of the roughly nineteen mutators** (`setTime`, `setFullYear`,
 `setMonth` and the rest are all absent). `Utc::now()` and `Local::now()` are
 never called; `Date.now()` already goes through `std::time::SystemTime`. The
@@ -79,7 +79,7 @@ move `cocoa.py` and `x11.py` already make for their libraries; or parse TZif,
 which is not worth it. Start with UTC.
 
 Two bugs are worth fixing in the same change, because both are live today and
-neither is covered — the entire `Date` test surface is one assertion,
+neither is covered: the entire `Date` test surface is one assertion,
 `tests/test_js.py:724`, that `Date.now() > 0`:
 
 ```js
@@ -93,7 +93,7 @@ components are formatted with `{}` rather than `{:02}` (`interp.rs:2134`,
 
 **Estimate: 2-4 days including the tests, which are most of the value.**
 
-### serde_json — 6 crates, and hand-rolling is the more correct option
+### serde_json: 6 crates, and hand-rolling is the more correct option
 
 `serde_json` is used in eight places, all in `stdlib.rs`, all within thirty
 lines, and all on the parse side. `serde_json::to_string` is never called and
@@ -111,8 +111,8 @@ semantics serde has no opinion about, and four of them are wrong today. All
 four were confirmed by running the engine:
 
 ```js
-JSON.stringify({b:1, a:2})        // we return {"a":2,"b":1} — keys sorted
-JSON.stringify({d: new Date(0)})  // we return {} — the key is silently dropped
+JSON.stringify({b:1, a:2})        // we return {"a":2,"b":1}: keys sorted
+JSON.stringify({d: new Date(0)})  // we return {}: the key is silently dropped
 JSON.stringify({a:1}, null, 2)    // we ignore `space` and always minify
 ```
 
@@ -121,18 +121,18 @@ The ordering bug is structural: `JsValue::Object` is a `BTreeMap`
 `toJSON` does not exist anywhere in the tree, which is why the `Date` key
 vanishes rather than becoming an ISO string. `replacer` and `space` are read
 but never applied (`stdlib.rs:1076`), and `JSON.parse` ignores its `reviver`.
-Cycles return `None` — so `"null"` in an array, and an elided key in an object
-— where JS throws `TypeError`.
+Cycles return `None`, so `"null"` in an array, and an elided key in an object
+where JS throws `TypeError`.
 
 The existing tests cannot see any of this: all four JSON assertions use
 single-key objects, which is exactly the case where sorted and insertion order
 agree.
 
 **Estimate: 1-2 days for the parser alone. 3-5 days, and 350-500 lines, to
-also make `JSON.stringify` correct** — insertion-ordered object storage is the
+also make `JSON.stringify` correct**: insertion-ordered object storage is the
 bulk of it, and it touches `value.rs` repo-wide.
 
-### miniz_oxide — 2 crates, and the project already has a second answer
+### miniz_oxide: 2 crates, and the project already has a second answer
 
 `miniz_oxide` arrived with the Rust renderer and is used in exactly one place,
 `image.rs:88-89`, to inflate PNG `IDAT` with a 256 MB ceiling on the output so
@@ -140,7 +140,7 @@ a crafted file cannot exhaust memory.
 
 The thing worth noticing is that PNG *encoding* does not use it.
 `raster.rs:888-916` writes PNGs by calling back into Python's standard library
-— `py.import("zlib")` then `zlib.compress(raw, 6)`. So the tree already
+(`py.import("zlib")` then `zlib.compress(raw, 6)`). So the tree already
 contains two deflate implementations for the same byte format, and the one the
 project reaches for when writing is the one it did not have to depend on.
 
@@ -154,13 +154,13 @@ runs once per image on a page and encode runs only for `--screenshot`.
 The other direction is to write the inflater. RFC 1951 is small and closed:
 fixed and dynamic Huffman blocks, stored blocks, and a 32 KB window, which is
 **300-400 lines of Rust** and would leave `Cargo.toml` free of it entirely. It
-is a genuinely good candidate — bounded, well-specified, and easy to test
-against the PNGs already in `tests/fixtures/` — but it is a decompressor
+is a genuinely good candidate (bounded, well-specified, and easy to test
+against the PNGs already in `tests/fixtures/`), but it is a decompressor
 reading hostile bytes, so it wants fuzzing rather than confidence.
 
 **Estimate: an hour to route it through `zlib`, or 2-3 days to write it.**
 
-### regex — the largest item, and the largest correctness win
+### regex: the largest item, and the largest correctness win
 
 `regex` backs JS `RegExp`: `compile_regex` builds the `regex::Regex`, and the
 compiled matcher is used at eleven sites across `interp.rs` and `stdlib.rs`.
@@ -170,7 +170,7 @@ There is also one unrelated use as `parseFloat`'s number scanner
 The gap between Rust's `regex` and JS's `RegExp` is not bridged, because Rust's
 `regex` is a finite-automata engine that deliberately has no backreferences and
 no lookaround, and JS has both. `compile_regex` (`interp.rs:774-795`) does no
-syntax translation at all — the JS pattern goes to `regex::Regex::new`
+syntax translation at all: the JS pattern goes to `regex::Regex::new`
 verbatim, wrapped only in `(?m:)` and `(?i:)`. And then line 785:
 
 ```rust
@@ -182,17 +182,17 @@ match.** No `SyntaxError`, no warning, no log line. Confirmed by running the
 engine:
 
 ```js
-/\d+/.test("abc123")                // true  — correct
-/(\w+)\s+\1/.test("hello hello")    // false — backreference
-/foo(?=bar)/.test("foobar")         // false — lookahead
-/(?<=x)\d+/.test("x42")             // false — lookbehind
+/\d+/.test("abc123")                // true  (correct)
+/(\w+)\s+\1/.test("hello hello")    // false (backreference)
+/foo(?=bar)/.test("foobar")         // false (lookahead)
+/(?<=x)\d+/.test("x42")             // false (lookbehind)
 ```
 
 Each of those constructs successfully and quietly returns the wrong answer.
 That is worse than a dependency; it is a dependency producing incorrect results
 in a way nothing can observe. Only three of the eight JS flags are read
 (`g`, `i`, `m`); `s`, `u`, `v`, `y` and `d` are lexed and discarded.
-`String.prototype.search` is not implemented at all — it throws.
+`String.prototype.search` is not implemented at all: it throws.
 
 A JS-compatible backtracking engine is roughly **1,050-1,500 lines**: 350-450
 for the pattern parser, 200-300 to compile it, 350-500 for the matcher, and
@@ -220,8 +220,8 @@ the three different failure messages the process can produce.
 
 **What stands between this and a ctypes arrangement is `dom.rs`.**
 
-The pyo3 decorator count is small — 6 `#[pyclass]`, 6 `#[pymethods]`, 3
-`#[pyfunction]`, one `#[pymodule]` — and that count is misleading. `dom.rs` is
+The pyo3 decorator count is small (6 `#[pyclass]`, 6 `#[pymethods]`, 3
+`#[pyfunction]`, one `#[pymodule]`), and that count is misleading. `dom.rs` is
 1,686 lines that manipulate Python objects directly: 95 `getattr` calls, 13
 `setattr`, 6 `call_method`, 5 `call1` and 14 `py.import`. It imports
 `feetbrowser.htmlparser` and `feetbrowser.jsdom` by name, constructs
@@ -230,19 +230,19 @@ The pyo3 decorator count is small — 6 `#[pyclass]`, 6 `#[pymethods]`, 3
 `node.parent` in place. On top of that, `JsValue::Host(Py<PyAny>)` is a
 first-class variant of the interpreter's value enum (`value.rs:98`), and
 `Host` is referenced 26 times across five of the nine Rust sources, so a
-Python object is not something `dom.rs` merely touches at the edges — it is a
+Python object is not something `dom.rs` merely touches at the edges; it is a
 kind of JavaScript value the interpreter carries everywhere.
 
 None of that survives a ctypes boundary. `getattr`, refcounting, `PyDict`
 casts and constructing Python classes *are* the CPython C API, which is
 precisely what ctypes does not give you. `jsdom_rust.py` is **214 lines** of
 shims that forward every `js_get`/`js_set` into `dom.rs`; dropping pyo3 means
-replacing those shims with a handle table — a Python DOM `dom.rs` would ask
-through callbacks on opaque handles — which is the 700-1,100 lines this
+replacing those shims with a handle table (a Python DOM `dom.rs` would ask
+through callbacks on opaque handles), which is the 700-1,100 lines this
 section has long estimated, and the risk is not the FFI. It is that every DOM
 operation changes from "Rust reaches into a Python object" to "Rust asks
-Python through a handle table", which moves behaviour at the edges — identity,
-exception propagation, mutation ordering — and `tests/test_js.py` is the only
+Python through a handle table", which moves behaviour at the edges (identity,
+exception propagation, mutation ordering), and `tests/test_js.py` is the only
 thing standing between that and a class of quiet regressions.
 
 What it would return is real, and the last item is the strongest argument:
@@ -289,15 +289,15 @@ What it decodes: baseline (SOF0), extended sequential (SOF1) and progressive
 restart intervals. What it refuses, with `ImageError` and the `[img]`
 placeholder: arithmetic coding, CMYK and YCCK, 12-bit samples, lossless and
 hierarchical frames, and any other component count. EXIF orientation is
-ignored, so a photograph relying on it appears rotated — the same as before,
+ignored, so a photograph relying on it appears rotated, the same as before,
 since nothing ever honoured it. The inverse transform is libjpeg's AAN one and
 chroma is reconstructed with its triangle filter; against libjpeg over 77
 JPEGs off the web the largest per-channel difference is 3.
 
 Performance was never the interesting number in Rust and is not: 800x600 in
 6.5 ms, 1800x1200 in 27 ms, 60-90 Mpixel/s. The two-codec-pass absurdity this
-section flagged — Pillow decoding a JPEG and re-encoding it to PNG so our own
-decoder could decode it again — went away with the branch that did it.
+section flagged (Pillow decoding a JPEG and re-encoding it to PNG so our own
+decoder could decode it again) went away with the branch that did it.
 
 Safety was the part that was not free, as predicted. Two failure modes exist
 in Rust that did not exist in the Python this was ported from, and both come
@@ -309,7 +309,7 @@ read rather than where it is used. The suite corrupts the real fixtures 1,500
 times a run and asserts `ImageError` every time.
 
 Still open, and unchanged by any of this: image *fetching* is off the UI
-thread (`Tab._fetch_image`) but image *decoding* is not — `_drain_images`
+thread (`Tab._fetch_image`) but image *decoding* is not: `_drain_images`
 calls `_decode_image` synchronously, which holds the GIL for the length of the
 decode. At 6.5 ms a photograph this is no longer urgent, but it is still the
 right shape and still a small change.
@@ -330,7 +330,7 @@ The rasteriser is better placed for this than it might look. `rasterize()` in
 subsampling and analytic horizontal coverage, so anti-aliased filled paths in
 a flat colour already work, and that is the single hardest primitive. What
 does not exist is everything around it: there is no stroker at all
-(`draw_line` is Bresenham with square dots — no joins, no caps, no dashes, and
+(`draw_line` is Bresenham with square dots: no joins, no caps, no dashes, and
 a real stroker is 400-700 lines of genuinely difficult geometry);
 `blit_coverage` takes exactly one solid colour, so gradients need a
 paint-source abstraction and a breaking change to the compositing API;
@@ -344,23 +344,23 @@ boundary rather than a Python function signature.
 
 `htmlparser.py` does not help either, for three separate disqualifying
 reasons. It lowercases every tag name (`htmlparser.py:259`), and SVG is
-case-sensitive camelCase throughout — `linearGradient`, `clipPath`,
+case-sensitive camelCase throughout: `linearGradient`, `clipPath`,
 `viewBox`. Its `VOID_ELEMENTS` list is the HTML one, so `<rect/>` is pushed
 and never closed, corrupting the tree. And `implicit_tags` injects
 `<html>`/`<head>`/`<body>`. SVG needs a namespace-aware XML parser: another
 250-400 lines.
 
-The subset that would render the SVGs you actually meet — paths, basic shapes,
+The subset that would render the SVGs you actually meet (paths, basic shapes,
 transforms, solid fills, strokes with joins and caps, linear and radial
 gradients, `viewBox`, `use`/`defs`, and explicitly no filters and no
-text-on-path — is **2,500-4,000 new lines plus that rasteriser API break**.
+text-on-path) is **2,500-4,000 new lines plus that rasteriser API break**.
 For scale, `layout.py` is the largest file in the project at 3,570 lines. Full
 text, filters and markers push past 6,000.
 
 The structural argument matters more than the line count. **JPEG terminates.**
 T.81 was finished in 1992 and a baseline decoder is bounded and checkable. SVG
 1.1 plus SVG 2 plus the CSS that applies to it is open-ended, and a partial SVG
-renderer produces *wrong pictures* rather than *no picture* — a gradient that
+renderer produces *wrong pictures* rather than *no picture*: a gradient that
 comes out flat black is worse than a placeholder, because it looks like it
 worked.
 
@@ -379,15 +379,15 @@ configuration file anywhere, so it runs at its defaults.
 **Recommendation: keep it, and write down why.** The distinction that justifies
 it is that pyflakes never ships, never runs in the browser, and is not part of
 the artefact. The project's claim is that the browser owns its stack; a linter
-is not in the stack. Drawing that line explicitly — no runtime dependencies,
-development tooling is fine — is more defensible than pretending there is no
+is not in the stack. Drawing that line explicitly (no runtime dependencies,
+development tooling is fine) is more defensible than pretending there is no
 difference.
 
 The replacement also splits unevenly. Unused-import detection over `ast` is
 genuinely easy, about 120-200 lines. Undefined-name detection is not: doing it
-without false positives needs full scope analysis — module, class, function
+without false positives needs full scope analysis (module, class, function
 and comprehension scopes, `global`/`nonlocal`, star imports, `del`,
-conditional imports, `__all__` — which is the bulk of pyflakes and the part
+conditional imports, `__all__`), which is the bulk of pyflakes and the part
 that makes people switch a linter off when it gets it wrong. Undefined names
 are also the high-value catch here, because `browser.py` is 4,510 lines and
 lazy imports still hide in branches nothing routinely takes (`curl_cffi` at
@@ -411,8 +411,8 @@ test.
 
 `net/net.go` is 1,091 lines and its own header calls it a port of
 `feetbrowser/net.py`. It is a near-complete one-to-one port down to the
-tunables — `MAX_REDIRECTS = 10`, `CACHE_MAX_SIZE = 1000`, the same 64 MB body
-cap and the same timeouts — with a hand-rolled HTTP/1.1 client on raw sockets,
+tunables (`MAX_REDIRECTS = 10`, `CACHE_MAX_SIZE = 1000`, the same 64 MB body
+cap and the same timeouts), with a hand-rolled HTTP/1.1 client on raw sockets,
 TLS with SNI, chunked decoding, gzip and deflate, a DNS cache, a keep-alive
 pool and a `Cache-Control`-aware response cache. `net/net_test.go` is 421 more
 lines and 19 test functions, and they are good tests.
@@ -421,7 +421,7 @@ lines and 19 test functions, and they are good tests.
 subprocess call or a ctypes load turn up only the CI job and the `test.sh`
 block that run its own tests. The only shared libraries the browser loads are
 the assembled span kernel and `libX11.so.6`. All three consumers of the
-transport layer — `browser.py`, `toehub.py`, `toes.py` — import the Python
+transport layer (`browser.py`, `toehub.py`, `toes.py`) import the Python
 `net.py`. No documentation mentions it. It has one real feature gap already:
 `RequestImpersonated` (`net.go:372`) is a one-line stub that returns a plain
 request, which is the opposite of what the method is for.
@@ -439,8 +439,8 @@ branch-protection setting that does not live in the repository, so that part
 is not something this file can answer.
 
 **Verdict: optional, and currently dead weight.** The decision to make is
-whether a Go transport has a job in a Python browser — a subprocess, or a
-cdylib over ctypes — and to wire it in, or to delete it. Keeping it as it
+whether a Go transport has a job in a Python browser (a subprocess, or a
+cdylib over ctypes), and to wire it in, or to delete it. Keeping it as it
 stands costs a toolchain in CI and guarantees continued drift.
 
 ## Suggested order

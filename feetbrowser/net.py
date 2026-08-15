@@ -52,7 +52,7 @@ _DNS_INFLIGHT = {}
 
 # Bounded pool of idle keep-alive connections, keyed by (scheme, host, port).
 # HTTP/1.1 lets one connection serve several requests to the same origin, which
-# skips the fresh TCP + TLS handshake each resource used to pay — the most
+# skips the fresh TCP + TLS handshake each resource used to pay, the most
 # expensive part of a fetch. Sockets are parked after a fully-framed response
 # and reclaimed by the next request to that origin; a parked socket whose peer
 # already closed it is detected and retried once on a fresh connection. A lock
@@ -598,7 +598,7 @@ class URL:
                 _pool_park(origin, s)
             else:
                 # Body was read to EOF (no framing), so the connection cannot
-                # be reused — it is already closed by the peer.
+                # be reused; it is already closed by the peer.
                 _close_socket(s)
         except BaseException:
             _close_socket(s)
@@ -723,12 +723,17 @@ class URL:
                 pass
 
         head, _, body = bytes(buf).partition(b"\r\n\r\n")
+        return URL._parse_status(head), headers, body, reusable
+
+    @staticmethod
+    def _parse_status(head):
+        """Parse the HTTP status code out of a header block."""
         # Status line is: HTTP/x.y <code> <explanation>
         status_line = head.split(b"\r\n")[0].decode("latin1")
         parts = status_line.split(" ", 2)
         if len(parts) < 2 or not parts[1].isdigit():
             raise RuntimeError(f"Malformed status line: {status_line!r}")
-        return int(parts[1]), headers, body, reusable
+        return int(parts[1])
 
     @staticmethod
     def _parse_headers(head):
@@ -761,20 +766,22 @@ class URL:
     def _decode_body(body, headers):
         if headers.get("transfer-encoding", "").lower() == "chunked":
             body = URL._dechunk(body)
+        return URL._decode_content_encoding(body, headers)
+
+    @staticmethod
+    def _decode_content_encoding(body, headers, limit=_MAX_BODY_BYTES):
         enc = headers.get("content-encoding", "").lower()
         if enc == "gzip":
             decompressed = URL._decompress_gzip_bounded(body)
             if decompressed is not None:
                 body = decompressed
         elif enc == "deflate":
-            try:
-                body = zlib.decompress(body, zlib.MAX_WBITS, _MAX_BODY_BYTES)
-            except zlib.error:
+            for wbits in (zlib.MAX_WBITS, -zlib.MAX_WBITS):
                 try:
-                    body = zlib.decompress(body, -zlib.MAX_WBITS,
-                                           _MAX_BODY_BYTES)
+                    body = zlib.decompress(body, wbits, limit)
+                    break
                 except (OSError, ValueError, zlib.error):
-                    pass
+                    continue
         return body
 
     @staticmethod
@@ -970,18 +977,7 @@ class HTTPStream:
                 raise RuntimeError("HTTP response body too large")
         body = bytes(out)
         if decode:
-            enc = self.headers.get("content-encoding", "").lower()
-            if enc == "gzip":
-                decompressed = URL._decompress_gzip_bounded(body)
-                if decompressed is not None:
-                    body = decompressed
-            elif enc == "deflate":
-                for wbits in (zlib.MAX_WBITS, -zlib.MAX_WBITS):
-                    try:
-                        body = zlib.decompress(body, wbits, limit)
-                        break
-                    except (OSError, ValueError, zlib.error):
-                        continue
+            body = URL._decode_content_encoding(body, self.headers, limit)
         return body
 
     # -- teardown --------------------------------------------------------
@@ -1025,11 +1021,7 @@ def _read_head(sock):
             raise IncompleteRead("connection closed before the headers ended")
         buf.extend(data)
     head, _, rest = bytes(buf).partition(b"\r\n\r\n")
-    status_line = head.split(b"\r\n")[0].decode("latin1")
-    parts = status_line.split(" ", 2)
-    if len(parts) < 2 or not parts[1].isdigit():
-        raise RuntimeError(f"Malformed status line: {status_line!r}")
-    return int(parts[1]), URL._parse_headers(head), rest
+    return URL._parse_status(head), URL._parse_headers(head), rest
 
 
 def open_stream(url, extra_headers=None, timeout=30,

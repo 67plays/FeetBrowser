@@ -937,7 +937,7 @@ def test_grid_columns_auto_placement_and_span():
 def test_flex_row_grow_and_justify():
     from feetbrowser.layout import DocumentLayout
     from feetbrowser.cssparser import CSSParser, style as apply_style
-    # justify-content: center — no growth, so leftover space is freed.
+    # justify-content: center: no growth, so leftover space is freed.
     css = ".f { display: flex; justify-content: center; gap: 10px; }"
     html = ("<style>css</style><div class=f>"
             "<div class=a>AA</div><div class=b>BB</div>"
@@ -953,7 +953,7 @@ def test_flex_row_grow_and_justify():
         "centered row shifted right of container"
     assert len({int(b.y) for b in items}) == 1, "items share the row baseline"
 
-    # flex-grow: 1 — the last item absorbs every leftover pixel.
+    # flex-grow: 1: the last item absorbs every leftover pixel.
     css = ".f { display: flex; gap: 10px; } .c { flex-grow: 1; }"
     dom = HTMLParser(html).parse()
     apply_style(dom, CSSParser(css).parse())

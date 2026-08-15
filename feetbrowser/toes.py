@@ -1,4 +1,4 @@
-"""Toes — FeetBrowser's extension hooking.
+"""Toes: FeetBrowser's extension hooking.
 
 Every foot deserves toes. A toe is a plain Python module, living in its own
 folder under `toes/`, that gets invited to dinner at a few well-placed points
@@ -14,7 +14,7 @@ A toe folder looks like:
 
 `toe.json` is read at startup; `toe.py` is imported and its `activate(ctx)`
 is called once with a Context that wires up the toe's hooks. A toe that
-raises while loading is skipped with a warning to stderr — one bad toe never
+raises while loading is skipped with a warning to stderr: one bad toe never
 bricks the browser.
 """
 
@@ -338,7 +338,7 @@ def discover_toes(toes_dir=None):
     """Scan toes/ for toe.json manifests and return a list of Toe objects.
 
     A manifest missing required fields, or whose entry module cannot be
-    imported, is skipped with a warning — a broken toe must not stop the
+    imported, is skipped with a warning; a broken toe must not stop the
     browser from starting.
     """
     root = os.path.join(repo_root(), toes_dir or TOES_DIR)

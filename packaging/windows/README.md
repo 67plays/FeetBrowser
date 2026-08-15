@@ -1,6 +1,6 @@
 # Packaging FeetBrowser for Windows
 
-This directory turns the repository into `FeetBrowser.exe` — a folder somebody
+This directory turns the repository into `FeetBrowser.exe`: a folder somebody
 can unzip anywhere and double-click, on a Windows machine with no Python, no
 Rust and no Visual Studio on it.
 
@@ -22,13 +22,13 @@ runner, `verify-bundle.ps1` on a second, clean one.
 Three things in one directory:
 
 1. **CPython**, from python.org's [Windows embeddable
-   package](https://www.python.org/downloads/windows/) — a zip of a plain
+   package](https://www.python.org/downloads/windows/), a zip of a plain
    interpreter with no installer, published specifically to be redistributed
    inside other applications. The version and its SHA-256 are pinned at the
    top of `build.ps1` and the hash is checked on every build.
 2. **`feetbrowser/`**, copied in verbatim. It is pure Python; there is nothing
    to do to it.
-3. **`feetbrowser_engine\`**, taken out of a maturin wheel — the Rust
+3. **`feetbrowser_engine\`**, taken out of a maturin wheel: the Rust
    rasteriser, font engine, image decoders and JavaScript engine. Current
    maturin wraps the extension in a package of its own: a directory holding
    `feetbrowser_engine.cp313-win_amd64.pyd` and a three-line `__init__.py`
@@ -45,8 +45,8 @@ freezer works by guessing which modules the program imports and then
 rewriting how imports work, which is exactly the sort of machinery this
 project exists to not have. The embeddable package needs none of it: it is a
 normal interpreter that finds a normal `feetbrowser/` directory on a normal
-`sys.path`. The bundle is inspectable — the `.py` files are right there, and
-`python.exe` in the folder is a working REPL with the browser importable —
+`sys.path`. The bundle is inspectable (the `.py` files are right there, and
+`python.exe` in the folder is a working REPL with the browser importable),
 and the failure modes are the ones any Python programmer already knows.
 
 ### The layout, and why everything is in one flat directory
@@ -72,7 +72,7 @@ FeetBrowser\
     install.ps1, uninstall.ps1
 ```
 
-A tidier tree — `runtime\` for CPython, `app\` for us — was the first
+A tidier tree (`runtime\` for CPython, `app\` for us) was the first
 instinct and is a mistake. Windows searches an executable's own directory for
 its DLLs first, so `FeetBrowser.exe` has to sit next to `python313.dll`; and
 `._pth` resolution is defined relative to the interpreter, so splitting the
@@ -112,13 +112,13 @@ and identical, the answer is the same either way.
 This file is also what makes the isolation claim true rather than hopeful,
 and the CI job leans on it directly: it sets `PYTHONHOME` and `PYTHONPATH` to
 a directory that does not exist before running anything. If the `._pth` ever
-stopped taking effect, the interpreter would fail to start — loudly, in CI,
+stopped taking effect, the interpreter would fail to start, loudly, in CI,
 rather than quietly borrowing a Python from somebody's machine.
 
 ### What is in the standard library zip, and what is not
 
 The stdlib arrives as `python313.zip`, bytecode only, no `.py` sources. Every
-top-level module `feetbrowser/*.py` imports —
+top-level module `feetbrowser/*.py` imports:
 
 ```
 base64 codecs collections copy ctypes hashlib heapq html importlib itertools
@@ -126,7 +126,7 @@ json math os platform re shutil socket ssl struct subprocess sys tempfile
 threading time traceback urllib zlib
 ```
 
-— is accounted for: most from the zip, `itertools`, `math`, `sys`, `time` and
+That list is accounted for: most from the zip, `itertools`, `math`, `sys`, `time` and
 `zlib` compiled straight into `python313.dll`, and the ones with a C half from
 the `.pyd` files beside it. `ssl` needs `_ssl.pyd`, `libssl-3.dll` and
 `libcrypto-3.dll`; `socket` needs `_socket.pyd` and `select.pyd`; `ctypes`
@@ -141,7 +141,7 @@ stdlib function fails. Neither affects the browser.
 
 Nothing is pruned. `sqlite3.dll` and `winsound.pyd` are dead weight the
 browser will never touch, and they stay, because the CPython half of the
-bundle is then byte-for-byte what python.org published — which keeps
+bundle is then byte-for-byte what python.org published, which keeps
 `python.cat` meaningful, keeps the licensing question to "we redistributed
 it unmodified", and means a CPython bump is a two-line change rather than a
 re-derivation of a file list.
@@ -160,7 +160,7 @@ except ImportError:
 That `except` is the only thing between a packaged browser and a traceback
 the first time somebody navigates to a site that asks for impersonation,
 because a bundle with no pip in it will never have `curl_cffi` and every user
-is therefore on the fallback path. `verify-bundle.ps1` asserts both halves —
+is therefore on the fallback path. `verify-bundle.ps1` asserts both halves:
 that the module really is absent, and that a navigation through
 `request_impersonated()` still comes back with a page.
 
@@ -208,7 +208,7 @@ Loading the DLL wins on three specific things:
   so that the window backend gets to choose per-monitor-v2 for itself.
 
 The cost is a `LoadLibraryExW` + `GetProcAddress` + one `transmute`, and the
-risk that `Py_Main` is not where we think it is — which is checked at run
+risk that `Py_Main` is not where we think it is, which is checked at run
 time, with a message box rather than a silent exit, and by CI on every build.
 
 `Py_Main` is part of CPython's stable ABI and is exported by every
@@ -224,8 +224,8 @@ The interpreter is handed:
 FeetBrowser.exe -X utf8 -m feetbrowser <everything the user typed>
 ```
 
-`-m feetbrowser` because `feetbrowser/__main__.py` is the browser's real CLI
-— `--help`, `--version`, `--screenshot`, the `--toe-*` family and a bare URL.
+`-m feetbrowser` because `feetbrowser/__main__.py` is the browser's real CLI:
+`--help`, `--version`, `--screenshot`, the `--toe-*` family and a bare URL.
 Python stops parsing its own options at `-m <module>`, so user arguments
 reach `sys.argv` untouched even when they start with a dash. `-X utf8` so
 that a page title printed to a redirected stdout does not die on the console
@@ -240,7 +240,7 @@ Redirection already works: `cmd.exe` passes its standard handles to GUI
 processes exactly as it does to console ones, so `FeetBrowser.exe --version >
 out.txt` writes the file with no help from us. The interactive case is
 handled with `AttachConsole(ATTACH_PARENT_PROCESS)`, and only when
-`GetStdHandle` shows nothing already there — stealing the handles back for
+`GetStdHandle` shows nothing already there; stealing the handles back for
 the console when the user asked for a file would throw their output away.
 
 The one visible artefact is the standard one for this technique: `cmd.exe`
@@ -269,7 +269,7 @@ configuration is incorrect", which mentions neither XML nor the file. This
 cost a CI run to a double hyphen inside an XML comment, where it is illegal.
 Now it is a build error with a line number.
 
-`make-icon.py` draws the `.ico` — standard library only, seven sizes, PNG
+`make-icon.py` draws the `.ico`: standard library only, seven sizes, PNG
 entries. It exists so that the one binary file in this directory is
 reviewable: change a number, re-run, and the diff is explained.
 
@@ -290,7 +290,7 @@ The result is `build\windows\FeetBrowser\` and
 embeddable package into `packaging\windows\.cache\`; later runs reuse it.
 
 The wheel's interpreter tag is checked against the pinned CPython version.
-The extension is not `abi3` — `wheels.yml` explains why in detail — so a
+The extension is not `abi3` (`wheels.yml` explains why in detail), so a
 `cp312` wheel in a 3.13 bundle would build a zip that fails on the user's
 machine with `DLL load failed while importing feetbrowser_engine`. That is
 the single most likely way to ship a broken bundle, so `build.ps1` refuses
@@ -303,7 +303,7 @@ the layout on a machine with no Rust. The result is not shippable.
 
 `wheels.yml` already produces Windows `cp39`–`cp314` wheels, and the `cp313`
 one is exactly what this bundle needs. The packaging workflow builds its own
-anyway, because `wheels.yml` runs on `rust/**` pull requests and on tags — so
+anyway, because `wheels.yml` runs on `rust/**` pull requests and on tags, so
 on a pull request that only touches `packaging/`, no wheel exists for that
 commit. Fetching one would mean reaching across workflow runs for the newest
 green build of some *other* commit, and the artifact would then contain an
@@ -328,8 +328,8 @@ The checks are:
 1. the folder has the files it claims to, one `python3NN.dll` and one
    `feetbrowser_engine*.pyd`;
 2. `FeetBrowser.exe` is subsystem 2 (`WINDOWS_GUI`), read straight out of the
-   PE header — "no console window flashes up" is a property of that one
-   16-bit field — and carries version information;
+   PE header ("no console window flashes up" is a property of that one
+   16-bit field), and carries version information;
 3. `--version` and `--help` answer correctly;
 4. from inside the bundle: the interpreter and every `sys.path` entry are
    under the bundle root, the poisoned environment variables were ignored,
@@ -344,8 +344,8 @@ The checks are:
    ones for the heading, so layout, the font engine and the rasteriser all
    have to have run;
 7. `--screenshot` writes to a path with a space and an accent in it;
-8. launching it the way Explorer does — no redirected handles, just a URL —
-   produces a real `HWND` within a minute.
+8. launching it the way Explorer does (no redirected handles, just a URL),
+   producing a real `HWND` within a minute.
 
 In CI all of this happens twice, on a runner that never checks the repository
 out: once from `C:\Program Files\FeetBrowser`, and once from a directory
@@ -406,14 +406,14 @@ Unsigned is the chosen way to ship this, not a stage on the way to signing.
 What signing would take is recorded here so the decision can be revisited by
 someone who knows what they would be taking on:
 
-* An OV or EV code-signing certificate from a CA — a few hundred dollars a
+* An OV or EV code-signing certificate from a CA: a few hundred dollars a
   year, and issued only to a verified legal entity, which a pseudonymous
   hobby project is not.
 * Since June 2023, the private key must live on FIPS 140-2 Level 2 hardware:
   a USB token, an HSM, or a cloud signing service. A key in a CI secret is no
   longer an option for a publicly trusted certificate.
 * `signtool sign /fd sha256 /tr <timestamp-url> /td sha256` over
-  `FeetBrowser.exe` — and, separately, over the `.pyd`, since a signed `.exe`
+  `FeetBrowser.exe`, and separately over the `.pyd`, since a signed `.exe`
   says nothing about the rest of the folder.
 * Reputation. An OV certificate does not silence SmartScreen on day one; the
   warning fades as installs accumulate. Only EV certificates get immediate
