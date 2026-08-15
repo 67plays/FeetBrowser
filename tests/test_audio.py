@@ -810,7 +810,7 @@ def test_a_closed_source_ends_once_it_has_played_out():
     output.close()
 
 
-def test_a_seek_throws_the_queue_away_without_ending_the_source():
+def test_clearing_throws_the_queue_away_without_ending_the_source():
     output = heel.Output(Capture(), threaded=False)
     source = output.add_source(44100, channels=1)
     source.write([0.5] * 44100, fmt="float")
@@ -818,7 +818,7 @@ def test_a_seek_throws_the_queue_away_without_ending_the_source():
     source.clear()
     eq(source.queued_seconds(), 0.0)
     assert not source.ended
-    eq(source.write([0.5] * 441, fmt="float"), 441, "a seek closed the source")
+    eq(source.write([0.5] * 441, fmt="float"), 441, "a clear closed the source")
     output.close()
 
 
@@ -834,6 +834,124 @@ def test_a_sources_position_is_what_has_been_heard_not_what_was_written():
     eq(source.position(), 0.0, "a primed ring has still been heard by nobody")
     device.pump(2400)
     close(source.position(), 0.05, 0.001, "half the ring is 50 ms")
+    output.close()
+
+
+# -- restart(): a seek is a new timeline through the same speaker -----------
+
+def test_a_source_nobody_restarts_reports_exactly_what_it_always_did():
+    """The identity case. `restart()` added two fields to every source in the
+    process, and a source that never seeks must not notice them."""
+    device = Capture(48000, 2)
+    output = heel.Output(device, ring_frames=4800, threaded=False)
+    source = output.add_source(48000, channels=1)
+    eq(source._origin_pulled, 0, "a fresh source starts at the origin")
+    eq(source._origin_at, 0.0, "a fresh source starts at zero seconds")
+    source.write([0.1] * 48000, fmt="float")
+    output.start()
+    device.pump(2400)
+    close(source.position(), 0.05, 1e-9, "the untouched timeline moved")
+    output.close()
+
+
+def test_a_restart_moves_the_timeline_to_where_it_was_told_to():
+    output = heel.Output(Capture(48000, 2), ring_frames=4800, threaded=False)
+    source = output.add_source(48000, channels=1)
+    eq(source.position(), 0.0)
+    source.restart(12.5)
+    eq(source.position(), 12.5, "a restart did not move the timeline")
+    source.restart()
+    eq(source.position(), 0.0, "restart() with no argument is a seek to zero")
+    output.close()
+
+
+def test_a_restart_throws_the_queue_away_without_ending_the_source():
+    output = heel.Output(Capture(), threaded=False)
+    source = output.add_source(44100, channels=1)
+    source.write([0.5] * 44100, fmt="float")
+    assert source.queued_seconds() > 0.5
+    source.restart(3.0)
+    eq(source.queued_seconds(), 0.0, "a seek kept the old sound")
+    assert not source.ended, "a seek is not the end of the stream"
+    eq(source.write([0.5] * 441, fmt="float"), 441, "a seek closed the source")
+    output.close()
+
+
+def test_a_restart_revives_a_source_that_had_played_itself_out():
+    """`ended` is how the player above finds out the file is over. Seeking
+    backwards into a stream that has drained has to take that back, or the
+    element stays finished for ever."""
+    output = heel.Output(Capture(), threaded=False)
+    source = output.add_source(48000, channels=1)
+    source.write([0.5] * 480, fmt="float")
+    source.close()
+    _drive(output.start(), 2048)
+    assert source.ended, "the source should have played out"
+    source.restart(0.0)
+    assert not source.ended, "a seek left the source ended"
+    output.close()
+
+
+def test_a_restart_while_sound_is_still_in_the_ring_leaves_no_offset():
+    """The load-bearing one, and the whole reason `restart()` is not `clear()`
+    with two assignments after it.
+
+    What is queued in the source is dropped by the seek. What has already
+    been handed to the mixer cannot be: it is in the ring, it is going to
+    come out of the speaker, and the new timeline must not start until it
+    has. Charging that backlog to the new segment instead is a permanent
+    offset between the sound and the picture for as long as the file plays,
+    and it is silent -- nothing errors, the video is just wrong by a ring's
+    depth from the seek onwards.
+    """
+    device = Capture(48000, 2)
+    output = heel.Output(device, ring_frames=4800, threaded=False)   # 100 ms
+    source = output.add_source(48000, channels=1)
+    source.write([0.1] * 48000, fmt="float")     # a second of the old segment
+    output.start()                               # primes the whole ring
+    device.pump(2400)                            # 50 ms of it has been heard
+    close(source.position(), 0.05, 1e-9, "the old timeline")
+
+    # Seek to ten seconds. 50 ms of the old segment is still in the ring.
+    source.restart(10.0)
+    source.write([0.2] * 48000, fmt="float")
+    eq(source.position(), 10.0, "a restart starts where it was told to")
+
+    # Play out what was left of the old segment. None of the new sound has
+    # been heard yet, so the new timeline has not started to run.
+    device.pump(2400)
+    eq(source.position(), 10.0,
+       "the old segment's ring backlog was charged to the new one")
+
+    # Now the new segment, ten milliseconds of it.
+    output.pump()
+    device.pump(480)
+    close(source.position(), 10.01, 1e-9, "the new timeline runs slow or fast")
+    device.pump(480)
+    close(source.position(), 10.02, 1e-9, "the new timeline drifted")
+    output.close()
+
+
+def test_a_restart_measures_the_new_segment_from_the_seek_not_from_zero():
+    """Two seeks in a row, with sound heard in between, so an implementation
+    that reset the counters instead of remembering them shows up as a
+    position that keeps sliding."""
+    device = Capture(48000, 2)
+    output = heel.Output(device, ring_frames=4800, threaded=False)
+    source = output.add_source(48000, channels=1)
+    output.start()
+    for target in (4.0, 30.0, 7.5):
+        source.restart(target)
+        source.write([0.3] * 48000, fmt="float")
+        # Whatever is in the ring belongs to the segment we just left. Play
+        # it out before the new one is mixed, so the sound after this line is
+        # entirely the new segment's.
+        device.pump(output.ring.backlog)
+        eq(source.position(), target,
+           "seeking to %.1f s did not start the timeline there" % target)
+        _drive(output, 4800, block=480)          # 100 ms of this segment
+        close(source.position(), target + 0.1, 1e-9,
+              "the segment starting at %.1f s did not run from there" % target)
     output.close()
 
 

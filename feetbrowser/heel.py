@@ -811,6 +811,11 @@ class Source:
         self._pulled = 0                # device frames handed to the mixer
         self._written = 0               # source frames accepted, ever
         self._closed = False
+        # Where this source's timeline began. Both move only in restart(),
+        # and their initial values are the identity, so a source nobody
+        # seeks reports exactly what it reported before they existed.
+        self._origin_pulled = 0         # _pulled when the timeline started
+        self._origin_at = 0.0           # the position it started at
         self._resampler = Resampler(self.rate, output.rate, self.channels,
                                     taps=taps)
 
@@ -864,9 +869,32 @@ class Source:
         self._closed = True
 
     def clear(self):
-        """Throw the queue away. For a seek."""
+        """Throw the queue away, and leave the timeline where it is."""
         with self._lock:
             del self._queue[:]
+        self._resampler.reset()
+
+    def restart(self, at=0.0):
+        """Throw the queue away and begin a new timeline at ``at`` seconds.
+
+        This is what a seek is. A seek is not a gap in one stream, it is a
+        different stream through the same speaker, and ``position()`` has to
+        say so or every picture scheduled against it lands in the wrong
+        place.
+
+        The care is in the second line. What is *queued* is dropped, but what
+        has already been handed to the mixer cannot be: it is in the ring,
+        possibly in the device's own buffer, and it is going to be heard.
+        Remembering how much of it there was is what makes the new timeline
+        begin when the last of the old sound comes out of the speaker rather
+        than a ring's depth before it, which would be a permanent offset
+        between the sound and the picture for as long as the file played.
+        """
+        with self._lock:
+            del self._queue[:]
+            self._origin_pulled = self._pulled
+            self._origin_at = float(at)
+            self.ended = False
         self._resampler.reset()
 
     # -- the mixing side ---------------------------------------------------
@@ -902,13 +930,16 @@ class Source:
         This is the number a `<video>` schedules its pictures against, and
         the reason it is a method on the source rather than on the clock is
         that a stream that starts late, stops, or is seeked has its own
-        timeline and the device's does not move with it.
+        timeline and the device's does not move with it. :meth:`restart` is
+        where that timeline is moved; until it is called this is seconds
+        since the source was made.
         """
-        heard = self._pulled - self.output.ring.backlog
+        heard = self._pulled - self.output.ring.backlog - self._origin_pulled
         if heard < 0:
+            # Sound from before the last restart() is still being heard.
             heard = 0
         seconds = heard / self.output.rate - self.output.latency
-        return seconds if seconds > 0.0 else 0.0
+        return self._origin_at + (seconds if seconds > 0.0 else 0.0)
 
     def __repr__(self):
         return ("<Source %s %d Hz x%d gain=%.2f queued=%.3fs>"
