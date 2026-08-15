@@ -74,6 +74,9 @@ rem one that skips everywhere else.
 %RUN% tests\test_cocoa.py || exit /b 1
 %RUN% tests\test_x11.py || exit /b 1
 %RUN% tests\test_win32.py || exit /b 1
+rem The audio stack. The waveOut backend is the one that only runs here; the
+rem live half needs a real output device and skips when there is not one.
+%RUN% tests\test_audio.py || exit /b 1
 %RUN% tests\test_units.py || exit /b 1
 %RUN% tests\test_js.py || exit /b 1
 %RUN% tests\test_shoes.py || exit /b 1

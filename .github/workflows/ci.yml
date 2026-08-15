@@ -74,6 +74,14 @@ jobs:
           $PY tests/test_x11.py
           $PY tests/test_win32.py
 
+      # The audio stack. Its pure half -- ring, resampler, mixer, clock --
+      # is nearly all of it and runs everywhere; the live half needs an
+      # output device that actually consumes samples, which no runner has,
+      # so it skips and says so. What this checks on a runner is that a
+      # machine with no sound card ends up silent-but-working.
+      - name: Audio tests
+        run: $PY tests/test_audio.py
+
       - name: Unit tests
         run: $PY tests/test_units.py
 
