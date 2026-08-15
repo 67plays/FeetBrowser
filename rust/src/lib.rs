@@ -11,6 +11,7 @@ mod font;
 mod html;
 mod image;
 mod interp;
+mod layout;
 // Hands the arena tree to Python as `htmlparser.Element`/`Text` objects, which
 // is what makes the tree builder above the browser's real parser.
 mod materialize;

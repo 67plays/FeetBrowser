@@ -1,0 +1,10 @@
+<!doctype html><meta charset=utf-8><style>
+body{margin:0}
+.g{display:grid;grid-template-columns:repeat(3, 1fr);width:600px}
+.h{display:grid;grid-template-columns:minmax(0, 1fr) minmax(0, 1fr);width:600px}
+.i{display:grid;grid-template-columns:1fr 1fr 1fr;width:600px}
+.g>div,.h>div,.i>div{background:#cde;height:20px}
+</style>
+<div class=g><div>a</div><div>b</div><div>c</div></div>
+<div class=h><div>a</div><div>b</div></div>
+<div class=i><div>a</div><div>b</div><div>c</div></div>
