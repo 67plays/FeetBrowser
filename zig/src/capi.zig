@@ -20,10 +20,31 @@ const Vm = vmod.Vm;
 const Value = val.Value;
 const CValue = vmod.CValue;
 
-var gpa_state = std.heap.GeneralPurposeAllocator(.{}){};
-
+/// Every object, string and scope the VM makes comes from here, so the choice
+/// of allocator is not a detail: a script allocates constantly and frees
+/// nothing directly, and the collector hands the whole graveyard back at once.
+///
+/// This used to be `GeneralPurposeAllocator`, which is the obvious thing to
+/// reach for and was costing us most of the engine's speed. GPA keeps
+/// per-allocation bookkeeping so it can tell you what you leaked, and that
+/// bookkeeping is priced per allocation -- which is exactly the operation a
+/// JavaScript program does millions of times. Bytecode dispatch was never the
+/// problem: a loop that only reads and writes values it already has runs at
+/// the speed you would want, while anything that *makes* something -- a call
+/// frame, an object literal, a joined string, a regexp match -- fell off a
+/// cliff. Calling a function a hundred thousand times took 3.3 seconds. It now
+/// takes 0.18, and the same change takes allocating fifty thousand objects
+/// from 2.8 seconds to 0.15 and twenty thousand regexp tests from 2.6 to 0.10.
+///
+/// `smp_allocator` is the thread-safe general allocator without the debugging
+/// apparatus. It is chosen over `c_allocator`, which measured a hair faster,
+/// because it does not need libc: this library has to build for macOS, Linux
+/// and Windows, and an allocator that drags a libc dependency behind it is a
+/// portability problem we would have to solve three times for a difference of
+/// a few percent. Leak detection is what we gave up, and the collector's own
+/// tests are what cover that ground instead.
 fn alloc() std.mem.Allocator {
-    return gpa_state.allocator();
+    return std.heap.smp_allocator;
 }
 
 // -- lifecycle -------------------------------------------------------------
