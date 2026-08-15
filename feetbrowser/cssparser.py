@@ -501,7 +501,13 @@ class CSSParser:
                 depth += 1
             elif c in ")]":
                 depth = max(0, depth - 1)
-            elif depth == 0 and c in ";}":
+            elif depth == 0 and c in ";}{":
+                # `{` ends a value the same way `;` does, because reaching one
+                # means this was never a declaration: `&:hover { ... }` is a
+                # nested rule whose prelude happens to contain a colon.
+                # Stopping here is what lets body() see the `{` afterwards
+                # and treat the whole thing as a nested rule; a value that
+                # swallowed the block would be a silently wrong declaration.
                 break
             self.i += 1
         value = self.s[vstart:self.i]
@@ -524,11 +530,36 @@ class CSSParser:
             self.skip_ws()
             if self.i >= len(self.s) or self.s[self.i] == "}":
                 break
+            here = self.i
             p = self.pair()
-            if p:
+            if self.i < len(self.s) and self.s[self.i] == "{":
+                # CSS nesting: a rule inside a rule, as in
+                #   .box { color: red; & + div pre { border: none } }
+                # which docs.python.org's theme and most Tailwind output are
+                # written in. A declaration ends at ';' or '}', so a '{' here
+                # means what pair() just read was a selector, not a property,
+                # whether or not it found a ':' in it (`&:hover {` has one).
+                #
+                # Nesting is not implemented -- flattening it needs the
+                # parent selector threaded through, which is a feature, not a
+                # parse fix -- so the nested rule is skipped like a @container
+                # block and the declarations around it are kept. What matters
+                # here is that it is *consumed*: leaving the scanner sitting
+                # on the '{' is what used to spin this loop forever, because
+                # pair() reads nothing when there is no ':' before the brace
+                # and neither did the ';' below.
+                self.i += 1
+                self._read_block()
+            elif p:
                 pairs[p[0]] = p[1]
             self.skip_ws()
             self.literal(";")
+            if self.i == here:
+                # Belt and braces: nothing above consumed a character, so the
+                # next pass would see the same input and do the same nothing.
+                # One character of progress turns a hang into a dropped
+                # declaration.
+                self.i += 1
         return pairs
 
     def simple_selector(self, text):
@@ -715,12 +746,15 @@ class CSSParser:
         """Return a list of (selector, declarations) rules."""
         rules = []
         while self.i < len(self.s):
+            here = self.i
             self.skip_ws()
             if self.i >= len(self.s):
                 break
             # @-rules: skip @media { ... } but keep inner rules for @media all/screen.
             if self.s[self.i] == "@":
                 self._handle_at_rule(rules)
+                if self.i == here:
+                    self.i += 1  # see the guard at the foot of this loop
                 continue
             # Read selector text up to '{'. A backslash-escaped brace is a
             # name character in a selector, not the start of a block: taking
@@ -742,6 +776,13 @@ class CSSParser:
                 sel = self.selector(one.strip())
                 if sel is not None:
                     rules.append((sel, decls))
+            if self.i == here:
+                # A stylesheet is arbitrary bytes off the network, and every
+                # loop that walks one has to end. Each branch above already
+                # consumes at least the character it looked at; this is the
+                # guarantee, so that a future branch that forgets costs a
+                # dropped rule instead of a browser that never comes back.
+                self.i += 1
         return rules
 
     def _handle_at_rule(self, rules):

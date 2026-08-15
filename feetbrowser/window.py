@@ -283,18 +283,36 @@ class Window:
         if handle:
             self._cancelled.add(handle)
 
-    def flush_timers(self):
+    def flush_timers(self, deadline=None):
         """Run every timer that is due. Returns seconds until the next one,
-        or None when nothing is pending."""
+        or None when nothing is pending.
+
+        `deadline` is a time.monotonic() reading that bounds the *batch*.
+        Timers still undelivered when it passes go back on the heap with
+        their original due time and sequence number, so the next call runs
+        them, in order, exactly once. Nothing is dropped and nothing repeats:
+        a caller that stops pumping here leaves the queue as it found it.
+
+        It exists because a batch is not a bounded amount of work. Each
+        callback can parse a stylesheet, lay a document out or run a script,
+        and a page with a hundred armed timers runs all hundred before the
+        caller gets to look at its clock again -- which is how settle() used
+        to sail past a deadline it was checking on every pass.
+        """
         now = time.monotonic()
         due = []
         while self._timers and self._timers[0][0] <= now:
-            _when, _seq, handle, func, args = heapq.heappop(self._timers)
-            if handle in self._cancelled:
-                self._cancelled.discard(handle)
+            entry = heapq.heappop(self._timers)
+            if entry[2] in self._cancelled:
+                self._cancelled.discard(entry[2])
                 continue
-            due.append((handle, func, args))
-        for _handle, func, args in due:
+            due.append(entry)
+        for index, entry in enumerate(due):
+            if deadline is not None and time.monotonic() >= deadline:
+                for pending in due[index:]:
+                    heapq.heappush(self._timers, pending)
+                break
+            _when, _seq, _handle, func, args = entry
             try:
                 func(*args)
             except Exception as exc:  # noqa: BLE001 - parity with Tk
