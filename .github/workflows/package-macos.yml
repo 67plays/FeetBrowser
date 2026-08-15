@@ -1,0 +1,146 @@
+name: Package (macOS)
+
+# The .app and the .dmg. Not on every push: it downloads a 60 MB CPython and
+# compiles the engine twice, which is a lot of runner minutes to spend on a
+# commit that changed the CSS parser. It runs when the packaging is what
+# changed, when a version is tagged, and whenever anyone asks for it.
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+  pull_request:
+    paths:
+      - 'packaging/macos/**'
+      - '.github/workflows/package-macos.yml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # Built on the Apple Silicon runner, which is what `macos-latest` is now.
+  # The host architecture does not decide what comes out: both halves of the
+  # extension are cross-compiled and lipo'd, and the CPython in the bundle is
+  # python.org's universal2 build.
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      # The CPython .pkg is pinned by version and by SHA-256 in build.sh, so
+      # a cache hit is the same bytes the hash check would have accepted.
+      - name: Cache the CPython installer
+        uses: actions/cache@v4
+        with:
+          path: packaging/macos/cache
+          key: cpython-pkg-${{ hashFiles('packaging/macos/build.sh') }}
+
+      - name: Cache the Rust build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: cargo-macos-pkg-${{ hashFiles('rust/Cargo.lock') }}
+          restore-keys: cargo-macos-pkg-
+
+      - name: Both Apple targets
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: Install maturin
+        run: pipx install maturin || pip3 install --break-system-packages maturin
+
+      - name: Build FeetBrowser.app and the disk image
+        run: packaging/macos/build.sh
+
+      # build.sh runs this on what it just built. Running it again here is
+      # not redundant: this is the copy that is about to be uploaded, and it
+      # is the last chance to notice that it is not self-contained.
+      - name: Audit the bundle
+        run: packaging/macos/verify.sh packaging/macos/dist/FeetBrowser.app
+
+      - name: Run it
+        run: |
+          mkdir -p artifacts
+          python3 packaging/macos/appshot.py \
+            packaging/macos/dist/FeetBrowser.app artifacts/feetbrowser-app.png
+
+      - name: Sizes
+        run: |
+          du -sh packaging/macos/dist/FeetBrowser.app
+          du -h packaging/macos/dist/*.dmg
+          lipo -archs packaging/macos/dist/FeetBrowser.app/Contents/MacOS/FeetBrowser
+
+      - name: Upload the disk image
+        uses: actions/upload-artifact@v4
+        with:
+          name: FeetBrowser-macos-dmg
+          path: packaging/macos/dist/*.dmg
+          if-no-files-found: error
+
+      # The picture the assertion was made about, for a human to look at.
+      - name: Upload the screenshot
+        uses: actions/upload-artifact@v4
+        with:
+          name: FeetBrowser-macos-screenshot
+          path: artifacts/feetbrowser-app.png
+          if-no-files-found: error
+
+  # The half of the universal binary the build machine cannot execute. An
+  # arm64 runner will happily produce an x86_64 slice that was never once
+  # loaded, and `lipo -archs` cannot tell the difference between a slice that
+  # works and a slice that is four megabytes of nothing. This runs the app on
+  # a real Intel Mac, off the mounted image, exactly as a user would.
+  #
+  # macos-15-intel, not macos-13: the Ventura images were retired in December
+  # 2025, and a job asking for a retired label does not fail, it queues for
+  # ever. This is the last x86_64 image Actions will offer, announced as
+  # available until August 2027. When it goes, this job goes with it and the
+  # x86_64 slice can only be checked by hand -- which is an argument for
+  # keeping the check while it is free, not for skipping it.
+  intel:
+    needs: build
+    runs-on: macos-15-intel
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: FeetBrowser-macos-dmg
+          path: dmg
+
+      - name: This runner is Intel
+        run: |
+          uname -m
+          test "$(uname -m)" = x86_64
+
+      - name: Mount, copy out, and check
+        run: |
+          image=$(echo dmg/*.dmg)
+          hdiutil verify "$image"
+          # A directory with a space in it, because that is where an app ends
+          # up on a real machine and it is where quoting mistakes surface.
+          mkdir -p "$RUNNER_TEMP/Applications 2" mnt
+          hdiutil attach "$image" -mountpoint mnt -nobrowse -readonly
+          ls -l mnt
+          ditto "mnt/FeetBrowser.app" "$RUNNER_TEMP/Applications 2/FeetBrowser.app"
+          hdiutil detach mnt
+          packaging/macos/verify.sh "$RUNNER_TEMP/Applications 2/FeetBrowser.app"
+          python3 packaging/macos/appshot.py \
+            "$RUNNER_TEMP/Applications 2/FeetBrowser.app" \
+            artifacts/feetbrowser-app-intel.png
+
+      - name: Upload the Intel screenshot
+        uses: actions/upload-artifact@v4
+        with:
+          name: FeetBrowser-macos-screenshot-intel
+          path: artifacts/feetbrowser-app-intel.png
+          if-no-files-found: error

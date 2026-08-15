@@ -3,11 +3,12 @@
 Uses a temporary toes/ dir and a local catalog served via file:// so the
 tests are deterministic and offline.
 
-The last section is a different kind of test. Toes in the wild were written
-against tkinter, and the raster backend only *imitates* Tk; SURFACE_TOE below
-is a fixture that makes exactly the calls the published catalog toes make, so
-that the day one of those calls stops behaving like Tk's, this file says so
-rather than a user's toolbar quietly going blank.
+The last section is a different kind of test. The toes in the published
+catalog were written against the widget API the browser started on, and
+canvas.py keeps that API as a compatibility surface; SURFACE_TOE below is a
+fixture that makes exactly the calls those toes make, so that the day one of
+them stops behaving as they expect, this file says so rather than a user's
+toolbar quietly going blank.
 """
 import json
 import os
@@ -16,7 +17,8 @@ import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from feetbrowser import gui
+from feetbrowser.canvas import Canvas
+from feetbrowser.window import Tk
 
 from feetbrowser import toes
 from feetbrowser.browser import Tab
@@ -537,17 +539,11 @@ def _capture(sink, func, *args):
 
 
 def _canvas(width=800, height=200):
-    return gui.Canvas(width=width, height=height, bg="white")
+    return Canvas(width=width, height=height, bg="white")
 
 
 def _scan(canvas, y0, y1, predicate):
-    """Count pixels in a horizontal strip that satisfy `predicate`.
-
-    Returns None on a backend that does not hand out its pixels -- Tk keeps
-    them inside Tcl, so there the item-level assertions are all we get.
-    """
-    if not hasattr(canvas, "render"):
-        return None
+    """Count pixels in a horizontal strip that satisfy `predicate`."""
     surface = canvas.render()
     hits = 0
     for y in range(max(0, y0), min(surface.height, y1)):
@@ -583,24 +579,21 @@ def test_toe_chrome_band_paints_inside_its_own_band():
         assert len(canvas.find_all()) - before == 4, canvas.find_all()
         assert ctx.band_width == canvas.winfo_width(), ctx.band_width
 
+        # winfo_width has to report the canvas width, or a band that sizes
+        # itself to the window draws a zero-width strip and vanishes.
+        assert ctx.band_width == 800, ctx.band_width
         inside = _scan(canvas, 0, BAND_HEIGHT, _greenish)
-        if inside is not None:
-            # winfo_width has to report the canvas width, or a band that
-            # sizes itself to the window draws a zero-width strip and
-            # vanishes. Real Tk answers 1 until the canvas is mapped, so
-            # this half of the contract is only assertable on our own.
-            assert ctx.band_width == 800, ctx.band_width
-            assert inside > 50, inside
-            below = _scan(canvas, BAND_HEIGHT, 200, _greenish)
-            assert below == 0, below
+        assert inside > 50, inside
+        below = _scan(canvas, BAND_HEIGHT, 200, _greenish)
+        assert below == 0, below
 
 
 def test_toe_band_items_stack_in_creation_order():
     """The 2003-toolbar toes rely on a later rectangle hiding earlier text.
 
-    Tk's canvas has no z-index: what you draw last wins. A backend that
-    sorted by anything else would leave the marquee showing through every
-    button on the bar.
+    The canvas has no z-index: what you draw last wins. Sorting items by
+    anything else would leave the marquee showing through every button on
+    the bar.
     """
     warnings = []
     with tempfile.TemporaryDirectory() as tmp:
@@ -608,8 +601,6 @@ def test_toe_band_items_stack_in_creation_order():
         canvas = _canvas()
         toes.dispatch([ctx], "on_chrome_draw", canvas,
                       toes.compute_bands([ctx]))
-        if not hasattr(canvas, "render"):
-            return
         surface = canvas.render()
         # (8, 15) is under the glyph run and under the yellow button that
         # was drawn over it.
@@ -628,9 +619,8 @@ def test_toe_overlay_draws_over_the_page_at_the_chrome_offset():
         assert not warnings, warnings
         assert len(canvas.find_all()) == 3, canvas.find_all()
         painted = _scan(canvas, CHROME, 200, _reddish)
-        if painted is not None:
-            assert painted > 50, painted
-            assert _scan(canvas, 0, CHROME, _reddish) == 0
+        assert painted > 50, painted
+        assert _scan(canvas, 0, CHROME, _reddish) == 0
 
 
 def test_toolbar_glyphs_have_real_widths():
@@ -641,7 +631,7 @@ def test_toolbar_glyphs_have_real_widths():
     """
     from feetbrowser.layout import get_font
     font = get_font(11, "bold", "roman", "Helvetica")
-    for glyph in "‹›⟳⌂★☆←→":
+    for glyph in "‹›↻⌂★☆←→":
         assert font.measure(glyph) > 0.5, (glyph, font.measure(glyph))
 
 
@@ -649,9 +639,7 @@ def test_toe_keypress_sees_char_and_keysym():
     warnings = []
     with tempfile.TemporaryDirectory() as tmp:
         ctx = _surface_ctx(tmp, warnings)
-        window = gui.Tk()
-        if not hasattr(window, "dispatch"):
-            return  # tkinter delivers its own events; nothing to synthesise
+        window = Tk()
         from feetbrowser.window import Event
         seen = []
         window.bind("<Key>", lambda e: seen.append(
@@ -665,14 +653,11 @@ def test_toe_keypress_sees_char_and_keysym():
 
 def test_toe_after_timer_fires():
     """Bars that animate schedule their next frame with window.after."""
-    window = gui.Tk()
+    window = Tk()
     ticks = []
     window.after(0, lambda: ticks.append(1))
-    # update(), not update_idletasks(): our window treats them alike, but real
-    # Tk flushes only idle callbacks from the latter, and an after() timer is
-    # not one -- so the idletasks spelling passes here and fails under
-    # FEETBROWSER_BACKEND=tk, which is the one thing this test exists to
-    # rule out.
+    # update(), not update_idletasks(): a timer is not an idle callback, and
+    # update() is the spelling that means "run whatever is due".
     window.update()
     assert ticks == [1], ticks
 
@@ -691,7 +676,7 @@ def test_toe_context_accepts_stashed_attributes():
 
 
 def main():
-    root = gui.Tk(); root.withdraw()
+    root = Tk(); root.withdraw()
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0
     for t in tests:

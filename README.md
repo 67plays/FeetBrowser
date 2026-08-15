@@ -4,10 +4,10 @@
 A web browser written **from scratch**. No Chromium, no WebKit, no borrowed
 libraries — it does its own networking, HTML parsing, CSS, layout, JavaScript,
 fonts, and pixels. No GUI toolkit either: the TrueType parser, the antialiased
-rasteriser and the image decoders are all in this repo. The JavaScript engine
-and DOM bridge are compiled to a native Rust extension; everything else
-(networking, parsing, layout, rendering, chrome) is Python, standard library
-only.
+rasteriser and the image decoders are all in this repo. The JavaScript engine,
+the DOM bridge and the renderer's inner loops are compiled to a native Rust
+extension; everything else (networking, parsing, layout, the scene graph,
+chrome) is Python, standard library only.
 
 ## STRIDE — how code is judged
 
@@ -24,23 +24,47 @@ Code in this repo is evaluated on six principles:
 ## Run it
 
 ```bash
-./run.sh                 # opens the welcome page
+./run.sh                 # macOS, Linux: opens the welcome page
 ./run.sh https://example.com
 ```
 
+```bat
+run.cmd                  :: Windows: the same script for cmd.exe
+run.cmd https://example.com
+```
+
 No GUI toolkit to install — just Python 3 and a system font. The one thing
-that does get built is the JavaScript engine: `run.sh` compiles the Rust
+that does get built is the engine: `run.sh` and `run.cmd` compile the Rust
 extension (`feetbrowser_engine`) into a local `.venv` when it isn't
 importable, so a first run needs the Rust toolchain (the script installs
-`maturin` into the venv for you). Once the extension is built and installed
+`maturin` into the venv for you). On Windows it needs a C++ linker as well,
+which rustup does not bring with it — [usage.md](docs/usage.md) has the one
+download and the one checkbox. Once the extension is built and installed
 for the interpreter you're invoking, `python3 -m feetbrowser <url>` works
 directly.
 
-The window itself is ours too. macOS gets one through AppKit and Linux gets
-one through Xlib — both by ctypes, so there is nothing to install for either,
-and X11 covers Wayland desktops through XWayland. Anywhere else, and anywhere
-with no display, the browser still renders: `--screenshot` writes the page to
-a PNG without opening anything.
+If you would rather not install a Rust toolchain at all, don't: the
+[Wheels](.github/workflows/wheels.yml) workflow builds the extension for
+macOS (Intel and Apple Silicon in one universal wheel), manylinux x86-64 and
+Windows x86-64, on CPython 3.9 through 3.14. They are attached to every
+tagged release, and every run of that workflow keeps the same files as
+downloadable artifacts. Install one into the interpreter you run the browser
+with — `pip install feetbrowser_engine-*.whl` — and `run.sh` finds the
+engine already importable and skips the build.
+
+There is a second JavaScript engine, written from scratch in Zig and loaded
+with `ctypes` rather than built into a venv. `FEETBROWSER_JS=zig ./run.sh`
+selects it; `rust` is the default. Both pass the same test suite, and the
+design of the Zig one is in [docs/jszig.md](docs/jszig.md). That variable and
+every other one the browser reads are documented in
+[docs/usage.md](docs/usage.md#environment-variables).
+
+The window itself is ours too. macOS gets one through AppKit, Linux one
+through Xlib, and Windows one through user32/gdi32 — all by ctypes, so there
+is nothing to install for any of them, and X11 covers Wayland desktops
+through XWayland. Anywhere else, and anywhere with no display, the browser
+still renders: `--screenshot` writes the page to a PNG without opening
+anything.
 
 To render a page to a PNG without opening a window:
 
@@ -52,6 +76,7 @@ To render a page to a PNG without opening a window:
 
 - Open tabs, back/forward, reload, bookmarks, history, and page source
 - Fill in forms, follow links, search from the address bar
+- Download files, watching them arrive — `Ctrl-J` shows the manager
 - Add extensions ("toes") — open **`toe://hub`** in the browser
 - Restyle the browser with **Shoes** themes — open **`about:shoes`**
   (`Ctrl+Shift+S`)
@@ -63,6 +88,8 @@ To render a page to a PNG without opening a window:
 - [Usage & shortcuts](docs/usage.md)
 - [Architecture — how the engine works](docs/architecture.md)
 - [The rendering engine — fonts, rasteriser, pixels](docs/rendering.md)
+- [The Zig JavaScript engine](docs/jszig.md)
+- [Video — what decodes, and what a real codec would need](docs/media.md)
 - [Extensions (Toes & ToeHub)](docs/toes.md)
 - [What it does and doesn't do](docs/limitations.md)
 - [Running the tests](docs/testing.md)

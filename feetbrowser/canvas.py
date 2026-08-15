@@ -1,16 +1,21 @@
-"""A drop-in replacement for the Tk widgets the browser actually used.
+"""The drawing surface: fonts, images, and a canvas of retained items.
 
-The browser only ever asked Tk for four things: a font that can measure text,
-an image that can report its size, a canvas that retains drawing items under
-tags, and an exception type to catch when a colour is bad. This module
-provides all four on top of our own font engine and rasteriser, so the paint
-path -- the display list's `execute` methods, the chrome drawing, the toe
-plugin `on_draw` contract -- keeps working verbatim.
+Four things sit behind every pixel the browser puts on screen -- a font that
+can measure text, an image that can report its size and hand back pixels, a
+canvas that keeps drawing items under tags, and an error to raise when a
+value is not usable. This module is all four, on top of our own font engine
+and rasteriser.
 
-The canvas is retained, exactly like Tk's: items keep their identity and tags,
-`delete(tag)` removes a layer, and stacking order is creation order. The
-difference is that compositing to pixels happens in `render()`, when a frame
-is actually wanted, rather than inside every `create_*` call.
+The canvas is retained rather than immediate: items keep their identity and
+their tags, `delete(tag)` removes a whole layer, and stacking order is
+creation order, so a later rectangle covers an earlier one. Compositing to
+pixels happens in `render()`, when a frame is actually wanted, rather than
+inside every `create_*` call.
+
+The shape of that API is inherited. It was grown from the widget set the
+browser started on, and the toe plugins in the wild are written against it,
+so the method names and keyword arguments are a compatibility surface now
+even though nothing underneath them is shared. See docs/toes.md.
 """
 import base64
 import math
@@ -18,8 +23,15 @@ import math
 from . import fontengine, imagecodec, raster
 
 
-class TclError(Exception):
-    """Stands in for tkinter.TclError so existing except-clauses still fire."""
+class CanvasError(Exception):
+    """Raised when the canvas is handed something it cannot draw with.
+
+    A colour name that parses to nothing, a family with no face behind it, an
+    image whose bytes are not a picture: all of them are the caller's mistake
+    about a value, and all of them are recoverable by substituting a default.
+    The display list depends on that -- every `execute` catches this and
+    paints in black rather than dropping the box.
+    """
 
 
 # -- colours ---------------------------------------------------------------
@@ -88,11 +100,12 @@ _COLOR_MEMO = {}
 
 
 def color(value):
-    """Parse a Tk/CSS colour into an ``(r, g, b)`` triple.
+    """Parse a colour into an ``(r, g, b)`` triple.
 
-    Returns None for "no colour" -- an empty string, which Tk treats as
-    transparent for a fill or outline. Raises TclError on genuine nonsense,
-    matching Tk, because the display list relies on that to fall back to
+    Returns None for "no colour" -- an empty string means transparent for a
+    fill or an outline, which is how a stylesheet spells "leave this alone".
+    Genuine nonsense raises CanvasError instead of quietly becoming
+    transparent, because the display list relies on the error to fall back to
     black rather than paint an invisible box.
     """
     if value is None:
@@ -114,10 +127,10 @@ def color(value):
             result = tuple(int(c * 2, 16) for c in digits)
         elif len(digits) == 6:
             result = tuple(int(digits[i:i + 2], 16) for i in (0, 2, 4))
-        elif len(digits) == 12:  # Tk's 16-bit-per-channel form
+        elif len(digits) == 12:  # the inherited 16-bit-per-channel form
             result = tuple(int(digits[i:i + 4], 16) >> 8 for i in (0, 4, 8))
     if result is None:
-        raise TclError("unknown color name %r" % value)
+        raise CanvasError("unknown color name %r" % value)
     if len(_COLOR_MEMO) < 20000:
         _COLOR_MEMO[value] = result
     return result
@@ -140,7 +153,7 @@ _FALLBACKS = {
 
 
 class Font:
-    """The subset of tkinter.font.Font the layout engine uses.
+    """A measurable font: a face, a size, and the metrics layout asks for.
 
     ``measure`` is exact and additive: a string's width is the sum of its
     characters' advances, with no kerning. That is not a shortcut, it is the
@@ -159,10 +172,9 @@ class Font:
         self.italic = slant in ("italic", "oblique")
         _FONT_SEQ[0] += 1
         self.name = "ftbsfont%d" % _FONT_SEQ[0]
-        self._tk = None  # no Tcl interpreter: layout's batch path stays off
         self.face = _resolve_face(self.family, self.bold, self.italic)
         if self.face is None:
-            raise TclError("no usable font for %r" % self.family)
+            raise CanvasError("no usable font for %r" % self.family)
         self._scale = self.face.scale(self.size)
         self.ascent = int(round(self.face.ascent * self._scale))
         self.descent = int(round(-self.face.descent * self._scale))
@@ -328,13 +340,13 @@ class PhotoImage:
                 data = handle.read()
         if data is None:
             if width is None or height is None:
-                raise TclError("PhotoImage needs data, a file, or a size")
+                raise CanvasError("PhotoImage needs data, a file, or a size")
             self._width, self._height = max(1, int(width)), max(1, int(height))
             self.rgba = bytearray(self._width * self._height * 4)
             self.opaque = False
             return
         if isinstance(data, str):
-            # Tk accepts base64 text for its supported formats.
+            # Image bytes may arrive as base64 text rather than raw.
             try:
                 data = base64.b64decode(data)
             except Exception:
@@ -342,7 +354,7 @@ class PhotoImage:
         try:
             self._width, self._height, self.rgba = imagecodec.decode(data)
         except imagecodec.ImageError as exc:
-            raise TclError(str(exc))
+            raise CanvasError(str(exc))
         # Checked once here so every blit can take the fast row-copy path;
         # most photos on the web have no transparency at all.
         self.opaque = self.rgba[3::4].count(255) == self._width * self._height
@@ -386,9 +398,9 @@ class _Item:
 class Canvas:
     """Retained display list, composited on demand.
 
-    Item ids and tags behave as Tk's do because the browser leans on both:
-    it diffs `find_all()` before and after a plugin draws to tag that
-    plugin's items, and deletes whole layers by tag on every frame.
+    The browser leans on both halves of the item identity: it diffs
+    `find_all()` before and after a plugin draws in order to tag that
+    plugin's items, and it deletes whole layers by tag on every frame.
     """
 
     def __init__(self, master=None, width=800, height=600, bg="white",
@@ -472,8 +484,8 @@ class Canvas:
         return item.id
 
     def create_rectangle(self, x1, y1, x2, y2, **opts):
-        # Validate colours now, as Tk does, so callers' except-TclError
-        # fallbacks still trigger on a bad colour rather than at paint time.
+        # Validate colours now rather than at paint time, so a caller's
+        # except-CanvasError fallback runs while it can still substitute one.
         color(opts.get("fill"))
         color(opts.get("outline"))
         return self._add("rectangle", (x1, y1, x2, y2), opts)
@@ -628,10 +640,10 @@ class Canvas:
             fill = color(opts.get("fill"))
             if fill:
                 surface.fill_rect(x0, y0, x1, y1, fill, alpha)
-            # Tk draws a rectangle with a black 1px border unless told
-            # otherwise, and a caller that says nothing is asking for that.
-            # Saying `outline=""` or `width=0` is how you decline it -- which
-            # is why the absent case has to be told apart from the empty one.
+            # A rectangle gets a black 1px border unless told otherwise,
+            # so a caller that says nothing is asking for one. Saying
+            # `outline=""` or `width=0` is how you decline it -- which is why
+            # the absent case has to be told apart from the empty one.
             outline = color(opts["outline"]) if "outline" in opts else (0, 0, 0)
             width = int(opts.get("width", 1))
             if outline and width:
@@ -742,9 +754,9 @@ class Canvas:
                                       int(round((outer - inner) * 255)))
 
     def _paint_arc(self, surface, item):
-        """Stroke an elliptical arc. Tk measures angles counter-clockwise
-        from 3 o'clock in degrees, and the browser uses this for one thing:
-        the loading spinner."""
+        """Stroke an elliptical arc. Angles are degrees measured
+        counter-clockwise from 3 o'clock, and the browser uses this for one
+        thing: the loading spinner."""
         x0, y0, x1, y1 = _ordered(item.coords)
         cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
         rx, ry = (x1 - x0) / 2.0, (y1 - y0) / 2.0

@@ -5,14 +5,14 @@ commands. Implements block-and-inline flow: block boxes stack vertically,
 inline content flows into lines with word wrapping. Supports font size /
 weight / style, colors, backgrounds, list bullets, and horizontal rules.
 
-Coordinates are in CSS px == canvas px. Fonts come from the GUI
-backend (see gui.py) and are cached.
+Coordinates are in CSS px == canvas px. Fonts come from canvas.py, which
+measures them with our own font engine, and are cached here.
 """
 
 import copy
 import re
 from collections import namedtuple
-from . import gui
+from .canvas import CanvasError, Font
 from . import cssparser
 
 from .htmlparser import Text, Element
@@ -22,24 +22,25 @@ INLINE_ELEMENTS = {
     "a", "b", "i", "em", "strong", "span", "small", "big", "sub", "sup",
     "code", "tt", "kbd", "samp", "u", "abbr", "cite", "q", "s", "strike",
     "font", "label", "br", "img", "input", "button", "mark", "time", "var",
-    "select", "textarea", "option", "optgroup",
+    "select", "textarea", "option", "optgroup", "video",
 }
 
 _FONT_CACHE = {}
 
-# Measuring text and reading metrics round-trips into the Tcl interpreter,
-# which costs on the order of a millisecond per call. Repeatedly measuring the
-# same word with the same font dominates layout time on text-heavy pages, so
-# both are memoized keyed by (font key, arg). Bounded so a wild page full of
-# unique strings cannot grow the cache without limit.
+# Measuring a character means finding the face that covers it and scaling
+# that glyph's advance, and reading metrics means the same work over a whole
+# face. Repeatedly measuring the same word with the same font dominates
+# layout time on text-heavy pages, so both are memoized keyed by
+# (font key, arg). Bounded so a wild page full of unique strings cannot grow
+# the cache without limit.
 _MEASURE_CACHE = {}
 _METRICS_CACHE = {}
 _MEASURE_CACHE_MAX = 100_000
-# Tk's font measure applies no kerning or ligatures here, so
+# Measuring applies no kerning and no ligatures, so
 # measure("abc") == measure("a") + measure("b") + measure("c") exactly. Only
-# each unique (font, char) therefore needs a Tcl round-trip; word widths are a
-# Python sum. Bounded because a page full of exotic codepoints must not grow
-# the table without limit.
+# each unique (font, char) therefore has to be measured at all; a word's width
+# is a Python sum over this table. Bounded because a page full of exotic
+# codepoints must not grow it without limit.
 _CHAR_CACHE = {}
 _CHAR_CACHE_MAX = 50_000
 
@@ -48,15 +49,16 @@ def get_font(size, weight, style, family=""):
     key = (size, weight, style, family)
     if key not in _FONT_CACHE:
         fam = family if family else "Times"
-        font = gui.Font(size=size, weight=weight, slant=style, family=fam)
+        font = Font(size=size, weight=weight, slant=style, family=fam)
         font._ftbs_key = key  # stable cache identity for memo tables
         _FONT_CACHE[key] = font
     return _FONT_CACHE[key]
 
 
 def _measure(font, text):
-    """Memoized font.measure(text). Because Tk applies no kerning, this is the
-    sum of per-character widths, so only unique characters need Tcl calls."""
+    """Memoized font.measure(text). With no kerning applied, this is exactly
+    the sum of the per-character widths, so only unique characters are ever
+    measured."""
     if not text:
         return 0.0
     key = (font._ftbs_key, text)
@@ -96,41 +98,30 @@ def _linespace(font):
     return _metrics(font, "linespace")
 
 
-def _measure_batch(font, chars):
-    """Measure a list of distinct characters with `font` in a single Tcl
-    round-trip, filling the shared per-character width cache. Falls back to
-    per-char calls if no Tk root is around (it always is during layout)."""
-    if not chars:
-        return
+def _warm_chars(font, chars):
+    """Measure every character in `chars` that is not cached yet.
+
+    Measuring past the cache ceiling is still worth doing: the font keeps its
+    own per-character widths, and resolving a character to the face that
+    covers it is the expensive half.
+    """
     key = font._ftbs_key
-    todo = [c for c in chars if (key, c) not in _CHAR_CACHE]
-    if not todo:
-        return
-    tk = getattr(font, "_tk", None)
-    if tk is None:
-        for c in todo:
-            if len(_CHAR_CACHE) < _CHAR_CACHE_MAX:
-                _CHAR_CACHE[(key, c)] = font.measure(c)
-            else:
-                font.measure(c)
-        return
-    # Pass the chars as a proper Tcl list (tkinter marshals each element
-    # safely), measure them all in one `eval`, then pull the widths back.
-    tk.call("set", "::fb_chars", todo)
-    tk.call("set", "::fb_font", font.name)
-    tk.call("eval", "set ::fb_out {}; foreach c $::fb_chars "
-                    "{lappend ::fb_out [font measure $::fb_font $c]}")
-    out = tk.splitlist(tk.call("set", "::fb_out"))
-    for c, value in zip(todo, out):
+    for c in chars:
+        if (key, c) in _CHAR_CACHE:
+            continue
+        width = font.measure(c)
         if len(_CHAR_CACHE) < _CHAR_CACHE_MAX:
-            _CHAR_CACHE[(key, c)] = float(value)
+            _CHAR_CACHE[(key, c)] = width
 
 
 def _prewarm(root_node):
-    """Measure every distinct character the text layout will need up front, in
-    a handful of batched Tcl calls. Because Tk applies no kerning, a word's
-    width is the sum of its character widths, so prewarming characters makes
-    the per-word _measure() calls pure Python."""
+    """Measure every distinct character the text layout will need up front.
+
+    A page's text is a few dozen distinct characters repeated thousands of
+    times. Because a word's width is the sum of its characters' widths, doing
+    the whole alphabet once per font here makes every later _measure() call a
+    dictionary lookup and an addition.
+    """
     pending = {}  # font._ftbs_key -> (font, set of chars)
     stack = [root_node]
     while stack:
@@ -145,13 +136,14 @@ def _prewarm(root_node):
         else:
             stack.extend(node.children)
     for font, chars in pending.values():
-        _measure_batch(font, chars)
+        _warm_chars(font, chars)
 
 
-# Map common web font-family names to the three generics Tk resolves well.
-# We can't know which fonts are actually installed, so we walk the whole
-# family stack and stop at the first name we can map; unknown first names are
-# still handed to Tk verbatim (it falls back if absent).
+# Map common web font-family names onto the three generics the font engine
+# keeps fallback chains for. We can't know which fonts are actually
+# installed, so we walk the whole family stack and stop at the first name we
+# can map; an unrecognised first name is handed over verbatim, and canvas.py
+# falls back for it if nothing on the system answers to it.
 _FAMILY_GENERICS = {
     # sans-serif
     "sans-serif": "Helvetica", "system-ui": "Helvetica",
@@ -225,7 +217,7 @@ class DrawText:
                 self.left, self.top - scroll, text=self.text,
                 font=self.font, fill=self.color or "black", anchor="nw",
                 tags=tags)
-        except gui.TclError:
+        except CanvasError:
             canvas.create_text(
                 self.left, self.top - scroll, text=self.text,
                 font=self.font, fill="black", anchor="nw", tags=tags)
@@ -246,7 +238,7 @@ class DrawRect(_DrawShape):
             canvas.create_rectangle(
                 self.left, self.top - scroll, self.right, self.bottom - scroll,
                 width=0, fill=self.color, tags=tags)
-        except gui.TclError:
+        except CanvasError:
             canvas.create_rectangle(
                 self.left, self.top - scroll, self.right, self.bottom - scroll,
                 width=0, fill="black", tags=tags)
@@ -267,7 +259,7 @@ class DrawOval(_DrawShape):
                 self.left, self.top - scroll, self.right, self.bottom - scroll,
                 fill=self.fill or "", outline=self.outline or "",
                 width=1 if self.outline else 0, tags=tags)
-        except gui.TclError:
+        except CanvasError:
             canvas.create_oval(
                 self.left, self.top - scroll, self.right, self.bottom - scroll,
                 fill="black", outline="", width=0, tags=tags)
@@ -279,7 +271,7 @@ class DrawLine(_DrawShape):
             canvas.create_line(
                 self.left, self.top - scroll, self.right, self.bottom - scroll,
                 fill=self.color, width=self.thickness, tags=tags)
-        except gui.TclError:
+        except CanvasError:
             canvas.create_line(
                 self.left, self.top - scroll, self.right, self.bottom - scroll,
                 fill="black", width=self.thickness, tags=tags)
@@ -291,7 +283,7 @@ class DrawOutline(_DrawShape):
             canvas.create_rectangle(
                 self.left, self.top - scroll, self.right, self.bottom - scroll,
                 width=self.thickness, outline=self.color, tags=tags)
-        except gui.TclError:
+        except CanvasError:
             canvas.create_rectangle(
                 self.left, self.top - scroll, self.right, self.bottom - scroll,
                 width=self.thickness, outline="black", tags=tags)
@@ -305,22 +297,80 @@ class DrawShadow(_DrawShape):
             canvas.create_rectangle(
                 self.left, self.top - scroll, self.right, self.bottom - scroll,
                 width=0, fill=self.color, stipple="gray50", tags=tags)
-        except gui.TclError:
+        except CanvasError:
             pass
 
 
 class DrawImage:
-    """Draws a decoded Tk PhotoImage at the given rectangle."""
+    """Draws a decoded PhotoImage at the given rectangle."""
 
     def __init__(self, x1, y1, x2, y2, photo, node=None):
         self.top, self.left, self.bottom, self.right = y1, x1, y2, x2
         self.photo = photo
         self.node = node  # source <img>, for hit-testing links
 
+    def hit(self, x, y):
+        return (self.left <= x <= self.right
+                and self.top <= y <= self.bottom)
+
     def execute(self, scroll, canvas, tags=()):
         canvas.create_image(
             self.left, self.top - scroll, anchor="nw", image=self.photo,
             tags=tags)
+
+
+class DrawVideo:
+    """The current frame of a `<video>`.
+
+    Separate from `DrawImage` for one reason, not the hit-testing one:
+    both answer `hit()`, so a click on either reaches its element and can
+    play or pause a video or follow an `<a>` around an image. What
+    `DrawVideo` carries that `DrawImage` does not is a `photo` that is a
+    buffer the player rewrites in place rather than a decoded file, so the
+    command stays valid across frames and the retained canvas item is not
+    rebuilt sixty times a second.
+    """
+
+    def __init__(self, x1, y1, x2, y2, photo, node=None):
+        self.top, self.left, self.bottom, self.right = y1, x1, y2, x2
+        self.photo = photo
+        self.node = node
+
+    def hit(self, x, y):
+        return (self.left <= x <= self.right
+                and self.top <= y <= self.bottom)
+
+    def execute(self, scroll, canvas, tags=()):
+        canvas.create_image(
+            self.left, self.top - scroll, anchor="nw", image=self.photo,
+            tags=tags)
+
+
+def _video_attr(node, name):
+    """A `<video>` width/height attribute as a positive int, or 0.
+
+    HTML says these are bare integers, and a page that writes `width="80%"`
+    is asking for the CSS property instead. Anything we cannot read as a
+    plain number is treated as absent rather than guessed at.
+    """
+    raw = node.attributes.get(name, "")
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return 0
+    return value if 0 < value <= 10000 else 0
+
+
+def _video_label(node, player):
+    """What to write in the box when there is no picture to show. The point
+    is to say something true and specific -- the codec and the reason -- so a
+    page that does not play tells you why."""
+    if player is None:
+        src = node.attributes.get("src", "")
+        return "[video: loading]" if src else "[video: no source]"
+    if player.error:
+        return "[video: %s]" % player.error
+    return "[video]"
 
 
 # `calc()` and its relatives. A page written this decade puts arithmetic in
@@ -685,7 +735,8 @@ def resolve_color(name):
         r, g, b = _hsl_to_rgb(_parse_hue(h), sval, lval)
         return "#%02x%02x%02x" % (
             int(round(r * 255)), int(round(g * 255)), int(round(b * 255)))
-    # 3/4/6/8-digit hex: Tk only accepts #rgb and #rrggbb reliably, so expand.
+    # 3/4/6/8-digit hex: canvas.color() reads #rgb and #rrggbb, so expand the
+    # four- and eight-digit forms here and drop the alpha channel.
     if name.startswith("#") and len(name) in (4, 5):
         n = "".join(c * 2 for c in name[1:])
         if len(n) == 8 and n[6:] == "00":
@@ -1388,7 +1439,7 @@ class _LineItem:
 
     def __init__(self, kind, x, text, font, color, node, w, h, photo=None,
                  bg=None, pl=0, pr=0, pt=0, pb=0):
-        self.kind = kind  # "text", "img", "pill", "block" or "listbox"
+        self.kind = kind  # "text", "img", "video", "pill", "block", "listbox"
         self.x = x
         self.text = text
         self.font = font
@@ -1405,7 +1456,7 @@ class _LineItem:
 
     @property
     def ascent(self):
-        if self.kind == "img":
+        if self.kind in ("img", "video"):
             return int(self.h * 0.82)
         if self.kind in ("block", "listbox"):
             # An inline-block sits on the baseline rather than straddling it,
@@ -1418,7 +1469,7 @@ class _LineItem:
 
     @property
     def descent(self):
-        if self.kind == "img":
+        if self.kind in ("img", "video"):
             return int(self.h * 0.18)
         if self.kind in ("block", "listbox"):
             return 0.0
@@ -2754,6 +2805,8 @@ class BlockLayout(LayoutBox):
             return self.flush(force=True)
         if node.tag == "img":
             return self._inline_img(node)
+        if node.tag == "video":
+            return self._inline_video(node)
         if node.tag in ("input", "textarea", "button"):
             return self._inline_button(node) if node.tag == "button" \
                 else self._inline_input(node)
@@ -2886,6 +2939,20 @@ class BlockLayout(LayoutBox):
                     item.x + offset, y,
                     item.x + offset + item.w, y + item.h, "#aaaaaa"))
                 xoff, ty, color = 4, y + 2, "#888888"
+            elif item.kind == "video":
+                y = baseline - item.ascent
+                if item.photo is not None:
+                    self.display_list.append(DrawVideo(
+                        item.x + offset, y,
+                        item.x + offset + item.w, y + item.h,
+                        item.photo, item.node))
+                    continue
+                # No decodable picture: a dark box with the reason in it, at
+                # the size the element would have had.
+                self.display_list.append(DrawRect(
+                    item.x + offset, y,
+                    item.x + offset + item.w, y + item.h, "#1a1a1a"))
+                xoff, ty, color = 6, y + 6, "#dddddd"
             elif item.kind == "block":
                 # Now that the baseline is settled there is a place to put it.
                 box = BlockLayout(item.node, self, None)
@@ -3030,6 +3097,53 @@ class BlockLayout(LayoutBox):
         self.line.append(_LineItem("img", self.cursor_x, label, font, None,
                                    node, w, h, photo))
         self.cursor_x += w + (_measure(font, " ") if photo is None else w * 0.25)
+
+    # HTML's default `<video>` box, used when the file says nothing useful
+    # and the page gave no width or height.
+    VIDEO_DEFAULT = (300, 150)
+
+    def _inline_video(self, node):
+        """Place a `<video>`.
+
+        Sizing follows the same order a real browser uses, and the order
+        matters most when the file is one we cannot decode: `width`/`height`
+        attributes first, then the size the *container* declared -- which we
+        know even for an MP4, because probing a container is cheap and does
+        not need a codec -- and only then the 300x150 default. So a page whose
+        video we cannot play still reserves the right hole in the layout
+        instead of collapsing, and the text around it lands where it would in
+        a browser that could play it.
+        """
+        if not isinstance(node, Element):
+            return
+        # The player lives on the element, attached by the tab once the file
+        # has been fetched: one `<video>` is one playhead, so two tags on the
+        # same URL scrub and pause independently.
+        player = getattr(node, "video_player", None)
+        info = getattr(player, "info", None)
+        w = _video_attr(node, "width")
+        h = _video_attr(node, "height")
+        if not w or not h:
+            intrinsic = (info.width, info.height) if info and info.width \
+                else self.VIDEO_DEFAULT
+            if not w and not h:
+                w, h = intrinsic
+            elif not w:
+                w = max(1, int(round(h * intrinsic[0] / intrinsic[1])))
+            else:
+                h = max(1, int(round(w * intrinsic[1] / intrinsic[0])))
+        photo = None
+        if player is not None and player.track is not None:
+            player.set_display_size(w, h)
+            photo = player.photo
+        label, font = "", None
+        if photo is None:
+            font = get_font(12, "normal", "roman")
+            label = _video_label(node, player)
+        w = self._fit_control(w, min_w=min(w, 40))
+        self.line.append(_LineItem("video", self.cursor_x, label, font, None,
+                                   node, w, h, photo))
+        self.cursor_x += w + (_measure(font, " ") if font else w * 0.25)
 
     def _inline_block(self, node):
         """Place an inline-block that holds blocks: measure it in a box of its

@@ -1,25 +1,61 @@
 #!/usr/bin/env bash
 # Run the FeetBrowser test suite.
 #
-# The renderer draws into its own framebuffer, so no display, no Tk and no
-# toolkit is needed. The JavaScript engine is the Rust extension
-# `feetbrowser_engine`, so the suite runs out of the local venv maturin builds
-# it into. Three suites step outside all that: test_cocoa.py and test_x11.py
-# open real windows wherever their platform has one and skip everywhere else,
-# and test_nav.py and smoke.py reach the network.
+# The renderer draws into its own framebuffer, so no display and no toolkit is
+# needed. There are two JavaScript engines and the suite builds both: the Zig
+# one is a dynamic library loaded with ctypes, the Rust one is a CPython
+# extension maturin builds into the local venv. The JS suite then runs against
+# each in turn, because two engines behind one contract are only worth having
+# if both are held to it.
+#
+# Four suites step outside all that: test_cocoa.py, test_x11.py and
+# test_win32.py open real windows wherever their platform has one and skip
+# everywhere else, and test_nav.py and smoke.py reach the network. The last
+# of those is why CI runs both of them against the offline mirror in
+# tests/fixtures instead -- see tests/fixture_server.py.
+#
+# On Windows, run test.cmd instead; it runs the same suites in the same order.
 set -euo pipefail
 cd "$(dirname "$0")"
 
+# Those window suites open dozens of real windows in a few seconds, and a
+# window's default manners -- centre itself, raise above everything, take the
+# keyboard -- make the machine unusable for as long as the run lasts. QUIET
+# drops exactly those three things and nothing else: the windows are still
+# created, mapped, drawn into and sent real events, so the suites still prove
+# what they proved before. Export it rather than assign it, so it reaches the
+# suites, and honour an existing value so `FEETBROWSER_QUIET=0 ./test.sh`
+# still gets you the windows when you want to watch them.
+export FEETBROWSER_QUIET="${FEETBROWSER_QUIET:-1}"
+
 if [ ! -x .venv/bin/python ]; then
-  python3 -m venv .venv
+  # Same venv run.sh builds, and for the same reason it is not sealed. That
+  # reason used to be the image decoders and is not any more -- we decode our
+  # own -- but curl_cffi is still optional and still lives in the system
+  # python, and the impersonating fetch in net.py is the one thing a sealed
+  # venv would quietly take away from the tests that exercise it.
+  python3 -m venv --system-site-packages .venv
+elif grep -qi '^include-system-site-packages *= *false' .venv/pyvenv.cfg 2>/dev/null; then
+  # A venv from before that flag was added is sealed, and a venv is only ever
+  # created once, so those tests would keep running without curl_cffi on every
+  # machine that already has one. Re-running venv over it rewrites pyvenv.cfg
+  # and leaves what is installed inside untouched.
+  python3 -m venv --system-site-packages .venv
 fi
 
-# Ensure the Rust JS engine (feetbrowser_engine) is built in the local venv,
-# and rebuilt whenever rust/ has moved on since. Importing it successfully is
-# not enough. An extension compiled from an older tree runs perfectly well and
-# fails the tests that the newer tree added, which reads as "your branch is
-# broken" when the truth is "your venv is old" -- and it is the tests of the
-# DOM bridge, whose Python and Rust halves have to agree, that go first.
+# The Zig engine: a compiler and nothing else. `zig build` is a no-op when
+# nothing under zig/ has moved, and rebuilds when it has, so the library next
+# to the tests is always the one the sources describe. A stale libfeetjs is
+# the same trap as a stale extension module below.
+(cd zig && zig build)
+(cd zig && zig build test)
+
+# The Rust engine, in the venv the rest of the suite runs from, rebuilt
+# whenever rust/ has moved on since. Importing it successfully is not enough.
+# An extension compiled from an older tree runs perfectly well and fails the
+# tests that the newer tree added, which reads as "your branch is broken" when
+# the truth is "your venv is old" -- and it is the tests of the DOM bridge,
+# whose Python and Rust halves have to agree, that go first.
 engine=$(.venv/bin/python -c "import feetbrowser_engine as e; print(e.__file__)" 2>/dev/null || true)
 if [ -z "$engine" ] || [ -n "$(find rust/src rust/Cargo.toml -newer "$engine" 2>/dev/null | head -1)" ]; then
   .venv/bin/pip install -q maturin
@@ -31,13 +67,36 @@ if ! .venv/bin/python -c "import pyflakes" 2>/dev/null; then
 fi
 
 .venv/bin/python -m pyflakes feetbrowser tests
-.venv/bin/python tests/test_render.py
-.venv/bin/python tests/test_cocoa.py   # opens real windows on macOS, skips elsewhere
-.venv/bin/python tests/test_x11.py     # opens real windows under X11, skips elsewhere
-.venv/bin/python tests/test_units.py
-.venv/bin/python tests/test_js.py
-.venv/bin/python tests/test_shoes.py
-.venv/bin/python tests/test_nav.py
-.venv/bin/python tests/test_toes.py
-.venv/bin/python tests/test_asmblend.py  # raw assembly on Linux/x86-64, Python elsewhere
-.venv/bin/python tests/smoke.py
+
+# Every suite below runs behind a deadline. Several of them start HTTP
+# servers, open real windows or reach the network, and any of those can stop
+# forever rather than fail -- at which point the run says nothing at all. The
+# watchdog turns that into every thread's stack and a non-zero exit. See
+# tests/watchdog.py; FEETBROWSER_TEST_TIMEOUT overrides the number.
+run=".venv/bin/python tests/watchdog.py 900"
+
+$run tests/test_suites.py  # every file below, and nothing missing
+$run tests/test_render.py
+$run tests/test_cocoa.py   # opens real windows on macOS, skips elsewhere
+$run tests/test_x11.py     # opens real windows under X11, skips elsewhere
+$run tests/test_win32.py   # opens real windows on Windows, skips elsewhere
+$run tests/test_units.py
+FEETBROWSER_JS=zig $run tests/test_js.py
+FEETBROWSER_JS=rust $run tests/test_js.py
+$run tests/test_shoes.py
+$run tests/test_e2e.py     # a fixture page in, its pixels back out
+$run tests/test_nav.py
+$run tests/test_toes.py
+$run tests/test_asmblend.py  # raw assembly on Linux/x86-64, Python elsewhere
+$run tests/test_asmops.py    # the image-codec kernels, against their Python references
+$run tests/smoke.py
+
+# The Go port of the transport layer (net/) is a separate toolchain, so it is
+# run where one is installed and skipped where there is not, the same way the
+# window suites treat their platforms.
+if command -v go >/dev/null 2>&1; then
+  go vet ./...
+  go test ./...
+else
+  echo "skipping the Go net tests: no go toolchain on PATH"
+fi

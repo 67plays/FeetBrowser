@@ -1,8 +1,13 @@
 mod ast;
+mod css;
 mod dom;
+mod font;
+mod image;
 mod interp;
 mod parser;
 mod pybind;
+mod pyutil;
+mod raster;
 mod stdlib;
 mod token;
 mod value;
@@ -22,5 +27,32 @@ fn feetbrowser_engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(dom::dom_get, m)?)?;
     m.add_function(wrap_pyfunction!(dom::dom_set, m)?)?;
     m.add_function(wrap_pyfunction!(dom::dom_call, m)?)?;
+
+    // -- image codecs --
+    m.add("ImageError", py.get_type::<image::ImageError>())?;
+    m.add("MAX_PIXELS", image::MAX_PIXELS)?;
+    m.add("MAX_INFLATED", image::MAX_INFLATED)?;
+    m.add_function(wrap_pyfunction!(image::py_decode, m)?)?;
+    m.add_function(wrap_pyfunction!(image::py_decode_png, m)?)?;
+    m.add_function(wrap_pyfunction!(image::py_decode_gif, m)?)?;
+    m.add_function(wrap_pyfunction!(image::py_decode_jpeg, m)?)?;
+    m.add_function(wrap_pyfunction!(image::py_decode_pnm, m)?)?;
+    m.add_function(wrap_pyfunction!(image::py_sniff, m)?)?;
+    m.add_function(wrap_pyfunction!(image::py_resize, m)?)?;
+
+    // -- rasteriser --
+    m.add_class::<raster::Surface>()?;
+    m.add_function(wrap_pyfunction!(raster::rasterize, m)?)?;
+    m.add_function(wrap_pyfunction!(raster::glyph_bitmap, m)?)?;
+    m.add_function(wrap_pyfunction!(raster::draw_text, m)?)?;
+    m.add_function(wrap_pyfunction!(raster::measure_text, m)?)?;
+
+    // -- css cascade --
+    m.add_function(wrap_pyfunction!(css::style, m)?)?;
+
+    // -- fonts --
+    m.add_class::<font::Font>()?;
+    m.add("FontError", py.get_type::<font::FontError>())?;
+    m.add_function(wrap_pyfunction!(font::flatten, m)?)?;
     Ok(())
 }

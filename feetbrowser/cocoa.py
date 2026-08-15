@@ -21,8 +21,8 @@ import ctypes.util
 import platform
 import sys
 
-from .window import (STATE_ALT, STATE_CONTROL, STATE_SHIFT, Event, Window,
-                     key_sequences)
+from .window import (QUIET, STATE_ALT, STATE_CONTROL, STATE_SHIFT, Event,
+                     Window, key_sequences)
 
 _FRAMEWORKS = {
     "objc": "/usr/lib/libobjc.A.dylib",
@@ -40,6 +40,10 @@ _STYLE_RESIZABLE = 8
 _BACKING_BUFFERED = 2
 _SCALE_AXES_INDEPENDENTLY = 1
 _ACTIVATION_REGULAR = 0
+# Accessory is Regular minus the demands for attention: no Dock icon, no
+# entry in the application switcher, and no becoming the active application
+# on its own. Windows still open, draw and receive posted events.
+_ACTIVATION_ACCESSORY = 1
 _EVENT_MASK_ANY = 0xFFFFFFFFFFFFFFFF
 
 # NSEventType
@@ -224,7 +228,8 @@ class CocoaWindow(Window):
         _load()
         super().__init__(width, height, title)
         self._app = msg(_cls("NSApplication"), "sharedApplication")
-        msg(self._app, "setActivationPolicy:", _ACTIVATION_REGULAR,
+        msg(self._app, "setActivationPolicy:",
+            _ACTIVATION_ACCESSORY if QUIET else _ACTIVATION_REGULAR,
             argtypes=(ctypes.c_long,))
         style = (_STYLE_TITLED | _STYLE_CLOSABLE | _STYLE_MINIATURIZABLE
                  | _STYLE_RESIZABLE)
@@ -246,11 +251,17 @@ class CocoaWindow(Window):
             argtypes=(ctypes.c_long,))
         msg(self._window, "setContentView:", self._view,
             argtypes=(ctypes.c_void_p,))
-        msg(self._window, "center")
-        msg(self._window, "makeKeyAndOrderFront:", None,
-            argtypes=(ctypes.c_void_p,))
-        msg(self._app, "activateIgnoringOtherApps:", True,
-            argtypes=(ctypes.c_bool,))
+        if QUIET:
+            # Ordered in, so it is on screen and drawable, but behind
+            # everything and never made key: the keyboard stays wherever the
+            # user left it.
+            msg(self._window, "orderBack:", None, argtypes=(ctypes.c_void_p,))
+        else:
+            msg(self._window, "center")
+            msg(self._window, "makeKeyAndOrderFront:", None,
+                argtypes=(ctypes.c_void_p,))
+            msg(self._app, "activateIgnoringOtherApps:", True,
+                argtypes=(ctypes.c_bool,))
         msg(self._app, "finishLaunching")
         # These outlive any autorelease pool, so they are retained explicitly.
         self._distant_past = msg(msg(_cls("NSDate"), "distantPast"), "retain")
@@ -531,12 +542,17 @@ class CocoaWindow(Window):
 
     def deiconify(self):
         super().deiconify()
-        msg(self._window, "makeKeyAndOrderFront:", None,
-            argtypes=(ctypes.c_void_p,))
+        self._order_in()
 
     def lift(self, *_args):
-        msg(self._window, "makeKeyAndOrderFront:", None,
-            argtypes=(ctypes.c_void_p,))
+        self._order_in()
+
+    def _order_in(self):
+        if QUIET:
+            msg(self._window, "orderBack:", None, argtypes=(ctypes.c_void_p,))
+        else:
+            msg(self._window, "makeKeyAndOrderFront:", None,
+                argtypes=(ctypes.c_void_p,))
 
     def lower(self, *_args):
         msg(self._window, "orderBack:", None, argtypes=(ctypes.c_void_p,))

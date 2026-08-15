@@ -1,0 +1,136 @@
+name: Package (Linux)
+
+# The downloadable Linux application: one file, chmod +x, run. No Python on
+# the machine, no Rust, no development packages, no install step.
+#
+# Two jobs and the split between them is the whole point. `build` runs inside
+# manylinux_2_28 -- AlmaLinux 8, glibc 2.28 -- because a bundle linked against
+# a current Ubuntu's glibc refuses to start on anything older, which is the
+# standard way a Linux artifact works on the machine that built it and nowhere
+# else. `verify` then runs the finished file in debian:stable-slim, a
+# different distribution family with a newer glibc, no Python, no fonts and no
+# CA certificates, and refuses to pass unless a real page comes back off a
+# real X server. Building it and testing it in the same container would prove
+# nothing at all.
+#
+# ci.yml stays the judge of whether the code is correct; nothing here runs the
+# unit suite. wheels.yml is a different artifact for a different audience --
+# a wheel for someone who already has Python -- and neither file touches the
+# other.
+
+on:
+  # Packaging changes are the only pushes that can break this, and the build
+  # is a ten-minute one, so everything else asks for it by hand.
+  pull_request:
+    paths:
+      - 'packaging/linux/**'
+      - '.github/workflows/package-linux.yml'
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: AppImage x86_64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Driven with `docker run` rather than a job-level `container:` so that
+      # checkout and artifact upload stay on the runner and only the
+      # compilers go inside -- the same shape wheels.yml uses.
+      - name: Build the AppImage in manylinux_2_28
+        run: packaging/linux/build.sh
+
+      # The container ran as root, so everything it wrote is root-owned and
+      # upload-artifact cannot read it.
+      - name: Take the output back
+        run: sudo chown -R "$(id -u):$(id -g)" dist rust/target
+
+      - name: Report what shipped
+        run: |
+          ls -lh dist
+          cat dist/glibc-floor.txt
+          # A build path is not supposed to survive into a shipped binary,
+          # and an absolute RPATH is how one usually does. This only sees the
+          # parts of the image that are not compressed; the thorough version
+          # unpacks the payload and is part of the acceptance test below.
+          if strings dist/*.AppImage | grep -E '/(home|Users)/[A-Za-z0-9_.-]+/' ; then
+            echo "a build path leaked into the artifact" >&2
+            exit 1
+          fi
+          echo "no absolute home directory paths in the artifact"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: feetbrowser-appimage-x86_64
+          path: |
+            dist/*.AppImage
+            dist/glibc-floor.txt
+          if-no-files-found: error
+
+  verify:
+    name: Acceptance test on a clean distro
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: feetbrowser-appimage-x86_64
+          path: dist
+
+      - name: Run it where nothing is installed
+        run: |
+          chmod +x dist/*.AppImage
+          packaging/linux/verify.sh
+
+      # The screenshots are the evidence and they are meant to be looked at:
+      # a page fetched over https with no system CA store, a local page
+      # rendered with no system fonts, a PNG and a GIF decoded by the bundled
+      # engine, and a photograph taken off a real X server with XGetImage.
+      # tests/x11_shot.py fails the job by itself if the colours come back in
+      # the wrong order, so a green run here is not merely "a PNG was
+      # produced".
+      - uses: actions/upload-artifact@v4
+        with:
+          name: feetbrowser-appimage-screenshots
+          path: dist/verify/*.png
+          if-no-files-found: error
+
+  release:
+    name: Attach to the release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [build, verify]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: feetbrowser-appimage-x86_64
+          path: dist
+
+      - name: Upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          ls -l dist
+          gh release view "$TAG" >/dev/null 2>&1 \
+            || gh release create "$TAG" --title "$TAG" --generate-notes
+          gh release upload "$TAG" dist/*.AppImage --clobber

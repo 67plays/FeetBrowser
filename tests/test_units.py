@@ -1,11 +1,16 @@
 """Fast, offline unit tests for URL parsing, HTML, CSS, and internal pages."""
 import http.server
+import socket
+import threading
+import time
 import urllib.parse
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from feetbrowser import gui
+from feetbrowser.canvas import CanvasError, PhotoImage
+from feetbrowser.window import Tk
 
+from feetbrowser import net as net_mod
 from feetbrowser.net import URL
 from feetbrowser.htmlparser import HTMLParser, Element, Text
 from feetbrowser.cssparser import CSSParser, style
@@ -21,6 +26,15 @@ from feetbrowser.browser import (
 
 def eq(a, b, msg=""):
     assert a == b, f"{msg}: {a!r} != {b!r}"
+
+
+def _swallow(fn, *args, **kwargs):
+    """Run fn on a helper thread without letting its exception escape into a
+    thread nobody is watching. Returns the result, or the exception."""
+    try:
+        return fn(*args, **kwargs)
+    except Exception as exc:
+        return exc
 
 
 def test_url_parsing():
@@ -611,7 +625,7 @@ def test_image_in_table_cell_sizes_column():
             "<td>zzz</td></tr></table>")
     dom = HTMLParser(html).parse()
     style(dom, [])
-    photo = gui.PhotoImage(width=200, height=100)
+    photo = PhotoImage(width=200, height=100)
     cache = {"https://example.com/img.png": photo}
     doc = DocumentLayout(dom, 620)
     doc.image_cache = cache
@@ -681,20 +695,27 @@ def test_wide_netpbm_samples_scale_to_maxval():
     eq(full[0], 255, "maxval is white")
 
 
-def test_webp_image_decode():
-    """WebP (used heavily by Google) must decode to a PhotoImage when Pillow
-    is available, instead of staying a placeholder."""
-    import io
-    try:
-        from PIL import Image as PILImage
-    except ImportError:
-        return  # Pillow is optional
-    im = PILImage.new("RGBA", (4, 4), (0, 0, 255, 255))
-    buf = io.BytesIO()
-    im.save(buf, format="WEBP")
-    photo = Tab._decode_image(buf.getvalue(), "image/webp")
-    assert photo is not None, "WebP should decode"
-    eq((photo.width(), photo.height()), (4, 4), "WebP dimensions preserved")
+def test_what_an_img_tag_decodes_and_what_it_does_not():
+    """WebP decoded here when Pillow happened to be installed, and does not
+    decode at all now. That is a real loss on Google's pages, written down in
+    docs/limitations.md rather than hidden, and what matters is the shape of
+    the failure: an image we cannot read comes back as None so the layout
+    draws its alt text, and never as an exception out of a decoder.
+
+    The content type is not consulted on the way in, because servers get it
+    wrong often enough that believing it costs more pictures than ignoring it
+    does."""
+    photo = Tab._decode_image(_fixture("photo.jpg"), "image/jpeg")
+    assert photo is not None, "a JPEG has to decode"
+    eq((photo.width(), photo.height()), (320, 224), "JPEG dimensions")
+    mislabelled = Tab._decode_image(_fixture("photo.jpg"), "image/png")
+    assert mislabelled is not None, "a mislabelled JPEG still has to decode"
+    eq((mislabelled.width(), mislabelled.height()), (320, 224))
+    eq(Tab._decode_image(b"RIFF\x24\x00\x00\x00WEBPVP8 " + b"\x00" * 24,
+                         "image/webp"), None, "WebP is alt text now")
+    eq(Tab._decode_image(b"<svg xmlns='http://www.w3.org/2000/svg'/>",
+                         "image/svg+xml"), None, "SVG is alt text now")
+    eq(Tab._decode_image(b"", "image/png"), None, "no bytes at all")
 
 
 def test_float_text_wraps_and_clears():
@@ -1182,6 +1203,45 @@ def test_data_image_pipeline_renders_drawimage():
                    if isinstance(c, DrawText)), "placeholder replaced"
 
 
+def test_clicking_an_image_follows_its_enclosing_link():
+    """A click on a photo wrapped in an `<a>` navigates, like any browser.
+
+    DrawImage used to carry the `<img>` node for hit-testing but no `hit()`
+    of its own, so `_node_at()` skipped it and a click on the picture fell
+    through to whatever was underneath. On a thumbnail grid such as
+    safebooru's browse page -- where every thumbnail is wrapped in a link to
+    the post page -- that meant nothing happened when you clicked a photo.
+    """
+    import base64
+    import struct
+    import zlib as _z
+    from feetbrowser.layout import DrawImage
+
+    def chunk(tag, data):
+        c = struct.pack(">I", len(data)) + tag + data
+        return c + struct.pack(">I", _z.crc32(tag + data))
+
+    def png(w, h):
+        rows = b"".join(b"\x00" + b"\xff\x00\x00" * w for _ in range(h))
+        raw = b"\x89PNG\r\n\x1a\n"
+        raw += chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+        raw += chunk(b"IDAT", _z.compress(rows))
+        raw += chunk(b"IEND", b"")
+        return raw
+
+    b64 = base64.b64encode(png(8, 8)).decode()
+    tab = _make_tab(
+        f'<a href="/post/1"><img src="data:image/png;base64,{b64}"></a>')
+    tab.load_images(None)
+    drawn = [c for c in tab.display_list if isinstance(c, DrawImage)]
+    assert drawn, "the image should have decoded"
+    img = drawn[0]
+    x, y = (img.left + img.right) / 2, (img.top + img.bottom) / 2
+    eq(str(tab.click(x, y)), "https://example.com/post/1",
+       "a click on the image follows the link around it")
+    eq(tab.link_at(x, y), "/post/1", "hovering the image reports the link")
+
+
 def test_base_href_detected():
     dom = HTMLParser("<head><base href='/sub/'></head><body>x</body>").parse()
     eq(find_base_href(dom), "/sub/")
@@ -1440,7 +1500,7 @@ def _key_stub(tab, clipboard=""):
     to be read the way the real one does when nothing text-shaped is on it."""
     def read():
         if clipboard is None:
-            raise gui.TclError("CLIPBOARD selection doesn't exist")
+            raise CanvasError("CLIPBOARD selection doesn't exist")
         return clipboard
 
     class Stub(Browser):
@@ -2107,7 +2167,7 @@ def test_async_load_in_gui_mode():
             pass
 
     srv = _start_server(H)
-    root = gui.Tk(); root.withdraw()
+    root = Tk(); root.withdraw()
     try:
         class FakeBrowser:
             window = root
@@ -2131,6 +2191,560 @@ def test_async_load_in_gui_mode():
     finally:
         srv.shutdown()
         root.destroy()
+
+
+# -- the Win32 backend, in the parts that are not Win32 --------------------
+#
+# tests/test_win32.py opens real windows and only runs on Windows. Everything
+# below is the arithmetic and the translation tables behind that window, and
+# those are plain functions on purpose: they run, and are checked, on every
+# platform the suite runs on.
+
+def test_dib_stride_rounds_rows_up_to_four_bytes():
+    from feetbrowser.win32 import dib_stride
+    eq(dib_stride(4, 24), 12, "a multiple of four needs no padding")
+    eq(dib_stride(5, 24), 16, "15 bytes of pixels round up to 16")
+    eq(dib_stride(999, 24), 3000, "2997 bytes of pixels round up to 3000")
+    # The reason this backend presents 32bpp: no row ever needs padding, so
+    # the frame is one buffer and the whole class of off-by-one row smears
+    # cannot happen.
+    for width in range(1, 40):
+        eq(dib_stride(width, 32), width * 4,
+           f"32bpp width {width} should need no padding")
+
+
+def test_rgb_becomes_bgr_without_moving_a_pixel():
+    from feetbrowser.win32 import bgra_from_rgb
+    # Two pixels: pure red, then pure green.
+    out = bgra_from_rgb(bytearray([255, 0, 0, 0, 255, 0]), 2, 1)
+    eq(bytes(out), b"\x00\x00\xff\x00\x00\xff\x00\x00", "channel order")
+    eq(len(out), 2 * 1 * 4, "four bytes per pixel")
+
+
+def test_the_dib_is_top_down_and_row_order_survives():
+    """A DIB is bottom-up by default and we declare a negative height
+    instead, so the rows must come out in the order they went in. Getting
+    this wrong flips the whole page upside down."""
+    from feetbrowser.win32 import bgra_from_rgb
+    pixels = bytearray([1, 2, 3, 4, 5, 6,        # row 0
+                        7, 8, 9, 10, 11, 12])    # row 1
+    out = bgra_from_rgb(pixels, 2, 2)
+    eq(bytes(out[0:4]), b"\x03\x02\x01\x00", "first pixel of the first row")
+    eq(bytes(out[8:12]), b"\x09\x08\x07\x00", "first pixel of the second row")
+
+
+def test_a_padded_source_stride_is_compacted():
+    from feetbrowser.win32 import bgra_from_rgb
+    # Three bytes of pixels per row plus two bytes of slack.
+    pixels = bytearray([10, 20, 30, 99, 99,
+                        40, 50, 60, 99, 99])
+    out = bgra_from_rgb(pixels, 1, 2, stride=5)
+    eq(bytes(out), b"\x1e\x14\x0a\x00\x3c\x32\x28\x00", "slack was skipped")
+
+
+def test_the_bitmap_header_is_the_size_windows_expects():
+    """GDI reads biSize to tell a BITMAPINFOHEADER from its successors, so a
+    header that is not 40 bytes is rejected outright."""
+    import ctypes
+    from feetbrowser.win32 import BITMAPINFOHEADER
+    eq(ctypes.sizeof(BITMAPINFOHEADER), 40)
+
+
+def test_packed_coordinates_can_be_negative():
+    """A drag that leaves the window on the left or the top reports a
+    negative coordinate, packed as an unsigned 16-bit field."""
+    from feetbrowser.win32 import lparam_point, signed_word
+    eq(signed_word(0xFFFF), -1)
+    eq(signed_word(0x8000), -32768)
+    eq(signed_word(0x7FFF), 32767)
+    eq(lparam_point((300 << 16) | 120), (120, 300))
+    eq(lparam_point((0xFFFB << 16) | 0xFFF6), (-10, -5), "off the top-left")
+
+
+def test_a_wheel_notch_stays_in_the_pixel_range():
+    """browser.py treats |delta| < 30 as a pixel count and anything larger as
+    line units, so a notch has to stay under 30 or one flick moves the page
+    by a screenful."""
+    from feetbrowser.win32 import wheel_delta
+    eq(wheel_delta(120), 20, "one notch forward")
+    eq(wheel_delta(-120), -20, "one notch back")
+    eq(wheel_delta(0), 0)
+    for raw in (120, -120, 360, -360, 3600, -3600, 7, -7):
+        delta = wheel_delta(raw)
+        assert abs(delta) < 30, f"{raw} became {delta}, out of the pixel range"
+        assert (delta > 0) == (raw > 0), f"{raw} lost its direction"
+
+
+def test_modifier_bits_are_the_ones_the_browser_reads():
+    from feetbrowser.win32 import modifier_state
+    from feetbrowser.window import STATE_ALT, STATE_CONTROL, STATE_SHIFT
+    eq(modifier_state(False, False, False), 0)
+    eq(modifier_state(True, False, False), STATE_SHIFT)
+    eq(modifier_state(False, True, False), STATE_CONTROL)
+    eq(modifier_state(False, False, True), STATE_ALT)
+    # browser.py tests `event.state & 0x4` directly for its shortcuts.
+    assert modifier_state(False, True, False) & 0x4
+
+
+def test_named_virtual_keys_map_to_tk_keysyms():
+    from feetbrowser.win32 import keysym_for_vk
+    from feetbrowser.window import STATE_CONTROL, STATE_SHIFT
+    eq(keysym_for_vk(0x0D, 0), "Return")
+    eq(keysym_for_vk(0x26, 0), "Up")
+    eq(keysym_for_vk(0x21, 0), "Prior", "PageUp is Tk's Prior")
+    eq(keysym_for_vk(0x7B, 0), "F12")
+    eq(keysym_for_vk(0x09, 0), "Tab")
+    # browser.py binds <Control-ISO_Left_Tab> for previous-tab, which is the
+    # keysym X11 and Tk use for a shifted Tab.
+    eq(keysym_for_vk(0x09, STATE_SHIFT), "ISO_Left_Tab")
+    eq(keysym_for_vk(0x09, STATE_SHIFT | STATE_CONTROL), "ISO_Left_Tab")
+
+
+def test_a_plain_letter_waits_for_the_character_message():
+    """WM_CHAR is the only thing that has been through the user's keyboard
+    layout, so an unmodified printable key is left to it."""
+    from feetbrowser.win32 import keysym_for_vk
+    from feetbrowser.window import STATE_ALT, STATE_CONTROL, STATE_SHIFT
+    eq(keysym_for_vk(0x4C, 0), None, "plain L")
+    eq(keysym_for_vk(0x4C, STATE_SHIFT), None, "shifted L")
+    # Under Control the character message carries a control code (Ctrl-L is
+    # 0x0C, not "l"), so the letter has to come from the virtual key.
+    eq(keysym_for_vk(0x4C, STATE_CONTROL), "l", "Ctrl-L reaches <Control-l>")
+    eq(keysym_for_vk(0x54, STATE_CONTROL), "t")
+    eq(keysym_for_vk(0x53, STATE_CONTROL | STATE_SHIFT), "S",
+       "Tk names a shifted letter by its shifted character")
+    eq(keysym_for_vk(0x31, STATE_CONTROL), "1", "digits are not cased")
+    eq(keysym_for_vk(0x25, STATE_ALT), "Left", "Alt-Left is still a named key")
+    eq(keysym_for_vk(0xBA, STATE_CONTROL), None, "no guess at an OEM key")
+
+
+def test_character_messages_become_keysyms():
+    from feetbrowser.win32 import keysym_for_char
+    from feetbrowser.window import STATE_CONTROL
+    eq(keysym_for_char("z", 0), ("z", "z"))
+    eq(keysym_for_char("é", 0), ("é", "é"), "the layout's own character")
+    eq(keysym_for_char(" ", 0), ("space", " "), "Tk calls a space 'space'")
+    eq(keysym_for_char("", 0), None, "half a surrogate pair carries nothing")
+    # Return, Tab, Escape and Backspace each arrive twice: once as a named
+    # virtual key and once as a control code. Only the first is the event.
+    eq(keysym_for_char("\r", 0), None)
+    eq(keysym_for_char("\x08", 0), None)
+    eq(keysym_for_char("\x0c", STATE_CONTROL), None,
+       "Ctrl-L was already delivered from the virtual key")
+
+
+def test_key_sequences_are_offered_most_specific_first():
+    """Tk fires exactly one binding, the most specific that matches, and a
+    binding matches when its modifiers are a subset of those held."""
+    from feetbrowser.window import STATE_CONTROL, STATE_SHIFT, key_sequences
+    names = key_sequences("l", STATE_CONTROL)
+    eq(names[0], "<Control-l>")
+    eq(names[-1], "<Key>", "the generic binding is always the last resort")
+    assert "<l>" in names
+    names = key_sequences("Up", 0)
+    eq(names, ["<Up>", "<Key>"], "an unmodified named key")
+    # browser.py binds <Control-Shift-s> for view-source and <Control-s> for
+    # nothing, so the shifted spelling has to be offered and has to win.
+    names = key_sequences("S", STATE_CONTROL | STATE_SHIFT)
+    assert "<Control-Shift-s>" in names, names
+    assert names.index("<Control-Shift-s>") < names.index("<Control-s>"), names
+    # A subset match is what lets <Control-ISO_Left_Tab> catch Ctrl-Shift-Tab.
+    names = key_sequences("ISO_Left_Tab", STATE_CONTROL | STATE_SHIFT)
+    assert "<Control-ISO_Left_Tab>" in names, names
+
+
+def test_win32_module_is_importable_off_windows():
+    """gui.platform_root(), pyflakes and this file all import it, so it has
+    to load on a machine with no windll at all."""
+    from feetbrowser import win32
+    if sys.platform != "win32":
+        eq(win32.available(), False, "no Win32 window off Windows")
+        try:
+            win32.Win32Tk()
+        except win32.Win32Unavailable:
+            pass
+        else:
+            assert False, "a window opened on a platform with no Win32"
+
+
+def test_the_display_variable_picks_a_backend_by_name():
+    from feetbrowser import gui
+    saved = gui.DISPLAY
+    try:
+        gui.DISPLAY = "none"
+        eq(gui.platform_root(), None, "'none' stays headless everywhere")
+
+        gui.DISPLAY = ""
+        root = gui.platform_root()
+        if sys.platform == "darwin":
+            eq(root.__name__, "CocoaTk")
+        elif sys.platform == "win32":
+            eq(root.__name__, "Win32Tk")
+        elif root is not None:
+            # x11.py answers here too, and whether it can is a property of
+            # the machine rather than of the platform: a desktop with a
+            # server running gets X11Tk and headless CI gets None. Both are
+            # right, so the only wrong answer is some *other* backend.
+            eq(root.__name__, "X11Tk")
+
+        for name in ("win32", "windows"):
+            gui.DISPLAY = name
+            if sys.platform == "win32":
+                eq(gui.platform_root().__name__, "Win32Tk")
+            else:
+                # Asking by name and silently getting a headless root is the
+                # kind of thing you discover from an empty screenshot.
+                try:
+                    gui.platform_root()
+                except RuntimeError as e:
+                    assert "Win32" in str(e), f"unhelpful message: {e}"
+                else:
+                    assert False, f"FEETBROWSER_DISPLAY={name} should raise"
+
+        gui.DISPLAY = "cocoa"
+        if sys.platform == "darwin":
+            eq(gui.platform_root().__name__, "CocoaTk")
+        else:
+            try:
+                gui.platform_root()
+            except RuntimeError as e:
+                assert "Cocoa" in str(e), f"unhelpful message: {e}"
+            else:
+                assert False, "FEETBROWSER_DISPLAY=cocoa should raise here"
+    finally:
+        gui.DISPLAY = saved
+
+
+def test_file_urls_understand_a_drive_letter():
+    """Windows paths do not fit the file: grammar: the drive lands where the
+    host goes, or behind an extra slash, and Explorer hands out backslashes.
+    All three have to name the same file."""
+    for raw in ("file:///C:/pages/a.html", "file://C:/pages/a.html",
+                "file://C:\\pages\\a.html", "file:///C|/pages/a.html"):
+        u = URL(raw)
+        eq(u.scheme, "file", raw)
+        eq(u.path, "/C:/pages/a.html" if "|" not in raw
+           else "/C|/pages/a.html", raw)
+        # Whatever went in, one canonical spelling comes out, and it parses
+        # back to the same place.
+        eq(URL(str(u)).path, u.path, f"{raw} does not round-trip")
+    eq(str(URL("file://C:/pages/a.html")), "file:///C:/pages/a.html")
+    # POSIX paths are untouched.
+    eq(URL("file:///etc/hosts").path, "/etc/hosts")
+    eq(URL("file:///tmp/a b.html").path, "/tmp/a b.html")
+    eq(URL("file://localhost/etc/hosts").path, "/etc/hosts", "host ignored")
+    eq(URL("file:/etc/hosts").path, "/etc/hosts", "the one-slash form")
+
+
+def test_a_file_url_converts_back_to_a_filesystem_path():
+    """The URL path and the filesystem path are different strings: the
+    leading slash in file:///C:/x is not part of the path, and the separator
+    is whatever this platform uses."""
+    sep = os.sep
+    eq(URL("file:///C:/pages/a.html").local_path(),
+       sep.join(["C:", "pages", "a.html"]))
+    eq(URL("file://C:\\pages\\a.html").local_path(),
+       sep.join(["C:", "pages", "a.html"]))
+    eq(URL("file:///C|/x.html").local_path(), sep.join(["C:", "x.html"]),
+       "the older bar spelling is still a drive")
+    eq(URL("file:///etc/hosts").local_path(), sep.join(["", "etc", "hosts"]))
+    # Percent-escapes come off, which is what makes the links a directory
+    # listing writes openable again.
+    eq(URL("file:///tmp/a%20b.html").local_path(),
+       sep.join(["", "tmp", "a b.html"]))
+
+
+def test_relative_links_resolve_inside_a_drive():
+    base = URL("file:///C:/pages/index.html")
+    eq(str(base.resolve("next.html")), "file:///C:/pages/next.html")
+    eq(str(base.resolve("../other/x.html")), "file:///C:/other/x.html")
+    eq(str(base.resolve("/C:/top.html")), "file:///C:/top.html")
+
+
+def test_local_pages_may_only_reach_their_own_directory():
+    """The same-origin rule for file: pages is a string prefix over URL
+    paths. Comparing them with os.path.dirname would compare a backslash
+    prefix against a slash path on Windows and deny everything."""
+    tab = Tab(700, None)
+    tab.base_url = URL("file:///C:/pages/index.html")
+    assert tab._js_scheme_allowed(URL("file:///C:/pages/data.json"))
+    assert tab._js_scheme_allowed(URL("file:///C:/pages/sub/deep.json"))
+    assert not tab._js_scheme_allowed(URL("file:///C:/secrets.txt"))
+    assert not tab._js_scheme_allowed(URL("file:///C:/pagesother/x.txt"))
+    tab.base_url = URL("file:///home/u/pages/index.html")
+    assert tab._js_scheme_allowed(URL("file:///home/u/pages/data.json"))
+    assert not tab._js_scheme_allowed(URL("file:///home/u/secret.txt"))
+
+
+def test_a_local_file_can_actually_be_opened():
+    import tempfile
+    fd, path = tempfile.mkstemp(suffix=".html")
+    try:
+        with os.fdopen(fd, "w", encoding="utf8") as f:
+            f.write("<h1>local</h1>")
+        # What a browser is handed is a path, and turning one into a URL is
+        # exactly where a Windows path stops looking like a URL.
+        url = URL("file:///" + path.replace(os.sep, "/").lstrip("/"))
+        _headers, body, ctype = url.request()
+        eq(ctype, "text/html")
+        assert "local" in body, f"read back {body!r}"
+        eq(URL(str(url)).local_path(), path, "round-trips through str()")
+    finally:
+        os.unlink(path)
+
+
+def test_a_missing_file_reports_rather_than_raises():
+    _headers, body, ctype = URL("file:///no/such/file.html").request()
+    eq(ctype, "text/html")
+    assert "Cannot open file" in body, body
+def _lis(dom):
+    return [n for n in tree_to_list(dom, [])
+            if isinstance(n, Element) and n.tag == "li"]
+
+
+def test_nth_child_with_a_zero_step_is_one_child():
+    # `0n+3` used to divide by the step and take the whole page down with a
+    # ZeroDivisionError raised from the middle of the cascade. It selects the
+    # third child and nothing else.
+    rules = CSSParser("li:nth-child(0n+3) { color: red }").parse()
+    dom = HTMLParser("<ul><li>a</li><li>b</li><li>c</li><li>d</li></ul>").parse()
+    style(dom, rules)
+    colors = [li.style["color"] for li in _lis(dom)]
+    eq(colors, ["black", "black", "red", "black"], "0n+3 is the third child")
+
+
+def test_nth_child_expression_forms():
+    rules = CSSParser(
+        "li:nth-child(odd) { color: red } "
+        "li:nth-child(even) { font-weight: bold } "
+        "li:nth-child(-n+2) { font-style: italic } "
+        "li:nth-child(3) { white-space: pre } "
+        "li:nth-child(  4  ) { text-align: right } "
+        "li:nth-child(banana) { font-family: serif } "
+        "li:nth-last-child(1) { list-style-type: square }"
+    ).parse()
+    dom = HTMLParser(
+        "<ul><li>a</li><li>b</li><li>c</li><li>d</li><li>e</li></ul>").parse()
+    style(dom, rules)
+    lis = _lis(dom)
+    eq([li.style["color"] for li in lis],
+       ["red", "black", "red", "black", "red"], "odd is 1, 3, 5")
+    eq([li.style["font-weight"] for li in lis],
+       ["normal", "bold", "normal", "bold", "normal"], "even is 2 and 4")
+    # `-n+2` should be the first two children. It is the first one, because
+    # the step count has always had to be at least 1, which drops the n=0
+    # term of every an+b expression. Kept as it is: the pages the renderer is
+    # checked against are pixel-identical with this behaviour and would not be
+    # without it. Recorded here so the next person finds it deliberately.
+    eq([li.style["font-style"] for li in lis][:3],
+       ["italic", "normal", "normal"], "-n+2 drops its n=0 term")
+    eq(lis[2].style["white-space"], "pre", "a bare number is that child")
+    eq(lis[3].style["text-align"], "right", "spaces around the number are fine")
+    eq([li.style["font-family"] for li in lis].count("serif"), 0,
+       "an unparseable expression matches nothing rather than raising")
+    eq([li.style["list-style-type"] for li in lis],
+       ["disc", "disc", "disc", "disc", "square"],
+       "nth-last-child counts from the end")
+
+
+def test_of_type_pseudo_classes_count_by_tag():
+    rules = CSSParser(
+        "p:first-of-type { color: red } p:last-of-type { font-weight: bold } "
+        "span:only-of-type { font-style: italic } "
+        "p:nth-of-type(2) { white-space: pre } "
+        "p:nth-last-of-type(1) { text-align: right }"
+    ).parse()
+    dom = HTMLParser(
+        "<div><p>a</p><span>s</span><p>b</p><p>c</p></div>").parse()
+    style(dom, rules)
+    ps = [n for n in tree_to_list(dom, [])
+          if isinstance(n, Element) and n.tag == "p"]
+    span = [n for n in tree_to_list(dom, [])
+            if isinstance(n, Element) and n.tag == "span"][0]
+    eq(ps[0].style["color"], "red", "the span between does not shift the count")
+    eq([p.style["font-weight"] for p in ps],
+       ["normal", "normal", "bold"], "last-of-type is the third p")
+    eq(span.style["font-style"], "italic", "the only span is only-of-type")
+    eq(ps[1].style["white-space"], "pre", "nth-of-type counts p's only")
+    eq(ps[2].style["text-align"], "right", "nth-last-of-type counts back")
+
+
+def test_attribute_operators():
+    rules = CSSParser(
+        'a[href] { color: red } a[href="/x"] { font-weight: bold } '
+        'a[class~="two"] { font-style: italic } a[lang|="en"] { white-space: pre } '
+        'a[href^="/x"] { text-align: right } a[href$="z"] { line-height: 3 } '
+        'a[href*="y"] { text-decoration: underline }'
+    ).parse()
+    dom = HTMLParser(
+        '<div><a href="/x" class="one two" lang="en-GB">a</a>'
+        '<a href="/xyz" lang="ends">b</a><a>c</a></div>').parse()
+    style(dom, rules)
+    a, b, c = [n for n in tree_to_list(dom, [])
+               if isinstance(n, Element) and n.tag == "a"]
+    eq(a.style["color"], "red", "presence matches")
+    eq(c.style["color"], "black", "presence does not match an absent attribute")
+    eq(a.style["font-weight"], "bold", "= is exact")
+    eq(b.style["font-weight"], "normal", "= is not a prefix")
+    eq(a.style["font-style"], "italic", "~= matches a whitespace-separated word")
+    eq(a.style["white-space"], "pre", "|= matches the hyphenated prefix")
+    eq(b.style["white-space"], "normal", "|= is not a bare prefix")
+    eq(b.style["text-align"], "right", "^= is a prefix")
+    eq(b.style["line-height"], "3", "$= is a suffix")
+    eq(b.style["text-decoration"], "underline", "*= is a substring")
+
+
+def test_is_and_where_match_their_argument():
+    rules = CSSParser(
+        "p:is(.x) { color: red } p:where(.y) { font-weight: bold } "
+        "p:not(:is(.x)) { font-style: italic }"
+    ).parse()
+    dom = HTMLParser(
+        '<div><p class="x">a</p><p id="keep">b</p><p class="y">c</p>'
+        '<p>d</p></div>').parse()
+    style(dom, rules)
+    ps = [n for n in tree_to_list(dom, [])
+          if isinstance(n, Element) and n.tag == "p"]
+    eq([p.style["color"] for p in ps], ["red", "black", "black", "black"],
+       ":is matches its argument")
+    eq([p.style["font-weight"] for p in ps],
+       ["normal", "normal", "bold", "normal"], ":where matches its argument")
+    eq([p.style["font-style"] for p in ps],
+       ["normal", "italic", "italic", "italic"], ":not(:is(...)) inverts it")
+    # A comma inside the parentheses is read as the end of the selector by the
+    # tokeniser, so the rule is dropped rather than matching either argument.
+    eq(len(CSSParser("p:is(.x, #keep) { color: red }").parse()), 0,
+       "a selector list inside :is() does not parse")
+
+
+def test_a_non_string_attribute_does_not_lose_the_page():
+    # Script can put anything in the attribute table. Splitting a number into
+    # class names used to raise out of the cascade, which cost the whole page
+    # rather than the one rule that asked.
+    rules = CSSParser(".skip { color: red } #five { font-weight: bold } "
+                      "p { font-style: italic }").parse()
+    dom = HTMLParser("<div><p>a</p></div>").parse()
+    p = [n for n in tree_to_list(dom, [])
+         if isinstance(n, Element) and n.tag == "p"][0]
+    p.attributes["class"] = 5
+    p.attributes["id"] = 5
+    style(dom, rules)
+    eq(p.style["color"], "black", "a number has no class names")
+    eq(p.style["font-weight"], "normal", "a number is not an id either")
+    eq(p.style["font-style"], "italic", "the rest of the cascade still runs")
+
+
+def test_styling_a_subtree_starts_its_ancestor_sets_empty():
+    # Script mutates one node and the tab restyles that subtree. The ancestor
+    # feature sets a descendant selector consults are built from the styling
+    # root down, so an ancestor above it is invisible to the fast path: a
+    # subtree restyle can drop `div.outer p` that a full restyle applies.
+    # Faithful to the Python this replaced, and load-bearing -- the corpus
+    # renders the same only because it still behaves this way.
+    rules = CSSParser("div.outer p { color: red } :root p { font-weight: bold } "
+                      "p { font-style: italic }").parse()
+    dom = HTMLParser('<div class="outer"><section><p>a</p></section></div>').parse()
+    style(dom, rules)
+    section = [n for n in tree_to_list(dom, [])
+               if isinstance(n, Element) and n.tag == "section"][0]
+    p = [n for n in tree_to_list(dom, [])
+         if isinstance(n, Element) and n.tag == "p"][0]
+    eq(p.style["color"], "red", "a full restyle sees the outer div")
+    style(section, rules)
+    eq(p.style["color"], "black", "a subtree restyle starts its ancestors empty")
+    eq(p.style["font-weight"], "bold",
+       ":root is still the document's root, not the subtree's")
+    eq(p.style["font-style"], "italic", "the subtree is restyled at all")
+
+
+def test_a_selector_nested_past_the_limit_matches_nothing():
+    # Absurd nesting compiles to a selector that never matches instead of
+    # raising a RecursionError from inside the cascade.
+    rules = CSSParser(" ".join(["div"] * 600) + " p { color: red }").parse()
+    dom = HTMLParser("<div><p>a</p></div>").parse()
+    style(dom, rules)
+    p = [n for n in tree_to_list(dom, [])
+         if isinstance(n, Element) and n.tag == "p"][0]
+    eq(p.style["color"], "black", "the page survives the selector")
+
+
+def test_a_deeply_nested_document_styles_without_recursing():
+    depth = 400
+    rules = CSSParser("div p { color: red }").parse()
+    dom = HTMLParser("<div>" * depth + "<p>x</p>" + "</div>" * depth).parse()
+    style(dom, rules)
+    p = [n for n in tree_to_list(dom, [])
+         if isinstance(n, Element) and n.tag == "p"][0]
+    eq(p.style["color"], "red", "a 400-deep document still cascades")
+
+
+def test_images_over_http_reach_the_display_list():
+    """The shape of a real page: HTML off the wire, then images off the wire.
+
+    Both halves are asynchronous and they finish in that order, so a caller
+    that waits on `tab.loading` alone stops exactly one step early -- with
+    the document rendered and every <img> still a placeholder. This is the
+    regression that made photographs vanish from the raster backend.
+    """
+    import struct
+    import time
+    import zlib
+
+    def png(width, height, rgb):
+        def chunk(tag, payload):
+            body = tag + payload
+            return (struct.pack(">I", len(payload)) + body
+                    + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF))
+        raw = b"".join(b"\x00" + bytes(rgb) * width for _ in range(height))
+        return (b"\x89PNG\r\n\x1a\n"
+                + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height,
+                                             8, 2, 0, 0, 0))
+                + chunk(b"IDAT", zlib.compress(raw))
+                + chunk(b"IEND", b""))
+
+    pixels = png(6, 6, (0, 128, 255))
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/pic.png":
+                body, ctype = pixels, "image/png"
+            else:
+                body = b"<h1>page</h1><p><img src='/pic.png'>"
+                ctype = "text/html"
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    from feetbrowser.layout import DrawImage
+
+    srv = _start_server(H)
+    browser = Browser()
+    try:
+        port = srv.server_address[1]
+        browser.new_tab(f"http://127.0.0.1:{port}/page")
+        tab = browser.tabs[0]
+        assert tab.loading, "http in GUI mode loads off the UI thread"
+        # Pump only until the document lands -- the old settle condition.
+        deadline = time.time() + 10
+        while tab.loading and time.time() < deadline:
+            browser.window.flush_timers()
+            time.sleep(0.01)
+        assert not tab.loading, "document should have arrived"
+        assert tab.pending_images(), "and its image should still be coming"
+        assert browser.settle(20.0), "settle should not have timed out"
+        eq(len(tab.image_cache), 1, "image decoded and cached")
+        images = [c for c in tab.display_list if isinstance(c, DrawImage)]
+        eq(len(images), 1, "image painted")
+        assert not any("[img" in getattr(c, "text", "")
+                       for c in tab.display_list), "placeholder replaced"
+    finally:
+        srv.shutdown()
+        browser.window.destroy()
 
 
 # -- <select> drop-downs ----------------------------------------------------
@@ -2609,8 +3223,473 @@ def test_an_untouched_select_submits_its_fallback_choice():
     eq(fields, [("size", "M")], "the first choosable option, not the disabled one")
 
 
+class _FakeResolver:
+    """Stands in for socket.getaddrinfo. Hosts named in `stall` block until
+    released; everything else answers at once. Records what it was asked."""
+
+    def __init__(self, stall=()):
+        self.stall = set(stall)
+        self.asked = []
+        self.release = threading.Event()
+        self.lock = threading.Lock()
+
+    def __call__(self, host, port, *args, **kwargs):
+        with self.lock:
+            self.asked.append(host)
+        if host in self.stall:
+            # Bounded so a failing test cannot wedge the suite.
+            self.release.wait(30)
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "",
+                 ("127.0.0.1", port))]
+
+
+def _with_resolver(resolver):
+    """Install `resolver` as socket.getaddrinfo; returns a restore callable."""
+    real = socket.getaddrinfo
+    socket.getaddrinfo = resolver
+
+    def restore():
+        resolver.release.set()
+        socket.getaddrinfo = real
+        with net_mod._DNS_LOCK:
+            net_mod._DNS_INFLIGHT.clear()
+            net_mod._DNS_CACHE.clear()
+    return restore
+
+
+def test_a_dns_lookup_that_never_answers_gives_up():
+    """getaddrinfo cannot be interrupted and settimeout does not reach it, so
+    an unreachable resolver used to hang the browser with nothing printed.
+    The wait is bounded now; the lookup itself still cannot be cancelled."""
+    resolver = _FakeResolver(stall=["stalled.invalid"])
+    restore = _with_resolver(resolver)
+    try:
+        started = time.time()
+        try:
+            net_mod._resolve("stalled.invalid", 80, timeout=0.25)
+            assert False, "a resolver that never answers should not return"
+        except socket.timeout:
+            pass
+        waited = time.time() - started
+        assert waited < 5, f"waited {waited:.1f}s, so the ceiling did not hold"
+    finally:
+        restore()
+
+
+def test_one_stalled_host_does_not_block_lookups_of_another():
+    """The regression this guards: the lookup used to happen while holding
+    _DNS_LOCK, so a single unreachable host stalled every other thread that
+    wanted any host at all -- background image fetches included."""
+    resolver = _FakeResolver(stall=["stalled.invalid"])
+    restore = _with_resolver(resolver)
+    try:
+        stuck = threading.Thread(
+            target=lambda: _swallow(net_mod._resolve, "stalled.invalid", 80),
+            daemon=True)
+        stuck.start()
+        # Wait until the stalled lookup is genuinely in flight.
+        deadline = time.time() + 5
+        while "stalled.invalid" not in resolver.asked and time.time() < deadline:
+            time.sleep(0.01)
+        assert "stalled.invalid" in resolver.asked, "the stall never started"
+
+        started = time.time()
+        infos = net_mod._resolve("fine.invalid", 80, timeout=5)
+        waited = time.time() - started
+        assert infos, "the second host should still resolve"
+        assert waited < 2, f"second host waited {waited:.1f}s behind the first"
+    finally:
+        restore()
+
+
+def test_a_stalled_host_does_not_stall_connections_to_another():
+    """The same regression seen from where it actually bit: _connect, not the
+    resolver underneath it. Written against _connect on purpose -- it is the
+    entry point that existed when the lock was held across the lookup, so it
+    is the one that can tell the two behaviours apart. The connection itself
+    is expected to fail (nothing is listening); only the time taken matters.
+    """
+    resolver = _FakeResolver(stall=["stalled.invalid"])
+    restore = _with_resolver(resolver)
+    try:
+        threading.Thread(
+            target=lambda: _swallow(net_mod._connect, "stalled.invalid", 80),
+            daemon=True).start()
+        deadline = time.time() + 5
+        while "stalled.invalid" not in resolver.asked and time.time() < deadline:
+            time.sleep(0.01)
+        assert "stalled.invalid" in resolver.asked, "the stall never started"
+
+        started = time.time()
+        _swallow(net_mod._connect, "fine.invalid", 80)
+        waited = time.time() - started
+        assert waited < 2, (
+            f"connecting to a second host waited {waited:.1f}s behind an "
+            "unrelated stalled lookup")
+    finally:
+        restore()
+
+
+def test_callers_wanting_the_same_host_share_one_lookup():
+    """A page with thirty images on one origin should cost one lookup, not
+    thirty -- and on a slow resolver, one waiting thread rather than thirty."""
+    resolver = _FakeResolver(stall=["slow.invalid"])
+    restore = _with_resolver(resolver)
+    try:
+        done = []
+        threads = [threading.Thread(
+            target=lambda: done.append(
+                _swallow(net_mod._resolve, "slow.invalid", 80, timeout=10)),
+            daemon=True) for _ in range(5)]
+        for t in threads:
+            t.start()
+        # Wait for the first caller to reach the resolver, then give the rest
+        # a moment to arrive and coalesce onto it.
+        deadline = time.time() + 5
+        while "slow.invalid" not in resolver.asked and time.time() < deadline:
+            time.sleep(0.01)
+        time.sleep(0.3)
+        # Counted per host, not as a total: a stalled lookup from an earlier
+        # test is still parked on its own thread, and when it is released it
+        # lands in whichever fake resolver is installed by then.
+        eq(resolver.asked.count("slow.invalid"), 1,
+           "five callers should share one lookup")
+        resolver.release.set()
+        for t in threads:
+            t.join(10)
+        eq(len(done), 5, "every caller should receive the answer")
+    finally:
+        restore()
+
+
+def test_a_resolver_failure_reaches_the_caller():
+    """A name that does not exist must still raise, not time out: the worker
+    re-raises the resolver's own error on the waiting thread."""
+    def broken(host, port, *args, **kwargs):
+        raise socket.gaierror(socket.EAI_NONAME, "Name or service not known")
+    real = socket.getaddrinfo
+    socket.getaddrinfo = broken
+    try:
+        try:
+            net_mod._resolve("nosuch.invalid", 80, timeout=5)
+            assert False, "a name that does not resolve should raise"
+        except socket.gaierror:
+            pass
+    finally:
+        socket.getaddrinfo = real
+        with net_mod._DNS_LOCK:
+            net_mod._DNS_INFLIGHT.clear()
+            net_mod._DNS_CACHE.clear()
+
+
+def test_a_failed_request_reports_the_network_error_not_a_cleanup_error():
+    """_request_http cleans up from `except` blocks that can be reached
+    before any socket exists -- a lookup that fails leaves it unset. Closing
+    None raised AttributeError, which is not an OSError and so slipped past
+    the guard, and the caller saw that instead of the real failure."""
+    resolver = _FakeResolver(stall=["stalled.invalid"])
+    restore = _with_resolver(resolver)
+    real_timeout = net_mod._DNS_TIMEOUT
+    net_mod._DNS_TIMEOUT = 0.25
+    try:
+        try:
+            URL("http://stalled.invalid/").request()
+            assert False, "a request to an unresolvable host should raise"
+        except AttributeError as exc:
+            assert False, f"cleanup error masked the real one: {exc}"
+        except OSError:
+            pass  # socket.timeout, which is what the caller should see
+    finally:
+        net_mod._DNS_TIMEOUT = real_timeout
+        restore()
+
+
+def test_closing_a_socket_that_was_never_opened_is_harmless():
+    """The narrow version of the same thing, so the intent is recorded even
+    if _request_http's cleanup is restructured later."""
+    net_mod._close_socket(None)
+
+
+def test_a_finished_lookup_leaves_nothing_in_flight():
+    """The in-flight entry has to be cleared however the lookup ended, or the
+    next caller for that host waits on a worker that is already gone."""
+    resolver = _FakeResolver()
+    restore = _with_resolver(resolver)
+    try:
+        net_mod._resolve("quick.invalid", 80, timeout=5)
+        eq(net_mod._DNS_INFLIGHT, {}, "in-flight entry outlived its lookup")
+    finally:
+        restore()
+
+
+def _fixture(name):
+    """The bytes of a file in tests/fixtures."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "fixtures", name)
+    with open(path, "rb") as handle:
+        return handle.read()
+
+
+def test_jpeg_photograph_decodes():
+    """A photograph, decoded by us and nobody else.
+
+    tests/fixtures/photo.jpg is a crop of NASA/JPL-Caltech PIA22228, which is
+    in the public domain, taken exactly as the server sent it: baseline,
+    Huffman coded, 4:2:0, which is the shape of very nearly every photograph
+    on the web. The colours below are libjpeg's own answers, and one of them
+    sits on a chroma edge where replicating a chroma sample instead of
+    filtering it lands 46 levels away -- so this notices a decoder that has
+    become merely close, which a size check never would.
+    """
+    from feetbrowser import imagecodec
+    width, height, rgba = imagecodec.decode(_fixture("photo.jpg"))
+    eq((width, height), (320, 224), "photo.jpg size")
+    eq(len(rgba), 320 * 224 * 4, "four bytes a pixel")
+    eq(rgba[3::4].count(255), 320 * 224, "a JPEG carries no transparency")
+    for (x, y), colour in (((0, 0), (195, 153, 113)),
+                           ((319, 223), (167, 108, 66)),
+                           ((19, 191), (85, 53, 28)),
+                           ((64, 113), (156, 124, 73))):
+        at = (y * width + x) * 4
+        eq(tuple(rgba[at:at + 3]), colour, "pixel (%d,%d)" % (x, y))
+
+
+def test_jpeg_progressive_and_restarts_are_the_same_picture():
+    """Two rearrangements of the baseline fixture, both made by jpegtran,
+    which moves coefficients between scans without changing any of them. All
+    three files are therefore the same photograph and have to decode to
+    identical bytes: nothing about spectral selection, successive
+    approximation, end-of-band runs or restart intervals is allowed to move a
+    single sample. Restart markers are worth their own file because they are
+    the one thing in the entropy decoder that a picture without them never
+    exercises -- and the bit reader is where they go wrong."""
+    from feetbrowser import imagecodec
+    width, height, base = imagecodec.decode(_fixture("photo.jpg"))
+    for name in ("photo-progressive.jpg", "photo-restart.jpg"):
+        other_width, other_height, other = imagecodec.decode(_fixture(name))
+        eq((other_width, other_height), (width, height), "%s size" % name)
+        differing = sum(1 for i in range(len(base)) if base[i] != other[i])
+        assert not differing, (
+            "%d of %d bytes of %s differ from the baseline coding of the "
+            "same photograph" % (differing, len(base), name))
+
+
+def test_jpeg_greyscale_and_horizontal_subsampling():
+    """Two more codings of the same photograph. One component instead of
+    three has no chroma to put back and must come out with equal channels;
+    4:2:2 halves the chroma across but not down, and goes through the
+    horizontal half of the filter alone -- where libjpeg rounds the left and
+    right of each output pair in opposite directions. Re-encoding moves the
+    picture about a level, so anything much beyond that is the filter."""
+    from feetbrowser import imagecodec
+    _w, _h, base = imagecodec.decode(_fixture("photo.jpg"))
+    width, height, grey = imagecodec.decode(_fixture("photo-grey.jpg"))
+    eq((width, height), (320, 224), "greyscale size")
+    coloured = sum(1 for i in range(0, len(grey), 4)
+                   if not grey[i] == grey[i + 1] == grey[i + 2])
+    assert not coloured, "%d greyscale pixels came out coloured" % coloured
+    width, height, half = imagecodec.decode(_fixture("photo-422.jpg"))
+    eq((width, height), (320, 224), "4:2:2 size")
+    off = sum(abs(base[i] - half[i])
+              for i in range(len(base)) if i % 4 != 3) / (width * height * 3)
+    assert off < 3.0, (
+        "the 4:2:2 coding is %.2f levels a channel from the 4:2:0 one, which "
+        "is more than re-encoding explains" % off)
+
+
+def test_a_cut_off_jpeg_decodes_as_far_as_it_arrived():
+    """A connection that drops mid-photograph is ordinary, and the half that
+    arrived is worth drawing -- which is what every other browser does. So a
+    truncated scan is not an error: the bit reader runs out and hands back
+    zeroes, the rest of the picture comes out flat, and the top of it is
+    still exactly what the whole file decodes to."""
+    from feetbrowser import imagecodec
+    whole = _fixture("photo.jpg")
+    width, height, full = imagecodec.decode(whole)
+    _w, _h, part = imagecodec.decode(whole[:len(whole) // 2])
+    eq((_w, _h), (width, height), "the header said how big it is")
+    rows = sum(1 for y in range(height)
+               if full[y * width * 4:(y + 1) * width * 4]
+               == part[y * width * 4:(y + 1) * width * 4])
+    assert rows > height // 3, (
+        "only %d of %d rows survived half the file" % (rows, height))
+
+
+def test_jpeg_unsupported_modes_raise_image_error():
+    """The JPEG family is much larger than the part of it the web uses, and
+    what is not implemented has to say so. The alternative -- running
+    arithmetic-coded coefficients through a Huffman decoder, say -- is a
+    picture made of noise, presented as though it were the page's."""
+    from feetbrowser import imagecodec
+    good = bytearray(_fixture("photo.jpg"))
+    frame = 2
+    while good[frame + 1] != 0xC0:      # walk the segments to the frame header
+        frame += 2 + ((good[frame + 2] << 8) | good[frame + 3])
+    cases = {"arithmetic coding": (frame + 1, 0xC9),
+             "lossless": (frame + 1, 0xC3),
+             "hierarchical": (frame + 1, 0xC5),
+             "12-bit samples": (frame + 4, 12),
+             "four components": (frame + 9, 4)}
+    for name, (at, value) in cases.items():
+        broken = bytearray(good)
+        broken[at] = value
+        try:
+            imagecodec.decode(bytes(broken))
+        except imagecodec.ImageError:
+            continue
+        except Exception as exc:  # noqa: BLE001 - that is the point
+            raise AssertionError("%s raised %r, not ImageError" % (name, exc))
+        raise AssertionError("%s decoded instead of being refused" % name)
+
+
+def _one_block_jpeg(coefs, quant):
+    """A whole JPEG file carrying a single 8x8 greyscale block.
+
+    Written here so the transform below can be handed coefficients chosen to
+    catch it out, which no photograph off the web can be made to contain.
+    Both Huffman tables are picked to make the coding trivial rather than
+    short: sixteen four-bit DC codes and 255 eight-bit AC ones, assigned in
+    order, so the canonical code for a symbol is the symbol's own value and
+    writing one is writing four or eight bits.
+    """
+    zigzag = [0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 32, 25, 18, 11, 4, 5,
+              12, 19, 26, 33, 40, 48, 41, 34, 27, 20, 13, 6, 7, 14, 21, 28,
+              35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37, 44, 51,
+              58, 59, 52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63]
+    out = []
+    pending = [0, 0]  # bits so far, how many of them
+
+    def put(value, count):
+        pending[0] = (pending[0] << count) | (value & ((1 << count) - 1))
+        pending[1] += count
+        while pending[1] >= 8:
+            pending[1] -= 8
+            byte = (pending[0] >> pending[1]) & 0xFF
+            out.append(byte)
+            if byte == 0xFF:
+                out.append(0x00)  # the stuffing every decoder has to undo
+
+    def magnitude(value):
+        size = abs(value).bit_length()
+        return size, (value if value > 0 else value + (1 << size) - 1)
+
+    size, bits = magnitude(coefs[0])
+    put(size, 4)
+    if size:
+        put(bits, size)
+    run = 0
+    for k in range(1, 64):
+        value = coefs[zigzag[k]]
+        if not value:
+            run += 1
+            continue
+        while run > 15:
+            put(0xF0, 8)   # sixteen zeroes and no coefficient
+            run -= 16
+        size, bits = magnitude(value)
+        put((run << 4) | size, 8)
+        put(bits, size)
+        run = 0
+    if run:
+        put(0x00, 8)       # end of block
+    if pending[1]:
+        put((1 << (8 - pending[1])) - 1, 8 - pending[1])
+
+    def segment(marker, body):
+        return bytes([0xFF, marker]) + bytes([(len(body) + 2) >> 8,
+                                              (len(body) + 2) & 0xFF]) + body
+
+    return b"".join([
+        b"\xff\xd8",
+        segment(0xDB, bytes([0]) + bytes(quant[z] for z in zigzag)),
+        segment(0xC0, bytes([8, 0, 8, 0, 8, 1, 1, 0x11, 0])),
+        segment(0xC4, bytes([0x00] + [0] * 3 + [16] + [0] * 12
+                            + list(range(16)))),
+        segment(0xC4, bytes([0x10] + [0] * 7 + [255] + [0] * 8
+                            + list(range(255)))),
+        segment(0xDA, bytes([1, 1, 0x00, 0, 63, 0])),
+        bytes(out),
+        b"\xff\xd9"])
+
+
+def test_jpeg_transform_matches_the_textbook_one():
+    """The inverse transform is the AAN factorisation, which reaches the
+    definition's answer by a much shorter route -- five multiplications a
+    pass rather than sixty-four. Fast and wrong looks exactly like fast, so
+    it is held against the definition, on coefficients quantised the way an
+    encoder would have quantised them. That range is the only one where the
+    comparison means anything: on coefficients no encoder could emit, both
+    transforms run thousands of levels outside the sample range, where the
+    only thing left answering is the clamp.
+
+    Three shapes, because the transform takes a shortcut on two of them: a
+    block whose AC coefficients are all zero is a flat colour and skips the
+    transform entirely, a block with zeroed columns skips those columns, and
+    a block with nothing zero in it takes the long way through.
+    """
+    import math
+    import random
+    from feetbrowser import imagecodec
+    cosine = [[math.cos((2 * x + 1) * u * math.pi / 16)
+               * (math.sqrt(0.5) if u == 0 else 1.0)
+               for u in range(8)] for x in range(8)]
+
+    def forward(samples, quant):
+        """What an encoder would have written for these samples."""
+        cols = [[sum((samples[y * 8 + x] - 128) * cosine[x][u]
+                     for x in range(8)) / 2.0 for u in range(8)]
+                for y in range(8)]
+        return [int(round(sum(cols[y][u] * cosine[y][v] for y in range(8))
+                          / 2.0 / quant[v * 8 + u]))
+                for v in range(8) for u in range(8)]
+
+    def textbook(coefs, quant):
+        """The transform as its definition states it: a double sum."""
+        f = [coefs[i] * quant[i] for i in range(64)]
+        rows = [[sum(f[v * 8 + u] * cosine[x][u] for u in range(8)) / 2.0
+                 for x in range(8)] for v in range(8)]
+        return [min(255, max(0, int(round(
+            sum(rows[v][x] * cosine[y][v] for v in range(8)) / 2.0 + 128))))
+            for y in range(8) for x in range(8)]
+
+    random.seed(20260814)
+    worst = 0
+    for case in range(60):
+        quant = [random.choice([1, 2, 3, 4, 6, 10, 16, 25, 40, 99])
+                 for _ in range(64)]
+        samples = [random.randrange(256) for _ in range(64)]
+        if case % 3 == 1:
+            samples = [samples[0]] * 64            # flat: DC and nothing else
+        coefs = forward(samples, quant)
+        if case % 3 == 2:
+            for u in range(0, 8, 2):               # empty every other column
+                for v in range(8):
+                    coefs[v * 8 + u] = 0
+        width, height, rgba = imagecodec.decode(_one_block_jpeg(coefs, quant))
+        eq((width, height), (8, 8), "the hand-built file is one block")
+        ours = list(rgba[0::4])
+        worst = max(worst, max(abs(a - b)
+                               for a, b in zip(ours, textbook(coefs, quant))))
+    assert worst <= 1, (
+        "the fast transform is %d levels from the definition" % worst)
+
+
+def test_images_do_not_reach_for_a_third_party_library():
+    """Pillow decoded JPEG here and cairosvg rasterised SVG. Nothing does
+    now, and this is the assertion that says so: on the one CI job that
+    installs both, an import added back by reflex fails the suite instead of
+    passing quietly. Everywhere else neither is installed and this costs
+    nothing to run."""
+    from feetbrowser import imagecodec
+    imagecodec.decode(_fixture("photo.jpg"))
+    Tab._decode_image(_fixture("photo.jpg"), "image/jpeg")
+    for module in ("PIL", "PIL.Image", "cairosvg"):
+        assert module not in sys.modules, \
+            "%s was imported on the way to decoding an image" % module
+
+
 def main():
-    root = gui.Tk(); root.withdraw()
+    root = Tk(); root.withdraw()
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0
     for t in tests:

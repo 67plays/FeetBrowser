@@ -2,11 +2,20 @@
 import sys, os, threading, http.server
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from feetbrowser import gui
+from feetbrowser.window import Tk
 
 from feetbrowser.browser import Tab, FormAction
 from feetbrowser.htmlparser import Element
 from feetbrowser.layout import DrawText
+
+
+# The page this walks away from and back to. The live web by default, so a
+# developer running ./test.sh exercises real DNS, real TLS and a real remote
+# server. CI passes the offline mirror in tests/fixtures instead, because a
+# pull request should not fail over somebody else's outage, and should not
+# send them traffic on every push either. Every assertion below is the same
+# in both modes: the mirror is laid out under the host names it stands in for.
+SITE = sys.argv[1] if len(sys.argv) > 1 else "https://example.com"
 
 
 FORM_PAGE = """<!doctype html><html><body>
@@ -129,9 +138,9 @@ def test_form_round_trip():
 
 
 def main():
-    root = gui.Tk(); root.withdraw()
+    root = Tk(); root.withdraw()
     tab = Tab(700)
-    tab.load("https://example.com")
+    tab.load(SITE)
     assert tab.title == "Example Domain", tab.title
     pt = find_link_point(tab, "more")
     assert pt, "link text not found in display list"
@@ -153,13 +162,22 @@ def main():
     assert "iana.org" in str(tab.url)
 
     # view-source
-    tab.load("view-source:https://example.com")
+    tab.load("view-source:" + SITE)
     assert any("<!doctype" in c.text.lower() or "<html" in c.text.lower()
                for c in tab.display_list if isinstance(c, DrawText)), \
         "view-source did not show markup"
     print("view-source OK")
 
     test_form_round_trip()
+
+    # Downloads: a link that turns out to be a file rather than a page is
+    # navigation's other ending, so it is checked from here. The cases live
+    # in their own module because test.sh and the CI workflow name every
+    # suite by hand and tests/test_suites.py fails a tests/test_*.py that
+    # neither of them runs -- and this change does not edit a runner.
+    print("\n-- downloads --")
+    import download_cases
+    download_cases.main()
 
     print("\nALL NAVIGATION TESTS PASSED")
 

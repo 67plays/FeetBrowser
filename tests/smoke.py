@@ -4,7 +4,7 @@ import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from feetbrowser import gui
+from feetbrowser.window import Tk
 
 from feetbrowser.net import URL
 from feetbrowser.htmlparser import HTMLParser
@@ -56,7 +56,7 @@ def run(url_str):
 
 
 if __name__ == "__main__":
-    root = gui.Tk()
+    root = Tk()
     root.withdraw()
     targets = sys.argv[1:] or [
         "data:text/html,<h1>Hi</h1><p>Hello <b>bold</b> and <i>italic</i> and "
@@ -64,11 +64,18 @@ if __name__ == "__main__":
         "https://example.com",
         "https://info.cern.ch/hypertext/WWW/TheProject.html",
     ]
+    failed = 0
     for t in targets:
         try:
             run(t)
         except Exception as e:
+            failed += 1
             import traceback
             traceback.print_exc()
             print("FAILED:", t, e)
+    # It printed the traceback and then exited 0, so every caller -- test.sh
+    # included -- read a page that would not load as a pass.
+    if failed:
+        print(f"\n{failed} of {len(targets)} FAILED")
+        sys.exit(1)
     print("\nOK")

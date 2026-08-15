@@ -32,6 +32,24 @@ _DNS_CACHE_MAX = 512
 _DNS_TTL = 300.0  # seconds
 _DNS_LOCK = threading.Lock()
 
+# How long a name lookup may block before we give up on it. getaddrinfo is a
+# blocking call into the platform resolver: socket.settimeout does not apply
+# to it, and there is no portable way to interrupt one in flight -- the usual
+# escape hatch, SIGALRM, does not exist on Windows at all. A resolver that
+# never answers (a VPN, a captive portal, an unreachable corporate DNS
+# server) would otherwise stop the browser dead with nothing printed and no
+# way out but killing it. Resolving on a worker thread and giving up on the
+# join puts a ceiling on it, at the cost of leaving that thread behind: it is
+# a daemon, so a wedged lookup cannot keep the process alive.
+_DNS_TIMEOUT = 20.0  # seconds
+
+# Lookups currently in flight, keyed like _DNS_CACHE. Callers that want a host
+# somebody else is already resolving wait on that one worker instead of
+# starting another, so a slow resolver costs one thread per host rather than
+# one per request -- a page with thirty images on a stalled origin would
+# otherwise start thirty identical lookups.
+_DNS_INFLIGHT = {}
+
 # Bounded pool of idle keep-alive connections, keyed by (scheme, host, port).
 # HTTP/1.1 lets one connection serve several requests to the same origin, which
 # skips the fresh TCP + TLS handshake each resource used to pay — the most
@@ -48,6 +66,13 @@ _CONN_LOCK = threading.Lock()
 
 
 def _close_socket(s):
+    # None is allowed: the cleanup paths in _request_http run from `except`
+    # blocks that can be reached before a socket was ever opened -- a failed
+    # lookup or a refused connect leaves `s` unset. Closing it there used to
+    # raise AttributeError, which is not an OSError and so escaped the guard
+    # below, replacing the real network error with a confusing one.
+    if s is None:
+        return
     try:
         s.close()
     except OSError:
@@ -88,10 +113,76 @@ def _pool_park(key, s):
         lst.append((s, time.time()))
 
 
+def _resolve(host, port, timeout=None):
+    """socket.getaddrinfo with a ceiling on how long it may block.
+
+    Raises socket.timeout if the resolver has not answered within `timeout`
+    seconds. The lookup itself cannot be cancelled, so the worker is left to
+    finish (or not) on its own; what is bounded is how long *we* wait.
+    """
+    if timeout is None:
+        timeout = _DNS_TIMEOUT
+    key = (host, port)
+    with _DNS_LOCK:
+        cell = _DNS_INFLIGHT.get(key)
+        mine = cell is None
+        if mine:
+            cell = {"done": threading.Event()}
+            _DNS_INFLIGHT[key] = cell
+
+    if mine:
+        def work():
+            try:
+                cell["infos"] = socket.getaddrinfo(
+                    host, port, 0, socket.SOCK_STREAM)
+            except BaseException as exc:  # re-raised on the waiting thread
+                cell["error"] = exc
+            finally:
+                with _DNS_LOCK:
+                    if _DNS_INFLIGHT.get(key) is cell:
+                        del _DNS_INFLIGHT[key]
+                cell["done"].set()
+
+        threading.Thread(target=work, name=f"dns-{host}", daemon=True).start()
+
+    if not cell["done"].wait(timeout):
+        raise socket.timeout(
+            f"DNS lookup for {host} took longer than {timeout:g}s")
+    if "error" in cell:
+        raise cell["error"]
+    infos = cell.get("infos")
+    if not infos:
+        raise socket.gaierror(socket.EAI_NONAME, "Name or service not known")
+    return infos
+
+
+def _connect_any(host, port):
+    """What socket.create_connection does -- try every address the host
+    reports, keep the first that answers -- with the name lookup bounded the
+    same way the cached path's is. create_connection resolves internally, so
+    calling it here would reintroduce the unbounded getaddrinfo this avoids.
+    """
+    last = None
+    for family, socktype, proto, _canon, sockaddr in _resolve(host, port):
+        s = None
+        try:
+            s = socket.socket(family, socktype, proto)
+            s.settimeout(20)
+            s.connect(sockaddr)
+            return s
+        except OSError as exc:
+            if s is not None:
+                _close_socket(s)
+            last = exc
+    if last is not None:
+        raise last
+    raise socket.gaierror(socket.EAI_NONAME, "Name or service not known")
+
+
 def _connect(host, port):
     """Open a TCP socket to (host, port), reusing a cached address when one
-    is available and falling back to socket.create_connection (which retries
-    across all resolved addresses) otherwise."""
+    is available and falling back to the full resolver (which retries across
+    all resolved addresses) otherwise."""
     key = (host, port)
     now = time.time()
     with _DNS_LOCK:
@@ -99,14 +190,17 @@ def _connect(host, port):
         if entry is not None and now - entry[0] > _DNS_TTL:
             _DNS_CACHE.pop(key, None)
             entry = None
-        if entry is None:
-            infos = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
-            if not infos:
-                raise socket.gaierror(socket.EAI_NONAME, "Name or service not known")
-            info = infos[0][:3] + (infos[0][4],)
+    if entry is None:
+        # Deliberately outside the lock. The lock is here to keep concurrent
+        # image fetches from corrupting the dict, not to serialise them
+        # against the network: holding it across a lookup would make one slow
+        # resolver stall every other thread that wanted any host at all.
+        infos = _resolve(host, port)
+        info = infos[0][:3] + (infos[0][4],)
+        entry = (now, info)
+        with _DNS_LOCK:
             if len(_DNS_CACHE) < _DNS_CACHE_MAX:
-                _DNS_CACHE[key] = (now, info)
-            entry = (now, info)
+                _DNS_CACHE[key] = entry
     info = entry[1]
     s = None
     try:
@@ -122,7 +216,7 @@ def _connect(host, port):
         with _DNS_LOCK:
             if _DNS_CACHE.get(key) == entry:
                 _DNS_CACHE.pop(key, None)
-        s = socket.create_connection((host, port), timeout=20)
+        s = _connect_any(host, port)
         # Cache the address the fallback actually connected to, so a repeat
         # request skips the failed attempt.
         try:
@@ -154,6 +248,11 @@ _MAX_BODY_BYTES = 64 * 1024 * 1024
 KNOWN_SCHEMES = {"http", "https", "file", "data"}
 
 
+def _is_drive(text):
+    """True for "C:" or the older "C|", a Windows drive in a file: URL."""
+    return len(text) == 2 and text[0].isalpha() and text[1] in ":|"
+
+
 class URL:
     """A parsed URL plus the logic to fetch it."""
 
@@ -183,13 +282,7 @@ class URL:
         if self.scheme in ("http", "https"):
             self._parse_http(rest)
         elif self.scheme == "file":
-            # file:///path, file://host/path (host ignored) or file:/path
-            if rest.startswith("//"):
-                remainder = rest[2:]
-                slash = remainder.find("/")
-                self.path = remainder[slash:] if slash != -1 else "/"
-            else:
-                self.path = rest or "/"
+            self._parse_file(rest)
         elif self.scheme == "data":
             self.data_payload = rest
         else:
@@ -208,6 +301,48 @@ class URL:
                 self.host = ""
                 self.path = rest or "/"
                 self.port = None
+
+    def _parse_file(self, rest):
+        """Parse the path out of a file: URL, in any of the shapes people
+        actually type.
+
+        The plain ones are ``file:///path``, ``file://host/path`` (the host is
+        ignored) and ``file:/path``. Windows adds two more, because a drive
+        letter does not fit the grammar: ``file://C:/x`` puts the drive where
+        the host goes, and a path pasted out of Explorer arrives with
+        backslashes.
+
+        What comes out is still a *URL* path -- forward slashes, leading
+        slash, percent-escapes intact -- so resolve(), str() and the
+        same-origin check all keep working in one coordinate system.
+        ``local_path()`` is what turns it back into something open() takes.
+        """
+        path = rest.replace("\\", "/")
+        if path.startswith("//"):
+            remainder = path[2:]
+            slash = remainder.find("/")
+            authority = remainder if slash == -1 else remainder[:slash]
+            if _is_drive(authority):
+                path = "/" + remainder
+            elif slash != -1:
+                path = remainder[slash:]
+            else:
+                path = "/"
+        self.path = path if path.startswith("/") else "/" + path
+
+    def local_path(self):
+        """The filesystem path this file: URL names.
+
+        A URL path and a filesystem path are different strings, and on Windows
+        they are not even the same shape: ``file:///C:/x`` carries a leading
+        slash that ``open()`` must not see, and the separator is a backslash.
+        Percent-escapes come off here too, which is what makes a directory
+        listing's own links openable -- it writes them escaped.
+        """
+        path = urllib.parse.unquote(self.path)
+        if _is_drive(path[1:3]):
+            path = path[1] + ":" + path[3:] if len(path) > 3 else path[1] + ":"
+        return path if os.sep == "/" else path.replace("/", os.sep)
 
     def _parse_http(self, rest):
         # rest looks like //host[:port]/path?query#frag
@@ -355,25 +490,32 @@ class URL:
         return dict(r.headers), r.text, ctype
 
     def _request_file(self, raw=False):
+        local = self.local_path()
         try:
-            with open(self.path, "rb") as f:
+            with open(local, "rb") as f:
                 payload = f.read(_MAX_BODY_BYTES + 1)
-        except (FileNotFoundError, IsADirectoryError, PermissionError) as e:
-            if os.path.isdir(self.path):
-                items = sorted(os.listdir(self.path))
+        # OSError, not the three obvious subclasses: a Windows path can be
+        # rejected outright (a bad drive, a reserved name), and that arrives
+        # as a plain OSError or ValueError rather than FileNotFoundError.
+        except (OSError, ValueError) as e:
+            if os.path.isdir(local):
+                # The links are built in URL space, not with os.path.join --
+                # a backslash in an href is not a path separator, it is a
+                # character that has to be escaped.
+                base = self.path if self.path.endswith("/") else self.path + "/"
                 links = "".join(
-                    f'<li><a href="file://{urllib.parse.quote(os.path.join(self.path, i))}">{i}</a></li>'
-                    for i in items)
-                body = f"<h1>Index of {self.path}</h1><ul>{links}</ul>"
+                    f'<li><a href="file://{urllib.parse.quote(base + i)}">{i}</a></li>'
+                    for i in sorted(os.listdir(local)))
+                body = f"<h1>Index of {local}</h1><ul>{links}</ul>"
             else:
                 body = f"<h1>Cannot open file</h1><p>{e}</p>"
             return {}, body.encode("utf8", "replace") if raw else body, \
                 "text/html"
         if len(payload) > _MAX_BODY_BYTES:
-            body = f"<h1>File too large to open</h1><p>{self.path}</p>"
+            body = f"<h1>File too large to open</h1><p>{local}</p>"
             return {}, body.encode("utf8", "replace") if raw else body, \
                 "text/html"
-        ext = os.path.splitext(self.path)[1].lower()
+        ext = os.path.splitext(local)[1].lower()
         ctype = "text/html" if ext in (".html", ".htm") else "text/plain"
         return {}, payload if raw else payload.decode("utf8", "replace"), ctype
 
@@ -664,3 +806,275 @@ class URL:
             except LookupError:
                 pass
         return "utf8"
+
+
+# -- Streaming responses -------------------------------------------------
+#
+# Everything above reads a whole response into memory before the caller sees
+# a byte of it. That is the right shape for a document -- the parser needs
+# all of it anyway -- and exactly the wrong one for a file: _MAX_BODY_BYTES
+# would reject a 2 GB download, and if it did not, the memory would still
+# not be there. What follows hands back the status line and the headers as
+# soon as they arrive and leaves the body on the socket, so a download can
+# write it to disk a piece at a time (feetbrowser/downloads.py) and a
+# navigation can decide from the headers alone whether what is coming back
+# is a page at all. It is deliberately separate from _request_http: no
+# cache, no connection pool, and no decompressing a body nobody has read.
+
+#: Cap on the header block of a streamed response. The body is unbounded by
+#: design here; the headers are not.
+_MAX_HEAD_BYTES = 256 * 1024
+
+
+class IncompleteRead(OSError):
+    """The peer stopped sending before the framing said the body ended.
+
+    An OSError, so a caller that already handles "the network broke" handles
+    a truncated body the same way -- which is what it is. It carries how
+    much arrived, so a download can decide whether resuming is worth a try.
+    """
+
+    def __init__(self, message, received=0, expected=None):
+        super().__init__(message)
+        self.received = received
+        self.expected = expected
+
+
+class HTTPStream:
+    """A response whose headers have arrived and whose body has not.
+
+    Iterate `chunks()` to pull the body off the socket a piece at a time,
+    already stripped of chunked transfer-encoding. `length` is the body size
+    when the server stated one and None when it did not, which is a fact the
+    caller has to carry rather than paper over: there is no honest
+    percentage for a response of unknown length.
+    """
+
+    def __init__(self, url, sock, status, headers, leftover=b""):
+        self.url = url
+        self.status = status
+        self.headers = headers
+        self._sock = sock
+        self._buf = bytearray(leftover)
+        self._eof = False
+        self._closed = False
+        self.received = 0
+        te = headers.get("transfer-encoding", "").lower()
+        self.chunked = "chunked" in te
+        self.length = None
+        if not self.chunked:
+            try:
+                self.length = int(headers["content-length"])
+            except (KeyError, ValueError):
+                self.length = None
+
+    # -- introspection ---------------------------------------------------
+
+    @property
+    def content_type(self):
+        return self.headers.get(
+            "content-type", "").split(";")[0].strip().lower()
+
+    def charset(self):
+        return URL._charset(self.headers)
+
+    # -- reading ---------------------------------------------------------
+
+    def _fill(self, n=65536):
+        """Pull more bytes off the socket. False once the peer is done."""
+        if self._eof:
+            return False
+        data = self._sock.recv(max(1, min(n, 65536)))
+        if not data:
+            self._eof = True
+            return False
+        self._buf.extend(data)
+        return True
+
+    def _take(self, n):
+        piece = bytes(self._buf[:n])
+        del self._buf[:n]
+        self.received += len(piece)
+        return piece
+
+    def chunks(self, size=65536):
+        """Yield the body a piece at a time, transfer-encoding removed."""
+        if self.chunked:
+            return self._chunked(size)
+        if self.length is not None:
+            return self._counted(size)
+        return self._until_eof(size)
+
+    def _counted(self, size):
+        remaining = self.length
+        while remaining > 0:
+            if not self._buf and not self._fill(min(size, remaining)):
+                raise IncompleteRead(
+                    "connection closed with %d of %d bytes received"
+                    % (self.received, self.length),
+                    received=self.received, expected=self.length)
+            take = min(len(self._buf), remaining)
+            remaining -= take
+            yield self._take(take)
+
+    def _until_eof(self, size):
+        # No framing at all: EOF is the end of the body, and nothing here
+        # can tell a complete response from a truncated one.
+        while True:
+            if self._buf:
+                yield self._take(len(self._buf))
+            elif not self._fill(size):
+                return
+
+    def _chunked(self, size):
+        while True:
+            while b"\r\n" not in self._buf:
+                if not self._fill(size):
+                    raise IncompleteRead("truncated chunked body",
+                                         received=self.received)
+            line, _, _rest = bytes(self._buf).partition(b"\r\n")
+            del self._buf[:len(line) + 2]
+            try:
+                count = int(line.strip().split(b";")[0], 16)
+            except ValueError:
+                raise IncompleteRead("malformed chunk header: %r" % line[:40],
+                                     received=self.received)
+            if count == 0:
+                return  # trailers, then the blank line; nothing reads them
+            got = 0
+            while got < count:
+                if not self._buf and not self._fill(min(size, count - got)):
+                    raise IncompleteRead("truncated chunk",
+                                         received=self.received)
+                take = min(len(self._buf), count - got)
+                got += take
+                yield self._take(take)
+            while len(self._buf) < 2:
+                if not self._fill(size):
+                    raise IncompleteRead("chunk missing its terminator",
+                                         received=self.received)
+            del self._buf[:2]
+
+    def read_all(self, limit=_MAX_BODY_BYTES, decode=True):
+        """Read the whole body into memory, bounded by `limit`.
+
+        For the caller that turned out to want a document after all: the
+        same cap and the same content-encoding handling as request(), so a
+        page fetched through a stream is the same string a page fetched
+        through _request_http would have been.
+        """
+        out = bytearray()
+        for piece in self.chunks():
+            out.extend(piece)
+            if len(out) > limit:
+                raise RuntimeError("HTTP response body too large")
+        body = bytes(out)
+        if decode:
+            enc = self.headers.get("content-encoding", "").lower()
+            if enc == "gzip":
+                decompressed = URL._decompress_gzip_bounded(body)
+                if decompressed is not None:
+                    body = decompressed
+            elif enc == "deflate":
+                for wbits in (zlib.MAX_WBITS, -zlib.MAX_WBITS):
+                    try:
+                        body = zlib.decompress(body, wbits, limit)
+                        break
+                    except (OSError, ValueError, zlib.error):
+                        continue
+        return body
+
+    # -- teardown --------------------------------------------------------
+
+    def shutdown(self):
+        """Unblock a read in progress from another thread.
+
+        A cancelled download has to stop a worker that may be parked in
+        recv() until the socket timeout. Shutting the socket down makes that
+        recv return at once without closing the descriptor underneath the
+        thread that owns it -- close() from a second thread frees a number
+        the kernel is free to hand to the next file opened anywhere in the
+        process.
+        """
+        try:
+            self._sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+
+    def close(self):
+        if not self._closed:
+            self._closed = True
+            _close_socket(self._sock)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        self.close()
+        return False
+
+
+def _read_head(sock):
+    """Read just the header block. Returns (status, headers, leftover)."""
+    buf = bytearray()
+    while b"\r\n\r\n" not in buf:
+        if len(buf) > _MAX_HEAD_BYTES:
+            raise RuntimeError("HTTP response headers too large")
+        data = sock.recv(65536)
+        if not data:
+            raise IncompleteRead("connection closed before the headers ended")
+        buf.extend(data)
+    head, _, rest = bytes(buf).partition(b"\r\n\r\n")
+    status_line = head.split(b"\r\n")[0].decode("latin1")
+    parts = status_line.split(" ", 2)
+    if len(parts) < 2 or not parts[1].isdigit():
+        raise RuntimeError(f"Malformed status line: {status_line!r}")
+    return int(parts[1]), URL._parse_headers(head), rest
+
+
+def open_stream(url, extra_headers=None, timeout=30,
+                redirects_left=MAX_REDIRECTS, accept_encoding="identity"):
+    """Send a GET and return an HTTPStream positioned at the body.
+
+    Redirects are followed here, so the caller only ever sees the response
+    it is going to read, and a redirect out of http/https is refused for the
+    same reason _request_http refuses one: a remote server must not be able
+    to point us at the local filesystem. `accept_encoding` defaults to
+    identity because a download wants the bytes of the file, and a
+    Content-Length describing something else is worse than none at all.
+    """
+    if isinstance(url, str):
+        url = URL(url)
+    while True:
+        if url.scheme not in ("http", "https"):
+            raise ValueError(f"cannot stream a {url.scheme or '?'}: URL")
+        headers = dict(DEFAULT_HEADERS)
+        headers["Host"] = url.netloc()
+        headers["Accept-Encoding"] = accept_encoding
+        headers["Connection"] = "close"
+        if extra_headers:
+            headers.update(extra_headers)
+        sock = _connect(url.host, url.port)
+        try:
+            if url.scheme == "https":
+                sock = ssl.create_default_context().wrap_socket(
+                    sock, server_hostname=url.host)
+            sock.settimeout(timeout)
+            lines = "\r\n".join(f"{k}: {v}" for k, v in headers.items())
+            sock.sendall(
+                f"GET {url.path} HTTP/1.1\r\n{lines}\r\n\r\n".encode("utf8"))
+            status, resp_headers, leftover = _read_head(sock)
+        except BaseException:
+            _close_socket(sock)
+            raise
+        if status in (301, 302, 303, 307, 308) and "location" in resp_headers:
+            _close_socket(sock)
+            if redirects_left <= 0:
+                raise RuntimeError("Too many redirects")
+            redirects_left -= 1
+            target = url.resolve(resp_headers["location"])
+            if target.scheme not in ("http", "https"):
+                raise RuntimeError(f"Blocked redirect to {target}")
+            url = target
+            continue
+        return HTTPStream(url, sock, status, resp_headers, leftover)

@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <assemblyIdentity type="win32" name="FeetBrowser.FeetBrowser" version="0.6.0.0" processorArchitecture="amd64"/>
+  <description>FeetBrowser</description>
+
+  <!-- asInvoker: the browser needs no elevation and asking for it would be a
+       lie that costs every user a UAC prompt. -->
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+    <security>
+      <requestedPrivileges>
+        <requestedExecutionLevel level="asInvoker" uiAccess="false"/>
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+
+  <!-- Declaring the Windows versions we have been built against is what makes
+       the version- and DPI-aware APIs behave as documented rather than
+       lying for the benefit of programs written before they existed.
+       Windows 10/11 is the last GUID; the earlier ones have to be present for
+       it to be honoured. -->
+  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+    <application>
+      <supportedOS Id="{e2011457-1546-43c5-a5fe-008deee3d3f0}"/> <!-- Vista -->
+      <supportedOS Id="{35138b9a-5d96-4fbd-8e2d-a2440225f93a}"/> <!-- 7 -->
+      <supportedOS Id="{4a2f28e3-53b9-4441-ba9c-d69d4a4a6e38}"/> <!-- 8 -->
+      <supportedOS Id="{1f676c76-80e1-4239-95bb-83d0f6d0da78}"/> <!-- 8.1 -->
+      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}"/> <!-- 10 and 11 -->
+    </application>
+  </compatibility>
+
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <!-- Deliberately silent about DPI. feetbrowser/win32.py calls
+           SetProcessDpiAwarenessContext itself, picking per-monitor-v2 where
+           it exists and stepping down where it does not; a dpiAware entry
+           here would settle the question before that code runs and make its
+           call fail. Marking a process DPI-aware from a manifest is normally
+           the right answer; it just is not the right answer when the window
+           backend already has a better one.
+
+           Note for anyone editing these comments: a double hyphen cannot
+           appear inside an XML comment. An application manifest that is not
+           well-formed does not get ignored, it stops the program from
+           starting at all, with "the side-by-side configuration is
+           incorrect" and nothing else. build.ps1 parses this file before it
+           builds anything so that the mistake is a build error instead. -->
+      <longPathAware xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">true</longPathAware>
+    </windowsSettings>
+  </application>
+</assembly>

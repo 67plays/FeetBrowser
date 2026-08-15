@@ -1,0 +1,74 @@
+name: Build FeetBrowser
+description: >
+  Everything a job needs before it can run a test: an interpreter, a system
+  font, and the Rust JS engine built into a local .venv. Sets $PY to that
+  venv's interpreter, so a step reads the same on every runner.
+
+inputs:
+  python-version:
+    description: The interpreter to build the engine against and test on.
+    required: true
+  extras:
+    description: >
+      Extra packages for the venv. The browser needs none; the one job that
+      passes anything here installs Pillow and cairosvg precisely so it can
+      prove the browser never imports them.
+    required: false
+    default: ''
+  xvfb:
+    description: Install an X server too, for the jobs that open a window.
+    required: false
+    default: 'false'
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs.python-version }}
+        cache: pip
+        cache-dependency-path: rust/pyproject.toml
+
+    # No Tk and no Xvfb for most of the suite: rendering is our own and runs
+    # with no display. The one outside requirement is a system font, which
+    # macOS and Windows ship and a bare Linux image does not.
+    - name: Install fonts
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y fonts-dejavu-core fonts-liberation
+
+    - name: Install an X server
+      if: runner.os == 'Linux' && inputs.xvfb == 'true'
+      shell: bash
+      run: sudo apt-get install -y xvfb
+
+    # The release build of the engine has LTO on and is by a wide margin the
+    # slowest thing in the run. Cargo.lock is the only input that can change
+    # what comes out, so it is the key; the interpreter is in it as well
+    # because the extension is compiled against one.
+    - name: Cache the Rust build
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          rust/target
+        key: cargo-${{ runner.os }}-py${{ inputs.python-version }}-${{ hashFiles('rust/Cargo.lock') }}
+        restore-keys: |
+          cargo-${{ runner.os }}-py${{ inputs.python-version }}-
+          cargo-${{ runner.os }}-
+
+    # bin/ on unix and Scripts/ on Windows: resolved once, here, so that a
+    # Windows job is a line in the matrix rather than a second copy of every
+    # step below it.
+    - name: Build the Rust JS engine
+      shell: bash
+      run: |
+        python -m venv .venv
+        if [ -d .venv/Scripts ]; then bin="$PWD/.venv/Scripts"; \
+          else bin="$PWD/.venv/bin"; fi
+        "$bin/pip" install --quiet maturin pyflakes ${{ inputs.extras }}
+        "$bin/maturin" develop --release --manifest-path rust/Cargo.toml
+        echo "PY=$bin/python" >> "$GITHUB_ENV"

@@ -1,0 +1,30 @@
+# A separate crate on purpose. `rust/` builds the engine extension module and
+# is driven by maturin; this builds a Windows executable and is driven by cargo
+# alone. Sharing a manifest would mean every engine build also dragged in a
+# Windows-only binary, and every launcher build waited on pyo3.
+
+[package]
+name = "feetbrowser-launcher"
+version = "0.6.0"
+edition = "2021"
+description = "The double-clickable front door of the portable Windows build of FeetBrowser"
+license = "MIT"
+publish = false
+build = "build.rs"
+
+# This is what makes the file on disk FeetBrowser.exe.
+[[bin]]
+name = "FeetBrowser"
+path = "src/main.rs"
+
+# Deliberately empty. The launcher reaches Win32 and the CPython C API through
+# hand-written `extern` declarations, so the shipped binary contains nothing
+# but this crate and libstd.
+[dependencies]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

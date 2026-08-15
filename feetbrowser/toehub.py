@@ -96,7 +96,12 @@ def install_toe(name, catalog_toes, browser=None):
         url = URL(base + fname)
         try:
             _h, data, _c = url.request()
-            with open(os.path.join(folder, fname), "w") as f:
+            # Explicit encoding and no newline translation: what the catalog
+            # served is what lands on disk, byte for byte. Without either,
+            # Windows would re-encode a UTF-8 toe as cp1252 (or fail) and
+            # rewrite every line ending.
+            with open(os.path.join(folder, fname), "w", encoding="utf8",
+                      newline="") as f:
                 f.write(data)
         except Exception as e:  # noqa: BLE001 - bad fetch leaves a note
             if optional:
@@ -143,7 +148,8 @@ def manual_toe(name):
     if not os.path.isfile(manual):
         # Fall back to the manifest description.
         try:
-            with open(os.path.join(folder, "toe.json")) as f:
+            with open(os.path.join(folder, "toe.json"),
+                      encoding="utf8") as f:
                 manifest = json.load(f)
             desc = manifest.get("description", "No description.")
         except (OSError, ValueError):
@@ -151,9 +157,9 @@ def manual_toe(name):
         return _manual_page(name, f"{desc}\n\nThis toe ships without a "
                                    "manual.md.")
     try:
-        with open(manual) as f:
+        with open(manual, encoding="utf8") as f:
             md = f.read()
-    except OSError as e:
+    except (OSError, UnicodeDecodeError) as e:
         return _manual_page(name, f"Could not read manual: {e}")
     return _manual_page(name, md)
 

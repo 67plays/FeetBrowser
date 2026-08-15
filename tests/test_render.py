@@ -1,26 +1,38 @@
 """Offline tests for the rendering stack: fonts, raster, image codecs, canvas.
 
-These cover the layers that replaced Tk. They need no display and no network,
-but they do need at least one installed font, which every platform we support
-has.
+These cover the layers that replaced Tk. They need no display and reach
+nothing outside this machine -- the few that need a page to arrive over HTTP
+serve it from a loopback server they start themselves -- but they do need at
+least one installed font, which every platform we support has.
 """
 import os
+import shutil
 import struct
 import sys
+import tempfile
+import time
 import zlib
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import media_fixtures
 from feetbrowser import canvas as canvasmod
-from feetbrowser import fontengine, gui, imagecodec, raster
+from feetbrowser import fontengine, gui, imagecodec, media, mediacodec, raster
+from feetbrowser.net import URL
 from feetbrowser.window import Event, Window
+
+_FIXTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
 
 
 # -- helpers ---------------------------------------------------------------
 
 def _png(width, height, depth, color, samples, palette=None, trns=None,
-         interlace=0):
-    """Build a PNG so the decoder can be tested against known pixels."""
+         interlace=0, idat=None):
+    """Build a PNG so the decoder can be tested against known pixels.
+
+    `idat` replaces the compressed pixel data outright, which is how the
+    malformed-input tests hand the decoder something no encoder wrote."""
     def chunk(tag, payload):
         body = tag + payload
         return (struct.pack(">I", len(payload)) + body
@@ -29,9 +41,11 @@ def _png(width, height, depth, color, samples, palette=None, trns=None,
     channels = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}[color]
     stride = (width * channels * depth + 7) // 8
     raw = bytearray()
-    for y in range(height):
-        raw.append(0)
-        raw += samples[y * stride:(y + 1) * stride]
+    if idat is None:
+        for y in range(height):
+            raw.append(0)
+            raw += samples[y * stride:(y + 1) * stride]
+        idat = zlib.compress(bytes(raw))
     out = b"\x89PNG\r\n\x1a\n" + chunk(
         b"IHDR", struct.pack(">IIBBBBB", width, height, depth, color, 0, 0,
                              interlace))
@@ -39,7 +53,26 @@ def _png(width, height, depth, color, samples, palette=None, trns=None,
         out += chunk(b"PLTE", palette)
     if trns:
         out += chunk(b"tRNS", trns)
-    return out + chunk(b"IDAT", zlib.compress(bytes(raw))) + chunk(b"IEND", b"")
+    return out + chunk(b"IDAT", idat) + chunk(b"IEND", b"")
+
+
+def _gif():
+    """A 2x2 GIF whose LZW stream is four literal codes and an end marker."""
+    palette = bytes([255, 0, 0, 0, 0, 255]) + bytes(6)
+    stream, acc, bits = bytearray(), 0, 0
+    for code in (0, 1, 1, 0, 5):     # 4-entry table: clear=4, end=5, 3 bits
+        acc |= code << bits
+        bits += 3
+        while bits >= 8:
+            stream.append(acc & 0xFF)
+            acc >>= 8
+            bits -= 8
+    if bits:
+        stream.append(acc & 0xFF)
+    return (b"GIF89a" + struct.pack("<HHBBB", 2, 2, 0x80 | 0x01, 0, 0)
+            + palette
+            + b"\x2C" + struct.pack("<HHHHB", 0, 0, 2, 2, 0)
+            + bytes([2, len(stream)]) + bytes(stream) + b"\x00" + b"\x3B")
 
 
 def _pixel(surface, x, y):
@@ -133,6 +166,205 @@ def test_missing_glyph_falls_back_to_another_face():
     assert font.measure(ch) >= 0
 
 
+# -- malformed fonts -------------------------------------------------------
+#
+# Fonts come off the local disk rather than off the network, so the threat is
+# not a hostile author but a truncated download, a partially written file, or
+# a face doing something the spec allows and nobody expects. The rule is the
+# same either way: a file that is not a font raises FontError, and a font that
+# is merely strange gives up on the glyph it cannot read and keeps going. It
+# may never crash the parser, which since the parser is Rust would mean
+# taking the process with it.
+
+def _sfnt(tables):
+    """Assemble an sfnt file from ``{tag: payload}``."""
+    tags = sorted(tables)
+    out = struct.pack(">IHHHH", 0x00010000, len(tags), 0, 0, 0)
+    offset = 12 + 16 * len(tags)
+    body = b""
+    for tag in tags:
+        payload = tables[tag]
+        out += tag.encode("ascii").ljust(4)[:4]
+        out += struct.pack(">III", 0, offset + len(body), len(payload))
+        body += payload + b"\x00" * (-len(payload) % 4)
+    return out + body
+
+
+def _minimal(glyf=None, loca=None, cmap=None, n_glyphs=2, n_metrics=2,
+             index_to_loc=0):
+    head = bytearray(54)
+    struct.pack_into(">H", head, 18, 1000)          # unitsPerEm
+    struct.pack_into(">h", head, 50, index_to_loc)  # indexToLocFormat
+    hhea = bytearray(36)
+    struct.pack_into(">hhh", hhea, 4, 800, -200, 0)
+    struct.pack_into(">H", hhea, 34, n_metrics)
+    maxp = bytearray(6)
+    struct.pack_into(">H", maxp, 4, n_glyphs)
+    hmtx = struct.pack(">HhHh", 500, 0, 300, 0)
+    if glyf is None:
+        # One square contour, points given as 16-bit deltas.
+        glyf = (struct.pack(">hhhhh", 1, 0, 0, 100, 100)
+                + struct.pack(">HH", 3, 0) + bytes([1, 1, 1, 1])
+                + struct.pack(">hhhh", 0, 100, 0, -100)
+                + struct.pack(">hhhh", 0, 0, 100, 0))
+    if loca is None:
+        loca = struct.pack(">HHH", 0, 0, len(glyf) // 2)
+    if cmap is None:
+        # Format 6, mapping 'A' to glyph 1.
+        sub = struct.pack(">HHHHHH", 6, 12, 0, ord("A"), 1, 1)
+        cmap = struct.pack(">HHHHI", 0, 1, 3, 1, 12) + sub
+    return _sfnt({"head": bytes(head), "hhea": bytes(hhea),
+                  "maxp": bytes(maxp), "hmtx": hmtx, "glyf": glyf,
+                  "loca": loca, "cmap": cmap})
+
+
+def _raises_fonterror(data, why):
+    try:
+        fontengine.Font(data)
+    except fontengine.FontError:
+        return
+    raise AssertionError(why)
+
+
+def test_minimal_font_parses():
+    """The scaffolding above has to make a font, or the tests below prove
+    nothing about the cases they break."""
+    font = fontengine.Font(_minimal())
+    assert (font.units_per_em, font.ascent, font.descent) == (1000, 800, -200)
+    assert font.glyph_id("A") == 1 and font.glyph_id("B") == 0
+    assert len(font.glyph_contours(1)) == 1
+    assert font.advance(0) == 500 and font.advance(1) == 300
+
+
+def test_font_rejects_files_that_are_not_fonts():
+    _raises_fonterror(b"", "an empty file is not a font")
+    _raises_fonterror(b"<html>not a font at all</html>", "HTML is not a font")
+    _raises_fonterror(b"\x00\x01\x00\x00", "a bare sfnt tag is not a font")
+    _raises_fonterror(_sfnt({"cmap": b"\x00" * 8}),
+                      "a font without head cannot be measured")
+
+
+def test_font_rejects_a_collection_index_it_does_not_have():
+    _raises_fonterror(b"ttcf" + struct.pack(">IIII", 0x00010000, 1, 200, 0),
+                      "a one-font collection has no second face")
+
+
+def test_font_treats_tables_pointing_past_the_end_as_absent():
+    """A truncated font leaves directory entries pointing into nothing. Those
+    read as missing tables, which is how a partly written file still gives up
+    politely instead of indexing off the end of the buffer."""
+    data = bytearray(_minimal())
+    # The directory is sorted by tag, so cmap is the first entry: aim its
+    # offset a megabyte past the end of the file.
+    struct.pack_into(">I", data, 12 + 8, 1 << 20)
+    font = fontengine.Font(bytes(data))
+    assert font.glyph_id("A") == 0, "a missing cmap maps nothing"
+    assert font.names() == {}
+
+
+def test_font_ignores_a_truncated_glyph():
+    good = _minimal()
+    for cut in (10, 12, 14, 16, 20, 24):
+        glyf = (struct.pack(">hhhhh", 1, 0, 0, 100, 100)
+                + struct.pack(">HH", 3, 0) + bytes([1, 1, 1, 1])
+                + struct.pack(">hhhh", 0, 100, 0, -100)
+                + struct.pack(">hhhh", 0, 0, 100, 0))[:cut]
+        font = fontengine.Font(_minimal(glyf=glyf,
+                                        loca=struct.pack(">HHH", 0, 0,
+                                                         len(glyf) // 2)))
+        assert font.glyph_contours(1) == [], f"cut at {cut} produced an outline"
+    assert fontengine.Font(good).glyph_contours(1), "the whole glyph is fine"
+
+
+def test_font_ignores_loca_entries_past_glyf():
+    font = fontengine.Font(_minimal(loca=struct.pack(">HHH", 0, 0, 30000)))
+    assert font.glyph_contours(1) == []
+    assert font.glyph_contours(9999) == [], "a glyph id past loca is blank"
+
+
+def test_font_stops_on_a_composite_that_refers_to_itself():
+    """A composite pointing at itself would recurse for ever. The parser gives
+    up after a few levels and returns nothing, which is the only answer that
+    terminates."""
+    glyf = (struct.pack(">hhhhh", -1, 0, 0, 100, 100)
+            + struct.pack(">HH", 0x0002, 1) + bytes([0, 0]))
+    font = fontengine.Font(_minimal(glyf=glyf,
+                                    loca=struct.pack(">HHH", 0, 0,
+                                                     len(glyf) // 2)))
+    assert font.glyph_contours(1) == []
+
+
+def test_font_cmap_ignores_impossible_ranges():
+    """A format 12 group spanning the whole 32-bit space is a corrupt record,
+    not four billion characters to enumerate."""
+    groups = (struct.pack(">III", ord("A"), ord("A"), 1)
+              + struct.pack(">III", 0, 0xFFFFFFFF, 1))
+    sub = struct.pack(">HHIII", 12, 0, 16 + len(groups), 0, 2) + groups
+    cmap = struct.pack(">HHHHI", 0, 1, 3, 10, 12) + sub
+    font = fontengine.Font(_minimal(cmap=cmap))
+    assert font.glyph_id("A") == 1
+    assert font.glyph_id("B") == 0, "the impossible group should be skipped"
+
+
+def test_font_advance_falls_back_to_the_last_metric():
+    """hmtx stops after numberOfHMetrics entries and every glyph after that
+    shares the last advance -- that is how the format spells a monospaced
+    tail, not a reason to index past the table."""
+    font = fontengine.Font(_minimal())
+    assert font.advance(1) == 300
+    assert font.advance(50000) == 300
+    assert font.advance(-1) == 300
+
+
+def test_font_survives_arbitrary_corruption():
+    """Flip bytes through a real font and a hand-built one and insist the
+    parser always either works or raises FontError. A font is read once and
+    then asked for outlines all day, so a stray offset must be survivable at
+    every one of those calls, not just at parse time."""
+    import random
+
+    seeds = [_minimal()]
+    for faces in fontengine.index().values():
+        path, _face = next(iter(faces.values()))
+        with open(path, "rb") as f:
+            seeds.append(f.read(200000))
+        break
+    rng = random.Random(20260814)
+    for _ in range(1500):
+        data = bytearray(rng.choice(seeds))
+        for _flip in range(rng.randint(1, 8)):
+            data[rng.randrange(len(data))] = rng.randrange(256)
+        if rng.random() < 0.3:
+            del data[rng.randrange(len(data)):]
+        try:
+            font = fontengine.Font(bytes(data))
+            font.names()
+            for ch in ("A", "g", "☃"):
+                font.glyph_id(ch)
+            for gid in (0, 1, 7, 4000):
+                fontengine.flatten(font.glyph_contours(gid), font.scale(16))
+                font.advance(gid)
+        except fontengine.FontError:
+            pass
+        except Exception as exc:                 # noqa: BLE001
+            raise AssertionError(
+                f"{type(exc).__name__} escaped the font parser: {exc}")
+
+
+def test_text_survives_lone_surrogates():
+    """``&#xD800;`` puts a lone surrogate in a page's text. It is not a
+    character any font maps, but measuring and drawing it must come back
+    quietly rather than raise on the way into the renderer."""
+    font = _sans()
+    face = font.face
+    assert face.glyph_id("\ud800") == 0
+    assert face.has_char("\ud800") is False
+    text = "a\ud800b"
+    assert raster.measure_text(face, 16, text) >= 0
+    s = raster.Surface(40, 20, (255, 255, 255))
+    raster.draw_text(s, face, 16, text, 2, 15, (0, 0, 0))
+
+
 # -- rasteriser ------------------------------------------------------------
 
 def test_surface_starts_filled_with_background():
@@ -166,32 +398,31 @@ def test_fill_rect_alpha_blends_halfway():
         f"half-alpha blend gave {(r, g, b)}"
 
 
-def test_fill_rect_alpha_uses_the_span_kernels_when_they_exist():
-    """The translucent fill hands whole rows to asmblend where the raw
-    kernels are compiled in. Force that path on -- asmblend's own fallback
-    computes the same thing the assembly does -- and check the blend landed
-    in the surface's own bytes, in the right rows and nowhere else."""
-    from feetbrowser import asmblend
-    saved = raster._ASM_SPANS
-    raster._ASM_SPANS = True
-    try:
-        s = raster.Surface(6, 4, (40, 40, 40))
-        s.fill_rect(1, 1, 5, 3, (200, 100, 50), 128)
-    finally:
-        raster._ASM_SPANS = saved
+def test_fill_rect_alpha_lands_in_the_right_rows_and_nowhere_else():
+    """This is what is left of the span-kernel test after the fill moved to
+    Rust. The row-at-a-time asmblend path is gone -- the Rust fill covers the
+    whole rectangle in one crossing instead of one per row -- so what is worth
+    checking is the same thing that test checked underneath the plumbing: the
+    blend is exact, it covers every pixel of the rectangle, and it touches
+    nothing outside it. The kernels themselves are still exercised, directly
+    against their Python references, in tests/test_asmblend.py.
+
+    Note the arithmetic: `// 255`, as the translate tables did. The assembly
+    rounded by `>> 8`, which is one level darker at the top of the range.
+    """
+    s = raster.Surface(6, 4, (40, 40, 40))
+    s.fill_rect(1, 1, 5, 3, (200, 100, 50), 128)
     inv = 255 - 128
-    expect = tuple((c * 128 + 40 * inv) >> 8 for c in (200, 100, 50))
+    expect = tuple((c * 128 + 40 * inv) // 255 for c in (200, 100, 50))
     assert _pixel(s, 1, 1) == expect, (_pixel(s, 1, 1), expect)
     assert _pixel(s, 4, 2) == expect, "the last covered pixel blended too"
     assert _pixel(s, 0, 1) == (40, 40, 40), "the blend escaped to the left"
     assert _pixel(s, 5, 1) == (40, 40, 40), "the blend escaped to the right"
     assert _pixel(s, 1, 0) == (40, 40, 40), "the blend escaped upwards"
+    assert _pixel(s, 1, 3) == (40, 40, 40), "the blend escaped downwards"
 
-    # And the surface is still a plain bytearray afterwards: every ctypes
-    # view over it has to be gone or it cannot be resized or replaced again.
     s.fill_all((1, 2, 3))
-    assert _pixel(s, 0, 0) == (1, 2, 3)
-    assert asmblend.using_assembly() in (True, False)
+    assert _pixel(s, 0, 0) == (1, 2, 3), "the surface still refills afterwards"
 
 
 def test_clip_confines_drawing():
@@ -470,6 +701,216 @@ def test_resize_is_identity_at_same_size():
     rgba = bytearray(bytes([1, 2, 3, 4]) * 4)
     assert imagecodec.resize(rgba, 2, 2, 2, 2) is rgba
 
+# -- malformed images ------------------------------------------------------
+#
+# Everything below feeds the decoders bytes no encoder would ever produce.
+# Images are the one part of a page that arrives as raw binary from a
+# stranger, so the decoders are where a hostile file gets its chance: the
+# rule is that a broken image is an ImageError and never a crash, a hang or
+# an allocation the file chose the size of. That mattered when this was
+# Python and it matters more now that it is Rust, where an unchecked index
+# is a panic no `except` can catch.
+
+def _rejects(data, why):
+    try:
+        imagecodec.decode(data)
+    except imagecodec.ImageError:
+        return
+    raise AssertionError(why)
+
+
+def test_decode_png_rejects_truncation_in_the_header():
+    """Cut a good PNG short at each structural boundary up to the end of
+    IHDR: the signature, the length word, the chunk tag, mid-payload."""
+    good = _png(4, 3, 8, 2, bytes(36))
+    for cut in (0, 1, 7, 8, 12, 20, 25):
+        _rejects(good[:cut], f"truncation at {cut} bytes should be rejected")
+
+
+def test_decode_png_pads_a_truncated_image():
+    """Past the header a short file is not an error: a header we believe
+    plus fewer pixels than it promised comes back padded, which is what a
+    half-arrived image on a slow connection looks like."""
+    good = _png(4, 3, 8, 2, bytes(range(36)))
+    width, height, rgba = imagecodec.decode(good[:len(good) - 20])
+    assert (width, height) == (4, 3)
+    assert len(rgba) == 4 * 3 * 4
+
+
+def test_decode_png_ignores_chunk_crcs():
+    """We have never checked CRCs and must not start: a stray bad checksum
+    is common in the wild and the pixels are usually perfectly fine."""
+    good = _png(2, 2, 8, 2, bytes(12))
+    _w, _h, rgba = imagecodec.decode(good[:-4] + b"\x00\x00\x00\x00")
+    assert len(rgba) == 2 * 2 * 4
+
+
+def test_decode_png_rejects_headers_it_cannot_honour():
+    _rejects(_png(2, 2, 8, 2, bytes(12), interlace=3),
+             "unknown interlace method should be rejected")
+    _rejects(_png(2, 2, 7, 2, bytes(12)), "bit depth 7 should be rejected")
+    header = struct.pack(">IIBBBBB", 2, 2, 8, 9, 0, 0, 0)
+    body = b"IHDR" + header
+    _rejects(b"\x89PNG\r\n\x1a\n" + struct.pack(">I", len(header)) + body
+             + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF),
+             "colour type 9 should be rejected")
+
+
+def test_decode_png_rejects_absurd_dimensions():
+    """Twenty million pixels is the cap, and a header is a claim rather
+    than a fact: a 65535x65535 IHDR must not become a 17-gigabyte buffer."""
+    _rejects(_png(0xFFFF, 0xFFFF, 8, 2, b""), "4G pixels should be rejected")
+    _rejects(_png(0, 0, 8, 2, b""), "a zero-area image should be rejected")
+    header = struct.pack(">IIBBBBB", 0x80000000, 4, 8, 2, 0, 0, 0)
+    body = b"IHDR" + header
+    _rejects(b"\x89PNG\r\n\x1a\n" + struct.pack(">I", len(header)) + body
+             + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF),
+             "a width past 2^31 should be rejected")
+
+
+def test_decode_png_rejects_undecodable_pixel_data():
+    _rejects(_png(2, 2, 8, 2, bytes(12), idat=b"junkjunkjunk"),
+             "an IDAT that is not deflate data should be rejected")
+    _rejects(_png(2, 2, 8, 2, bytes(12),
+                  idat=zlib.compress(bytes([9, 1, 2, 3, 4, 5, 6,
+                                            9, 1, 2, 3, 4, 5, 6]))),
+             "filter type 9 does not exist and should be rejected")
+
+
+def test_decode_png_inflate_is_bounded():
+    """A third of a megabyte on the wire that would expand past
+    MAX_INFLATED has to stop at the ceiling rather than eat the machine."""
+    packer = zlib.compressobj(9)
+    megabyte = b"\x00" * (1 << 20)
+    parts = [packer.compress(megabyte)
+             for _ in range((imagecodec.MAX_INFLATED >> 20) + 4)]
+    parts.append(packer.flush())
+    bomb = b"".join(parts)
+    assert len(bomb) < (1 << 20), "the bomb should be small on the wire"
+    _rejects(_png(64, 64, 8, 2, b"", idat=bomb),
+             "a zip bomb should be rejected, not decoded")
+
+
+def test_decode_gif_rejects_truncation():
+    good = _gif()
+    for cut in (0, 3, 6, 10, 13, 20, 26, 30):
+        _rejects(good[:cut], f"truncation at {cut} bytes should be rejected")
+
+
+def test_decode_gif_rejects_impossible_code_sizes():
+    """A GIF palette holds 256 colours at most, so an initial LZW code size
+    above 8 is a file asking us to size a table from a number it invented."""
+    for min_code in (9, 12, 200, 255):
+        raw = bytearray(_gif())
+        raw[raw.index(b"\x2C") + 10] = min_code
+        _rejects(bytes(raw),
+                 f"LZW code size {min_code} should be rejected")
+
+
+def test_decode_gif_rejects_absurd_geometry():
+    _rejects(b"GIF89a" + struct.pack("<HHBBB", 0xFFFF, 0xFFFF, 0, 0, 0)
+             + b"\x3B", "a 4G-pixel canvas should be rejected")
+    _rejects(b"GIF89a" + struct.pack("<HHBBB", 4, 4, 0, 0, 0) + b"\x3B",
+             "a GIF with no image block should be rejected")
+    _rejects(b"GIF89a" + struct.pack("<HHBBB", 2, 2, 0x80 | 0x01, 0, 0)
+             + bytes(12) + b"\x2C"
+             + struct.pack("<HHHHB", 60000, 60000, 2, 2, 0)
+             + bytes([2, 1]) + b"\x00\x00\x3B",
+             "a frame placed 60000 pixels off canvas should be rejected")
+
+
+def test_decode_pnm_rejects_malformed_headers():
+    _rejects(b"P6", "a header with nothing after it should be rejected")
+    _rejects(b"P6\n2 1\n", "a missing maxval should be rejected")
+    _rejects(b"P6\nx y\n255\n" + bytes(6), "junk dimensions are rejected")
+    _rejects(b"P6\n0 0\n255\n", "a zero-area image should be rejected")
+    _rejects(b"P6\n99999 99999\n255\n" + bytes(6),
+             "ten billion pixels should be rejected")
+    _rejects(b"P3\n2 1\n255\nred green blue\n", "junk samples are rejected")
+    _rejects(b"P9\n2 1\n255\n" + bytes(6), "P9 is not a Netpbm type")
+
+
+def test_decode_pnm_accepts_the_awkward_but_legal():
+    """Comments mid-header, 16-bit samples and bitmaps are all in the spec
+    and all three take a different path through the reader."""
+    _w, _h, rgba = imagecodec.decode(b"P6\n# who\n2 1\n# what\n255\n"
+                                     + bytes([1, 2, 3, 4, 5, 6]))
+    assert tuple(rgba[:4]) == (1, 2, 3, 255)
+    _w, _h, rgba = imagecodec.decode(b"P5\n2 1\n65535\n"
+                                     + bytes([255, 255, 0, 0]))
+    assert rgba[0] == 255 and rgba[4] == 0
+    _w, _h, rgba = imagecodec.decode(b"P4\n8 1\n" + bytes([0b10000000]))
+    assert rgba[0] == 0 and rgba[4] == 255, "in PBM a set bit is black"
+    _w, _h, rgba = imagecodec.decode(b"P6\n4 4\n255\n" + bytes(6))
+    assert len(rgba) == 4 * 4 * 4, "short pixel data is padded, not fatal"
+
+
+def test_decoders_survive_arbitrary_corruption():
+    """Flip bytes at random through each format and insist that the only
+    thing which ever comes back is a picture or an ImageError."""
+    import random
+
+    seeds = [_png(4, 3, 8, 2, bytes(36)),
+             _png(4, 2, 8, 3, bytes([0, 1, 2, 3, 0, 1, 2, 3]),
+                  palette=bytes(12)),
+             _png(2, 2, 16, 6, bytes(32)),
+             _gif(),
+             b"P6\n3 2\n255\n" + bytes(18),
+             b"P3\n2 2\n255\n1 2 3 4 5 6 7 8\n"]
+    rng = random.Random(20260813)
+    for _ in range(3000):
+        data = bytearray(rng.choice(seeds))
+        for _flip in range(rng.randint(1, 5)):
+            data[rng.randrange(len(data))] = rng.randrange(256)
+        if rng.random() < 0.3:
+            del data[rng.randrange(len(data)):]
+        try:
+            imagecodec.decode(bytes(data))
+        except imagecodec.ImageError:
+            pass
+        except Exception as exc:                 # noqa: BLE001
+            raise AssertionError(
+                f"{type(exc).__name__} escaped the decoder for "
+                f"{bytes(data)!r}: {exc}")
+
+
+def test_jpeg_survives_arbitrary_corruption():
+    """The same treatment for JPEG, from the real fixtures rather than from
+    anything built here. It needs its own round because a JPEG is mostly one
+    long entropy-coded run: a flipped bit does not stop the decoder, it
+    changes what every following symbol means, and the sizes and counts it
+    then reads are numbers no encoder ever wrote. Those are the numbers that
+    index a table or size an allocation, so this is the test that says a
+    corrupt photograph loses its picture and not the page it is on.
+    """
+    import random
+
+    seeds = []
+    for name in ("photo.jpg", "photo-progressive.jpg", "photo-grey.jpg",
+                 "photo-restart.jpg"):
+        with open(os.path.join(_FIXTURES, name), "rb") as fh:
+            seeds.append(fh.read())
+    rng = random.Random(20260813)
+    decoded = 0
+    for _ in range(1500):
+        data = bytearray(rng.choice(seeds))
+        for _flip in range(rng.randint(1, 6)):
+            data[rng.randrange(len(data))] = rng.randrange(256)
+        if rng.random() < 0.4:
+            del data[rng.randrange(len(data)):]
+        try:
+            imagecodec.decode(bytes(data))
+            decoded += 1
+        except imagecodec.ImageError:
+            pass
+        except Exception as exc:                 # noqa: BLE001
+            raise AssertionError(
+                f"{type(exc).__name__} escaped the JPEG decoder for "
+                f"{bytes(data)!r}: {exc}")
+    assert decoded > 500, (
+        "only %d of 1500 corrupted photographs decoded at all, which means "
+        "the run is testing rejection and not the decoder" % decoded)
+
 
 # -- colours ---------------------------------------------------------------
 
@@ -486,9 +927,9 @@ def test_color_empty_is_transparent_and_junk_raises():
     assert canvasmod.color(None) is None
     try:
         canvasmod.color("not-a-colour")
-    except canvasmod.TclError:
+    except canvasmod.CanvasError:
         return
-    raise AssertionError("a bad colour name must raise TclError, as Tk does")
+    raise AssertionError("a bad colour name must raise CanvasError")
 
 
 # -- canvas ----------------------------------------------------------------
@@ -538,12 +979,12 @@ def test_canvas_addtag_by_item_id():
 
 
 def test_canvas_rejects_bad_colour_at_creation():
-    """The display list catches TclError to fall back to black, so the error
+    """The display list catches CanvasError to fall back to black, so the error
     has to arrive from create_*, not from render()."""
     c = canvasmod.Canvas(width=10, height=10)
     try:
         c.create_rectangle(0, 0, 5, 5, fill="rgb-ish?")
-    except canvasmod.TclError:
+    except canvasmod.CanvasError:
         return
     raise AssertionError("create_rectangle accepted an invalid colour")
 
@@ -764,11 +1205,1384 @@ def test_window_destroy_takes_children_with_it():
     assert not child.winfo_exists() and not root.winfo_exists()
 
 
-def test_gui_backend_exports_everything_used():
-    for name in ("Tk", "Toplevel", "Canvas", "PhotoImage", "TclError",
-                 "Font"):
+def test_gui_exports_the_window_names_browser_uses():
+    for name in ("Toplevel", "new_window", "has_display", "display_problem"):
         assert getattr(gui, name, None) is not None, f"gui.{name} missing"
-    assert gui.backend() in ("raster", "tk")
+
+
+# -- images end to end -----------------------------------------------------
+#
+# imagecodec is tested above against known pixels, and passed happily while
+# every <img> on the screen was the "[img]" placeholder: decoding was never
+# the broken part. What follows drives the whole path instead -- page load,
+# the fetch that runs off the UI thread, the timer sweep that publishes the
+# decoded image, layout, and the blit -- and looks at the pixels that come
+# out the far end.
+
+IMAGE_RGB = (255, 0, 255)
+IMAGE_SIZE = 8
+
+
+def _page_with_image(directory, rgb=IMAGE_RGB, size=IMAGE_SIZE):
+    """Write an HTML file whose <img> is a data: PNG of a solid colour."""
+    import base64
+    samples = bytes(rgb) * size * size
+    src = "data:image/png;base64," + base64.b64encode(
+        _png(size, size, 8, 2, samples)).decode()
+    path = os.path.join(directory, "page.html")
+    with open(path, "w") as handle:
+        handle.write(f"<!doctype html><title>img</title><p><img src='{src}'>")
+    return path
+
+
+def _serve_page_with_image(delay, rgb=IMAGE_RGB, size=IMAGE_SIZE):
+    """A loopback server: an HTML page, and a PNG that takes `delay` to send.
+
+    The delay is the whole point. Images arrive after the document that asked
+    for them, and anything that captures a frame in between captures
+    placeholders -- so a test that lets the image win the race tests nothing.
+    """
+    import http.server
+    import threading
+    import time
+
+    pixels = _png(size, size, 8, 2, bytes(rgb) * size * size)
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path.endswith(".png"):
+                time.sleep(delay)
+                body, ctype = pixels, "image/png"
+            else:
+                body = b'<!doctype html><title>img</title><p><img src="/i.png">'
+                ctype = "text/html"
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server
+
+
+def _count_pixels(surface, rgb):
+    return sum(1 for y in range(surface.height) for x in range(surface.width)
+               if _pixel(surface, x, y) == rgb)
+
+
+def test_screenshot_paints_images_rather_than_placeholders():
+    """A screenshot must contain the page's image, not its alt text.
+
+    The regression this guards was not in any decoder: --screenshot stopped
+    waiting the moment the *document* had arrived, which is the moment image
+    loading begins, so every frame was captured with an empty image cache and
+    every <img> laid out as "[img]".
+    """
+    import shutil
+    import tempfile
+    from feetbrowser.browser import screenshot
+
+    work = tempfile.mkdtemp(prefix="fb-shot-")
+    server = _serve_page_with_image(0.3)
+    try:
+        out = os.path.join(work, "shot.png")
+        url = "http://127.0.0.1:%d/page" % server.server_address[1]
+        browser = screenshot(url, out, settle=20.0)
+        placeholders = [c for c in browser.tabs[0].display_list
+                        if "[img" in getattr(c, "text", "")]
+        assert not placeholders, f"placeholder still drawn: {placeholders}"
+        width, height, rgba = imagecodec.decode(open(out, "rb").read())
+        assert (width, height) == (browser.canvas.winfo_width(),
+                                   browser.canvas.winfo_height())
+        painted = sum(1 for i in range(0, len(rgba), 4)
+                      if tuple(rgba[i:i + 3]) == IMAGE_RGB)
+        assert painted == IMAGE_SIZE * IMAGE_SIZE, \
+            f"expected an {IMAGE_SIZE}px square, found {painted} pixels"
+    finally:
+        server.shutdown()
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def test_settle_waits_for_images_a_finished_document_asked_for():
+    """`loading` going false does not mean the page is finished.
+
+    A document is fetched first and its images afterwards, so there is a
+    window in which nothing is "loading" and the page is still all
+    placeholders. Browser.settle() has to span it.
+    """
+    import shutil
+    import tempfile
+    from feetbrowser.browser import Browser
+
+    work = tempfile.mkdtemp(prefix="fb-settle-")
+    try:
+        page = _page_with_image(work)
+        browser = Browser()
+        browser.new_tab("file://" + page)
+        tab = browser.tabs[0]
+        assert not tab.loading, "a file: document loads synchronously"
+        assert tab.pending_images(), "images are queued, so work remains"
+        assert browser.busy(), "and the browser has to call that busy"
+        assert browser.settle(20.0), "settle should not have timed out"
+        assert not browser.busy() and not tab.pending_images()
+        assert tab.image_cache, "settling means the image is decoded"
+        browser.draw()
+        assert _count_pixels(browser.canvas.render(),
+                             IMAGE_RGB) == IMAGE_SIZE * IMAGE_SIZE
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def test_script_created_images_are_fetched_and_painted():
+    """A `<script>` that builds `<img>` elements must have them fetched like
+    anything else in the document.
+
+    20plays.com (and plenty of other pages) build their banner strip by
+    creating `<img>` elements in JavaScript after the document has already
+    been scanned for images. Those used to render as "[img]": the DOM bridges
+    dropped `img.src = ...` writes, and nothing re-scanned the tree for images
+    a script added. This drives both halves through a loopback server.
+    """
+    import http.server
+    import struct
+    import threading
+    import zlib as _z
+
+    def chunk(tag, data):
+        c = struct.pack(">I", len(data)) + tag + data
+        return c + struct.pack(">I", _z.crc32(tag + data))
+
+    pixels = b"".join(b"\x00" + b"\xff\x00\x00" * 8 for _ in range(8))
+    png_bytes = b"\x89PNG\r\n\x1a\n"
+    png_bytes += chunk(b"IHDR", struct.pack(">IIBBBBB", 8, 8, 8, 2, 0, 0, 0))
+    png_bytes += chunk(b"IDAT", _z.compress(pixels))
+    png_bytes += chunk(b"IEND", b"")
+
+    script = (
+        'var files = ["a.png", "b.png", "c.png"];'
+        'for (var i = 0; i < files.length; i++) {'
+        '  var img = document.createElement("img");'
+        '  img.src = "/" + files[i];'
+        '  document.getElementById("wrap").appendChild(img);'
+        '}')
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path.endswith(".png"):
+                body, ctype = png_bytes, "image/png"
+            else:
+                body = (b'<!doctype html><div id="wrap"></div><script>'
+                        + script.encode() + b'</script>')
+                ctype = "text/html"
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        from feetbrowser.browser import Browser
+        from feetbrowser.layout import DrawImage
+
+        browser = Browser()
+        browser.window.geometry("900x700")
+        browser.canvas.resize(900, 700)
+        browser._apply_resize()
+        browser.new_tab("http://127.0.0.1:%d/" % server.server_address[1])
+        assert browser.settle(20.0), "script-created images should arrive"
+        tab = browser.tabs[0]
+        drawn = [c for c in tab.display_list if isinstance(c, DrawImage)]
+        assert len(drawn) == 3, \
+            f"wanted 3 JS-created images drawn, found {len(drawn)}"
+        assert not [c for c in tab.display_list
+                    if "[img" in getattr(c, "text", "")], \
+            "no [img] placeholder may remain"
+    finally:
+        server.shutdown()
+
+
+def test_browse_page_thumbnails_with_query_urls_render():
+    """safebooru's post list: absolute JPEG `<img>` URLs with a query
+    string, wrapped in flex cells.
+
+    The regression this guards is the safebooru.org browse page, whose
+    thumbnails are all `.../thumbnail_<hash>.jpg?<post_id>`. The query is
+    part of the URL the layout keys its image cache on, so a URL
+    round-trip that dropped it would turn every photo back into an
+    "[img]" placeholder; so would an engine built before native JPEG
+    support, which draws the homepage PNG and quietly no JPEG at all --
+    exactly the page as safebooru serves it.
+    """
+    import http.server
+    import threading
+
+    from feetbrowser.browser import Browser
+    from feetbrowser.layout import DrawImage
+
+    photo = open(os.path.join(_FIXTURES, "photo.jpg"), "rb").read()
+    thumbs = "".join(
+        f'<span class="thumb"><a href="/index.php?page=post&s=view&id={i}">'
+        f'<img src="/thumbnails/999/thumbnail_{i}.jpg?{i}" border="0"></a>'
+        f'</span>'
+        for i in range(6))
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path.startswith("/thumbnails/"):
+                body, ctype = photo, "image/jpeg"
+            else:
+                body = (b'<!doctype html><style>'
+                        b'div.image-list{display:flex;flex-flow:wrap}'
+                        b'.thumb{width:200px;height:200px}</style>'
+                        b'<div class="image-list">' + thumbs.encode() +
+                        b'</div>')
+                ctype = "text/html"
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        browser = Browser()
+        browser.new_tab("http://127.0.0.1:%d/index.php?page=post&s=list"
+                        % server.server_address[1])
+        tab = browser.tabs[0]
+        assert browser.settle(20.0), "thumbnails should have arrived"
+        drawn = [c for c in tab.display_list if isinstance(c, DrawImage)]
+        assert len(drawn) == 6, \
+            f"wanted 6 thumbnails drawn, found {len(drawn)}"
+        for c in drawn:
+            assert (c.photo.width(), c.photo.height()) == (320, 224), \
+                "each thumbnail decodes to the real photograph"
+    finally:
+        server.shutdown()
+
+
+def test_a_scrolled_page_never_paints_over_the_chrome():
+    """Scrolling, then a page re-render, must not bury the nav bar.
+
+    The canvas paints in insertion order, so page commands re-executed after
+    the chrome was drawn paint on top of it. Once the page is scrolled, its
+    full-viewport background rectangles start above the window top and span
+    the whole chrome strip -- so a page-layer repaint on its own (the 120ms
+    coalescer, which fires when a background image arrives) used to white out
+    the tabs and address bar. _draw_page now re-asserts the chrome over the
+    page, and this proves the tab strip survives the exact sequence.
+    """
+    import shutil
+    import tempfile
+    from feetbrowser.browser import Browser
+
+    work = tempfile.mkdtemp(prefix="fb-chrome-")
+    try:
+        page = os.path.join(work, "page.html")
+        with open(page, "w") as handle:
+            handle.write('<!doctype html><style>div{background:#ff0000;'
+                         'height:5000px}</style><div><p>hi</p></div>')
+        browser = Browser()
+        browser.window.geometry("900x700")
+        browser.canvas.resize(900, 700)
+        browser._apply_resize()
+        browser.new_tab("file://" + page)
+        browser.settle(20.0)
+        tab = browser.tabs[0]
+        chrome = browser.chrome_height()
+        # Scroll the red page up under the chrome, then re-render and let the
+        # 120ms coalescer repaint the page alone -- the sequence that follows
+        # a scroll while background images are still arriving.
+        tab.set_scroll(400)
+        tab.render()
+        browser._repaint_tick()
+        surface = browser.canvas.render()
+        tab_bar = tuple(canvasmod.color(browser.c("tab_bar"))[:3])
+        red = (255, 0, 0)
+        assert _pixel(surface, 400, 5) == tab_bar, \
+            "the tab strip was painted over by the scrolled page"
+        assert _pixel(surface, 400, chrome - 3) != red, \
+            "the chrome strip shows page content instead of chrome"
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+# -- the scrollbar, dragged ------------------------------------------------
+#
+# The bar is painted onto the same canvas as everything else and is not a
+# widget, so nothing in the platform layers knows it exists: whether a press
+# on it scrolls is decided in browser.py, and both backends deliver the
+# press, the drag and the release through exactly the bindings used here.
+# That is why these live with the rest of the drawn chrome rather than in
+# either platform suite -- and why the platform suites each drive the same
+# gesture through their own event translation as well.
+
+def _scrollable_browser(lines=300):
+    """A browser showing a page far taller than its window."""
+    from feetbrowser.browser import Browser
+
+    browser = Browser()
+    browser.new_tab("data:text/html," + "".join("<p>line %d</p>" % i
+                                                for i in range(lines)))
+    browser.draw()
+    tab = browser.tabs[0]
+    assert tab.content_height() > browser.tab_height(), \
+        "the fixture page is not tall enough to scroll"
+    assert _thumb(browser)[0] is not None, "no scrollbar is drawn"
+    return browser, tab
+
+
+def _mouse(browser, sequence, y, x=None):
+    """Press, drag or release on the scrollbar, the way a backend would."""
+    if x is None:
+        x = browser.canvas.winfo_width() - 7  # the middle of the thumb
+    browser.window.dispatch(sequence, Event(x=x, y=y, num=1, type=sequence))
+
+
+def _thumb(browser):
+    """(top, height) of the thumb, read off the painted pixels.
+
+    Off the pixels rather than out of the browser's own arithmetic, so these
+    tests say where the reader can see the thumb and not merely where the
+    code that draws it thinks it is.
+    """
+    rgb = tuple(canvasmod.color(browser.c("scroll_thumb"))[:3])
+    x = browser.canvas.winfo_width() - 7
+    surface = browser.canvas.render()
+    rows = [y for y in range(surface.height) if _pixel(surface, x, y) == rgb]
+    if not rows:
+        return None, None
+    return min(rows), max(rows) - min(rows) + 1
+
+
+def _track(browser):
+    """(top, height) of the whole track the thumb travels in."""
+    return browser.chrome_height(), browser.tab_height()
+
+
+def _span(tab):
+    """The scroll offset the bottom of the track stands for."""
+    return tab.content_height() - tab.tab_height
+
+
+def test_dragging_the_scrollbar_scrolls_the_page():
+    """The bug: the bar was painted and nothing hit-tested it, so a press on
+    it started a text selection and the page never moved."""
+    browser, tab = _scrollable_browser()
+    top, _height = _thumb(browser)
+    _mouse(browser, "<Button-1>", top + 5)
+    assert tab.scroll == 0, "merely grabbing the thumb moved the page"
+    assert tab.selection is None, "the press started a text selection"
+    _mouse(browser, "<B1-Motion>", top + 105)
+    assert tab.scroll > 0, "dragging the scrollbar did not scroll the page"
+    # 100px of a track that is (track height - thumb height) long, in
+    # document terms: the thumb covers the viewport, the rest is the scroll.
+    _track_top, track_h = _track(browser)
+    expected = 100 / (track_h - _thumb(browser)[1]) * _span(tab)
+    assert abs(tab.scroll - expected) < 10, \
+        "scrolled %r, expected about %r" % (tab.scroll, expected)
+
+
+def test_the_grabbed_point_stays_under_the_pointer():
+    """Whatever part of the thumb was grabbed is the part that follows the
+    pointer -- otherwise the page jumps on the first pixel of movement."""
+    browser, _tab = _scrollable_browser()
+    top, height = _thumb(browser)
+    grab = top + height - 3  # grabbed near the bottom edge of the thumb
+    _mouse(browser, "<Button-1>", grab)
+    assert _thumb(browser)[0] == top, "the thumb moved when it was grabbed"
+    for step in (40, 90, 61):
+        _mouse(browser, "<B1-Motion>", grab + step)
+        moved = _thumb(browser)[0] - top
+        assert abs(moved - step) <= 1, \
+            "pointer moved %d, thumb moved %r" % (step, moved)
+
+
+def test_dragging_the_scrollbar_stops_where_the_wheel_stops():
+    """Past either end of the track the page stops at the same offsets the
+    wheel stops at, rather than at limits of the scrollbar's own."""
+    browser, tab = _scrollable_browser()
+    tab.scroll_by(10 ** 9)
+    bottom = tab.scroll  # where the wheel gives up
+    tab.set_scroll(0)
+    browser.draw()
+    top, _height = _thumb(browser)
+    _mouse(browser, "<Button-1>", top + 5)
+    _mouse(browser, "<B1-Motion>", 10 ** 6)  # far below the window
+    assert tab.scroll == bottom, \
+        "dragging off the bottom gave %r, the wheel gives %r" % (tab.scroll,
+                                                                 bottom)
+    _mouse(browser, "<B1-Motion>", -10 ** 6)  # and far above it
+    assert tab.scroll == 0, "dragging off the top gave %r" % tab.scroll
+
+
+def test_releasing_outside_the_window_ends_the_drag():
+    """A release lands wherever the pointer got to, which is routinely
+    outside the window. Missing it would leave the bar stuck to the mouse."""
+    browser, tab = _scrollable_browser()
+    top, _height = _thumb(browser)
+    _mouse(browser, "<Button-1>", top + 5)
+    _mouse(browser, "<B1-Motion>", top + 205)
+    scrolled = tab.scroll
+    assert scrolled > 0, "the drag never got going"
+    # Off the bottom of the window and off its left edge, which is where a
+    # pointer ends up when someone flings the bar and lets go.
+    _mouse(browser, "<ButtonRelease-1>", 10 ** 6, x=-400)
+    _mouse(browser, "<B1-Motion>", top + 400)
+    assert tab.scroll == scrolled, \
+        "the page kept following the pointer after the button came up"
+
+
+def test_pressing_the_empty_track_centres_the_thumb_and_drags_on():
+    """The track is jump-to-here, and the jump hands straight over to a drag
+    so one gesture can start anywhere on the bar."""
+    browser, tab = _scrollable_browser()
+    track_top, track_h = _track(browser)
+    target = track_top + track_h - 40  # well below the thumb, on the track
+    _mouse(browser, "<Button-1>", target)
+    top, height = _thumb(browser)
+    assert abs((top + height / 2) - target) <= 1, \
+        "the thumb centred on %r, not on the press at %r" % (top + height / 2,
+                                                             target)
+    jumped = tab.scroll
+    _mouse(browser, "<B1-Motion>", target - 50)
+    assert tab.scroll < jumped, "the press did not hand over to a drag"
+    assert abs(_thumb(browser)[0] - (top - 50)) <= 1, \
+        "the drag did not continue from where the thumb landed"
+
+
+def test_a_page_that_fits_has_no_scrollbar_to_drag():
+    """Nothing to scroll, so a press in the gutter is the page's, and a drag
+    across it must not move anything or raise."""
+    from feetbrowser.browser import Browser
+
+    browser = Browser()
+    browser.new_tab("data:text/html,<p>short</p>")
+    browser.draw()
+    tab = browser.tabs[0]
+    assert tab.content_height() <= browser.tab_height(), "fixture too tall"
+    assert _thumb(browser)[0] is None, "a bar was drawn anyway"
+    _mouse(browser, "<Button-1>", browser.chrome_height() + 200)
+    _mouse(browser, "<B1-Motion>", browser.chrome_height() + 300)
+    _mouse(browser, "<ButtonRelease-1>", browser.chrome_height() + 300)
+    assert tab.scroll == 0, "a page that fits scrolled to %r" % tab.scroll
+
+
+# -- selecting page text ---------------------------------------------------
+#
+# Every test below drives the same path a mouse does -- a press, some drags,
+# a release, at pixel coordinates worked out from where the text actually
+# landed -- and asserts on the string the selection spells, because that
+# string is what a user gets when they press Ctrl+C. Asserting on the
+# internal ranges instead would pass just as happily with the offsets one
+# character out.
+
+
+def _selection_tab(html, height=600):
+    """A laid-out page in a Tab, with no browser and no window."""
+    from feetbrowser.browser import Tab
+    tab = Tab(height)
+    tab._build(None, html)
+    return tab
+
+
+def _runs(tab):
+    """The page's text runs by the word they drew, in document order."""
+    from feetbrowser.layout import DrawText
+    out = {}
+    for cmd in tab.display_list:
+        if isinstance(cmd, DrawText) and cmd.text:
+            out.setdefault(cmd.text, cmd)
+    return out
+
+
+def _x_of(run, offset):
+    """Pixel x of the boundary before character `offset` of `run`."""
+    from feetbrowser.layout import _measure
+    return run.left + _measure(run.font, run.text[:offset])
+
+
+def _drag(tab, start, end):
+    """Press at `start`, drag through and release at `end`; both (x, y)."""
+    tab.start_selection(*start)
+    tab.extend_selection(*end)
+    return tab.selected_text()
+
+
+def test_selection_hit_testing_uses_per_character_advances():
+    """A pixel maps to a character offset, in a proportional face.
+
+    "Illustration" in a serif face is the case that catches an implementation
+    assuming every character is the same width: an `l` is a fraction of an
+    `I`, so dividing the run's width by its length puts every offset past the
+    first one in the wrong place.
+    """
+    tab = _selection_tab("<p>Illustration</p>")
+    run = _runs(tab)["Illustration"]
+    index = tab.selection_index()
+    widths = [_x_of(run, i + 1) - _x_of(run, i) for i in range(len(run.text))]
+    assert max(widths) - min(widths) > 1.0, \
+        "this face is monospaced, so the test proves nothing"
+    for offset in range(len(run.text) + 1):
+        # Aim a hair to the right of the boundary, as a pointer would.
+        hit_run, hit = index.hit(_x_of(run, offset) + 0.4, run.top + 2)
+        assert (hit_run.text, hit) == (run.text, offset), \
+            f"x of offset {offset} resolved to {hit}"
+
+
+def test_selection_click_past_the_end_of_a_line_lands_at_the_line_end():
+    """Dragging out into the margin selects to the end of the line, which is
+    where the pointer is pointing -- not nothing, which is what a hit test
+    requiring the point to be inside a glyph returns."""
+    tab = _selection_tab("<p>Alpha beta gamma</p><p>Delta</p>")
+    runs = _runs(tab)
+    alpha, gamma = runs["Alpha"], runs["gamma"]
+    assert _drag(tab, (alpha.left, alpha.top + 2),
+                 (gamma.right + 400, gamma.top + 2)) == "Alpha beta gamma"
+    # And to the left of the first word, which is the same question mirrored.
+    assert _drag(tab, (gamma.right, gamma.top + 2),
+                 (alpha.left - 40, alpha.top + 2)) == "Alpha beta gamma"
+
+
+def test_selection_spans_three_paragraphs_in_both_directions():
+    """The case a pixel-pair model gets wrong: the selection covers whole
+    lines in the middle, partial runs at each end, and reads the same however
+    the drag ran."""
+    tab = _selection_tab("<p>Alpha beta gamma</p>"
+                         "<p>Delta epsilon</p>"
+                         "<p>Zeta eta theta</p>")
+    runs = _runs(tab)
+    start = (_x_of(runs["beta"], 2), runs["beta"].top + 2)
+    end = (_x_of(runs["eta"], 1), runs["eta"].top + 2)
+    forwards = _drag(tab, start, end)
+    assert forwards == "ta gamma\nDelta epsilon\nZeta e", repr(forwards)
+    backwards = _drag(tab, end, start)
+    assert backwards == forwards, repr(backwards)
+
+
+def test_selection_of_a_partial_run_paints_only_the_selected_characters():
+    """A run the selection stops inside must be split, in the ranges the
+    painter uses as well as in the text that gets copied."""
+    tab = _selection_tab("<p>Alpha beta gamma</p>")
+    runs = _runs(tab)
+    beta = runs["beta"]
+    text = _drag(tab, (_x_of(beta, 1), beta.top + 2),
+                 (_x_of(beta, 3), beta.top + 2))
+    assert text == "et", repr(text)
+    spans = tab._selection_spans()
+    assert len(spans) == 1, spans
+    run, s, e = spans[0]
+    assert (run.text, s, e) == ("beta", 1, 3)
+    assert abs(run.x_at(s) - _x_of(beta, 1)) < 0.01
+    assert run.x_at(e) < beta.right, "a partial run must not paint to its end"
+
+
+def test_double_click_selects_a_word_and_triple_click_the_line():
+    """The convention on both platforms we run on: two clicks take the word
+    under the pointer, three take the whole laid-out line."""
+    tab = _selection_tab("<p>Alpha beta-gamma, delta.</p>")
+    runs = _runs(tab)
+    run = runs["beta-gamma,"]
+    # Inside "gamma", which is a word bounded by a hyphen and a comma.
+    tab.start_selection(_x_of(run, 7), run.top + 2, "word")
+    assert tab.selected_text() == "gamma", repr(tab.selected_text())
+    # Inside "beta".
+    tab.start_selection(_x_of(run, 2), run.top + 2, "word")
+    assert tab.selected_text() == "beta", repr(tab.selected_text())
+    # On the punctuation between them: browsers take the punctuation run.
+    tab.start_selection(_x_of(run, 4) + 0.5, run.top + 2, "word")
+    assert tab.selected_text() == "-", repr(tab.selected_text())
+    tab.start_selection(_x_of(run, 2), run.top + 2, "line")
+    assert tab.selected_text() == "Alpha beta-gamma, delta."
+
+
+def test_double_click_then_drag_keeps_extending_by_whole_words():
+    tab = _selection_tab("<p>Alpha beta gamma delta</p>")
+    runs = _runs(tab)
+    tab.start_selection(_x_of(runs["beta"], 2), runs["beta"].top + 2, "word")
+    tab.extend_selection(_x_of(runs["gamma"], 2), runs["gamma"].top + 2)
+    assert tab.selected_text() == "beta gamma", repr(tab.selected_text())
+    # Dragging back past where it started keeps the word it started on.
+    tab.extend_selection(_x_of(runs["Alpha"], 2), runs["Alpha"].top + 2)
+    assert tab.selected_text() == "Alpha beta", repr(tab.selected_text())
+
+
+def test_selection_stays_on_its_words_when_the_page_scrolls():
+    """The highlight is attached to the text, not to the screen.
+
+    repaint() rebuilds the display list on every scroll tick, so a selection
+    remembering paint commands or y coordinates is pointing at nothing one
+    wheel click later. The positions are node offsets, so they survive -- and
+    a press after the scroll has to be read in the same coordinates.
+    """
+    tab = _selection_tab("".join("<p>Para %d alpha beta gamma</p>" % i
+                                 for i in range(60)))
+    runs = _runs(tab)
+    before = _drag(tab, (runs["alpha"].left, runs["alpha"].top + 2),
+                   (runs["gamma"].right, runs["gamma"].top + 2))
+    assert before == "alpha beta gamma"
+    top_before = tab._selection_spans()[0][0].top
+    tab.set_scroll(300)
+    tab.repaint()
+    assert tab.scroll == 300, "the page has to be scrollable for this to test"
+    assert tab.selected_text() == before, "the selection moved off its words"
+    assert tab._selection_spans()[0][0].top == top_before, \
+        "the highlight is in document space, so its y must not move"
+    # A fresh press is given viewport coordinates and must land on the word
+    # actually under the pointer.
+    from feetbrowser.layout import DrawText
+    visible = next(c for c in tab.display_list
+                   if isinstance(c, DrawText) and c.text
+                   and c.top > tab.scroll + 40)
+    text = _drag(tab, (visible.left, visible.top - tab.scroll + 2),
+                 (visible.right, visible.top - tab.scroll + 2))
+    assert text == visible.text, repr(text)
+
+
+def test_selection_survives_a_rewrap_but_not_a_new_document():
+    """A relayout that only moved the words keeps the highlight on them; one
+    that replaced them drops it, rather than leaving a highlight sitting over
+    whatever moved into those pixels."""
+    tab = _selection_tab("<p>Alpha beta gamma delta epsilon zeta</p>")
+    runs = _runs(tab)
+    before = _drag(tab, (runs["beta"].left, runs["beta"].top + 2),
+                   (runs["delta"].right, runs["delta"].top + 2))
+    assert before == "beta gamma delta"
+    tab.document.width = 120        # force the paragraph to rewrap narrower
+    tab.render()
+    assert tab.selected_text() == before, "a rewrap must not move the selection"
+    tab._build(None, "<p>Something else entirely</p>")
+    assert tab.selection is None, "a new document must drop the selection"
+    assert tab.selected_text() == ""
+
+
+def test_selection_ignores_text_a_stacking_context_lifted():
+    """Document order comes from the DOM, not from paint order: a z-index
+    lifts a paragraph's paint above its neighbours without moving its text in
+    the document, and a selection ordered by the display list would copy the
+    paragraphs back to front."""
+    tab = _selection_tab(
+        "<p>First one</p><p style='position:relative;z-index:5'>Second one"
+        "</p><p>Third one</p>")
+    runs = _runs(tab)
+    lifted = [c.text for c in tab.display_list
+              if getattr(c, "text", None) == "Second"]
+    assert lifted, "the middle paragraph still has to be painted"
+    text = _drag(tab, (runs["First"].left, runs["First"].top + 2),
+                 (runs["Third"].right, runs["Third"].top + 2))
+    assert text == "First one\nSecond one\nThird", repr(text)
+
+
+def _selection_browser(html, tmpdir):
+    """A real Browser on a real canvas, showing `html` from a file."""
+    from feetbrowser.browser import Browser
+    path = os.path.join(tmpdir, "page.html")
+    with open(path, "w") as handle:
+        handle.write(html)
+    browser = Browser()
+    browser.new_tab("file://" + path)
+    browser.draw()
+    return browser
+
+
+def test_selection_paints_a_themed_highlight_with_legible_text():
+    """Press, drag and release through the browser's own handlers, then look
+    at the pixels: the highlight is the shoe's accent, it lies where the
+    selected characters are and nowhere else, and there is contrasting text
+    on top of it rather than a solid slab."""
+    import shutil
+    import tempfile
+    from feetbrowser.canvas import color
+    from feetbrowser.window import Event
+
+    work = tempfile.mkdtemp(prefix="fb-selection-")
+    try:
+        browser = _selection_browser(
+            "<!doctype html><body style='font-size:20px'>"
+            "<p>Alpha beta gamma delta</p><p>Second paragraph</p>", work)
+        tab = browser.tabs[0]
+        accent = color(browser.c("accent"))
+        assert _count_pixels(browser.canvas.render(), accent) == 0, \
+            "nothing should be accent-coloured before anything is selected"
+        runs = _runs(tab)
+        alpha, gamma = runs["Alpha"], runs["gamma"]
+        chrome = browser.chrome_height()
+        browser._on_click(Event(x=alpha.left, y=alpha.top + chrome + 2))
+        browser._on_drag(Event(x=gamma.right, y=gamma.top + chrome + 2))
+        browser._on_release(Event(x=gamma.right, y=gamma.top + chrome + 2))
+        assert tab.selected_text() == "Alpha beta gamma"
+
+        surface = browser.canvas.render()
+        painted = _count_pixels(surface, accent)
+        assert painted > 500, f"no highlight painted ({painted} px)"
+        # All of it inside the band the selected characters occupy, so a
+        # partially selected line is not filled to the window edge.
+        x0, x1 = int(alpha.left), int(gamma.right) + 1
+        y0, y1 = int(alpha.top + chrome), int(alpha.bottom + chrome) + 1
+        inside = sum(1 for y in range(y0, y1) for x in range(x0, x1)
+                     if _pixel(surface, x, y) == accent)
+        assert inside == painted, \
+            f"{painted - inside} highlight pixels outside the selection"
+        ink = color(tab.selection_colors()[1])
+        legible = sum(1 for y in range(y0, y1) for x in range(x0, x1)
+                      if _pixel(surface, x, y) == ink)
+        assert legible > 100, \
+            f"the highlighted text is not being drawn on top ({legible} px)"
+        # "delta" is not selected, so its glyphs stay the page's own colour.
+        delta = runs["delta"]
+        assert _pixel(surface, int(delta.left + 2),
+                      int(delta.top + chrome + 10)) != accent
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def test_a_plain_click_clears_the_selection_and_copy_puts_it_on_the_clipboard():
+    import shutil
+    import tempfile
+    from feetbrowser.window import Event
+
+    work = tempfile.mkdtemp(prefix="fb-selection-")
+    try:
+        browser = _selection_browser(
+            "<!doctype html><p>Alpha beta gamma delta</p>", work)
+        tab = browser.tabs[0]
+        runs = _runs(tab)
+        alpha, gamma = runs["Alpha"], runs["gamma"]
+        chrome = browser.chrome_height()
+        browser._on_click(Event(x=alpha.left, y=alpha.top + chrome + 2))
+        browser._on_drag(Event(x=gamma.right, y=gamma.top + chrome + 2))
+        browser._on_release(Event(x=gamma.right, y=gamma.top + chrome + 2))
+        browser._copy_selection()
+        assert browser.window.clipboard_get() == "Alpha beta gamma"
+        assert any(item and item[0] == "Copy" for item
+                   in browser._context_items(alpha.left, alpha.top + chrome)), \
+            "a selection should offer Copy in the context menu"
+        # A press and release with no drag in between, somewhere else on the
+        # page, is a plain click.
+        delta = runs["delta"]
+        browser._on_click(Event(x=delta.right, y=delta.top + chrome + 2))
+        browser._on_release(Event(x=delta.right, y=delta.top + chrome + 2))
+        assert tab.selection is None
+        assert tab.selected_text() == ""
+        surface = browser.canvas.render()
+        from feetbrowser.canvas import color
+        assert _count_pixels(surface, color(browser.c("accent"))) == 0, \
+            "the highlight outlived the selection"
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def test_a_press_in_the_scrollbar_gutter_starts_no_selection():
+    """The strip the scrollbar lives in belongs to the bar, not to the text.
+
+    Hit testing resolves any point to the nearest line, so without this a
+    grab at the scrollbar -- and the drag down that follows it -- selects
+    whatever text happens to end nearest the right-hand edge instead of
+    scrolling.
+    """
+    import shutil
+    import tempfile
+    from feetbrowser.window import Event
+
+    work = tempfile.mkdtemp(prefix="fb-selection-")
+    try:
+        browser = _selection_browser(
+            "<!doctype html>" + "".join("<p>Para %d alpha beta</p>" % i
+                                        for i in range(80)), work)
+        tab = browser.tabs[0]
+        assert tab.content_height() > browser.tab_height(), \
+            "the page has to overflow for there to be a scrollbar"
+        chrome = browser.chrome_height()
+        x = browser.canvas.winfo_width() - 5
+        browser._on_click(Event(x=x, y=chrome + 100))
+        assert tab.selection is None, "a scrollbar press anchored a selection"
+        browser._on_drag(Event(x=x, y=chrome + 400))
+        assert tab.selected_text() == "", \
+            "dragging the scrollbar selected page text"
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+# -- video: containers and codecs ------------------------------------------
+#
+# Everything below reads bytes this file wrote, so an assertion about a pixel
+# is an assertion about a decoder and not about a fixture nobody can open.
+# The scheduling tests all drive a ManualClock, so what they measure is the
+# scheduler and not how busy the machine was when they ran.
+
+def _clip(count=10, width=8, height=6, fps=10.0, top_down=False):
+    """An uncompressed AVI whose frame `i` is the flat colour (i, 0, 0)
+    everywhere except pixel (1, 2), which is (0, 200, i). The frame index is
+    written into the pixels, so "which frame is on screen" is a question the
+    screen itself answers."""
+    def painter(i):
+        def pixel(x, y):
+            return (0, 200, i) if (x, y) == (1, 2) else (i, 0, 0)
+        return pixel
+    frames = [media_fixtures.rgb24_frame(width, height, painter(i), top_down)
+              for i in range(count)]
+    return media_fixtures.avi(frames, width, height, fps=fps,
+                              top_down=top_down)
+
+
+def _rgba_at(frame, x, y):
+    offset = (y * frame.width + x) * 4
+    return tuple(frame.rgba[offset:offset + 4])
+
+
+def test_avi_header_reports_geometry_rate_and_frame_count():
+    track = mediacodec.open_video(_clip(count=7, width=12, height=5, fps=20.0))
+    assert track.container == "AVI"
+    assert track.codec_name == "BI_RGB"
+    assert (track.width, track.height) == (12, 5)
+    assert track.frame_count == 7
+    assert abs(track.frame_rate - 20.0) < 1e-9
+    assert abs(track.duration - 0.35) < 1e-9
+    assert track.info.supported
+
+
+def test_avi_rgb24_frames_decode_to_the_exact_pixels_written():
+    track = mediacodec.open_video(_clip(count=4))
+    for index in range(4):
+        frame = track.frame(index)
+        assert frame.index == index
+        assert (frame.width, frame.height) == (8, 6)
+        assert len(frame.rgba) == 8 * 6 * 4
+        assert _rgba_at(frame, 0, 0) == (index, 0, 0, 255)
+        assert _rgba_at(frame, 1, 2) == (0, 200, index, 255)
+        # Every codec in this module writes opaque alpha; the player relies
+        # on it to take the surface's row-copy blit.
+        assert frame.rgba[3::4].count(255) == 8 * 6
+
+
+def test_avi_rows_come_out_the_same_way_up_whichever_way_they_went_in():
+    """A DIB is bottom-up unless biHeight is negative. Getting this wrong
+    produces a picture that is upside down but otherwise perfect, which is
+    exactly the bug that survives a "does it look like video" check."""
+    up = mediacodec.open_video(_clip(count=2, top_down=False)).frame(1)
+    down = mediacodec.open_video(_clip(count=2, top_down=True)).frame(1)
+    assert _rgba_at(up, 1, 2) == (0, 200, 1, 255)
+    assert _rgba_at(down, 1, 2) == (0, 200, 1, 255)
+    assert bytes(up.rgba) == bytes(down.rgba)
+
+
+def test_avi_decodes_32_bit_and_8_bit_palettised_frames():
+    def pixel(x, y):
+        return (10 + x, 20 + y, 30)
+    raw32 = media_fixtures.avi([media_fixtures.rgb32_frame(4, 3, pixel)],
+                               4, 3, bit_count=32)
+    frame = mediacodec.open_video(raw32).frame(0)
+    assert _rgba_at(frame, 3, 2) == (13, 22, 30, 255)
+
+    palette = media_fixtures.grey_palette()
+    raw8 = media_fixtures.avi(
+        [media_fixtures.pal8_frame(4, 3, lambda x, y: x + y * 4)],
+        4, 3, bit_count=8, palette=palette)
+    frame = mediacodec.open_video(raw8).frame(0)
+    assert _rgba_at(frame, 2, 1) == (6, 6, 6, 255)
+    assert _rgba_at(frame, 0, 0) == (0, 0, 0, 255)
+
+
+def test_avi_frame_times_follow_the_declared_rate():
+    track = mediacodec.open_video(_clip(count=5, fps=8.0))
+    times = [track.frame(i).pts for i in range(5)]
+    assert times == [0.0, 0.125, 0.25, 0.375, 0.5]
+    assert all(abs(track.frame(i).duration - 0.125) < 1e-9 for i in range(5))
+    # dwRate/dwScale is exact; dwMicroSecPerFrame is rounded to whole
+    # microseconds and must not be the one we believe.
+    assert abs(track.frame_rate - 8.0) < 1e-9
+
+
+def test_rle8_keyframes_decode_and_delta_frames_composite_on_the_last():
+    """The inter-frame case, and the reason decoding is stateful: frames 1
+    and 2 carry only the pixels that changed."""
+    palette = media_fixtures.grey_palette()
+    key = media_fixtures.rle8_keyframe(4, 3, lambda x, y: 5)
+    # Bottom-up: opcode row 0 is image row 2, so (delta 1,1) lands on image
+    # row 1 at x=1, where two pixels become index 99.
+    delta = media_fixtures.rle8_delta([("delta", 1, 1), ("run", 2, 99),
+                                       ("eob",)])
+    data = media_fixtures.avi([key, delta], 4, 3, bit_count=8, compression=1,
+                              palette=palette, handler="MRLE",
+                              keyframes=[1, 0])
+    track = mediacodec.open_video(data)
+    assert track.codec_name == "BI_RLE8"
+    assert [track.is_keyframe(i) for i in range(2)] == [True, False]
+
+    first = track.frame(0)
+    assert all(_rgba_at(first, x, y) == (5, 5, 5, 255)
+               for x in range(4) for y in range(3))
+    second = track.frame(1)
+    assert [_rgba_at(second, x, 1)[0] for x in range(4)] == [5, 99, 99, 5]
+    # Untouched rows kept the previous picture, which is the whole point.
+    assert [_rgba_at(second, x, 0)[0] for x in range(4)] == [5, 5, 5, 5]
+
+
+def test_seeking_an_inter_frame_stream_replays_from_the_keyframe():
+    palette = media_fixtures.grey_palette()
+    key = media_fixtures.rle8_keyframe(4, 3, lambda x, y: 5)
+    delta = media_fixtures.rle8_delta([("delta", 1, 1), ("run", 2, 99),
+                                       ("eob",)])
+    grow = media_fixtures.rle8_delta([("delta", 0, 1), ("run", 4, 77),
+                                      ("eob",)])
+    data = media_fixtures.avi([key, delta, grow], 4, 3, bit_count=8,
+                              compression=1, palette=palette,
+                              handler="MRLE", keyframes=[1, 0, 0])
+    track = mediacodec.open_video(data)
+    forwards = [bytes(track.frame(i).rgba) for i in range(3)]
+    assert track.keyframe_before(2) == 0
+    # Jump backwards: the decoder must rewind to frame 0 and replay, not hand
+    # back whatever plane it happened to be holding.
+    assert bytes(track.frame(1).rgba) == forwards[1]
+    assert bytes(track.frame(2).rgba) == forwards[2]
+    track.reset()
+    assert bytes(track.frame(2).rgba) == forwards[2]
+
+
+def test_truncated_avi_files_fail_cleanly_instead_of_hanging():
+    """A media parser fed half a file is the classic place a browser hangs.
+    Every prefix of a real AVI must come back as a MediaError or a working
+    track -- never an IndexError, never a struct error, never a wait."""
+    good = _clip(count=4)
+    deadline = time.monotonic() + 20.0
+    for cut in range(0, len(good), 7):
+        chopped = good[:cut]
+        try:
+            track = mediacodec.open_video(chopped)
+        except mediacodec.MediaError:
+            pass
+        else:
+            for index in range(track.frame_count):
+                try:
+                    track.frame(index)
+                except mediacodec.MediaError:
+                    break
+        assert time.monotonic() < deadline, "truncated AVI took too long"
+
+
+def test_hostile_chunk_sizes_terminate_the_walk():
+    """Sizes that point at themselves, at zero, or past the end of the file.
+    Each one is a loop that does not advance if the walker trusts it."""
+    good = _clip(count=2)
+    at = good.index(b"LIST")
+    for size in (0xFFFFFFFF, 0, 4, 8):
+        broken = bytearray(good)
+        broken[at + 4:at + 8] = struct.pack("<I", size)
+        start = time.monotonic()
+        try:
+            mediacodec.open_video(bytes(broken))
+        except mediacodec.MediaError:
+            pass
+        assert time.monotonic() - start < 5.0, \
+            "a LIST size of %d took too long" % size
+
+    # A RIFF header that claims the file is enormous.
+    broken = bytearray(good)
+    broken[4:8] = struct.pack("<I", 0xFFFFFFFF)
+    try:
+        mediacodec.open_video(bytes(broken))
+    except mediacodec.MediaError:
+        pass
+
+
+def test_rle8_opcodes_that_leave_the_frame_are_rejected():
+    palette = media_fixtures.grey_palette()
+    key = media_fixtures.rle8_keyframe(4, 3, lambda x, y: 1)
+    for ops in (
+            [("run", 200, 9), ("eob",)],                 # run past the row
+            [("delta", 0, 60), ("run", 1, 9), ("eob",)],  # delta off the end
+            [("literal", list(range(40))), ("eob",)],     # literals past it
+    ):
+        data = media_fixtures.avi([key, media_fixtures.rle8_delta(ops)],
+                                  4, 3, bit_count=8, compression=1,
+                                  palette=palette, handler="MRLE",
+                                  keyframes=[1, 0])
+        track = mediacodec.open_video(data)
+        assert track.frame(0) is not None
+        try:
+            track.frame(1)
+        except mediacodec.MediaError:
+            continue
+        raise AssertionError("bad RLE8 opcodes %r were accepted" % (ops,))
+
+
+def test_an_rle8_stream_that_never_ends_is_stopped():
+    """No end-of-bitmap and no advance: the decoder has to give up on its
+    own rather than run until the process is killed."""
+    palette = media_fixtures.grey_palette()
+    key = media_fixtures.rle8_keyframe(2, 2, lambda x, y: 1)
+    endless = b"\x00\x02\x00\x00" * 200000        # delta of (0, 0), for ever
+    data = media_fixtures.avi([key, endless], 2, 2, bit_count=8,
+                              compression=1, palette=palette,
+                              handler="MRLE", keyframes=[1, 0])
+    track = mediacodec.open_video(data)
+    start = time.monotonic()
+    try:
+        track.frame(1)
+    except mediacodec.MediaError:
+        pass
+    assert time.monotonic() - start < 10.0
+
+
+def test_probe_reports_mp4_and_webm_without_pretending_to_decode_them():
+    info = mediacodec.probe(media_fixtures.mp4(1280, 720, 4.5))
+    assert info.container == "MP4"
+    assert (info.width, info.height) == (1280, 720)
+    assert abs(info.duration - 4.5) < 0.01
+    assert info.codec == "avc1"
+    assert not info.supported and "H.264" in info.reason
+
+    info = mediacodec.probe(media_fixtures.webm(640, 360, 2.5))
+    assert info.container == "WebM"
+    assert (info.width, info.height) == (640, 360)
+    assert abs(info.duration - 2.5) < 0.01
+    assert info.codec == "V_VP9"
+    assert not info.supported
+
+    for payload in (b"", b"not a video at all", b"RIFF\x04\x00\x00\x00WAVE"):
+        try:
+            mediacodec.probe(payload)
+        except mediacodec.MediaError:
+            continue
+        raise AssertionError("probe accepted %r" % payload)
+
+
+def test_an_avi_carrying_a_codec_we_lack_names_it_rather_than_guessing():
+    """MJPEG demuxes perfectly and decodes not at all. The file's geometry
+    and frame count are still real, which is what lets the element reserve
+    the right box and say something true."""
+    data = media_fixtures.avi([b"\xff\xd8\xff\xe0stub"] * 3, 320, 240,
+                              bit_count=24,
+                              compression=int.from_bytes(b"MJPG", "little"),
+                              handler="MJPG")
+    info = mediacodec.probe(data)
+    assert info.codec == "MJPG"
+    assert (info.width, info.height) == (320, 240)
+    assert info.frame_count == 3
+    assert not info.supported
+    assert "JPEG" in info.reason
+    try:
+        mediacodec.open_video(data)
+    except mediacodec.MediaError as exc:
+        assert "JPEG" in str(exc)
+    else:
+        raise AssertionError("open_video decoded MJPEG")
+
+
+# -- video: scheduling against a clock we control ---------------------------
+
+def test_frames_are_presented_against_the_clock_not_counted_off():
+    clock = media.ManualClock()
+    player = media.VideoPlayer(data=_clip(count=20, fps=10.0), clock=clock,
+                               threaded=False, decode_budget=8)
+    assert player.info.supported
+    player.play()
+    shown = []
+    for step in range(20):
+        clock.set(step * 0.1)
+        if player.tick():
+            shown.append(player.scheduler.current.index)
+    assert shown == list(range(20))
+    assert player.stats()["dropped"] == 0
+    assert abs(player.position() - 1.9) < 1e-9
+
+
+def test_a_slow_decoder_drops_frames_instead_of_drifting():
+    """The load-bearing test. The decoder is given one frame of budget per
+    tick while the clock moves four frames per tick, so it cannot keep up by
+    construction. What must not happen is playback sliding further and
+    further behind: the lag has to stay bounded and the position has to stay
+    exactly on the clock."""
+    clock = media.ManualClock()
+    player = media.VideoPlayer(data=_clip(count=200, fps=10.0), clock=clock,
+                               threaded=False, decode_budget=1)
+    player.play()
+    lags = []
+    for step in range(1, 41):
+        clock.set(step * 0.4)
+        player.tick()
+        current = player.scheduler.current
+        assert current is not None
+        lags.append(player.scheduler.due_index() - current.index)
+    assert abs(player.position() - 16.0) < 1e-9, "the clock is the position"
+    assert max(lags) <= 4 * media.RESYNC_FRAMES, \
+        "playback drifted: lag grew to %d frames" % max(lags)
+    assert lags[-1] <= max(lags), "lag is bounded, not monotonic"
+    stats = player.stats()
+    assert stats["dropped"] > 50, stats
+    assert stats["resyncs"] > 0, stats
+    # And it really did skip: far fewer frames were decoded than were due.
+    assert stats["decoded"] < 60, stats
+
+
+def test_pause_freezes_the_position_and_resume_carries_on_from_it():
+    clock = media.ManualClock()
+    player = media.VideoPlayer(data=_clip(count=40, fps=10.0), clock=clock,
+                               threaded=False)
+    player.play()
+    clock.set(1.0)
+    player.tick()
+    player.pause()
+    assert abs(player.position() - 1.0) < 1e-9
+    clock.set(9.0)                      # eight seconds pass with it paused
+    assert abs(player.position() - 1.0) < 1e-9
+    assert player.tick() is False
+    player.play()
+    clock.set(9.5)
+    assert abs(player.position() - 1.5) < 1e-9
+
+
+def test_seek_moves_the_playhead_and_the_decoder_with_it():
+    clock = media.ManualClock()
+    player = media.VideoPlayer(data=_clip(count=40, fps=10.0), clock=clock,
+                               threaded=False, decode_budget=4)
+    player.play()
+    player.seek(2.0)
+    assert abs(player.position() - 2.0) < 1e-9
+    # seek() re-bases the clock, so the position is 2.0 plus whatever has
+    # elapsed *since the seek* -- not 2.0 plus the whole session.
+    clock.set(0.05)
+    assert abs(player.position() - 2.05) < 1e-9
+    assert player.tick()
+    assert player.scheduler.current.index == 20
+    player.seek(-5.0)
+    assert player.position() == 0.0
+    player.seek(1e6)
+    assert abs(player.position() - player.scheduler.duration) < 1e-9
+
+
+def test_playback_stops_at_the_end_and_loops_when_asked():
+    clock = media.ManualClock()
+    player = media.VideoPlayer(data=_clip(count=10, fps=10.0), clock=clock,
+                               threaded=False, decode_budget=4)
+    player.play()
+    clock.set(1.5)                      # past the 1.0s end
+    player.tick()
+    assert not player.playing and player.ended
+
+    clock = media.ManualClock()
+    looping = media.VideoPlayer(data=_clip(count=10, fps=10.0), clock=clock,
+                                threaded=False, decode_budget=4, loop=True)
+    looping.play()
+    clock.set(1.5)
+    looping.tick()
+    assert looping.playing and not looping.ended
+    assert looping.position() < 1.0
+
+
+def test_the_player_scales_frames_to_the_size_the_layout_asked_for():
+    player = media.VideoPlayer(data=_clip(count=3, width=8, height=6),
+                               clock=media.ManualClock(), threaded=False)
+    player.first_frame()
+    assert (player.photo.width(), player.photo.height()) == (8, 6)
+    assert player.set_display_size(16, 12)
+    assert (player.photo.width(), player.photo.height()) == (16, 12)
+    assert len(player.photo.rgba) == 16 * 12 * 4
+    # Nearest neighbour: the flat background survives the scale exactly.
+    assert tuple(player.photo.rgba[0:4]) == (0, 0, 0, 255)
+    assert not player.set_display_size(16, 12), "no-op resize rebuilt buffer"
+
+
+def test_a_file_we_cannot_decode_still_makes_a_usable_player():
+    player = media.VideoPlayer(data=media_fixtures.mp4(1920, 1080, 3.0))
+    assert player.track is None
+    assert (player.width, player.height) == (1920, 1080)
+    assert "H.264" in player.error
+    assert player.play() is False and not player.playing
+    assert player.tick() is False
+    assert "1920x1080" in player.status()
+
+
+def test_the_decode_worker_runs_off_the_ticking_thread():
+    """Threaded mode: `tick()` must never be the thing that decodes. The
+    proof is that frames appear in the queue while the caller is doing
+    nothing at all."""
+    player = media.VideoPlayer(data=_clip(count=60, fps=25.0))
+    try:
+        player.play()
+        deadline = time.monotonic() + 3.0
+        while player.decoded < media.QUEUE_DEPTH \
+                and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert player.decoded >= media.QUEUE_DEPTH, \
+            "the worker decoded nothing without a tick"
+        started = time.monotonic()
+        for _ in range(50):
+            player.tick()
+        assert time.monotonic() - started < 0.5, "tick() blocked"
+    finally:
+        player.close()
+    assert player._thread is None
+
+
+# -- video: the element on the page ----------------------------------------
+
+def _video_page(directory, markup, clip=None):
+    """Write a page and the AVI it points at, and return the file:// URL."""
+    with open(os.path.join(directory, "clip.avi"), "wb") as handle:
+        handle.write(clip if clip is not None else _clip(count=10, width=16,
+                                                         height=12))
+    with open(os.path.join(directory, "far.mp4"), "wb") as handle:
+        handle.write(media_fixtures.mp4(320, 180, 3.0))
+    page = os.path.join(directory, "video.html")
+    with open(page, "w", encoding="utf8") as handle:
+        handle.write("<html><body>%s</body></html>" % markup)
+    return "file://" + page
+
+
+def test_a_video_element_lays_out_and_paints_decoded_frames():
+    from feetbrowser.browser import Browser
+    from feetbrowser.layout import DrawVideo
+    work = tempfile.mkdtemp()
+    try:
+        url = _video_page(work, "<p>before</p><video src='clip.avi'></video>"
+                                "<p>after</p>")
+        browser = Browser()
+        browser.new_tab(url)
+        browser.settle(20.0)
+        tab = browser.active_tab
+        assert len(tab.video_players) == 1
+        player = tab.video_players[0]
+        assert player.track is not None
+        assert (player.width, player.height) == (16, 12)
+
+        drawn = [c for c in tab.display_list if isinstance(c, DrawVideo)]
+        assert len(drawn) == 1, tab.display_list
+        box = drawn[0]
+        assert (box.right - box.left, box.bottom - box.top) == (16, 12)
+
+        # Frame zero is on screen before anyone pressed play.
+        browser.draw()
+        surface = browser.canvas.render()
+        top = browser.chrome_height()
+        assert _pixel(surface, int(box.left) + 2,
+                      int(box.top) + 2 + top) == (0, 0, 0)
+        assert _pixel(surface, int(box.left) + 1,
+                      int(box.top) + 2 + top) == (0, 200, 0)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def test_clicking_a_video_plays_it_and_the_picture_changes():
+    from feetbrowser.browser import Browser
+    from feetbrowser.layout import DrawVideo
+    work = tempfile.mkdtemp()
+    try:
+        url = _video_page(work, "<video src='clip.avi'></video>")
+        browser = Browser()
+        browser.new_tab(url)
+        browser.settle(20.0)
+        tab = browser.active_tab
+        player = tab.video_players[0]
+        box = [c for c in tab.display_list if isinstance(c, DrawVideo)][0]
+
+        assert tab.click(int(box.left) + 3, int(box.top) + 3) is None
+        assert player.playing
+
+        # Drive the browser's own frame timer, not the player directly.
+        deadline = time.monotonic() + 3.0
+        while player.scheduler.presented < 3 and time.monotonic() < deadline:
+            browser.window.flush_timers()
+            time.sleep(0.005)
+        assert player.scheduler.presented >= 3, player.stats()
+        assert player.scheduler.current.index >= 1
+
+        browser.draw()
+        surface = browser.canvas.render()
+        top = browser.chrome_height()
+        shown = _pixel(surface, int(box.left) + 2, int(box.top) + 2 + top)
+        assert shown == (player.scheduler.current.index, 0, 0), shown
+
+        tab.click(int(box.left) + 3, int(box.top) + 3)
+        assert not player.playing
+        where = player.position()
+        time.sleep(0.05)
+        assert player.position() == where
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def test_two_video_tags_on_one_file_are_two_independent_playheads():
+    from feetbrowser.browser import Browser
+    work = tempfile.mkdtemp()
+    try:
+        url = _video_page(work, "<video src='clip.avi'></video>"
+                                "<video width='32' height='24' "
+                                "src='clip.avi'></video>")
+        browser = Browser()
+        browser.new_tab(url)
+        browser.settle(20.0)
+        tab = browser.active_tab
+        assert len(tab.video_players) == 2
+        first, second = tab.video_players
+        assert first is not second
+        assert (first.photo.width(), first.photo.height()) == (16, 12)
+        assert (second.photo.width(), second.photo.height()) == (32, 24)
+        first.play()
+        assert first.playing and not second.playing
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def test_a_video_we_cannot_play_reserves_its_real_size_and_says_why():
+    from feetbrowser.browser import Browser
+    from feetbrowser.layout import DrawVideo
+    work = tempfile.mkdtemp()
+    try:
+        url = _video_page(
+            work, "<video><source src='far.mp4' type='video/mp4'></video>")
+        browser = Browser()
+        browser.new_tab(url)
+        browser.settle(20.0)
+        tab = browser.active_tab
+        assert len(tab.video_players) == 1
+        player = tab.video_players[0]
+        assert player.track is None and "H.264" in player.error
+        assert not [c for c in tab.display_list if isinstance(c, DrawVideo)]
+        # The box is the size the *container* declared, not a 300x150 guess.
+        boxes = [c for c in tab.display_list
+                 if getattr(c, "color", "") == "#1a1a1a"]
+        assert boxes, tab.display_list
+        assert (boxes[0].right - boxes[0].left,
+                boxes[0].bottom - boxes[0].top) == (320, 180)
+        labels = [c.text for c in tab.display_list
+                  if hasattr(c, "text") and "video" in str(c.text)]
+        assert labels and "H.264" in labels[0], labels
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def test_navigating_away_stops_the_decode_threads():
+    from feetbrowser.browser import Browser
+    work = tempfile.mkdtemp()
+    try:
+        url = _video_page(work, "<video src='clip.avi'></video>")
+        plain = os.path.join(work, "plain.html")
+        with open(plain, "w", encoding="utf8") as handle:
+            handle.write("<p>nothing here</p>")
+        browser = Browser()
+        browser.new_tab(url)
+        browser.settle(20.0)
+        tab = browser.active_tab
+        player = tab.video_players[0]
+        player.play()
+        tab.load(URL("file://" + plain))
+        browser.settle(20.0)
+        assert tab.video_players == []
+        assert player._thread is None
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
 
 
 def main():

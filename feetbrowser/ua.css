@@ -55,6 +55,11 @@ hr       { margin-top: 8px; margin-bottom: 8px; }
 
 title, head, style, script, meta, link { display: none; }
 
+/* <source> and <track> configure their parent <video>; they are not content.
+   Without this they would spill into the flow as empty inline boxes, which
+   is exactly the "video does not play *and* the layout is wrong" failure. */
+source, track { display: none; }
+
 /* The HTML `hidden` attribute is a presentation hint every browser wires up
    in its default sheet, and pages lean on it to keep menus and dialogs out
    of the way until something opens them. */

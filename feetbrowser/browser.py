@@ -5,8 +5,8 @@ Pipeline per navigation:
     -> DocumentLayout -> display list -> paint on a canvas.
 
 Chrome (tabs, address bar, back/forward, scrollbar) is drawn by hand onto the
-same canvas, and the canvas itself comes from gui.py -- by default our own
-rasteriser -- so the whole browser really is "from scratch", pixels included.
+same canvas, and the canvas is our own rasteriser, so the whole browser
+really is "from scratch", pixels included.
 """
 
 import os
@@ -17,19 +17,25 @@ import json
 import html
 import threading
 from . import gui
+from .canvas import Canvas, CanvasError, PhotoImage
+from .window import Tk
 import urllib.parse
 from collections import deque
 
-from .net import URL
+from .net import URL, open_stream
 from .htmlparser import HTMLParser, Text, Element
 from .cssparser import CSSParser, style, parse_inline, set_viewport, \
     media_matches, get_viewport
-from .layout import DocumentLayout, paint_tree, get_font, DrawText, _measure, \
+from .layout import DocumentLayout, paint_tree, get_font, _measure, \
     field_value, field_checked, \
     select_options, selected_options, option_value, \
     select_rows, listbox_rows, listbox_scroll, listbox_active, \
     LISTBOX_ROW_H, LISTBOX_PAD
+from .selection import Index as SelectionIndex, Selection, \
+    contrasting_text_color
 from . import shoes as shoes
+from . import downloads as downloads
+from . import media
 from .jsdom import JSDocument, JSLocation, _JSStaticProps, _JSComputedStyle
 from .jsengine import Interpreter, JSException, UNDEFINED
 from . import toes as toes
@@ -44,6 +50,13 @@ TAB_WIDTH = 158  # each tab's drawn width
 TAB_GAP = 160  # stride between tab left edges (TAB_WIDTH + 2px gutter)
 TAB_CLOSE_W = 20  # hit width of the per-tab "×" close box
 NEW_TAB_W = 34  # hit width of the "+" new-tab button
+SCROLLBAR_RIGHT = 10  # the thumb's left edge, measured back from the right
+SCROLLBAR_W = 6  # the thumb's drawn width
+SCROLLBAR_MIN_THUMB = 30  # a thumb shorter than this is too small to grab
+# The thumb is 6px wide and a pointer is not that accurate, so the region
+# that answers to a press is the whole gutter: a little to the left of the
+# thumb, and everything to the right of it out to the window edge.
+SCROLLBAR_GRAB_PAD = 4
 BOOKMARKS_FILE = os.path.expanduser("~/.feetbrowser_bookmarks.json")
 MAX_CACHED_IMAGES = 300
 # Cap the number of concurrent image fetches across the whole browser.
@@ -51,7 +64,59 @@ MAX_CACHED_IMAGES = 300
 # at once; a small pool keeps memory and file-descriptor use flat while
 # still fetching far faster than the layout can paint.
 MAX_CONCURRENT_IMAGE_FETCHES = 6
+# Two presses this close together, in seconds and in pixels, are one gesture.
+# 0.5s is the macOS default double-click interval and the slop is what a hand
+# moves between clicks it means as one.
+MULTI_CLICK_SECONDS = 0.5
+MULTI_CLICK_SLOP = 4
+# How wide a strip down the right-hand edge of the page belongs to the
+# scrollbar rather than to the text under it -- derived from the bar's own
+# grab region rather than restated, so the strip that refuses a selection is
+# exactly the strip that answers a press.
+SCROLLBAR_GUTTER_W = SCROLLBAR_RIGHT + SCROLLBAR_GRAB_PAD
+# What each click of a multi-click selects. Double-click takes the word and
+# triple-click the line, which is the convention on both platforms we run on.
+_CLICK_GRANULARITY = {2: "word", 3: "line"}
 _image_fetch_sem = threading.Semaphore(MAX_CONCURRENT_IMAGE_FETCHES)
+# How long Browser.settle() waits for a page to stop having work outstanding.
+# It is a ceiling, not a delay: settling returns the moment the last image is
+# in, and only a page pointing at something that never answers waits it out.
+# Generous, because the alternative is a screenshot of a half-drawn page.
+# How often the frame timer runs. 40 ms is 25 ticks a second: a ceiling on
+# how often a frame can change, not a frame rate -- the scheduler shows
+# whatever the clock says is current, so a faster file drops frames here
+# rather than playing slowly. See docs/media.md.
+VIDEO_TICK_MS = 40
+
+# `<source type="...">` values we will even try. Filtering here means a page
+# offering WebM first and AVI second gets the AVI, which is the entire purpose
+# of the element.
+PLAYABLE_TYPES = ("video/x-msvideo", "video/avi", "video/msvideo",
+                  "video/vnd.avi")
+
+
+def _first_playable_source(node):
+    """Pick a `<source>` for a `<video>` that has no src of its own.
+
+    Prefers one whose `type` we know we can decode, then one whose URL ends
+    in `.avi`, and falls back to the first source with a src at all -- the
+    last case being how the element still shows a real "MP4, H.264, no
+    decoder" box instead of nothing.
+    """
+    sources = [n for n in tree_to_list(node, [])
+               if isinstance(n, Element) and n.tag == "source"
+               and n.attributes.get("src")]
+    for candidate in sources:
+        kind = candidate.attributes.get("type", "").split(";")[0].strip()
+        if kind.lower() in PLAYABLE_TYPES:
+            return candidate.attributes["src"]
+    for candidate in sources:
+        if candidate.attributes["src"].lower().split("?")[0].endswith(".avi"):
+            return candidate.attributes["src"]
+    return sources[0].attributes["src"] if sources else ""
+
+
+SETTLE_TIMEOUT = 30.0
 
 # Deeply nested documents walk DOM/layout trees recursively; give Python a
 # comfortable margin so pathological pages degrade gracefully instead of
@@ -59,7 +124,7 @@ _image_fetch_sem = threading.Semaphore(MAX_CONCURRENT_IMAGE_FETCHES)
 sys.setrecursionlimit(20000)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-with open(os.path.join(HERE, "ua.css")) as f:
+with open(os.path.join(HERE, "ua.css"), encoding="utf8") as f:
     DEFAULT_STYLE_SHEET = CSSParser(f.read()).parse()
 
 
@@ -229,9 +294,18 @@ class Tab:
         self.base_url = None
         self.focused_input = None
         self.form_values = {}
-        # Absolute URL -> decoded gui.PhotoImage, shared with the layout
+        # Absolute URL -> decoded PhotoImage, shared with the layout
         # so <img> elements render their actual pixels.
         self.image_cache = {}
+        # Absolute URL -> media.VideoPlayer, shared with the layout so a
+        # <video> lays out at the file's real size and paints its own frames.
+        # Separate from image_cache because a player is not a picture: it owns
+        # a decode thread and has to be closed when the page goes away.
+        self.video_players = []
+        self._video_queue = []
+        self._video_nodes = {}
+        self._video_results = deque()
+        self._video_failures = deque()
         self._image_queue = []
         self._image_results = deque()
         self._image_root = None
@@ -269,9 +343,13 @@ class Tab:
         self._load_gen = 0
         self._load_queue = deque()
         self._load_meta = None
-        # Page text selection: (ax, ay, ex, ey) in document coordinates, or
-        # None when nothing is selected. Used by drag-selection + Ctrl+C.
+        # Page text selection: a selection.Selection (an anchor and a focus,
+        # each a DOM text node plus a character offset), or None when nothing
+        # is selected. Used by drag-selection + Ctrl+C.
         self.selection = None
+        # The selectable text of the current display list, rebuilt lazily
+        # because repaint() throws the display list away on every scroll.
+        self._sel_index = None
 
     # -- navigation ------------------------------------------------------
 
@@ -331,13 +409,70 @@ class Tab:
             # Internal URL objects (about:blank, bookmarks, history) expose a
             # simpler request(); retry without the refresh flag.
             body, ctype, doc_error = self._fetch_document(url, payload, False)
+        if body is None and ctype is None:
+            # The response was a file, not a page: it is downloading now and
+            # this tab stays where it was, the way every browser behaves
+            # when a link turns out to be an attachment.
+            self.loading = False
+            return
         self._complete_load(url, payload, push, pending_scroll, body, ctype,
                             doc_error=doc_error)
+
+    def _stream_document(self, url, payload, refresh):
+        """Fetch an http(s) GET as a stream and decide, from the headers
+        alone, whether this navigation is a page or a file.
+
+        This is the only place a link to a 2 GB installer can be told apart
+        from a link to a page without paying for it: the headers arrive, the
+        body is still on the socket, and if the answer is "file" the live
+        connection is handed to the download manager, which keeps reading it
+        straight to disk. One request, no buffering, no navigation.
+
+        Returns the (body, ctype, doc_error) triple _fetch_document owes its
+        caller, or (None, None, None) when the response became a download,
+        or None when this path does not apply or did not work out -- in
+        which case _fetch_document falls back to the buffered request() it
+        has always used. Falling back costs a second request and only
+        happens on an error, which is the case that was going to be slow
+        anyway.
+        """
+        manager = getattr(self.browser, "downloads", None) \
+            if self.browser is not None else None
+        if manager is None or payload is not None or not isinstance(url, URL) \
+                or url.scheme not in ("http", "https"):
+            return None
+        stream = None
+        try:
+            extra = {"Cache-Control": "no-cache"} if refresh else None
+            stream = open_stream(url, extra_headers=extra,
+                                 accept_encoding="gzip, deflate")
+            if stream.status < 400 and downloads.should_download(stream.headers):
+                manager.start(stream.url, stream=stream)
+                self.status = "Downloading %s" % downloads.filename_for(
+                    stream.url, stream.headers)
+                stream = None  # the manager owns the connection now
+                return (None, None, None)
+            body = stream.read_all()
+            ctype = stream.content_type or "text/html"
+            text = body.decode(stream.charset(), "replace")
+            if self._is_google_js_wall(url, text):
+                return None  # let the buffered path do its impersonation
+            if str(stream.url) != str(url):
+                url._adopt(stream.url)
+            return (text, ctype, None)
+        except Exception:  # noqa: BLE001 - any trouble here: use the old path
+            return None
+        finally:
+            if stream is not None:
+                stream.close()
 
     def _fetch_document(self, url, payload, refresh):
         """Fetch a document body, surfacing load errors and retrying through a
         Chrome-impersonating transport when a JS-gated site (Google) serves an
         'enable JavaScript' wall instead of its real application."""
+        streamed = self._stream_document(url, payload, refresh)
+        if streamed is not None:
+            return streamed
         try:
             _headers, body, ctype = url.request(payload=payload,
                                                 refresh=refresh)
@@ -371,7 +506,7 @@ class Tab:
 
     def _start_async_load(self, url, payload, push, refresh, pending_scroll):
         """Fetch the page body on a background thread; the UI thread applies
-        it in `_poll_async` so Tk/DOM work never leaves the main loop."""
+        it in `_poll_async` so canvas and DOM work never leaves the main loop."""
         self.loading = True
         self._load_gen += 1
         gen = self._load_gen
@@ -418,6 +553,11 @@ class Tab:
             ctype = "text/html"
         else:
             doc_error = None
+        if body is None and ctype is None:
+            # A download took the navigation over (see _stream_document);
+            # the tab keeps the page it was showing.
+            self.loading = False
+            return
         self._complete_load(meta["url"], meta["payload"], meta["push"],
                             meta["pending_scroll"], body, ctype,
                             doc_error=doc_error)
@@ -468,15 +608,19 @@ class Tab:
             # Headless (tests / no Browser): fetch and decode synchronously so
             # the display list shows real images instead of placeholders.
             self.load_images()
+        self.load_videos(self.browser.window if self._gui_mode() else None)
 
     def _build(self, url, body, ctype="text/html"):
         """Parse, collect stylesheets, cascade, and lay out `body`."""
+        self.stop_videos()
         # Fresh document: drop any previous form focus/values and JS state.
         self.focused_input = None
         self.form_values = {}
         self.js_logs = []
         self.net_errors = []
         self._image_failures = deque()
+        self._image_queue = []
+        self._image_results = deque()
         self._js_log_cursor = 0
         self._js_interp = None
         self._js_doc = None
@@ -537,27 +681,45 @@ class Tab:
         # Keep the rules around so JS mutations can re-style the tree.
         self._last_rules = rules
 
-        # Resolve <img src> to absolute URLs now so the layout's cache lookup
-        # keys (absolute) always match what load_images() fetches.
-        for node in tree_to_list(self.nodes, []):
-            if isinstance(node, Element) and node.tag == "img" \
-                    and node.attributes.get("src"):
-                try:
-                    node.attributes["src"] = str(
-                        resolve_from.resolve(node.attributes["src"]))
-                except Exception:  # noqa: BLE001 - bad src renders placeholder
-                    pass
+        self._absolutize_media_srcs()
         self.render()
         self._run_scripts()
 
+    def _absolutize_media_srcs(self):
+        """Resolve <img>/<video> src attributes to absolute URLs so the
+        layout's cache lookup keys (absolute) always match what load_images()
+        fetches. Run on the initial build and again after a JS mutation,
+        which can create media elements after the first scan."""
+        for node in tree_to_list(self.nodes, []):
+            if isinstance(node, Element) and node.tag == "video" \
+                    and not node.attributes.get("src"):
+                # <video><source src=...></video>: hoist the first source we
+                # could conceivably play onto the element, so everything below
+                # only ever has to look at one attribute.
+                picked = _first_playable_source(node)
+                if picked:
+                    node.attributes["src"] = picked
+            if isinstance(node, Element) and node.tag in ("img", "video") \
+                    and node.attributes.get("src"):
+                try:
+                    node.attributes["src"] = str(
+                        self.base_url.resolve(node.attributes["src"]))
+                except Exception:  # noqa: BLE001 - bad src renders placeholder
+                    pass
+
     def render(self):
-        self.selection = None
         self._sync_selects()
         self.document = DocumentLayout(self.nodes, WIDTH)
         self.document.image_cache = self.image_cache
         self.document.layout()
         self.document.input_boxes = self.document.collect_inputs([])
         self.repaint()
+        # A relayout that only rewrapped (a resize, an image arriving) leaves
+        # every node and offset meaningful, so the highlight stays on the
+        # words it was on; one that replaced the text does not, and dropping
+        # it here is what stops a stale highlight sitting over whatever moved
+        # into those pixels.
+        self.selection = self.selection_index().revalidate(self.selection)
         # Content changed: flag the repaint loop so the canvas is redrawn even
         # when no event handler happens to call draw() directly (e.g. JS DOM
         # mutations and background image completion funnel through here).
@@ -572,6 +734,7 @@ class Tab:
         if not self.document:
             return
         self.display_list = []
+        self._sel_index = None
         paint_tree(self.document, self.display_list, scroll=self.scroll)
 
     # -- scripting ------------------------------------------------------
@@ -598,7 +761,7 @@ class Tab:
         self._js_interp.globals["parent"] = self._js_interp.globals["window"]
         self._js_interp.globals["self"] = self._js_interp.globals["window"]
         self._js_interp.globals["top"] = self._js_interp.globals["window"]
-        # Browser-provided host APIs (network + nothing Tk).
+        # Browser-provided host APIs (network, and nothing that draws).
         self._js_interp.globals["fetch"] = self._js_fetch
         self._js_interp.globals["XMLHttpRequest"] = self._js_xhr_ctor()
         # Rendering/event APIs. rAF rides the existing virtual-clock timer
@@ -769,6 +932,11 @@ class Tab:
         fresh_title = get_title(self.nodes)
         if fresh_title:
             self.title = fresh_title
+        # A script may have created media elements after the first scan; make
+        # their src absolute (layout keys its image cache on absolute URLs)
+        # and fetch the ones we do not have yet.
+        self._absolutize_media_srcs()
+        self._fetch_js_added_images()
         self.render()
 
     # -- JS host APIs (fetch, XMLHttpRequest) ------------------------------
@@ -787,9 +955,12 @@ class Tab:
             base = self.base_url
             if base is None or base.scheme != "file":
                 return False
+            # URL space, not os.path: a file: URL's path is slash-separated
+            # whatever the platform, and os.path.dirname would hand back a
+            # backslash-separated prefix on Windows that never matches.
             base_path = base.path
             base_dir = base_path if base_path.endswith("/") \
-                else os.path.dirname(base_path) + "/"
+                else base_path.rpartition("/")[0] + "/"
             return target.path.startswith(base_dir)
         return False
 
@@ -937,12 +1108,38 @@ class Tab:
         asynchronously (off the UI thread), re-rendering as each arrives."""
         self._image_root = root
         self._image_done = done
-        self._image_queue = []
-        # Background threads stash raw bytes here; the UI thread drains the
-        # deque on a timer so Tk (Photos, canvas) is only ever touched on the
-        # main thread. deque append/popleft are atomic under the GIL.
-        self._image_results = deque()
-        seen = set()
+        # Re-entrant: a script may already have queued fetches
+        # (_fetch_js_added_images) before the load path calls this. Keep them
+        # in flight rather than dropping them (settle() would think the page
+        # was done) or starting their threads again (the same URL fetched
+        # twice) -- only the genuinely new sources get threads here.
+        in_flight = dict(self._image_queue)
+        new = list(self._missing_images(in_flight))
+        self._image_queue = list(in_flight.items()) + new
+        if not self._image_queue:
+            if done:
+                done()
+            return
+        if root is None:
+            # No UI loop (tests / headless): fetch and decode synchronously so
+            # results are available immediately and deterministically.
+            for key, url in new:
+                try:
+                    _headers, data, ctype = url.request_bytes()
+                except Exception:  # noqa: BLE001 - keep placeholder on failure
+                    data, ctype = None, None
+                self._decode_and_finish(key, data, ctype)
+            return
+        for key, url in new:
+            threading.Thread(
+                target=self._fetch_image, args=(key, url), daemon=True).start()
+
+    def _missing_images(self, skip=()):
+        """Yield ``(key, url)`` for every <img> source that is neither decoded
+        nor on its way: not in the image cache and not in `skip` (keys already
+        being fetched). Shared by the initial scan (load_images) and the
+        re-scan after a script adds elements (_fetch_js_added_images)."""
+        skip = set(skip)
         if self.nodes is None:
             return
         for node in tree_to_list(self.nodes, []):
@@ -956,32 +1153,53 @@ class Tab:
             except Exception:  # noqa: BLE001 - bad src shouldn't kill the page
                 continue
             key = str(url)
-            if key in self.image_cache or key in seen:
+            if key in self.image_cache or key in skip:
                 continue
-            seen.add(key)
-            self._image_queue.append((key, url))
-        if not self._image_queue:
-            if done:
-                done()
+            skip.add(key)
+            yield key, url
+
+    def _fetch_js_added_images(self):
+        """Fetch <img> sources a script created after the page's first scan.
+
+        Scripts build their own content (a banner strip, say) by creating
+        <img> elements after load_images() has already run, and those must be
+        fetched like any other. Sources already cached or already being
+        fetched are skipped; new ones join _image_queue so pending_images()
+        and settle() keep accounting for them, and the same synchronous /
+        threaded split as load_images() applies."""
+        in_flight = {key for key, _ in self._image_queue}
+        queued = list(self._missing_images(in_flight))
+        if not queued:
             return
-        if root is None:
-            # No UI loop (tests / headless): fetch and decode synchronously so
-            # results are available immediately and deterministically.
-            while self._image_queue:
-                key, url = self._image_queue[0]
+        for key, url in queued:
+            self._image_queue.append((key, url))
+        if not self._gui_mode():
+            for key, _url in queued:
                 try:
-                    _headers, data, ctype = url.request_bytes()
+                    _headers, data, ctype = _url.request_bytes()
                 except Exception:  # noqa: BLE001 - keep placeholder on failure
                     data, ctype = None, None
                 self._decode_and_finish(key, data, ctype)
             return
-        for key, url in self._image_queue:
+        for key, url in queued:
             threading.Thread(
                 target=self._fetch_image, args=(key, url), daemon=True).start()
 
+    def pending_images(self):
+        """True while image fetches started by load_images() are outstanding.
+
+        A tab whose document has arrived is not finished: `loading` goes
+        false the moment the HTML is in, and only then does load_images()
+        start fetching what the page points at. Entries leave the queue in
+        _drain_images(), on the UI thread, at the moment decoded pixels reach
+        the image cache -- so waiting on this is waiting for the render that
+        stops drawing "[img]" placeholders.
+        """
+        return bool(self._image_queue)
+
     def _fetch_image(self, key, url):
         """Background thread: fetch bytes, hand them back to the UI thread via
-        the results queue. Never touches Tk directly. The semaphore bounds
+        the results queue. Never touches the canvas directly. The semaphore bounds
         how many image fetches run at once browser-wide."""
         try:
             with _image_fetch_sem:
@@ -1028,64 +1246,164 @@ class Tab:
         if self._image_done:
             self._image_done()
 
-    @staticmethod
-    def _decode_image(data, ctype):
-        """Decode image bytes to a Tk PhotoImage. PNG/GIF/PNM are handled
-        natively by Tk; JPEG/WebP/BMP/ICO/TIFF are converted to PNG through
-        Pillow when it is installed; SVG is rasterized via cairosvg when
-        available (or handed to Tk on Tk 8.7+, which can rasterize it)."""
-        ctype = (ctype or "").split(";")[0].strip().lower()
-        # Formats Tk decodes natively.
-        if ctype in ("image/png", "image/gif", "image/x-xbitmap"):
+    # -- video ----------------------------------------------------------
+
+    def load_videos(self, root=None):
+        """Fetch every `<video src>` the page names and give each element a
+        player of its own.
+
+        Two decisions worth naming. It is a separate queue from
+        load_images(): the two produce different things (a decoded picture
+        against a live player with a decode thread behind it), fail
+        differently, and a video that never arrives must not hold up the
+        "images are in, stop drawing placeholders" signal that
+        pending_images() drives.
+
+        And the player belongs to the *element*, not to the URL. Two
+        `<video>` tags pointing at one file are two independent playheads --
+        one can be paused at 3s while the other plays, and each scales its
+        own frames to its own box. The bytes are still fetched once.
+        """
+        self._video_results = deque()
+        self._video_queue = []
+        if self.nodes is None:
+            return
+        by_src = {}
+        for node in tree_to_list(self.nodes, []):
+            if not (isinstance(node, Element) and node.tag == "video"):
+                continue
+            src = node.attributes.get("src")
+            if src:
+                by_src.setdefault(src, []).append(node)
+        if not by_src:
+            return
+        self._video_queue = list(by_src)
+        self._video_nodes = by_src
+        if root is None:
+            for key in list(by_src):
+                try:
+                    _headers, data, _ctype = URL(key).request_bytes()
+                except Exception:  # noqa: BLE001 - a bad URL shows the box
+                    data = None
+                self._finish_video(key, data)
+            return
+        for key in by_src:
+            threading.Thread(target=self._fetch_video, args=(key,),
+                             daemon=True).start()
+
+    def _fetch_video(self, key):
+        """Background thread: bytes only. Nothing here touches a player, a
+        photo or the canvas."""
+        try:
+            with _image_fetch_sem:
+                _headers, data, _ctype = URL(key).request_bytes()
+        except Exception as exc:  # noqa: BLE001 - reported on the UI thread
+            self._video_failures.append((key, str(exc)))
+            self._video_results.append((key, None))
+            return
+        self._video_results.append((key, data))
+
+    def _drain_videos(self):
+        """UI thread: build players for whatever finished downloading."""
+        while self._video_failures:
+            key, _why = self._video_failures.popleft()
+            self._add_error(f"VIDEO {key}")
+        if not self._video_results:
+            return
+        arrived = []
+        try:
+            while True:
+                arrived.append(self._video_results.popleft())
+        except IndexError:
+            pass
+        for key, data in arrived:
+            self._finish_video(key, data)
+        self.render()
+
+    def _finish_video(self, key, data):
+        """Attach a player to every element that named this URL."""
+        if key in self._video_queue:
+            self._video_queue.remove(key)
+        nodes = self._video_nodes.get(key, ())
+        if not data:
+            return
+        for node in nodes:
             try:
-                return gui.PhotoImage(data=data)
-            except Exception:  # noqa: BLE001 - bad bytes; try Pillow below
-                pass
-        # Formats Pillow can convert to PNG (otherwise fall through to Tk
-        # sniffing, which may still decode).
-        if ctype in ("image/jpeg", "image/jpg", "image/webp", "image/bmp",
-                     "image/x-icon", "image/vnd.microsoft.icon", "image/tiff"):
-            photo = Tab._photo_from_pillow(data)
-            if photo is not None:
-                return photo
-        if ctype == "image/svg+xml":
-            photo = Tab._photo_from_svg(data)
-            if photo is not None:
-                return photo
-        # Unknown type: let Tk sniff the data (it may still decode).
+                player = media.VideoPlayer(data=data, loop=False)
+            except Exception as exc:  # noqa: BLE001 - a page must not die
+                self._add_error(f"VIDEO {key}: {exc}")
+                return
+            # Show frame zero straight away. A paused <video> displaying its
+            # own first frame is what a browser does, and it is also the
+            # cheapest proof that the file really decoded.
+            player.first_frame()
+            node.video_player = player
+            self.video_players.append(player)
+            if "autoplay" in node.attributes and player.track is not None:
+                player.play()
+                if self.browser is not None:
+                    self.browser._ensure_video_tick()
+
+    def pending_videos(self):
+        return bool(self._video_queue)
+
+    def tick_videos(self):
+        """Advance every player to the frame that is due. Returns True when
+        anything on screen changed. Called from the browser's frame timer;
+        it decodes nothing itself and never blocks."""
+        changed = False
+        for player in self.video_players:
+            if player.tick():
+                changed = True
+        return changed
+
+    def playing_videos(self):
+        return any(p.playing for p in self.video_players)
+
+    def stop_videos(self):
+        """Drop every player and its decode thread. Called when the tab
+        navigates away or closes -- a daemon thread still decoding a film
+        nobody is watching is a leak with a picture on it."""
+        for player in self.video_players:
+            player.close()
+        self.video_players = []
+        self._video_queue = []
+        self._video_nodes = {}
+
+    @staticmethod
+    def _enclosing_video(node):
+        while node is not None:
+            if isinstance(node, Element) and node.tag == "video":
+                return node
+            node = node.parent
+        return None
+
+    def _toggle_video(self, node):
+        """Play/pause the player behind a `<video>`. True if we handled it."""
+        player = getattr(node, "video_player", None)
+        if player is None or player.track is None:
+            return False
+        player.toggle()
+        if self.browser is not None:
+            self.browser._ensure_video_tick()
+        self.status = player.status()
+        if self.browser is not None:
+            self.browser._repaint_needed = True
+        return True
+
+    @staticmethod
+    def _decode_image(data, _ctype):
+        """Decode image bytes to a PhotoImage, or None for the placeholder.
+
+        The content type is not consulted. Servers label images wrongly often
+        enough that the bytes are the only reliable answer, and `imagecodec`
+        sniffs them: what it recognises it decodes, and everything else --
+        SVG, WebP, BMP, ICO, TIFF, and the corners of JPEG we refuse -- draws
+        as the alt text, which is what the caller does with None.
+        """
         try:
-            return gui.PhotoImage(data=data)
+            return PhotoImage(data=data)
         except Exception:  # noqa: BLE001 - undecodable data -> placeholder
-            return None
-
-    @staticmethod
-    def _photo_from_pillow(data):
-        """Convert image bytes to a Tk PhotoImage via Pillow. Returns None
-        if Pillow is missing or the data is undecodable."""
-        try:
-            from PIL import Image as PILImage
-            import io
-            # Refuse giant images (decompression bombs): Pillow raises
-            # DecompressionBombWarning/Error past this pixel count, and both
-            # subclass Exception so the fallback placeholder is used.
-            PILImage.MAX_IMAGE_PIXELS = 20_000_000
-            pil = PILImage.open(io.BytesIO(data))
-            pil.load()
-            pil = pil.convert("RGBA")
-            buf = io.BytesIO()
-            pil.save(buf, format="PNG")
-            return gui.PhotoImage(data=buf.getvalue())
-        except Exception:  # noqa: BLE001 - Pillow missing / bad data
-            return None
-
-    @staticmethod
-    def _photo_from_svg(data):
-        """Rasterize SVG bytes to a Tk PhotoImage via cairosvg (optional)."""
-        try:
-            import cairosvg
-            png = cairosvg.svg2png(bytestring=data)
-            return gui.PhotoImage(data=png)
-        except Exception:  # noqa: BLE001 - cairosvg missing / bad data
             return None
 
     def content_height(self):
@@ -1174,6 +1492,11 @@ class Tab:
         Returns a URL to load, a FormAction (form submit), or None.
         """
         node = self._node_at(x, y)
+        video = self._enclosing_video(node)
+        if video is not None and self._toggle_video(video):
+            # Clicking the picture is the whole transport UI for now: no
+            # control bar, no scrubber. Said plainly in docs/media.md.
+            return None
         control = self._hit_control(node)
         if control is not None:
             result = self._activate_control(control, x, y + self.scroll)
@@ -1200,85 +1523,62 @@ class Tab:
 
     # -- text selection --------------------------------------------------
 
-    def _text_char_at(self, x, y):
-        """Return the DrawText command and char index under (x, y), or
-        (None, None) if no text is under the point."""
-        for cmd in self.display_list:
-            if isinstance(cmd, DrawText) and cmd.text and cmd.hit(x, y):
-                return cmd, self._char_at_x(cmd, x)
-        return None, None
+    def selection_index(self):
+        """The selectable text of the current display list, in document order.
+
+        Rebuilt whenever the display list is (see `repaint`), which is what
+        keeps the highlight glued to the words rather than to the screen: the
+        positions in `self.selection` are node offsets, and each rebuild
+        resolves them against wherever those words have just been painted.
+        """
+        if self._sel_index is None:
+            self._sel_index = SelectionIndex(self.display_list)
+        return self._sel_index
+
+    def start_selection(self, x, y, granularity="char"):
+        """Begin (or reset) a selection at viewport coords (x, y).
+
+        `granularity` is "char" for a press, "word" for a double-click and
+        "line" for a triple-click; a drag after a multi-click keeps extending
+        in the same unit.
+        """
+        index = self.selection_index()
+        doc_y = y + self.scroll
+        if granularity == "word":
+            self.selection = index.word_around(x, doc_y) or \
+                self._collapsed_at(index, x, doc_y)
+            return
+        if granularity == "line":
+            self.selection = index.line_around(x, doc_y) or \
+                self._collapsed_at(index, x, doc_y)
+            return
+        self.selection = self._collapsed_at(index, x, doc_y)
 
     @staticmethod
-    def _char_at_x(cmd, x):
-        """Index of the character whose left edge is nearest to x within a
-        DrawText command."""
-        i = 0
-        while i < len(cmd.text) and \
-                cmd.left + _measure(cmd.font, cmd.text[:i + 1]) <= x:
-            i += 1
-        return i
-
-    def start_selection(self, x, y):
-        """Begin (or reset) a selection anchored at document coords (x, y)."""
-        cmd, i = self._text_char_at(x, y)
-        if cmd:
-            x = cmd.left + _measure(cmd.font, cmd.text[:i])
-        self.selection = (x, y, x, y)
+    def _collapsed_at(index, x, doc_y):
+        point = index.point_at(x, doc_y)
+        return Selection(point) if point is not None else None
 
     def extend_selection(self, x, y):
-        """Extend the selection to document coords (x, y)."""
+        """Extend the selection to viewport coords (x, y)."""
         if self.selection is None:
             self.start_selection(x, y)
             return
-        cmd, i = self._text_char_at(x, y)
-        if cmd:
-            x = cmd.left + _measure(cmd.font, cmd.text[:i])
-        self.selection = (self.selection[0], self.selection[1], x, y)
+        self.selection = self.selection_index().extend(
+            self.selection, x, y + self.scroll)
 
     def _selection_spans(self):
-        """Selected character ranges as (cmd, start_char, end_char) tuples,
+        """Selected character ranges as (run, start_char, end_char) tuples,
         in document order, or [] when nothing is selected."""
         if self.selection is None:
             return []
-        ax, ay, ex, ey = self.selection
-        if ax == ex and ay == ey:
-            return []
-        spans = []
-        for cmd in self.display_list:
-            if not isinstance(cmd, DrawText) or not cmd.text:
-                continue
-            if cmd.bottom <= min(ay, ey) or cmd.top > max(ay, ey):
-                continue
-            s, e = 0, len(cmd.text)
-            on_anchor = cmd.top <= ay < cmd.bottom
-            on_end = cmd.top <= ey < cmd.bottom
-            forward = (ey, ex) >= (ay, ax)
-            if on_anchor:
-                if forward:
-                    s = max(s, self._char_at_x(cmd, ax))
-                else:
-                    e = min(e, self._char_at_x(cmd, ax))
-            if on_end:
-                if forward:
-                    e = min(e, self._char_at_x(cmd, ex))
-                else:
-                    s = max(s, self._char_at_x(cmd, ex))
-            if s < e:
-                spans.append((cmd, s, e))
-        return spans
+        return self.selection_index().spans(self.selection)
 
     def selected_text(self):
-        """The selected text, line-by-line, for clipboard copying."""
-        lines, cur, last_top = [], [], None
-        for cmd, s, e in self._selection_spans():
-            if last_top is not None and cmd.top != last_top:
-                lines.append(" ".join(cur))
-                cur = []
-            cur.append(cmd.text[s:e])
-            last_top = cmd.top
-        if cur:
-            lines.append(" ".join(cur))
-        return "\n".join(lines)
+        """The selected text, as drawn, for clipboard copying."""
+        if self.selection is None:
+            return ""
+        return self.selection_index().text(self.selection)
 
     # -- forms -----------------------------------------------------------
 
@@ -1739,33 +2039,65 @@ class Tab:
                             (f"c{id(cmd)}", "page"))
         self._draw_selection(canvas, offset)
 
+    def selection_colors(self):
+        """(highlight fill, text on top of it) for the active shoe.
+
+        The fill is the shoe's `accent`, which is the role the palette
+        already names "selection / spinner / focus highlight", so the
+        highlight changes with the theme like the rest of the chrome. The
+        text is whichever of black or white stays readable on it -- the pale
+        shoes and the near-black ones both have accents that one fixed
+        foreground would disappear into.
+        """
+        fill = self.browser.c("accent") if self.browser is not None \
+            else shoes.SHOES[shoes.DEFAULT_SHOE]["accent"]
+        return fill, contrasting_text_color(fill)
+
     def _draw_selection(self, canvas, offset):
-        """Paint the text-selection highlight (blue fill + white text) over
-        whatever was already drawn."""
+        """Paint the text-selection highlight over whatever was drawn.
+
+        A run the selection only partly covers is split here rather than
+        highlighted whole: the fill starts and stops at the measured x of the
+        selected characters, and only those characters are repainted on top.
+        """
         canvas.delete("selection")
-        for cmd, s, e in self._selection_spans():
-            x1 = cmd.left + _measure(cmd.font, cmd.text[:s])
-            x2 = cmd.left + _measure(cmd.font, cmd.text[:e])
-            y1, y2 = cmd.top, cmd.bottom
-            if y2 < self.scroll or y1 > self.scroll + self.tab_height:
-                continue
+        fill, ink = self.selection_colors()
+        dy = offset - self.scroll
+        previous = None
+        for run, s, e in self._selection_spans():
+            y1, y2 = run.top, run.bottom
+            visible = not (y2 < self.scroll
+                           or y1 > self.scroll + self.tab_height)
+            x1, x2 = run.x_at(s), run.x_at(e)
             try:
-                canvas.create_rectangle(
-                    x1, y1 - self.scroll + offset,
-                    x2, y2 - self.scroll + offset,
-                    fill="#1a73e8", width=0, tags=("selection",))
-                canvas.create_text(
-                    x1, y1 - self.scroll + offset, text=cmd.text[s:e],
-                    font=cmd.font, fill="white", anchor="nw",
-                    tags=("selection",))
-            except gui.TclError:
+                if previous is not None and visible:
+                    # The space between two words is not drawn by anything, so
+                    # without this the highlight comes out as a row of
+                    # separate boxes instead of the continuous band every
+                    # other browser paints.
+                    gap_run, gap_end = previous
+                    if gap_run.line == run.line and gap_end == len(gap_run.text) \
+                            and s == 0 and gap_run.right < x1:
+                        canvas.create_rectangle(
+                            gap_run.right, min(gap_run.top, y1) + dy,
+                            x1, max(gap_run.bottom, y2) + dy,
+                            fill=fill, width=0, tags=("selection",))
+                if visible:
+                    canvas.create_rectangle(x1, y1 + dy, x2, y2 + dy,
+                                            fill=fill, width=0,
+                                            tags=("selection",))
+                    canvas.create_text(x1, y1 + dy, text=run.text[s:e],
+                                       font=run.font, fill=ink, anchor="nw",
+                                       tags=("selection",))
+            except CanvasError:
                 pass
+            previous = (run, e)
 
 
 class ContextMenu:
     """A hand-drawn context menu painted on the browser canvas.
 
-    Stays true to the "chrome is drawn by hand" design: no native Tk menu
+    Stays true to the "chrome is drawn by hand" design: no native menu
     widgets, just rectangles and text, so it looks and behaves like the rest
     of the UI. Items are None (a separator) or (label, callback, enabled).
 
@@ -2109,6 +2441,202 @@ class SelectPopup:
             y0 += self.ROW_H
 
 
+class DownloadsPanel:
+    """The download manager, drawn by hand on the browser canvas.
+
+    Same deal as ContextMenu and SelectPopup: rectangles and text in the
+    active shoe's colors, because there is no widget toolkit here to borrow
+    a list view from. It shows one row per download with its name, a
+    progress bar, a line of status, and an × that cancels while the transfer
+    is still running.
+
+    It owns no state about the transfers themselves -- it reads the
+    DownloadManager every time it paints, on the UI thread, while workers
+    write to those records from their own threads. That is the whole
+    synchronisation story: short locks inside Download, and a panel that
+    only ever reads.
+    """
+
+    WIDTH = 400
+    HEADER_H = 32
+    ITEM_H = 64
+    FOOTER_H = 26
+    PAD = 12
+    MAX_ROWS = 6
+    BAR_H = 6
+
+    def __init__(self, browser):
+        self.browser = browser
+        self.open_ = False
+        self.x = self.y = 0
+        self.width = self.WIDTH
+        self.height = self.HEADER_H + self.FOOTER_H
+        self._rows = []  # (download, y0) laid out by the last draw()
+
+    # -- geometry --------------------------------------------------------
+
+    def _visible(self):
+        return self.browser.downloads.items()[:self.MAX_ROWS]
+
+    def _layout(self):
+        canvas = self.browser.canvas
+        rows = max(1, len(self._visible()))
+        self.width = min(self.WIDTH, max(220, canvas.winfo_width() - 24))
+        self.height = self.HEADER_H + rows * self.ITEM_H + self.FOOTER_H
+        self.x = max(8, canvas.winfo_width() - self.width - 12)
+        self.y = self.browser.chrome_height() + 6
+
+    def point_in(self, x, y):
+        return (self.open_ and self.x <= x <= self.x + self.width
+                and self.y <= y <= self.y + self.height)
+
+    def toggle(self):
+        self.open_ = not self.open_
+        return self.open_
+
+    def close(self):
+        self.open_ = False
+
+    # -- input -----------------------------------------------------------
+
+    def hit(self, x, y):
+        """What a click at (x, y) means: (action, download) or None.
+
+        Actions are "close", "clear", "cancel" and "row"; a click anywhere
+        else inside the panel is swallowed ("row" with no download) so it
+        does not fall through to the page behind it.
+        """
+        if not self.point_in(x, y):
+            return None
+        if y <= self.y + self.HEADER_H:
+            if x >= self.x + self.width - 28:
+                return ("close", None)
+            return ("row", None)
+        if y >= self.y + self.height - self.FOOTER_H:
+            if x <= self.x + 120:
+                return ("clear", None)
+            return ("row", None)
+        for download, y0 in self._rows:
+            if y0 <= y < y0 + self.ITEM_H:
+                if x >= self.x + self.width - 34 and download.is_active():
+                    return ("cancel", download)
+                return ("row", download)
+        return ("row", None)
+
+    # -- painting --------------------------------------------------------
+
+    def draw(self, canvas):
+        canvas.delete("downloads")
+        if not self.open_:
+            self._rows = []
+            return
+        self._layout()
+        items = self._visible()
+        tags = ("downloads",)
+        x, y, w, h = self.x, self.y, self.width, self.height
+        canvas.create_rectangle(x + 2, y + 2, x + w + 2, y + h + 2,
+                                fill=self.browser.c("menu_shadow"), width=0,
+                                tags=tags)
+        canvas.create_rectangle(x, y, x + w, y + h,
+                                fill=self.browser.c("menu_bg"),
+                                outline=self.browser.c("menu_border"), width=1,
+                                tags=tags)
+        canvas.create_text(x + self.PAD, y + self.HEADER_H / 2,
+                           text="Downloads", anchor="w",
+                           font=self.browser.bold_font,
+                           fill=self.browser.c("menu_text"), tags=tags)
+        canvas.create_text(x + w - 14, y + self.HEADER_H / 2, text="×",
+                           font=self.browser.bold_font,
+                           fill=self.browser.c("menu_text"), tags=tags)
+        canvas.create_line(x + 1, y + self.HEADER_H, x + w - 1,
+                           y + self.HEADER_H,
+                           fill=self.browser.c("menu_sep"), tags=tags)
+
+        self._rows = []
+        y0 = y + self.HEADER_H
+        if not items:
+            canvas.create_text(x + self.PAD, y0 + self.ITEM_H / 2,
+                               text="Nothing downloaded yet.", anchor="w",
+                               font=get_font(12, "normal", "roman",
+                                             "Helvetica"),
+                               fill=self.browser.c("menu_disabled"), tags=tags)
+        for download in items:
+            self._rows.append((download, y0))
+            self._draw_row(canvas, download, y0, tags)
+            y0 += self.ITEM_H
+
+        canvas.create_line(x + 1, y + h - self.FOOTER_H, x + w - 1,
+                           y + h - self.FOOTER_H,
+                           fill=self.browser.c("menu_sep"), tags=tags)
+        canvas.create_text(x + self.PAD, y + h - self.FOOTER_H / 2,
+                           text="Clear finished", anchor="w",
+                           font=get_font(11, "normal", "roman", "Helvetica"),
+                           fill=self.browser.c("link_color"), tags=tags)
+        canvas.create_text(x + w - self.PAD, y + h - self.FOOTER_H / 2,
+                           text=self.browser.downloads.directory(), anchor="e",
+                           font=get_font(10, "normal", "roman", "Helvetica"),
+                           fill=self.browser.c("menu_disabled"), tags=tags)
+
+    def _draw_row(self, canvas, download, y0, tags):
+        x, w = self.x, self.width
+        name_font = get_font(12, "normal", "roman", "Helvetica")
+        info_font = get_font(10, "normal", "roman", "Helvetica")
+        name = _elide(download.filename or "download", name_font,
+                      w - 2 * self.PAD - 30)
+        canvas.create_text(x + self.PAD, y0 + 16, text=name, anchor="w",
+                           font=name_font,
+                           fill=self.browser.c("menu_text"), tags=tags)
+        if download.is_active():
+            canvas.create_text(x + w - 18, y0 + 16, text="×",
+                               font=self.browser.bold_font,
+                               fill=self.browser.c("menu_text"), tags=tags)
+
+        bar_x0 = x + self.PAD
+        bar_x1 = x + w - self.PAD
+        bar_y = y0 + 30
+        canvas.create_rectangle(bar_x0, bar_y, bar_x1, bar_y + self.BAR_H,
+                                fill=self.browser.c("menu_sep"), width=0,
+                                tags=tags)
+        fraction = download.percent()
+        state = download.state
+        if state == downloads.COMPLETE:
+            fill, span = self.browser.c("accent"), (bar_x0, bar_x1)
+        elif state == downloads.FAILED:
+            fill, span = self.browser.c("log_text"), (bar_x0, bar_x1)
+        elif state == downloads.CANCELLED:
+            fill, span = self.browser.c("menu_disabled"), (bar_x0, bar_x1)
+        elif fraction is None:
+            # No Content-Length, so there is no share of the whole to draw.
+            # A band sliding along the track says "still going" without
+            # claiming a percentage nobody sent us.
+            fill = self.browser.c("accent")
+            width = (bar_x1 - bar_x0) * 0.25
+            travel = (bar_x1 - bar_x0) - width
+            phase = (self.browser._downloads_phase % 100) / 100.0
+            start = bar_x0 + travel * abs(1 - 2 * phase)
+            span = (start, start + width)
+        else:
+            fill = self.browser.c("accent")
+            span = (bar_x0, bar_x0 + (bar_x1 - bar_x0) * fraction)
+        if span[1] > span[0]:
+            canvas.create_rectangle(span[0], bar_y, span[1],
+                                    bar_y + self.BAR_H, fill=fill, width=0,
+                                    tags=tags)
+        status = _elide(download.describe(), info_font, w - 2 * self.PAD)
+        canvas.create_text(x + self.PAD, y0 + 48, text=status, anchor="w",
+                           font=info_font,
+                           fill=self.browser.c("status_text"), tags=tags)
+
+
+def _elide(text, font, width):
+    """Trim `text` with an ellipsis until it fits `width` pixels."""
+    if _measure(font, text) <= width:
+        return text
+    while text and _measure(font, text + "…") > width:
+        text = text[:-1]
+    return text + "…"
+
+
 class Browser:
     def __init__(self, window=None):
         self.tabs = []
@@ -2123,8 +2651,18 @@ class Browser:
         self.address_sel = None  # (start, end) while selecting, else None
         self.address_view = 0  # horizontal scroll offset in px
         self._drag_moved = False  # a press+move (vs. a plain click) happened
+        # Scrollbar drag: how far below the top of the thumb the pointer went
+        # down, so the grabbed point stays under it. None when not dragging.
+        self._scroll_grab = None
         self._resize_after = None
         self._last_size = (WIDTH, HEIGHT)
+        # Multi-click tracking for word/line selection. No platform backend
+        # reports a click count, so it is counted here: presses close enough
+        # in time and in space are one gesture, and the count cycles 1-2-3 so
+        # a fourth click starts over the way it does elsewhere.
+        self._click_count = 0
+        self._click_time = 0.0
+        self._click_pos = (0, 0)
         # Chrome-style loading spinner: current arc start angle (degrees).
         self._loading_angle = 0
         # Dirty flag for the repaint loop: set by render() whenever page
@@ -2132,6 +2670,11 @@ class Browser:
         # canvas entirely while the page is idle instead of repainting every
         # 120ms forever.
         self._repaint_needed = True
+        # Whether the _poll_images() after-chain is already running. It is
+        # started by whoever needs it first -- run(), or settle() in a
+        # headless render -- and there must only ever be one of it.
+        self._polling_images = False
+        self._video_ticking = False
 
         # Toes: one Context per loaded toe, all optional hooks.
         self.toes = toes.discover_toes()
@@ -2143,11 +2686,11 @@ class Browser:
 
         # A headless root by default, so tests and --screenshot never open
         # anything; main() passes a real one from gui.new_window().
-        self.window = window if window is not None else gui.Tk()
+        self.window = window if window is not None else Tk()
         self.window.title("FeetBrowser")
         self.window.geometry(f"{WIDTH}x{HEIGHT}")
         self.window.minsize(480, 320)
-        self.canvas = gui.Canvas(
+        self.canvas = Canvas(
             self.window, width=WIDTH, height=HEIGHT,
             bg="white", highlightthickness=0)
         self.canvas.pack(fill="both", expand=True)
@@ -2157,6 +2700,13 @@ class Browser:
 
         self.context_menu = ContextMenu(self)
         self.select_popup = SelectPopup(self)
+        # Downloads: the manager owns the worker threads and the records,
+        # the panel is a view of them. `_downloads_phase` advances on the
+        # UI timer and drives the indeterminate progress bar for transfers
+        # whose total nobody stated.
+        self.downloads = downloads.DownloadManager()
+        self.downloads_panel = DownloadsPanel(self)
+        self._downloads_phase = 0
 
         self._bind()
 
@@ -2194,6 +2744,7 @@ class Browser:
         w.bind("<Control-r>", lambda e: self._reload())
         w.bind("<Control-d>", lambda e: self._toggle_bookmark())
         w.bind("<Control-h>", lambda e: self._open_history_page())
+        w.bind("<Control-j>", lambda e: self._toggle_downloads())
         w.bind("<Control-Shift-s>", lambda e: self._open_shoes_page())
         w.bind("<Control-Tab>", lambda e: self._cycle_tab(1))
         w.bind("<Control-ISO_Left_Tab>", lambda e: self._cycle_tab(-1))
@@ -2265,6 +2816,7 @@ class Browser:
             return
         self._dismiss_select_popup()
         idx = self.tabs.index(self.active_tab)
+        self.active_tab.stop_videos()
         self.tabs.remove(self.active_tab)
         if not self.tabs:
             self.window.destroy()
@@ -2386,9 +2938,7 @@ class Browser:
         if self.active_tab:
             self.active_tab.scroll_by(delta)
             self._draw_page()
-            # Page content scrolls up underneath the chrome; redraw the chrome
-            # on top so its background covers the overlap (see _draw_chrome).
-            self._draw_chrome()
+            # _draw_page re-asserts the chrome on top of the scrolled page.
 
     def _on_home_key(self, e):
         if self.focus == "address":
@@ -2419,13 +2969,25 @@ class Browser:
         if self.select_popup.open_:
             self._select_popup_click(e.x, e.y)
             return
+        if self.downloads_panel.point_in(e.x, e.y):
+            self._downloads_click(e.x, e.y)
+            return
         was_address = self.focus == "address"
         self.focus = None
         self._drag_moved = False
+        # A press ends any scrollbar drag still on the books -- normally the
+        # release did, but a release delivered somewhere else (the pointer
+        # left the window at the wrong moment) must not leave the bar stuck
+        # to the pointer for the rest of the session.
+        self._scroll_grab = None
         if e.y < self.chrome_height():
             self._chrome_click(e.x, e.y, was_address)
             return
         if not self.active_tab:
+            return
+        if self._scrollbar_press(e.x, e.y):
+            if was_address:
+                self._draw_chrome()  # drop the address bar's focus ring
             return
         ctrl = bool(getattr(e, "state", 0) & 0x4)
         dest = self.active_tab.click(e.x, e.y - self.chrome_height())
@@ -2453,10 +3015,54 @@ class Browser:
             # highlight grows during the drag), so no full canvas wipe is
             # needed here — that wipe is what blanked the page on heavy pages.
             self.canvas.delete("selection")
-            self.active_tab.start_selection(e.x, e.y - self.chrome_height())
+            self.active_tab.selection = None
+            if self._in_scrollbar_gutter(e.x):
+                # The strip the scrollbar lives in belongs to the chrome, not
+                # to the page: a press there is aimed at the bar, and hit
+                # testing that resolves any point to the nearest line would
+                # otherwise turn a grab at the scrollbar into a selection of
+                # whatever text happens to end nearest it. _scrollbar_press
+                # has already claimed the presses it wants; this covers the
+                # rest of the strip, above and below the track, so the whole
+                # column behaves like one thing.
+                if was_address:
+                    self._draw_chrome()
+                return
+            self._count_click(e.x, e.y)
+            self.active_tab.start_selection(
+                e.x, e.y - self.chrome_height(),
+                _CLICK_GRANULARITY.get(self._click_count, "char"))
+            if self._click_count > 1:
+                # A double- or triple-click has selected something already,
+                # so it has to show without waiting for a drag.
+                self._repaint_selection()
             if was_address:
                 # Dropping the address-bar focus ring is a chrome-only change.
                 self._draw_chrome()
+
+    def _in_scrollbar_gutter(self, x):
+        """Whether `x` lands in the strip the scrollbar occupies.
+
+        Only when there is a bar to occupy it: on a page that fits, the strip
+        is ordinary page and the last word on a line is selectable like any
+        other.
+        """
+        tab = self.active_tab
+        if not tab or tab.content_height() <= self.tab_height():
+            return False
+        return x >= self.canvas.winfo_width() - SCROLLBAR_GUTTER_W
+
+    def _count_click(self, x, y):
+        """Update the multi-click counter for a press at (x, y)."""
+        now = time.monotonic()
+        near = abs(x - self._click_pos[0]) <= MULTI_CLICK_SLOP \
+            and abs(y - self._click_pos[1]) <= MULTI_CLICK_SLOP
+        if near and now - self._click_time <= MULTI_CLICK_SECONDS:
+            self._click_count = self._click_count % 3 + 1
+        else:
+            self._click_count = 1
+        self._click_time = now
+        self._click_pos = (x, y)
 
     def _on_middle_click(self, e):
         if self.context_menu.open_:
@@ -2490,13 +3096,21 @@ class Browser:
             self.new_tab(str(dest))
 
     def _on_release(self, e):
+        if self._scroll_grab is not None:
+            # Letting go anywhere -- inside the window or well outside it --
+            # ends the drag and leaves the page where the bar put it.
+            self._scroll_grab = None
+            self._drag_moved = False
+            return
         if self.focus == "address":
             return
         tab = self.active_tab
         if not tab or tab.selection is None:
             return
-        if not self._drag_moved:
+        if not self._drag_moved and self._click_count < 2:
             # A plain click (press + release, no drag) clears the selection.
+            # A double- or triple-click is a click too, and it selected on the
+            # way down, so it is exempt.
             tab.selection = None
         self._drag_moved = False
         # Refresh only the highlight layer; a full canvas wipe here would
@@ -2505,8 +3119,16 @@ class Browser:
         c.delete("selection")
         if tab.selection is not None:
             tab._draw_selection(c, self.chrome_height())
+            self._publish_primary(tab.selected_text())
 
     def _on_drag(self, e):
+        if self._scroll_grab is not None:
+            # Dragging the scrollbar, wherever the pointer has got to by now:
+            # both backends keep sending the drag to the window the press
+            # went to, so e.y may be above the track or below the window.
+            self._drag_moved = True
+            self._scrollbar_drag_to(e.y)
+            return
         if self.focus == "address" and e.x >= self._address_bar_x() - 10:
             self._drag_moved = True
             if self.address_sel is None:
@@ -2521,6 +3143,11 @@ class Browser:
         if self.select_popup.open_:
             return
         if self.active_tab and e.y >= self.chrome_height():
+            if self.active_tab.selection is None:
+                # Nothing was anchored on the way down -- the press went to a
+                # link, a form control or the scrollbar gutter -- so this drag
+                # is not a selection and must not become one halfway through.
+                return
             self._drag_moved = True
             self.active_tab.extend_selection(e.x, e.y - self.chrome_height())
             self._repaint_selection()
@@ -2656,13 +3283,51 @@ class Browser:
         try:
             self.window.clipboard_clear()
             self.window.clipboard_append(text)
-        except gui.TclError:
+        except CanvasError:
             pass
 
     def _view_source(self):
         tab = self.active_tab
         if tab and isinstance(tab.url, URL):
             self._navigate(tab, URL("view-source:" + str(tab.url)))
+
+    # -- downloads -------------------------------------------------------
+
+    def _toggle_downloads(self):
+        self.downloads_panel.toggle()
+        self.draw()
+
+    def _download(self, url):
+        """Save `url` to the download directory, without navigating.
+
+        This is what "Download Link" does. There is no file picker to open
+        -- a native save dialog is exactly the sort of thing this browser
+        does not have -- so the file lands in the download directory under
+        the name the server suggests, and the panel says where.
+        """
+        if not isinstance(url, URL):
+            try:
+                url = URL(str(url))
+            except Exception:  # noqa: BLE001 - a malformed href downloads nothing
+                return
+        if url.scheme not in ("http", "https"):
+            return
+        self.downloads.start(url)
+        self.downloads_panel.open_ = True
+        self.draw()
+
+    def _downloads_click(self, x, y):
+        action = self.downloads_panel.hit(x, y)
+        if action is None:
+            return
+        what, download = action
+        if what == "close":
+            self.downloads_panel.close()
+        elif what == "clear":
+            self.downloads.clear_finished()
+        elif what == "cancel" and download is not None:
+            download.cancel()
+        self.draw()
 
     # -- <select> drop-down ----------------------------------------------
 
@@ -2819,12 +3484,16 @@ class Browser:
                 ("View Source", self._view_source,
                  bool(tab and isinstance(tab.url, URL))),
                 ("History", self._open_history_page, bool(tab)),
+                ("Downloads", self._toggle_downloads, True),
             ]
         doc_y = y - self.chrome_height()
         node = tab._node_at(x, doc_y)
         href = tab._enclosing_link(node)
         img_src = self._enclosing_image(node)
         items = []
+        if tab.selected_text():
+            items.append(("Copy", self._copy_selection, True))
+            items.append(None)
         if href:
             try:
                 resolved = tab.base_url.resolve(href) if tab.base_url \
@@ -2836,6 +3505,10 @@ class Browser:
                               lambda r=resolved: self._navigate(tab, r), True))
                 items.append(("Open Link in New Tab",
                               lambda r=resolved: self.new_tab(str(r)), True))
+                items.append(("Download Link",
+                              lambda r=resolved: self._download(r),
+                              getattr(resolved, "scheme", "")
+                              in ("http", "https")))
             items.append(("Copy Link Address",
                           lambda h=href: self._copy_text(h), True))
             items.append(None)
@@ -2848,6 +3521,10 @@ class Browser:
             if img_url is not None:
                 items.append(("Open Image",
                               lambda u=img_url: self._navigate(tab, u), True))
+                items.append(("Download Image",
+                              lambda u=img_url: self._download(u),
+                              getattr(img_url, "scheme", "")
+                              in ("http", "https")))
                 items.append(("Copy Image URL",
                               lambda u=str(img_url): self._copy_text(u), True))
             items.append(None)
@@ -2865,6 +3542,7 @@ class Browser:
             None,
             ("New Tab", lambda: self.new_tab("about:blank"), True),
             ("Close Tab", self.close_tab, len(self.tabs) > 1),
+            ("Downloads", self._toggle_downloads, True),
         ])
         return items
 
@@ -2973,6 +3651,23 @@ class Browser:
         self.window.clipboard_clear()
         self.window.clipboard_append(text)
 
+    def _publish_primary(self, text):
+        """Offer a finished mouse selection as X11's PRIMARY selection.
+
+        On X, selecting with the mouse is itself a copy -- middle-click
+        pastes it -- and that is a separate selection from the CLIPBOARD an
+        explicit Ctrl+C claims, so a page selection must not overwrite what
+        was copied earlier. Every other platform ignores this: the base
+        window's hook does nothing and macOS does not override it, because a
+        NSPasteboard only changes when the user asks it to.
+        """
+        if not text:
+            return
+        try:
+            self.window.on_primary_set(text)
+        except Exception as exc:  # noqa: BLE001 - a clipboard is not the page
+            self.window.on_callback_error("primary selection", exc)
+
     def _address_bar_x(self):
         """Canvas x where the address-bar text starts (after toe buttons
         and the bookmark star)."""
@@ -2982,6 +3677,10 @@ class Browser:
         url = str(self.active_tab.url) if \
             (self.active_tab and self.active_tab.url and
              not isinstance(self.active_tab.url, _AboutURL)) else ""
+        # Nothing should put a break in a URL, but this is the one route into
+        # the bar that does not go through _address_insert, and a URL that
+        # came in over the wire is not ours to trust.
+        url = self._flatten_address_text(url).strip()
         self.address_text = url
         self.address_caret = len(url)
         self.address_sel = None
@@ -3020,7 +3719,46 @@ class Browser:
         self.address_sel = None
         return True
 
+    @staticmethod
+    def _flatten_address_text(text):
+        """`text` with everything that breaks a line folded away.
+
+        The address bar is one line of text drawn inside one box, and the
+        renderer honours a line break wherever it finds one: paste a couple
+        of bullet points in and the second line is painted below the box,
+        floating over the page. A URL cannot hold a break either, so there
+        is nothing to preserve.
+
+        The break family is bigger than "\\n". A copy out of rendered text
+        can carry CR and CRLF from a Windows or classic-Mac source, the
+        vertical tab and form feed, NEL (U+0085) and the Unicode line and
+        paragraph separators U+2028/U+2029 -- `str.splitlines` knows all of
+        them, so the split is delegated to it rather than spelled out here
+        and left to rot. The tab goes the same way: not valid in a URL, and
+        drawn as a missing glyph.
+
+        A break becomes a *space*, not nothing. This bar is a search box as
+        much as it is a URL bar, and welding "...bullet one" onto "bullet
+        two..." quietly corrupts the query, where a space is what the line
+        break meant in the first place. Blank lines and the whitespace
+        hugging each break collapse into that one space, so a wrapped
+        paragraph does not arrive full of gaps.
+
+        Text with no break in it is returned as it stands, spaces included:
+        this runs on every inserted character, and a bar that eats the
+        space bar is worse than the bug it fixes.
+        """
+        lines = text.replace("\t", " ").splitlines()
+        if len(lines) <= 1:
+            return lines[0] if lines else ""
+        return " ".join(part for part in (line.strip() for line in lines)
+                        if part)
+
     def _address_insert(self, text):
+        # Every route into the address text -- typing, pasting, whatever a
+        # future one is -- lands here, so this is where a line break is
+        # stopped rather than at each caller.
+        text = self._flatten_address_text(text)
         self._address_delete_selection()
         self.address_text = (self.address_text[:self.address_caret] + text
                              + self.address_text[self.address_caret:])
@@ -3071,7 +3809,7 @@ class Browser:
         try:
             self.window.clipboard_clear()
             self.window.clipboard_append(self.address_text[s:e])
-        except gui.TclError:
+        except CanvasError:
             pass
 
     def _address_cut(self):
@@ -3086,11 +3824,14 @@ class Browser:
         flavour, and neither deserves a traceback in the user's face."""
         try:
             return self.window.clipboard_get()
-        except gui.TclError:
+        except CanvasError:
             return ""
 
     def _address_paste(self):
-        data = self._clipboard_text()
+        # A paste arrives as a block, so the whitespace around the block goes
+        # too -- a URL copied off a page usually brings a trailing newline
+        # with it, and one typed space is not what the user asked for.
+        data = self._flatten_address_text(self._clipboard_text()).strip()
         if data:
             self._address_insert(data)
 
@@ -3353,6 +4094,7 @@ class Browser:
             if item_id not in before:
                 c.addtag_withtag("toe-draw", item_id)
         self._draw_chrome()
+        self.downloads_panel.draw(self.canvas)
         self.context_menu.draw(self.canvas)
         self._draw_select_popup()
         self._update_title()
@@ -3363,9 +4105,15 @@ class Browser:
             + " — FeetBrowser")
 
     def _draw_page(self):
-        """Repaint the page layer only, leaving the chrome intact. Correct
-        whenever the page content changed (a new display list from render())
-        but no chrome element did."""
+        """Repaint the page layer, then re-assert the chrome on top of it.
+
+        The canvas paints in insertion order, so page commands re-executed
+        here land after the chrome that was drawn earlier and would cover it
+        -- once the page is scrolled, its full-viewport background rectangles
+        start above the window top and span the whole chrome strip. Re-drawing
+        the chrome after the page is what keeps the nav bar over the page, and
+        it is the cheap layer: a few dozen items, against hundreds of page
+        commands."""
         self._repaint_needed = False
         c = self.canvas
         c.delete("toe-draw")
@@ -3378,8 +4126,9 @@ class Browser:
         for item_id in c.find_all():
             if item_id not in before:
                 c.addtag_withtag("toe-draw", item_id)
-        # An open drop-down must stay on top of the page it floats over.
-        self._draw_select_popup()
+        # An open drop-down (or the downloads panel) must stay on top of the
+        # page it floats over; _draw_chrome ends by re-drawing both.
+        self._draw_chrome()
         self._update_title()
 
     def _draw_page_region(self, rect):
@@ -3437,8 +4186,9 @@ class Browser:
         for item_id in c.find_all():
             if item_id not in before:
                 c.addtag_withtag("chrome", item_id)
-        # After the tagging, so the drop-down is not mistaken for chrome and
-        # wiped by the next chrome repaint.
+        # After the tagging, so neither the drop-down nor the downloads
+        # panel is mistaken for chrome and wiped by the next chrome repaint.
+        self.downloads_panel.draw(self.canvas)
         self._draw_select_popup()
 
     def _repaint_selection(self):
@@ -3447,7 +4197,7 @@ class Browser:
         commands (the old approach) only slowed the drag and could blank the
         canvas on heavy pages."""
         tab = self.active_tab
-        if not tab or not tab.selection:
+        if not tab or tab.selection is None:
             self._draw_page()
             return
         c = self.canvas
@@ -3526,7 +4276,7 @@ class Browser:
         tab = self.active_tab
         btn(8, "‹", bool(tab and tab.history))
         btn(40, "›", bool(tab and tab.future))
-        btn(72, "⟳", bool(tab))
+        btn(72, "↻", bool(tab))
         btn(104, "⌂", bool(tab))
         marked = bool(tab and self._is_bookmarked(tab.url))
         btn(136 + self._toe_buttons_offset(), "★" if marked else "☆",
@@ -3545,7 +4295,11 @@ class Browser:
         else:
             url = ""
             if tab and tab.url and not isinstance(tab.url, _AboutURL):
-                url = str(tab.url)
+                # The unfocused bar echoes the tab's URL rather than the text
+                # the user typed, and a link href can carry a literal break
+                # (`&#10;` survives the parser and the URL), so it is flattened
+                # here too or it escapes the box by the back door.
+                url = self._flatten_address_text(str(tab.url))
             c.create_text(addr_x + 10, top + 60, text=url, anchor="w",
                           font=self.chrome_font, fill=self.c("addr_text"))
 
@@ -3642,25 +4396,94 @@ class Browser:
                       font=get_font(11, "normal", "roman", "Helvetica"),
                       fill=self.c("status_text"), tags=("statusbar",))
 
-    def _draw_scrollbar(self):
+    def _scrollbar_metrics(self):
+        """Where the scrollbar is right now, or None when there is not one.
+
+        One description of the geometry, used both to draw the thumb and to
+        decide what a press on it means -- drawing and hit-testing that each
+        work it out for themselves drift apart, and a bar you cannot grab
+        where you can see it is the bug this is here to avoid.
+
+        Returns (track_x, track_top, track_h, thumb_top, thumb_h, span),
+        where `span` is the scroll offset the bottom of the track stands for.
+        """
         tab = self.active_tab
         if not tab:
-            return
+            return None
         view = self.tab_height()
         total = tab.content_height()
-        c = self.canvas
-        c.delete("scrollbar")
         if total <= view:
-            return
-        track_x = c.winfo_width() - 10
+            return None  # the page fits: nothing to scroll and no bar drawn
+        track_x = self.canvas.winfo_width() - SCROLLBAR_RIGHT
         track_top = self.chrome_height()
         track_h = view
-        frac = view / total
-        thumb_h = max(30, track_h * frac)
-        thumb_top = track_top + (track_h - thumb_h) * (tab.scroll / (total - view))
-        c.create_rectangle(track_x, thumb_top, track_x + 6, thumb_top + thumb_h,
+        thumb_h = max(SCROLLBAR_MIN_THUMB, track_h * (view / total))
+        thumb_h = min(thumb_h, track_h)
+        span = total - view
+        thumb_top = track_top + (track_h - thumb_h) * (tab.scroll / span)
+        return track_x, track_top, track_h, thumb_top, thumb_h, span
+
+    def _draw_scrollbar(self):
+        c = self.canvas
+        c.delete("scrollbar")
+        metrics = self._scrollbar_metrics()
+        if metrics is None:
+            return
+        track_x, _track_top, _track_h, thumb_top, thumb_h, _span = metrics
+        c.create_rectangle(track_x, thumb_top, track_x + SCROLLBAR_W,
+                           thumb_top + thumb_h,
                            fill=self.c("scroll_thumb"), width=0,
                            tags=("scrollbar",))
+
+    # -- scrollbar dragging ----------------------------------------------
+
+    def _scrollbar_press(self, x, y):
+        """Handle a left press at (x, y) if it landed on the scrollbar.
+
+        True means the press was the bar's and the page must not also treat
+        it as a click. Pressing the thumb starts a drag that keeps the
+        grabbed point under the pointer; pressing the empty track jumps the
+        thumb to centre on the press and then drags from there, so one
+        gesture can start anywhere on the bar.
+        """
+        metrics = self._scrollbar_metrics()
+        if metrics is None:
+            return False
+        track_x, track_top, track_h, thumb_top, thumb_h, _span = metrics
+        if x < track_x - SCROLLBAR_GRAB_PAD:
+            return False
+        if not track_top <= y < track_top + track_h:
+            return False
+        if thumb_top <= y < thumb_top + thumb_h:
+            self._scroll_grab = y - thumb_top
+        else:
+            self._scroll_grab = thumb_h / 2
+            self._scrollbar_drag_to(y)
+        return True
+
+    def _scrollbar_drag_to(self, y):
+        """Put the thumb where a pointer at `y` says it should be."""
+        if self._scroll_grab is None:
+            return
+        metrics = self._scrollbar_metrics()
+        if metrics is None:
+            # The page shrank under the drag (an image failed, a script
+            # rewrote it) and there is nothing left to scroll.
+            self._scroll_grab = None
+            return
+        _track_x, track_top, track_h, _thumb_top, thumb_h, span = metrics
+        travel = track_h - thumb_h
+        if travel <= 0:
+            return  # a thumb that fills the track has nowhere to go
+        # Dragging past either end of the track is ordinary -- the pointer
+        # leaves the window all the time -- and set_scroll() clamps to the
+        # same limits the wheel gets.
+        offset = (y - self._scroll_grab - track_top) / travel * span
+        self._dismiss_select_popup()
+        self.active_tab.set_scroll(offset)
+        # Same repaint the wheel gets: the page layer first, then the chrome
+        # over it -- which is where the thumb itself is drawn, so it follows.
+        self._draw_page()
 
     def run(self):
         self.window.update_idletasks()
@@ -3671,6 +4494,7 @@ class Browser:
         # forever, which burned CPU for idle pages.
         self.window.after(120, self._repaint_tick)
         self._poll_images()
+        self._ensure_video_tick()
         self.window.mainloop()
 
     def _repaint_tick(self):
@@ -3679,14 +4503,84 @@ class Browser:
             self._draw_page()
         self.window.after(120, self._repaint_tick)
 
+    def _ensure_video_tick(self):
+        """Arm the frame timer once, on demand.
+
+        Not armed in __init__ because a browser with no video in it should
+        not have a 25 Hz timer in it either, and not armed twice because two
+        chains would tick every player twice a frame -- which is harmless for
+        correctness (the clock decides what is due) and pure waste.
+        """
+        if self._video_ticking:
+            return
+        self._video_ticking = True
+        self._video_tick()
+
+    def _video_tick(self):
+        """The frame timer, on its own chain because it has to run far more
+        often than the 120 ms repaint coalescer and the 60 ms image sweep.
+
+        It asks each tab for the frame that is due now and repaints only if
+        one changed, so an idle page with no video costs a dictionary walk.
+        The interval is the ceiling on frame rate, not the frame rate: what
+        gets shown is whatever the clock says is current, so a 30 fps file on
+        a 40 ms tick drops frames rather than slowing down. Raising it is a
+        one-line change once the decoders are fast enough to deserve it.
+        """
+        for tab in self.tabs:
+            if tab.tick_videos() and tab is self.active_tab:
+                self._repaint_needed = True
+        self.window.after(VIDEO_TICK_MS, self._video_tick)
+
+    def busy(self):
+        """True while any tab still has work that changes what is on screen.
+
+        Three different things count, and conflating them is what made
+        screenshots come out full of placeholders: a document still on the
+        wire, images still on the wire for a document that has already
+        arrived, and -- for the same reason -- a video file still on the
+        wire, whose element is drawing a "[video: loading]" box until it
+        lands. A video that has *arrived* never makes us busy: playing is not
+        loading, and a looping film would make settle() wait for ever.
+        """
+        return any(tab.loading or tab.pending_images() or tab.pending_videos()
+                   for tab in self.tabs)
+
+    def settle(self, timeout=SETTLE_TIMEOUT):
+        """Run the timer queue until nothing is outstanding, or `timeout`.
+
+        Without a platform event loop nothing drains the timers, and image
+        loading lives entirely on them: fetches finish on background threads
+        and only become pixels when _poll_images() picks them up on the UI
+        thread. Anything that wants a finished frame without calling run()
+        -- --screenshot, tests -- has to pump here first.
+
+        Returns True if everything settled, False if the timeout arrived
+        first (a page can always point at an image that never answers).
+        """
+        if not self._polling_images:
+            self._poll_images()
+        deadline = time.monotonic() + timeout
+        while True:
+            wait = self.window.flush_timers()
+            if not self.busy():
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(min(wait, 0.01) if wait is not None else 0.01)
+
     def _poll_images(self):
         """Periodic UI-thread sweep: pick up decoded image bytes left by the
         fetch threads, re-render, and spin the loading indicator while any
         tab is still fetching. The `after` chain lives for the whole session,
         which keeps the loop alive across navigations."""
+        # Whoever gets here first owns the chain; settle() checks this so a
+        # headless render does not start a second one alongside run()'s.
+        self._polling_images = True
         loading = False
         for tab in self.tabs:
             tab._drain_images()
+            tab._drain_videos()
             if tab._js_interp is not None:
                 # Advance the JS virtual clock so setTimeout/setInterval fire
                 # on schedule, then run microtasks/timers/fetch settlements.
@@ -3695,11 +4589,31 @@ class Browser:
             tab._flush_pending_nav()
             if tab.loading:
                 loading = True
+        self._poll_downloads()
         if loading:
             self._loading_angle = (self._loading_angle + 18) % 360
             self.canvas.delete("spinner")
             self._draw_spinner()
         self.window.after(60, self._poll_images)
+
+    def _poll_downloads(self):
+        """UI thread: repaint the downloads panel as transfers move.
+
+        The workers never touch the canvas; they update their own Download
+        record and set a flag. This picks the flag up on the same 60ms timer
+        that drains image fetches, so a progress bar advances without a
+        thread anywhere near the rasteriser -- and when nothing is
+        downloading, nothing repaints.
+        """
+        panel = self.downloads_panel
+        if self.downloads.take_announcement():
+            panel.open_ = True
+        moved = self.downloads.take_changed()
+        active = self.downloads.active()
+        if active:
+            self._downloads_phase += 1
+        if panel.open_ and (moved or active):
+            panel.draw(self.canvas)
 
     def _draw_spinner(self):
         """Chrome-style spinning arc at the left of the address bar."""
@@ -3718,7 +4632,7 @@ class Browser:
 
 
 class PopupWindow:
-    """A real popup window (a separate Tk Toplevel), not a redirect.
+    """A real popup window (a separate Toplevel), not a redirect.
 
     Each popup is a mini-browser: its own canvas, a hand-drawn title bar
     with a close button, a Tab rendering the URL through the full pipeline,
@@ -3740,7 +4654,7 @@ class PopupWindow:
         self.window = gui.Toplevel(browser.window)
         self.window.title("")
         self.window.geometry(f"{width}x{height}")
-        self.canvas = gui.Canvas(
+        self.canvas = Canvas(
             self.window, width=width, height=height,
             bg="white", highlightthickness=0)
         self.canvas.pack(fill="both", expand=True)
@@ -3838,7 +4752,7 @@ class PopupWindow:
         try:
             self.window.clipboard_clear()
             self.window.clipboard_append(text)
-        except gui.TclError:
+        except CanvasError:
             pass
 
     def _navigate(self, dest):
@@ -4435,21 +5349,14 @@ def shoes_html(theme, active):
 """
 
 
-def screenshot(url, path, width=WIDTH, height=HEIGHT, settle=3.0):
+def screenshot(url, path, width=WIDTH, height=HEIGHT, settle=SETTLE_TIMEOUT):
     """Load `url` and write the rendered window to `path` as a PNG.
 
-    No display is opened. The raster backend draws into an ordinary buffer,
-    so a full render -- chrome, page, images, whatever scripts produced -- is
-    just a file write, which makes the renderer inspectable from a shell and
+    No display is opened. The canvas draws into an ordinary buffer, so a full
+    render -- chrome, page, images, whatever scripts produced -- is just a
+    file write, which makes the renderer inspectable from a shell and
     diffable in a test.
     """
-    if gui.backend() != "raster":
-        # Only our own canvas can hand back its pixels; a Tk one draws into a
-        # window we are not opening. Say so rather than failing on a missing
-        # method halfway through a page load.
-        raise RuntimeError(
-            "--screenshot needs the raster backend; this run is using "
-            "%r (set FEETBROWSER_BACKEND=raster)" % gui.backend())
     browser = Browser()
     browser.window.geometry("%dx%d" % (width, height))
     browser.canvas.resize(width, height)
@@ -4458,16 +5365,9 @@ def screenshot(url, path, width=WIDTH, height=HEIGHT, settle=3.0):
     # now, or the page lays out for the default viewport and gets cropped.
     browser._apply_resize()
     browser.new_tab(url)
-    # Images and deferred scripts land on the timer queue; give them a
-    # bounded window to arrive before the frame is captured.
-    browser._poll_images()
-    deadline = time.time() + settle
-    while time.time() < deadline:
-        browser.window.flush_timers()
-        if not any(tab.loading for tab in browser.tabs):
-            break
-        time.sleep(0.02)
-    browser.window.flush_timers()  # final drain of decoded images
+    # Images and deferred scripts land on the timer queue, so the frame is
+    # only finished once that queue has run itself out.
+    browser.settle(settle)
     browser.draw()
     browser.canvas.render().save_png(path)
     return browser
