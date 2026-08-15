@@ -288,6 +288,7 @@ _STATUS = {
     -6: "the picture is larger than this decoder's fixed buffers",
     -7: "the SPS crops the picture away to nothing",
     -8: "the stream asks for more reference frames than this decoder keeps",
+    -9: "lossless coding (transform bypass), which x264 uses at --qp 0",
     -11: "a PPS arrived before any SPS",
     -12: "the PPS ran off the end of its own NAL unit",
     -13: "slice groups (FMO), which no browser stream uses",

@@ -22,6 +22,7 @@ the toolchain still has a browser, it just has a browser that says "no
 decoder" for H.264, and the tests have to prove that path works too.
 """
 import os
+import re
 import sys
 import zlib
 
@@ -560,6 +561,125 @@ def test_a_machine_without_gfortran_still_has_a_browser():
         print("  ok  no toolchain: probed, refused, said why")
     finally:
         h264._loaded, h264._lib, h264._load_error = saved
+
+
+# Streams committed for what the decoder must *refuse*, so they have no
+# `.i420.z` beside them: there is no right picture to compare against, only
+# a right error. Both are combinations that decode to a plausible-looking
+# wrong picture if the refusal is missing, which is the failure mode worth
+# a fixture.
+REFUSALS = [
+    ("lossless", "lossless coding",
+     "x264 at --qp 0 sets qpprime_y_zero_transform_bypass_flag, and a "
+     "decoder that reads the flag and ignores it runs an inverse transform "
+     "over residuals that never had a forward one"),
+    ("b-cavlc", "CAVLC",
+     "B slices were built for CABAC and CAVLC for I and P, and their "
+     "overlap reads the wrong number of bits rather than failing: CAVLC's "
+     "mb_type table stops at the four P shapes and its sub_mb_type at four "
+     "rather than B's thirteen"),
+]
+
+
+def test_the_two_refusal_cases_are_refused_by_name():
+    """A refusal is a feature and gets a test like any other. Each of these
+    streams is well formed and decodable by FFmpeg; what is asserted is that
+    this decoder says so rather than producing a picture."""
+    if _skip():
+        return
+    for name, wanted, why in REFUSALS:
+        data = _stream(name)
+        decoder = h264.Decoder()
+        try:
+            for unit in _access_units(data):
+                decoder.decode_i420(unit)
+        except h264.H264Error as exc:
+            assert wanted in str(exc), (
+                "%s was refused, but for the wrong reason: %s" % (name, exc))
+            print("  ok  %-10s refused: %s" % (name, exc))
+            continue
+        raise AssertionError("%s decoded to a picture. %s" % (name, why))
+
+
+def test_no_fortran_routine_is_called_with_the_wrong_number_of_arguments():
+    """FORTRAN 77 has no prototypes, so a routine that grew an argument and
+    a caller that did not are a link that succeeds and a decoder that writes
+    through whatever was next on the stack. That is not a hypothetical: it
+    is how the CAVLC and B-slice branches met, and it segfaulted on the
+    second frame of `cavlc-p` rather than at the call.
+
+    This reads the sources rather than running anything, so it is the one
+    test here that is worth something on a machine with no gfortran."""
+    fortran = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "fortran")
+    declared, bad = {}, []
+    for name in sorted(os.listdir(fortran)):
+        if not name.endswith(".f"):
+            continue
+        for line in _folded(os.path.join(fortran, name)):
+            head = re.match(r"\s*(?:SUBROUTINE|(?:INTEGER|REAL|LOGICAL)\s+"
+                            r"FUNCTION)\s+(\w+)\s*(?:\(([^)]*)\))?", line)
+            if head:
+                args = (head.group(2) or "").strip()
+                declared[head.group(1).upper()] = (
+                    len(args.split(",")) if args else 0, name)
+    for name in sorted(os.listdir(fortran)):
+        if not name.endswith(".f"):
+            continue
+        for line in _folded(os.path.join(fortran, name)):
+            if re.match(r"\s*(?:SUBROUTINE|(?:INTEGER|REAL|LOGICAL)\s+"
+                        r"FUNCTION)\s", line):
+                continue
+            for call in re.finditer(r"\b(H2\w+)\s*\(", line):
+                routine = call.group(1).upper()
+                if routine not in declared:
+                    continue
+                count = _arity_at(line, call.end() - 1)
+                if count is None:
+                    continue
+                want, where = declared[routine]
+                if count != want:
+                    bad.append("%s calls %s with %d, declared with %d in %s"
+                               % (name, routine, count, want, where))
+    assert not bad, "argument count mismatches:\n  " + "\n  ".join(bad)
+    print("  ok  %d Fortran routines, every call site the declared arity"
+          % len(declared))
+
+
+def _folded(path):
+    """Fixed-form source with comments dropped, column 73 onwards cut off,
+    and continuation lines folded onto the statement they continue."""
+    out = []
+    with open(path) as handle:
+        for raw in handle:
+            line = raw.rstrip("\n")
+            if not line or line[0] in "Cc*!":
+                continue
+            line = line[:72]
+            if len(line) > 5 and line[5] not in (" ", "0"):
+                if out:
+                    out[-1] += line[6:]
+                continue
+            out.append(line)
+    return out
+
+
+def _arity_at(line, open_paren):
+    """Arguments in the call whose "(" is at `open_paren`, or None if the
+    parenthesis does not close on this statement."""
+    depth, count, anything = 0, 1, False
+    for char in line[open_paren:]:
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth == 0:
+                return count if anything else 0
+        elif char == "," and depth == 1:
+            count += 1
+        if depth == 1 and char not in "( \t":
+            anything = True
+    return None
 
 
 def main():

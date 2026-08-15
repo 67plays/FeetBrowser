@@ -17,6 +17,7 @@ C     * pic_order_cnt_type 1                                    -42
 C     * long-term references, and the four marking operations
 C       and the one reordering operation that name them         -50
 C     * more reference frames than MXREF                         -8
+C     * lossless coding, qpprime_y_zero_transform_bypass_flag     -9
 C     * temporal direct prediction with
 C       direct_8x8_inference_flag clear                         -55
 C     * a B slice coded with CAVLC, which no real stream is      -56

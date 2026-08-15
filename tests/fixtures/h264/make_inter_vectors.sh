@@ -265,3 +265,34 @@ open(sys.argv[2], "wb").write(zlib.compress(raw, 9))
 print("%-14s %s %2d frames  %7d -> %6d bytes"
       % ("bframes.mp4", "128x96", 12, len(raw), len(zlib.compress(raw, 9))))' \
     "$work/truth.i420" "$out/bframes.i420.z"
+
+# -- the two refusal fixtures -------------------------------------------------
+#
+# No truth file, because there is no right picture: what is asserted is the
+# error. Both are well formed and FFmpeg decodes both, which is the point --
+# a decoder missing either refusal produces a plausible picture rather than a
+# complaint, and a fixture is the only way to notice.
+#
+# They are encoded with ffmpeg directly rather than through `vector` because
+# neither goes near the common settings and both want to be as small as a
+# stream can be while still containing the thing.
+
+# --qp 0 is x264's lossless mode: profile 244 and
+# qpprime_y_zero_transform_bypass_flag set, so a macroblock at QP 0 skips the
+# transform and the deblocking filter and adds its residual as it stands.
+ffmpeg -v error -y -f lavfi -i "testsrc2=size=64x48:rate=25" \
+       -vf format=yuv420p -frames:v 1 \
+       -c:v libx264 -preset veryfast -x264-params "qp=0:bframes=0:tune=psnr" \
+       -f h264 "$out/lossless.264"
+
+# B slices under CAVLC. Nothing on the web is encoded this way -- Baseline has
+# no B slices and everything above it uses CABAC -- and the two halves of the
+# syntax have never been read together.
+ffmpeg -v error -y -f lavfi -i "testsrc2=size=64x48:rate=25" \
+       -vf format=yuv420p -frames:v 6 \
+       -c:v libx264 -preset veryfast \
+       -x264-params "cabac=0:bframes=2:b-adapt=0:b-pyramid=none:ref=2:qp=30:tune=psnr" \
+       -f h264 "$out/b-cavlc.264"
+
+printf '%-14s %s\n' lossless.264 "(refusal case, no truth file)" \
+                    b-cavlc.264  "(refusal case, no truth file)"

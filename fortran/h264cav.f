@@ -864,7 +864,13 @@ C     P_8x8ref0 is P_8x8 with the reference indices left out.
       END IF
 
       IF (CINTR .EQ. 0) THEN
-         CALL H2PPRD(N8)
+C     H2PPRD reports through ST because a B slice can reach a reference
+C     index with no picture behind it.  A P slice under CAVLC cannot,
+C     but the argument is not optional: Fortran 77 checks no signature,
+C     and a routine that writes a status into an argument its caller did
+C     not pass writes into whatever is next on the stack.
+         CALL H2PPRD(N8, ST)
+         IF (ST .NE. 0) RETURN
          DO 20 I = 1, 16
             CI4(I) = 2
    20    CONTINUE

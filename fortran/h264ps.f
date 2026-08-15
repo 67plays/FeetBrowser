@@ -49,7 +49,17 @@ C     8-bit by definition and say nothing.
          IF (CHFMT .EQ. 3) SEPCP = H2U1()
          BITDL = H2UE() + 8
          BITDC = H2UE() + 8
-         DUMMY = H2U1()
+C     qpprime_y_zero_transform_bypass_flag.  With it set, a macroblock at
+C     QP 0 skips the transform and the deblocking filter entirely and its
+C     residual is added to the prediction as it stands -- x264's lossless
+C     mode, which is what --qp 0 turns on.  Reading the flag and ignoring
+C     it does not produce a slightly wrong picture, it produces a wholly
+C     wrong one, because every coefficient goes through an inverse
+C     transform that was never applied.  Refuse instead.
+         IF (H2U1() .NE. 0) THEN
+            ST = -9
+            RETURN
+         END IF
          SLPRES = H2U1()
          IF (SLPRES .NE. 0) THEN
             N = 8

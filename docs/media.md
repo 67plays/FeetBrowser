@@ -314,8 +314,11 @@ bearing rather than defensive: the browser decodes video on a worker thread
 per element.
 
 **What it is not.** No SP or SI slices, no interlaced coding in any of its
-forms, no long-term reference pictures, and no picture order count type 1. A B
-slice coded with CAVLC is refused too: the two features were built for
+forms, no long-term reference pictures, no picture order count type 1, and no
+lossless coding -- `qpprime_y_zero_transform_bypass_flag`, which is what
+x264's `--qp 0` turns on, and where a macroblock's residual is added to the
+prediction without ever going through a transform. A B slice coded with CAVLC
+is refused too: the two features were built for
 different halves of the syntax, the combination does not occur in a real
 stream, and reading it would produce a plausible picture rather than an error.
 Temporal direct prediction is refused when `direct_8x8_inference_flag` is
