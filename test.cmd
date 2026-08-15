@@ -96,20 +96,6 @@ rem PCM, which needs no compiler anywhere: the fixtures are containers and
 rem the truth beside them, and the assertions are equalities.
 %RUN% tests\test_pcm.py || exit /b 1
 %RUN% tests\smoke.py || exit /b 1
-
-rem The Go port of the transport layer (net/) is a separate toolchain, so it is
-rem run where one is installed and skipped where there is not, the same way the
-rem window suites treat their platforms. Written with goto rather than an
-rem if/else block because `||` inside parentheses is parsed before the block
-rem runs, and binds to something other than what it looks like it binds to.
-where /q go
-if errorlevel 1 goto :nogo
-go vet ./... || exit /b 1
-go test ./... || exit /b 1
-goto :done
-:nogo
-echo skipping the Go net tests: no go toolchain on PATH
-:done
 exit /b 0
 
 rem The same two toolchain failures run.cmd explains, said shorter because

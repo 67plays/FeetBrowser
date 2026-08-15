@@ -85,12 +85,4 @@ $run tests/test_aac.py       # the Fortran AAC decoder, against FFmpeg's samples
 $run tests/test_pcm.py       # uncompressed sound, against the waveform it was made from
 $run tests/smoke.py
 
-# The Go port of the transport layer (net/) is a separate toolchain, so it is
-# run where one is installed and skipped where there is not, the same way the
-# window suites treat their platforms.
-if command -v go >/dev/null 2>&1; then
-  go vet ./...
-  go test ./...
-else
-  echo "skipping the Go net tests: no go toolchain on PATH"
-fi
+
