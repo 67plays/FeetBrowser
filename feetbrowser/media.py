@@ -110,10 +110,16 @@ class Scheduler:
     file, a codec or a canvas anywhere near them.
     """
 
-    def __init__(self, duration, frame_rate, clock=None, loop=False):
+    def __init__(self, duration, frame_rate, clock=None, loop=False,
+                 index_at=None):
         self.clock = clock or SystemClock()
         self.duration = duration
         self.frame_rate = frame_rate or 0.0
+        # How to turn a media position into a frame number. A track from a
+        # container that records per-frame times hands its own lookup over,
+        # because dividing by an average rate is only right when the rate is
+        # constant, and an MP4's is allowed not to be.
+        self.index_at = index_at
         self.loop = loop
         self.playing = False
         self._origin = 0.0          # clock reading when play() was called
@@ -160,6 +166,8 @@ class Scheduler:
 
     def due_index(self):
         """The frame that should be on screen right now."""
+        if self.index_at is not None:
+            return self.index_at(self.position())
         if self.frame_rate <= 0:
             return 0
         return int(self.position() * self.frame_rate)
@@ -236,6 +244,12 @@ class VideoPlayer:
         self._stop = threading.Event()
         self._wake = threading.Event()
         self._lock = threading.Lock()
+        # Held across every call into the track. The decode worker is not the
+        # only thread that decodes: a seek while paused decodes the frame it
+        # landed on, inline, so the picture moves under the scrubber, and a
+        # codec that keeps a previous frame between calls does not survive two
+        # threads walking it at once.
+        self._decode_lock = threading.Lock()
         self._next_index = 0        # next frame the decoder will produce
         self._resync_to = None
         self.decoded = 0
@@ -261,7 +275,8 @@ class VideoPlayer:
         self.height = info.height
         self.scheduler = Scheduler(info.duration,
                                    track.frame_rate if track else 0.0,
-                                   clock=clock, loop=loop)
+                                   clock=clock, loop=loop,
+                                   index_at=track.index_at if track else None)
         self.display_size = (self.width, self.height)
         if track is not None:
             self.photo = PhotoImage(width=track.width, height=track.height)
@@ -340,9 +355,32 @@ class VideoPlayer:
         if self.track is None:
             return False
         self.scheduler.seek(seconds)
+        target = self.scheduler.due_index()
         with self._lock:
-            self._resync_to = self.scheduler.due_index()
+            self._resync_to = target
         self._wake.set()
+        if not self.scheduler.playing:
+            # Nothing else will draw this. A paused player's tick() returns
+            # None by design, so without decoding here the scrubber would
+            # move and the picture would not -- which is the one thing a
+            # viewer uses a scrubber to look at.
+            self._present_index(target)
+        return True
+
+    def _present_index(self, index):
+        """Decode one frame on the calling thread and put it on screen."""
+        track = self.track
+        if track is None:
+            return False
+        index = max(0, min(int(index), track.frame_count - 1))
+        try:
+            with self._decode_lock:
+                frame = track.frame(index)
+        except MediaError:
+            self.decode_errors += 1
+            return False
+        self._present(frame)
+        self.scheduler.current = frame
         return True
 
     # -- decoding -----------------------------------------------------------
@@ -400,7 +438,8 @@ class VideoPlayer:
                 return False
             index = 0
         try:
-            frame = track.frame(index)
+            with self._decode_lock:
+                frame = track.frame(index)
         except MediaError:
             # One bad packet is not a reason to lose the film; skip it and
             # keep the position honest.
@@ -484,12 +523,8 @@ class VideoPlayer:
         `<video>` shows its own first frame instead of an empty box."""
         if self.track is None or self.scheduler.current is not None:
             return False
-        try:
-            frame = self.track.frame(0)
-        except MediaError:
+        if not self._present_index(0):
             return False
-        self._present(frame)
-        self.scheduler.current = frame
         with self._lock:
             self._resync_to = 0
         return True

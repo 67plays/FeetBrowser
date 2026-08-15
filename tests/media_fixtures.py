@@ -1,4 +1,4 @@
-"""Build real AVI/MP4/WebM bytes for the media tests.
+"""Build real AVI/MOV/MP4/WebM bytes for the media tests.
 
 Test media is generated here rather than committed, for the reason every
 media project eventually learns: a binary fixture is a file nobody can read
@@ -11,6 +11,7 @@ Not a test suite: nothing here starts with `test_`, so `tests/test_suites.py`
 does not expect a runner to name it. The tests live in `tests/test_render.py`.
 """
 
+import math
 import struct
 
 
@@ -185,6 +186,302 @@ def grey_palette():
     return [(i, i, i) for i in range(256)]
 
 
+# -- JPEG, so that a Motion JPEG fixture is a real Motion JPEG ---------------
+#
+# A test that wants to know whether the MJPEG path works has to hand it JPEGs,
+# and there is nowhere to get one from that is not either a committed binary
+# or a library. So this encodes them. It is a genuine baseline encoder --
+# level shift, 8x8 DCT, quantise, zigzag, Huffman -- and what comes out is a
+# file any decoder reads; it is only the choices inside that are made for a
+# fixture's convenience rather than a photograph's.
+#
+# Two of those choices are worth naming. The quantisation table is all ones,
+# which is the largest file and the smallest error: a test that says "this
+# frame is the colour #204070" wants that colour back, not that colour after
+# a quality-75 table has been through it. And the Huffman codes are the
+# standard ones from Annex K of the JPEG specification, transcribed below
+# rather than built from the image's own symbol frequencies.
+#
+# That second choice is the one that matters, and it is not about size. Motion
+# JPEG frames very often carry no DHT segment at all, because the tables would
+# be identical in every frame of the clip; a decoder is expected to know the
+# Annex K tables and supply them itself. `strip_huffman_tables` below produces
+# exactly those frames, and it can only produce a *decodable* one if the codes
+# the encoder used were the standard codes to begin with. So the fixture uses
+# them, and the round trip through the abbreviated form is then a real test of
+# the decoder's copy of the tables rather than a test of a private agreement
+# between two halves of the test suite.
+
+_ZIGZAG = (0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 32, 25, 18, 11, 4, 5,
+           12, 19, 26, 33, 40, 48, 41, 34, 27, 20, 13, 6, 7, 14, 21, 28,
+           35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37, 44, 51,
+           58, 59, 52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63)
+
+# Annex K, tables K.3 and K.4: the DC codes, over magnitude categories 0..11.
+# Eleven is enough for any 8-bit input through an unquantised DCT, whose DC
+# coefficient lands in -1024..1016 and whose successive difference therefore
+# never needs a twelfth bit.
+_DC_LUMA_BITS = (0, 1, 5, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0)
+_DC_CHROMA_BITS = (0, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0)
+_DC_VALUES = tuple(range(12))
+
+# Annex K, table K.5: the luminance AC codes. The symbols are (run, size)
+# bytes, plus 0x00 for end-of-block and 0xF0 for a run of sixteen zeroes.
+_AC_LUMA_BITS = (0, 2, 1, 3, 3, 2, 4, 3, 5, 5, 4, 4, 0, 0, 1, 0x7D)
+_AC_LUMA_VALUES = (
+    0x01, 0x02, 0x03, 0x00, 0x04, 0x11, 0x05, 0x12,
+    0x21, 0x31, 0x41, 0x06, 0x13, 0x51, 0x61, 0x07,
+    0x22, 0x71, 0x14, 0x32, 0x81, 0x91, 0xA1, 0x08,
+    0x23, 0x42, 0xB1, 0xC1, 0x15, 0x52, 0xD1, 0xF0,
+    0x24, 0x33, 0x62, 0x72, 0x82, 0x09, 0x0A, 0x16,
+    0x17, 0x18, 0x19, 0x1A, 0x25, 0x26, 0x27, 0x28,
+    0x29, 0x2A, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39,
+    0x3A, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49,
+    0x4A, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59,
+    0x5A, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69,
+    0x6A, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, 0x79,
+    0x7A, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89,
+    0x8A, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98,
+    0x99, 0x9A, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7,
+    0xA8, 0xA9, 0xAA, 0xB2, 0xB3, 0xB4, 0xB5, 0xB6,
+    0xB7, 0xB8, 0xB9, 0xBA, 0xC2, 0xC3, 0xC4, 0xC5,
+    0xC6, 0xC7, 0xC8, 0xC9, 0xCA, 0xD2, 0xD3, 0xD4,
+    0xD5, 0xD6, 0xD7, 0xD8, 0xD9, 0xDA, 0xE1, 0xE2,
+    0xE3, 0xE4, 0xE5, 0xE6, 0xE7, 0xE8, 0xE9, 0xEA,
+    0xF1, 0xF2, 0xF3, 0xF4, 0xF5, 0xF6, 0xF7, 0xF8,
+    0xF9, 0xFA)
+
+# Annex K, table K.6: the chrominance AC codes.
+_AC_CHROMA_BITS = (0, 2, 1, 2, 4, 4, 3, 4, 7, 5, 4, 4, 0, 1, 2, 0x77)
+_AC_CHROMA_VALUES = (
+    0x00, 0x01, 0x02, 0x03, 0x11, 0x04, 0x05, 0x21,
+    0x31, 0x06, 0x12, 0x41, 0x51, 0x07, 0x61, 0x71,
+    0x13, 0x22, 0x32, 0x81, 0x08, 0x14, 0x42, 0x91,
+    0xA1, 0xB1, 0xC1, 0x09, 0x23, 0x33, 0x52, 0xF0,
+    0x15, 0x62, 0x72, 0xD1, 0x0A, 0x16, 0x24, 0x34,
+    0xE1, 0x25, 0xF1, 0x17, 0x18, 0x19, 0x1A, 0x26,
+    0x27, 0x28, 0x29, 0x2A, 0x35, 0x36, 0x37, 0x38,
+    0x39, 0x3A, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48,
+    0x49, 0x4A, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58,
+    0x59, 0x5A, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68,
+    0x69, 0x6A, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78,
+    0x79, 0x7A, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87,
+    0x88, 0x89, 0x8A, 0x92, 0x93, 0x94, 0x95, 0x96,
+    0x97, 0x98, 0x99, 0x9A, 0xA2, 0xA3, 0xA4, 0xA5,
+    0xA6, 0xA7, 0xA8, 0xA9, 0xAA, 0xB2, 0xB3, 0xB4,
+    0xB5, 0xB6, 0xB7, 0xB8, 0xB9, 0xBA, 0xC2, 0xC3,
+    0xC4, 0xC5, 0xC6, 0xC7, 0xC8, 0xC9, 0xCA, 0xD2,
+    0xD3, 0xD4, 0xD5, 0xD6, 0xD7, 0xD8, 0xD9, 0xDA,
+    0xE2, 0xE3, 0xE4, 0xE5, 0xE6, 0xE7, 0xE8, 0xE9,
+    0xEA, 0xF2, 0xF3, 0xF4, 0xF5, 0xF6, 0xF7, 0xF8,
+    0xF9, 0xFA)
+
+_COS = [[math.cos((2 * x + 1) * u * math.pi / 16) for u in range(8)]
+        for x in range(8)]
+
+
+def _canonical(bits, values):
+    """{symbol: (code, length)} for a JPEG Huffman table.
+
+    The generation procedure the standard gives: codes are handed out in
+    increasing length, in the order the values are listed, and moving to the
+    next length shifts the running code left by one.
+    """
+    assert sum(bits) == len(values)
+    codes = {}
+    code = 0
+    index = 0
+    for length in range(1, 17):
+        for _ in range(bits[length - 1]):
+            codes[values[index]] = (code, length)
+            index += 1
+            code += 1
+        code <<= 1
+    return codes
+
+
+_DC_LUMA_CODES = _canonical(_DC_LUMA_BITS, _DC_VALUES)
+_DC_CHROMA_CODES = _canonical(_DC_CHROMA_BITS, _DC_VALUES)
+_AC_LUMA_CODES = _canonical(_AC_LUMA_BITS, _AC_LUMA_VALUES)
+_AC_CHROMA_CODES = _canonical(_AC_CHROMA_BITS, _AC_CHROMA_VALUES)
+
+
+class _BitWriter:
+    """MSB-first bits, with JPEG's byte stuffing: a 0xFF in the entropy
+    stream is followed by a 0x00 so it cannot be read as a marker."""
+
+    def __init__(self):
+        self.out = bytearray()
+        self._bits = 0
+        self._count = 0
+
+    def write(self, value, length):
+        for shift in range(length - 1, -1, -1):
+            self._bits = (self._bits << 1) | ((value >> shift) & 1)
+            self._count += 1
+            if self._count == 8:
+                self.out.append(self._bits)
+                if self._bits == 0xFF:
+                    self.out.append(0x00)
+                self._bits = 0
+                self._count = 0
+
+    def flush(self):
+        while self._count:
+            self.write(1, 1)        # pad with ones, as the standard says
+        return bytes(self.out)
+
+
+def _fdct(block):
+    """Separable 8x8 forward DCT-II with JPEG's normalisation."""
+    rows = []
+    for y in range(8):
+        row = block[y * 8:y * 8 + 8]
+        rows.append([sum(row[x] * _COS[x][u] for x in range(8))
+                     * (0.70710678118654752 if u == 0 else 1.0) / 2.0
+                     for u in range(8)])
+    out = [0.0] * 64
+    for u in range(8):
+        column = [rows[y][u] for y in range(8)]
+        for v in range(8):
+            total = sum(column[y] * _COS[y][v] for y in range(8))
+            scale = 0.70710678118654752 if v == 0 else 1.0
+            out[v * 8 + u] = total * scale / 2.0
+    return out
+
+
+def _category(value):
+    """JPEG's magnitude category: how many bits the value needs."""
+    magnitude = abs(value)
+    size = 0
+    while magnitude:
+        size += 1
+        magnitude >>= 1
+    return size
+
+
+def _encode_block(writer, coefficients, previous_dc, dc_codes, ac_codes):
+    """One 8x8 block, already quantised, in zigzag order."""
+    zigzag = [coefficients[i] for i in _ZIGZAG]
+    diff = zigzag[0] - previous_dc
+    size = _category(diff)
+    writer.write(*dc_codes[size])
+    if size:
+        writer.write(diff if diff > 0 else diff + (1 << size) - 1, size)
+    run = 0
+    for index in range(1, 64):
+        value = zigzag[index]
+        if value == 0:
+            run += 1
+            continue
+        while run > 15:
+            writer.write(*ac_codes[0xF0])
+            run -= 16
+        size = _category(value)
+        # The standard AC tables stop at category 10, and an 8-bit image
+        # through an unquantised DCT cannot exceed it: the largest AC
+        # coefficient any input can produce is about 909. If this ever fires,
+        # the fixture has grown a quantisation table that scales coefficients
+        # up, and the tables have to grow with it.
+        assert size <= 10, "AC coefficient %d needs a longer code" % value
+        writer.write(*ac_codes[(run << 4) | size])
+        writer.write(value if value > 0 else value + (1 << size) - 1, size)
+        run = 0
+    if run:
+        writer.write(*ac_codes[0x00])
+    return zigzag[0]
+
+
+def _dht(table_class, table_id, bits, values):
+    body = bytes([(table_class << 4) | table_id]) + bytes(bits) + bytes(values)
+    return b"\xff\xc4" + struct.pack(">H", len(body) + 2) + body
+
+
+def jpeg(width, height, pixel):
+    """A baseline 4:4:4 JPEG of `pixel(x, y) -> (r, g, b)`."""
+    if width <= 0 or height <= 0:
+        raise ValueError("a JPEG needs a positive size")
+    planes = ([], [], [])
+    for y in range(height):
+        for x in range(width):
+            r, g, b = pixel(x, y)
+            planes[0].append(0.299 * r + 0.587 * g + 0.114 * b)
+            planes[1].append(128 - 0.168736 * r - 0.331264 * g + 0.5 * b)
+            planes[2].append(128 + 0.5 * r - 0.418688 * g - 0.081312 * b)
+
+    writer = _BitWriter()
+    last_dc = [0, 0, 0]
+    for block_y in range(0, height, 8):
+        for block_x in range(0, width, 8):
+            for component in range(3):
+                plane = planes[component]
+                block = []
+                for row in range(8):
+                    # Edge blocks repeat the last real row and column, which
+                    # is what an encoder does and what stops a border of
+                    # ringing along the right and bottom edges.
+                    sy = min(block_y + row, height - 1)
+                    for col in range(8):
+                        sx = min(block_x + col, width - 1)
+                        block.append(plane[sy * width + sx] - 128.0)
+                quantised = [int(round(value)) for value in _fdct(block)]
+                dc_codes = _DC_LUMA_CODES if component == 0 \
+                    else _DC_CHROMA_CODES
+                ac_codes = _AC_LUMA_CODES if component == 0 \
+                    else _AC_CHROMA_CODES
+                last_dc[component] = _encode_block(writer, quantised,
+                                                   last_dc[component],
+                                                   dc_codes, ac_codes)
+    scan = writer.flush()
+
+    quant = b"\xff\xdb" + struct.pack(">H", 3 + 64) + b"\x00" + bytes([1] * 64)
+    sof = b"\xff\xc0" + struct.pack(">HBHHB", 8 + 3 * 3, 8, height, width, 3)
+    for component in (1, 2, 3):
+        sof += bytes((component, 0x11, 0))
+    sos = b"\xff\xda" + struct.pack(">HB", 6 + 2 * 3, 3)
+    for component in (1, 2, 3):
+        # Luma reads table 0, both chroma components table 1.
+        sos += bytes((component, 0x00 if component == 1 else 0x11))
+    sos += bytes((0, 63, 0))
+    app0 = b"\xff\xe0" + struct.pack(">H", 16) + b"JFIF\x00" \
+        + bytes((1, 1, 0, 0, 1, 0, 1, 0, 0))
+    return (b"\xff\xd8" + app0 + quant
+            + _dht(0, 0, _DC_LUMA_BITS, _DC_VALUES)
+            + _dht(0, 1, _DC_CHROMA_BITS, _DC_VALUES)
+            + _dht(1, 0, _AC_LUMA_BITS, _AC_LUMA_VALUES)
+            + _dht(1, 1, _AC_CHROMA_BITS, _AC_CHROMA_VALUES)
+            + sof + sos + scan + b"\xff\xd9")
+
+
+def strip_huffman_tables(image):
+    """The same JPEG in the abbreviated format: every DHT segment removed.
+
+    Motion JPEG files in the wild do this, because the tables are the same in
+    every frame of a clip. A decoder is expected to supply the standard ones.
+    """
+    out = bytearray(image[:2])
+    pos = 2
+    while pos + 4 <= len(image):
+        marker = image[pos + 1]
+        if marker == 0xDA:                  # start of scan: the rest is data
+            out += image[pos:]
+            return bytes(out)
+        length = struct.unpack(">H", image[pos + 2:pos + 4])[0]
+        if marker != 0xC4:
+            out += image[pos:pos + 2 + length]
+        pos += 2 + length
+    return bytes(out)
+
+
+MJPG = int.from_bytes(b"MJPG", "little")
+
+
+def mjpeg_avi(frames, width, height, fps=25.0, handler="MJPG", **kwargs):
+    """An AVI whose video stream is Motion JPEG."""
+    return avi(frames, width, height, fps=fps, compression=MJPG,
+               handler=handler, **kwargs)
+
+
 # -- containers we only probe ------------------------------------------------
 
 def _box(kind, payload):
@@ -210,6 +507,120 @@ def mp4(width, height, duration, timescale=600, codec="avc1"):
     trak = _box("trak", tkhd + mdia)
     moov = _box("moov", mvhd + trak)
     return ftyp + moov + _box("mdat", b"\x00" * 16)
+
+
+def _visual_sample_entry(codec, width, height, depth=24):
+    """A VisualSampleEntry: 78 bytes of it, laid out the way the spec does."""
+    body = (b"\x00" * 6                       # reserved
+            + struct.pack(">H", 1)            # data reference index
+            + b"\x00" * 16                    # pre_defined / reserved
+            + struct.pack(">HH", width, height)
+            + struct.pack(">II", 72 << 16, 72 << 16)
+            + struct.pack(">I", 0)            # reserved
+            + struct.pack(">H", 1)            # frame count
+            + b"\x00" * 32                    # compressor name
+            + struct.pack(">H", depth)
+            + struct.pack(">h", -1))          # pre_defined
+    assert len(body) == 78, len(body)
+    return struct.pack(">I", 8 + len(body)) + codec.encode("latin-1") + body
+
+
+def _stts(durations):
+    """A time-to-sample table, run-length encoded the way the spec asks.
+
+    Passing the per-sample durations rather than a rate is what lets a fixture
+    be variable frame rate, which is the case a player that divides by an
+    average gets wrong and never notices.
+    """
+    runs = []
+    for delta in durations:
+        if runs and runs[-1][1] == delta:
+            runs[-1][0] += 1
+        else:
+            runs.append([1, delta])
+    return _box("stts", struct.pack(">II", 0, len(runs))
+                + b"".join(struct.pack(">II", count, delta)
+                           for count, delta in runs))
+
+
+def mov(frames, width, height, codec="jpeg", fps=25.0, depth=24,
+        timescale=600, brand=b"qt  ", samples_per_chunk=1, sync=None,
+        wide_offsets=False, durations=None):
+    """A QuickTime/ISO file over the given list of sample payloads.
+
+    Real sample tables, and `mdat` is written before `moov` so the chunk
+    offsets in `stco` are offsets into a file that is still being built --
+    which is exactly the ordering that makes an offset bug visible.
+    """
+    delta = int(round(timescale / fps))
+    count = len(frames)
+    if durations is None:
+        durations = [delta] * count
+    ftyp = _box("ftyp", brand + struct.pack(">I", 512) + brand)
+    mdat_payload = b"".join(frames)
+    mdat = _box("mdat", mdat_payload)
+    # Samples live at their own offset inside mdat, whose payload starts
+    # eight bytes into the box, which itself starts after ftyp.
+    base = len(ftyp) + 8
+
+    chunk_offsets = []
+    offsets = []
+    running = base
+    for i, payload in enumerate(frames):
+        if i % samples_per_chunk == 0:
+            chunk_offsets.append(running)
+        offsets.append(running)
+        running += len(payload)
+
+    stsd = _box("stsd", struct.pack(">II", 0, 1)
+                + _visual_sample_entry(codec, width, height, depth))
+    stts = _stts(durations)
+    stsc = _box("stsc", struct.pack(">II", 0, 1)
+                + struct.pack(">III", 1, samples_per_chunk, 1))
+    stsz = _box("stsz", struct.pack(">III", 0, 0, count)
+                + b"".join(struct.pack(">I", len(f)) for f in frames))
+    if wide_offsets:
+        stco = _box("co64", struct.pack(">II", 0, len(chunk_offsets))
+                    + b"".join(struct.pack(">Q", o) for o in chunk_offsets))
+    else:
+        stco = _box("stco", struct.pack(">II", 0, len(chunk_offsets))
+                    + b"".join(struct.pack(">I", o) for o in chunk_offsets))
+    tables = stsd + stts + stsc + stsz + stco
+    if sync is not None:
+        tables += _box("stss", struct.pack(">II", 0, len(sync))
+                       + b"".join(struct.pack(">I", n) for n in sync))
+
+    duration_ticks = sum(durations)
+    mdhd = _box("mdhd", struct.pack(">BBBBIIIIHH", 0, 0, 0, 0, 0, 0,
+                                    timescale, duration_ticks, 0x55C4, 0))
+    hdlr = _box("hdlr", struct.pack(">I", 0) + b"\x00\x00\x00\x00vide"
+                + b"\x00" * 12 + b"\x00")
+    minf = _box("minf", _box("stbl", tables))
+    mdia = _box("mdia", mdhd + hdlr + minf)
+    tkhd = _box("tkhd", struct.pack(">BBBB", 0, 0, 0, 7)
+                + struct.pack(">IIIII", 0, 0, 1, 0, 0)
+                + b"\x00" * 52
+                + struct.pack(">II", width << 16, height << 16))
+    trak = _box("trak", tkhd + mdia)
+    mvhd = _box("mvhd", struct.pack(">BBBBIIII", 0, 0, 0, 0, 0, 0, timescale,
+                                    duration_ticks)
+                + b"\x00" * 80)
+    moov = _box("moov", mvhd + trak)
+    assert len(ftyp) + 8 == base and offsets[0] == base
+    return ftyp + mdat + moov
+
+
+def quicktime_raw_frame(width, height, pixel, depth=24):
+    """One `raw ` sample: top-down, and RGB rather than the DIB's BGR."""
+    out = bytearray()
+    for y in range(height):
+        for x in range(width):
+            r, g, b = pixel(x, y)
+            if depth == 32:
+                out += bytes((255, r, g, b))
+            else:
+                out += bytes((r, g, b))
+    return bytes(out)
 
 
 def _ebml(element_id, payload):

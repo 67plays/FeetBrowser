@@ -27,6 +27,7 @@ from .htmlparser import HTMLParser, Text, Element
 from .cssparser import CSSParser, style, parse_inline, set_viewport, \
     media_matches, get_viewport
 from .layout import DocumentLayout, paint_tree, get_font, _measure, \
+    DrawVideoControls, \
     field_value, field_checked, \
     select_options, selected_options, option_value, \
     select_rows, listbox_rows, listbox_scroll, listbox_active, \
@@ -90,17 +91,25 @@ VIDEO_TICK_MS = 40
 
 # `<source type="...">` values we will even try. Filtering here means a page
 # offering WebM first and AVI second gets the AVI, which is the entire purpose
-# of the element.
+# of the element. A type we can decode is not the same as a container we can
+# decode -- `video/mp4` covers both an H.264 film we cannot play and a Motion
+# JPEG .mov we can -- so the container types stay on this list and the codec
+# question is settled by opening the file.
 PLAYABLE_TYPES = ("video/x-msvideo", "video/avi", "video/msvideo",
-                  "video/vnd.avi")
+                  "video/vnd.avi", "video/quicktime", "video/x-motion-jpeg",
+                  "video/x-jpeg", "video/mjpeg", "multipart/x-mixed-replace")
+
+# The same question asked of a URL, for the many pages that write `<source>`
+# with no type on it at all.
+PLAYABLE_EXTENSIONS = (".avi", ".mov", ".qt", ".mjpeg", ".mjpg", ".mjpe")
 
 
 def _first_playable_source(node):
     """Pick a `<source>` for a `<video>` that has no src of its own.
 
-    Prefers one whose `type` we know we can decode, then one whose URL ends
-    in `.avi`, and falls back to the first source with a src at all -- the
-    last case being how the element still shows a real "MP4, H.264, no
+    Prefers one whose `type` we know we can decode, then one whose URL has an
+    extension we know, and falls back to the first source with a src at all --
+    the last case being how the element still shows a real "MP4, H.264, no
     decoder" box instead of nothing.
     """
     sources = [n for n in tree_to_list(node, [])
@@ -111,7 +120,8 @@ def _first_playable_source(node):
         if kind.lower() in PLAYABLE_TYPES:
             return candidate.attributes["src"]
     for candidate in sources:
-        if candidate.attributes["src"].lower().split("?")[0].endswith(".avi"):
+        path = candidate.attributes["src"].lower().split("?")[0]
+        if path.endswith(PLAYABLE_EXTENSIONS):
             return candidate.attributes["src"]
     return sources[0].attributes["src"] if sources else ""
 
@@ -1282,7 +1292,11 @@ class Tab:
             return
         for node in nodes:
             try:
-                player = media.VideoPlayer(data=data, loop=False)
+                # `loop` is per element, not per file: the same clip can be a
+                # looping background in one place on the page and a thing you
+                # watch once in another.
+                player = media.VideoPlayer(
+                    data=data, loop="loop" in node.attributes)
             except Exception as exc:  # noqa: BLE001 - a page must not die
                 self._add_error(f"VIDEO {key}: {exc}")
                 return
@@ -1337,11 +1351,45 @@ class Tab:
         if player is None or player.track is None:
             return False
         player.toggle()
+        self._after_transport(player)
+        return True
+
+    def _after_transport(self, player):
+        """What every transport control does once it has done its own bit:
+        make sure the frame timer is running, say where we are, and ask for a
+        repaint. The scrubber has to move even while paused, so the repaint
+        is not conditional on playing."""
         if self.browser is not None:
             self.browser._ensure_video_tick()
-        self.status = player.status()
-        if self.browser is not None:
             self.browser._repaint_needed = True
+        self.status = player.status()
+
+    def _video_controls_at(self, x, y):
+        """The transport bar under a point in document space, or None.
+
+        Scanned in paint order like `_node_at`, and before it, because the
+        bar sits over the picture: a click on the play button must not also
+        read as a click on the film behind it and toggle twice.
+        """
+        for cmd in reversed(self.display_list):
+            if isinstance(cmd, DrawVideoControls) and cmd.hit(x, y):
+                return cmd
+        return None
+
+    def _activate_video_controls(self, bar, x, y):
+        """Act on a click inside a transport bar. Always True: the bar
+        swallows clicks that land on nothing in particular rather than
+        letting them fall through and pause the film."""
+        action = bar.action_at(x, y)
+        player = bar.player
+        if action is None or player is None:
+            return True
+        what, value = action
+        if what == "toggle":
+            player.toggle()
+        elif what == "seek":
+            player.seek(value)
+        self._after_transport(player)
         return True
 
     @staticmethod
@@ -1444,11 +1492,16 @@ class Tab:
 
         Returns a URL to load, a FormAction (form submit), or None.
         """
+        bar = self._video_controls_at(x, y + self.scroll)
+        if bar is not None:
+            self._activate_video_controls(bar, x, y + self.scroll)
+            return None
         node = self._node_at(x, y)
         video = self._enclosing_video(node)
         if video is not None and self._toggle_video(video):
-            # Clicking the picture is the whole transport UI for now: no
-            # control bar, no scrubber. Said plainly in docs/media.md.
+            # A click on the picture itself is play/pause, with or without a
+            # control bar -- which is what every browser does and the only
+            # transport a `<video>` without `controls` has.
             return None
         control = self._hit_control(node)
         if control is not None:

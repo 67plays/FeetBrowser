@@ -62,12 +62,20 @@ hand, though one the network interrupts is resumed with a `Range` request
 where the server allows it. Nothing is opened after it is saved, and there is
 no history of past downloads across runs: the list is what this session did.
 
-**Video, barely:** a `<video>` element lays out, decodes and plays AVI files
-carrying uncompressed `BI_RGB` or run-length `BI_RLE8`, and toggles on click.
-MP4 and WebM are identified and measured but not decoded — no H.264, no VP9,
-no MJPEG — and an element carrying one draws a correctly sized box saying so.
-There is **no audio** anywhere in the browser. The design, the exact
-unsupported list and the ordered next steps are in [media.md](media.md).
+**Video, within one family of formats:** a `<video>` element lays out,
+decodes and plays Motion JPEG — in an AVI, in a QuickTime `.mov`, or as a
+bare `.mjpeg` file of JPEGs end to end — along with uncompressed `BI_RGB`,
+run-length `BI_RLE8`, and QuickTime's `raw ` and `png `. It plays and pauses
+on a click, and `<video controls>` gets a real transport bar with a play
+button, a scrubber you can seek with and a time readout. What it cannot do is
+the format the web actually uses: there is no H.264, no VP8, VP9 or AV1, no
+MPEG-4 ASP, so most MP4s and every WebM are identified and measured but not
+decoded, and an element carrying one draws a correctly sized box saying which
+codec it is and why it is not playing. YouTube and its neighbours do not
+work, and are not close to working. There is also **no audio** anywhere in
+the browser — nothing in the project opens an output device on any platform,
+so a clip with a soundtrack plays silently. The design, the exact unsupported
+list and the ordered next steps are in [media.md](media.md).
 
 **Doesn't (yet):** flexbox wrapping, `<textarea>`/`<select>` selection (beyond
 read-only), or the full ECMAScript feature set (see below). Shoes themes are

@@ -10,13 +10,24 @@ What is actually decoded to pixels:
   AVI (RIFF) with `BI_RGB`   uncompressed 8/24/32-bit DIB frames
   AVI (RIFF) with `BI_RLE8`  Microsoft's 8-bit run-length codec, including
                              the delta frames that make it inter-frame
+  AVI (RIFF) with `MJPG`     Motion JPEG: every frame is a whole JPEG
+  MOV/MP4 with `jpeg`/`mjpa` the same codec in QuickTime's container
+  MOV/MP4 with `raw `/`png ` uncompressed and PNG-per-frame QuickTime video
+  a bare `.mjpeg` stream      JPEGs end to end with no container at all
 
-Those two are here because they are decodable from scratch in a few hundred
-lines and are encumbered by nothing. Everything else in this module *reads*
-the file and refuses honestly: an MP4 or a WebM is walked far enough to
-report its dimensions, duration and codec name, and then declines, because
-saying "1280x720, H.264, 4.0s, no decoder" is useful and pretending to play
-it is not. See docs/media.md.
+Motion JPEG is the one that makes this a video player rather than a
+demonstration. It is here because the expensive half of it was already
+written: `imagecodec.decode_jpeg` is our own baseline-and-progressive JPEG
+decoder in Rust, and it decodes a 320x240 picture in about a millisecond, so
+a frame costs a couple of percent of one frame's worth of time. The codec
+below is the cheap half -- work out where each JPEG starts and ends, hand it
+over, and put the pixels where the compositor expects them.
+
+Everything else in this module *reads* the file and refuses honestly: an MP4
+carrying H.264, or a WebM carrying VP9, is walked far enough to report its
+dimensions, duration and codec name, and then declines, because saying
+"1280x720, H.264, 4.0s, no decoder" is useful and pretending to play it is
+not. See docs/media.md.
 
 Three rules the parsers hold to, because the file came from a stranger:
 
@@ -35,10 +46,12 @@ decoded frame goes to the screen without a conversion step.
 
 import struct
 
+from . import imagecodec
 from .imagecodec import MAX_PIXELS
 
 __all__ = ["MediaError", "VideoFrame", "VideoTrack", "MediaInfo",
-           "open_video", "probe", "sniff", "MAX_FRAMES", "MAX_CHUNKS"]
+           "open_video", "probe", "sniff", "MAX_FRAMES", "MAX_CHUNKS",
+           "MJPEG_DEFAULT_FPS"]
 
 
 class MediaError(Exception):
@@ -98,6 +111,9 @@ class _Reader:
 
     def u32le(self):
         return struct.unpack("<I", self.take(4))[0]
+
+    def u16be(self):
+        return struct.unpack(">H", self.take(2))[0]
 
     def u32be(self):
         return struct.unpack(">I", self.take(4))[0]
@@ -373,16 +389,249 @@ class _Rle8(_Codec):
         return bytes(out)
 
 
+# -- JPEG, as a video codec --------------------------------------------------
+
+# JPEG markers we have to recognise to walk a frame without decoding it.
+_SOI = 0xD8
+_EOI = 0xD9
+_SOS = 0xDA
+_DHT = 0xC4
+
+# Standard Huffman tables, ISO/IEC 10918-1 Annex K.3. A JPEG file normally
+# carries its own, but Motion JPEG has a long tradition of leaving them out:
+# the tables are identical in every frame of a clip, so an encoder that is
+# writing thousands of frames saves a few hundred bytes each by relying on
+# the decoder to already know them. That is legal for the "abbreviated"
+# format and it is what a great many camera AVIs and QuickTime .movs do, so a
+# frame with no DHT in it gets these spliced in ahead of its scan rather than
+# being called corrupt. Written out as (class, id, counts, symbols) because
+# that is the order they go into the segment.
+_STD_DC_LUMA_BITS = (0, 1, 5, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0)
+_STD_DC_CHROMA_BITS = (0, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0)
+_STD_DC_VALUES = tuple(range(12))
+
+_STD_AC_LUMA_BITS = (0, 2, 1, 3, 3, 2, 4, 3, 5, 5, 4, 4, 0, 0, 1, 0x7D)
+_STD_AC_LUMA_VALUES = (
+    0x01, 0x02, 0x03, 0x00, 0x04, 0x11, 0x05, 0x12,
+    0x21, 0x31, 0x41, 0x06, 0x13, 0x51, 0x61, 0x07,
+    0x22, 0x71, 0x14, 0x32, 0x81, 0x91, 0xA1, 0x08,
+    0x23, 0x42, 0xB1, 0xC1, 0x15, 0x52, 0xD1, 0xF0,
+    0x24, 0x33, 0x62, 0x72, 0x82, 0x09, 0x0A, 0x16,
+    0x17, 0x18, 0x19, 0x1A, 0x25, 0x26, 0x27, 0x28,
+    0x29, 0x2A, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39,
+    0x3A, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49,
+    0x4A, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59,
+    0x5A, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69,
+    0x6A, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, 0x79,
+    0x7A, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89,
+    0x8A, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98,
+    0x99, 0x9A, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7,
+    0xA8, 0xA9, 0xAA, 0xB2, 0xB3, 0xB4, 0xB5, 0xB6,
+    0xB7, 0xB8, 0xB9, 0xBA, 0xC2, 0xC3, 0xC4, 0xC5,
+    0xC6, 0xC7, 0xC8, 0xC9, 0xCA, 0xD2, 0xD3, 0xD4,
+    0xD5, 0xD6, 0xD7, 0xD8, 0xD9, 0xDA, 0xE1, 0xE2,
+    0xE3, 0xE4, 0xE5, 0xE6, 0xE7, 0xE8, 0xE9, 0xEA,
+    0xF1, 0xF2, 0xF3, 0xF4, 0xF5, 0xF6, 0xF7, 0xF8,
+    0xF9, 0xFA)
+
+_STD_AC_CHROMA_BITS = (0, 2, 1, 2, 4, 4, 3, 4, 7, 5, 4, 4, 0, 1, 2, 0x77)
+_STD_AC_CHROMA_VALUES = (
+    0x00, 0x01, 0x02, 0x03, 0x11, 0x04, 0x05, 0x21,
+    0x31, 0x06, 0x12, 0x41, 0x51, 0x07, 0x61, 0x71,
+    0x13, 0x22, 0x32, 0x81, 0x08, 0x14, 0x42, 0x91,
+    0xA1, 0xB1, 0xC1, 0x09, 0x23, 0x33, 0x52, 0xF0,
+    0x15, 0x62, 0x72, 0xD1, 0x0A, 0x16, 0x24, 0x34,
+    0xE1, 0x25, 0xF1, 0x17, 0x18, 0x19, 0x1A, 0x26,
+    0x27, 0x28, 0x29, 0x2A, 0x35, 0x36, 0x37, 0x38,
+    0x39, 0x3A, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48,
+    0x49, 0x4A, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58,
+    0x59, 0x5A, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68,
+    0x69, 0x6A, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78,
+    0x79, 0x7A, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87,
+    0x88, 0x89, 0x8A, 0x92, 0x93, 0x94, 0x95, 0x96,
+    0x97, 0x98, 0x99, 0x9A, 0xA2, 0xA3, 0xA4, 0xA5,
+    0xA6, 0xA7, 0xA8, 0xA9, 0xAA, 0xB2, 0xB3, 0xB4,
+    0xB5, 0xB6, 0xB7, 0xB8, 0xB9, 0xBA, 0xC2, 0xC3,
+    0xC4, 0xC5, 0xC6, 0xC7, 0xC8, 0xC9, 0xCA, 0xD2,
+    0xD3, 0xD4, 0xD5, 0xD6, 0xD7, 0xD8, 0xD9, 0xDA,
+    0xE2, 0xE3, 0xE4, 0xE5, 0xE6, 0xE7, 0xE8, 0xE9,
+    0xEA, 0xF2, 0xF3, 0xF4, 0xF5, 0xF6, 0xF7, 0xF8,
+    0xF9, 0xFA)
+
+
+def _dht_segment(table_class, table_id, bits, values):
+    """One DHT marker segment: length, class/id nibble pair, 16 counts, the
+    symbols. Assembled rather than pasted as a blob so the tables above stay
+    readable as tables."""
+    assert sum(bits) == len(values), "Huffman counts do not match the symbols"
+    body = bytes([(table_class << 4) | table_id]) + bytes(bits) + bytes(values)
+    return b"\xff\xc4" + struct.pack(">H", len(body) + 2) + body
+
+
+DEFAULT_HUFFMAN_TABLES = (
+    _dht_segment(0, 0, _STD_DC_LUMA_BITS, _STD_DC_VALUES)
+    + _dht_segment(0, 1, _STD_DC_CHROMA_BITS, _STD_DC_VALUES)
+    + _dht_segment(1, 0, _STD_AC_LUMA_BITS, _STD_AC_LUMA_VALUES)
+    + _dht_segment(1, 1, _STD_AC_CHROMA_BITS, _STD_AC_CHROMA_VALUES))
+
+
+def _jpeg_scan(data, start=0):
+    """Walk one JPEG image from `start` and return (sos_at, end, size).
+
+    `sos_at` is the offset of the 0xFF that begins the first scan header, or
+    None when the image has no scan; `end` is one past the image's last byte;
+    `size` is the (width, height) the frame header declared, or None.
+
+    This has to be a real marker walk rather than a search for `FF D9`,
+    because JPEG carries JPEGs inside itself: an EXIF thumbnail in an APP1
+    segment is a complete image with its own end-of-image marker, and a
+    scanner that stops at the first one it sees cuts every such frame in
+    half. Inside a scan the rule is different again -- there is no length --
+    so entropy-coded bytes are scanned for the next 0xFF that is neither a
+    stuffed zero nor a restart marker.
+    """
+    n = len(data)
+    if start + 2 > n or data[start] != 0xFF or data[start + 1] != _SOI:
+        raise MediaError("MJPEG frame does not start with an SOI marker")
+    pos = start + 2
+    sos_at = None
+    size = None
+    guard = 0
+    while pos < n:
+        guard += 1
+        if guard > MAX_CHUNKS:
+            raise MediaError("JPEG marker list does not terminate")
+        if data[pos] != 0xFF:
+            raise MediaError("JPEG marker expected at offset %d" % pos)
+        while pos < n and data[pos] == 0xFF:
+            pos += 1            # fill bytes are legal between markers
+        if pos >= n:
+            raise MediaError("JPEG ended inside a marker")
+        marker = data[pos]
+        pos += 1
+        if marker == _EOI:
+            return sos_at, pos, size
+        if marker == _SOI or 0xD0 <= marker <= 0xD7 or marker == 0x01:
+            continue            # standalone markers, no payload
+        if pos + 2 > n:
+            raise MediaError("JPEG segment length runs off the end")
+        length = struct.unpack(">H", data[pos:pos + 2])[0]
+        if length < 2 or pos + length > n:
+            raise MediaError("JPEG segment of %d bytes at %d" % (length, pos))
+        if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC) \
+                and size is None and length >= 7:
+            size = (struct.unpack(">H", data[pos + 5:pos + 7])[0],
+                    struct.unpack(">H", data[pos + 3:pos + 5])[0])
+        if marker == _SOS:
+            if sos_at is None:
+                sos_at = pos - 2
+            pos += length
+            pos = _jpeg_entropy_end(data, pos)
+            continue
+        pos += length
+    # Truncated: no EOI. Real capture files are cut mid-write often enough
+    # that the last frame of an otherwise good clip is worth decoding anyway,
+    # so hand back what there is and let the decoder judge it.
+    return sos_at, n, size
+
+
+def _jpeg_entropy_end(data, pos):
+    """Skip entropy-coded data: everything up to the next real marker."""
+    n = len(data)
+    while pos < n:
+        if data[pos] != 0xFF:
+            pos += 1
+            continue
+        if pos + 1 >= n:
+            return n
+        nxt = data[pos + 1]
+        if nxt == 0x00 or 0xD0 <= nxt <= 0xD7 or nxt == 0xFF:
+            pos += 2 if nxt != 0xFF else 1
+            continue
+        return pos
+    return n
+
+
+def _jpeg_frame(packet):
+    """One MJPEG packet, turned into a JPEG a decoder will accept.
+
+    Two fixups, both of which real files need. The packet may carry padding
+    on either side of the image -- AVI pads chunks to even lengths and some
+    muxers pad rather more generously -- so the image is cut out at its own
+    markers. And a frame in the abbreviated format has no Huffman tables in
+    it, in which case the standard ones are spliced in immediately before the
+    scan, which is exactly where a DHT is allowed to appear.
+    """
+    start = packet.find(b"\xff\xd8\xff")
+    if start < 0 or start > 4096:
+        raise MediaError("MJPEG packet contains no JPEG image")
+    sos_at, end, _size = _jpeg_scan(packet, start)
+    image = packet[start:end]
+    if sos_at is None:
+        raise MediaError("MJPEG frame has no scan in it")
+    if b"\xff\xc4" in image[:sos_at - start]:
+        return image
+    cut = sos_at - start
+    return image[:cut] + DEFAULT_HUFFMAN_TABLES + image[cut:]
+
+
+class _Mjpeg(_Codec):
+    """Motion JPEG: one whole JPEG per frame, decoded by our own decoder.
+
+    Stateless, because every frame is a keyframe -- which is the property
+    that makes MJPEG the pleasant codec to seek in and the wasteful one to
+    store. There is no motion compensation and no reference frame, so
+    `frame(n)` costs exactly one decode wherever the playhead came from, and
+    `keyframe_before(n)` is `n`.
+
+    Frames whose own size disagrees with the size the container declared are
+    scaled to the container's, because that is the size layout already
+    reserved and a buffer that changes shape mid-clip would mean rebuilding
+    the retained canvas item. It happens in practice: a field-encoded camera
+    AVI stores each field at half height under a full-height header.
+    """
+
+    def __init__(self, width, height):
+        _check_size(width, height)
+        self.width = width
+        self.height = height
+
+    def reset(self):
+        pass
+
+    def decode(self, packet, keyframe):
+        if not packet:
+            return None
+        image = _jpeg_frame(packet)
+        try:
+            width, height, rgba = imagecodec.decode_jpeg(image)
+        except imagecodec.ImageError as exc:
+            raise MediaError("MJPEG frame: %s" % exc)
+        if (width, height) != (self.width, self.height):
+            _check_size(width, height)
+            rgba = imagecodec.resize(rgba, width, height,
+                                     self.width, self.height)
+        return rgba
+
+
+# fourccs that mean "Motion JPEG". AVI and QuickTime each accumulated their
+# own spellings over twenty years and the files are still out there, so they
+# are all here; `dmb1` is Matrox's, `AVRn` Avid's, `MJPG`/`jpeg` the two
+# common ones.
+MJPEG_FOURCCS = ("MJPG", "mjpg", "MJPX", "jpeg", "JPEG", "mjpa", "AVDJ",
+                 "dmb1", "AVRn", "ADJV")
+
+# A bare `.mjpeg` stream has nowhere to record a frame rate -- it is JPEGs
+# and nothing else -- so one has to be assumed. 25 matches what the webcams
+# and capture cards that emit these files usually run at, and `<video>` gives
+# a page no way to say otherwise.
+MJPEG_DEFAULT_FPS = 25.0
+
+
 # fourccs we can name but not decode. Naming them is the point: the element
-# can say "MJPG" instead of "unknown", and the next contributor can see
+# can say "XVID" instead of "unknown", and the next contributor can see
 # exactly where a decoder plugs in.
 KNOWN_UNDECODABLE = {
-    "MJPG": "Motion JPEG: needs a baseline JPEG decoder, which this project "
-            "does not have yet",
-    "mjpg": "Motion JPEG: needs a baseline JPEG decoder, which this project "
-            "does not have yet",
-    "jpeg": "Motion JPEG: needs a baseline JPEG decoder, which this project "
-            "does not have yet",
     "H264": "H.264: a from-scratch decoder is a multi-month project",
     "h264": "H.264: a from-scratch decoder is a multi-month project",
     "avc1": "H.264: a from-scratch decoder is a multi-month project",
@@ -581,13 +830,20 @@ class VideoTrack:
     tests decode deterministically and the browser decode without stalling.
     """
 
-    def __init__(self, data, info, packets, codec, frame_rate, keyframes):
+    def __init__(self, data, info, packets, codec, frame_rate, keyframes,
+                 times=None):
         self._data = data
         self.info = info
         self._packets = packets            # (offset, length, keyframe)
         self._codec = codec
         self.frame_rate = frame_rate
         self._keyframes = keyframes
+        # Per-frame presentation times, when the container carries them.
+        # AVI does not -- it has one rate for the whole stream -- but an MP4's
+        # `stts` is a list of durations and is allowed to vary, so a track
+        # from that container hands the real times over rather than letting
+        # them be recomputed from an average that is right only on average.
+        self._times = list(times) if times else None
         self._cursor = -1                  # last index handed to the codec
         self.width = info.width
         self.height = info.height
@@ -597,7 +853,37 @@ class VideoTrack:
         self.container = info.container
 
     def frame_time(self, index):
+        if self._times is not None:
+            if 0 <= index < len(self._times):
+                return self._times[index][0]
+            return 0.0
         return index / self.frame_rate if self.frame_rate else 0.0
+
+    def frame_duration(self, index):
+        if self._times is not None:
+            if 0 <= index < len(self._times):
+                return self._times[index][1]
+            return 0.0
+        return 1.0 / self.frame_rate if self.frame_rate else 0.0
+
+    def index_at(self, seconds):
+        """The frame on screen at `seconds`. Bisects the real times when we
+        have them, so a seek into a variable-rate file lands on the frame the
+        viewer is actually looking at rather than near it."""
+        if self._times is None:
+            if self.frame_rate <= 0:
+                return 0
+            index = int(seconds * self.frame_rate)
+        else:
+            lo, hi = 0, len(self._times)
+            while lo < hi:
+                mid = (lo + hi) // 2
+                if self._times[mid][0] <= seconds:
+                    lo = mid + 1
+                else:
+                    hi = mid
+            index = lo - 1
+        return max(0, min(index, max(0, self.frame_count - 1)))
 
     def packet(self, index):
         if not 0 <= index < len(self._packets):
@@ -646,7 +932,7 @@ class VideoTrack:
             # rather than nothing at all.
             rgba = bytes(self.width * self.height * 4)
         return VideoFrame(index, self.frame_time(index),
-                          1.0 / self.frame_rate if self.frame_rate else 0.0,
+                          self.frame_duration(index),
                           self.width, self.height, rgba)
 
     def reset(self):
@@ -679,13 +965,27 @@ def _open_avi(data):
     if frame_rate <= 0 or frame_rate > 1000:
         frame_rate = 25.0
 
+    codec_name = _fourcc_of(compression)
+    # Some encoders record the codec only in the stream handler and leave
+    # biCompression at zero, which would otherwise read as "uncompressed" and
+    # produce a screen of noise from JPEG bytes. The handler is the tie-break.
+    if codec_name == "BI_RGB" and stream.handler in MJPEG_FOURCCS:
+        codec_name = stream.handler
+    is_mjpeg = codec_name in MJPEG_FOURCCS
+
     ours = []
     ordinal = 0
     for stream_id, kind, offset, length in packets:
         if stream_id != video_index or kind not in ("dc", "db"):
             continue
         flags = index_flags.get((stream_id, ordinal))
-        if flags is None:
+        if is_mjpeg:
+            # Every MJPEG frame is a whole picture, whatever idx1 claims --
+            # and idx1 claims nothing useful in a good many camera files,
+            # where every entry has the keyframe bit clear. Trusting it there
+            # would make a seek replay the clip from frame zero.
+            keyframe = True
+        elif flags is None:
             keyframe = compression in (BI_RGB, BI_BITFIELDS) or ordinal == 0
         else:
             keyframe = bool(flags & AVIIF_KEYFRAME)
@@ -698,11 +998,12 @@ def _open_avi(data):
     if not ours[0][2]:
         ours[0] = (ours[0][0], ours[0][1], True)
 
-    codec_name = _fourcc_of(compression)
     duration = len(ours) / frame_rate
     info = MediaInfo("AVI", codec_name, width, height, duration, len(ours))
 
-    if compression == BI_RGB:
+    if is_mjpeg:
+        codec = _Mjpeg(width, height)
+    elif compression == BI_RGB:
         codec = _RawDib(width, height, bit_count, palette, top_down)
     elif compression == BI_RLE8:
         if bit_count != 8:
@@ -727,7 +1028,21 @@ class _Unsupported(MediaError):
         self.info = info
 
 
-# -- MP4 / ISO base media (probe only) ---------------------------------------
+# -- MP4 / MOV / ISO base media ----------------------------------------------
+#
+# One parser for both, because they are one format: QuickTime's file layout is
+# what ISO standardised, and the only interesting differences are which
+# codecs turn up inside. That is why the demuxer below is worth having even
+# though the MP4s on the web are all H.264 -- the .mov half of the same code
+# is where Motion JPEG lives, and a camera that writes .mov writes `jpeg`.
+#
+# The sample tables are the whole job. A frame's bytes are not marked in the
+# file; they are computed from five tables that between them say how long
+# each sample lasts (stts), which samples share a chunk (stsc), how big each
+# sample is (stsz), where each chunk starts (stco/co64) and which samples can
+# be decoded from cold (stss). Get any of them wrong and every frame after
+# the first is garbage, which is why this reconstructs the list once, up
+# front, and the tests check the offsets rather than the picture.
 
 def _boxes(reader, depth=0):
     if depth > MAX_DEPTH:
@@ -755,39 +1070,55 @@ def _boxes(reader, depth=0):
         reader.pos = end
 
 
-def _probe_mp4(data):
-    info = MediaInfo("MP4")
-    reader = _Reader(data)
-    for kind, box in _boxes(reader):
-        if kind == "moov":
-            _probe_moov(box, info)
-    if not info.reason:
-        info.reason = KNOWN_UNDECODABLE.get(
-            info.codec,
-            "no decoder for %s" % (info.codec or "this MP4's video codec"))
-    return info
+class _Mp4Track:
+    """One `trak`'s worth of sample tables, before they are joined up."""
+
+    def __init__(self):
+        self.handler = ""
+        self.timescale = 0
+        self.duration_ticks = 0
+        self.display_width = 0      # tkhd, in points -- what to draw it at
+        self.display_height = 0
+        self.width = 0              # stsd, in pixels -- what is stored
+        self.height = 0
+        self.depth = 24
+        self.codec = ""
+        self.stts = []              # (sample count, duration in ticks)
+        self.sync = None            # 1-based sample numbers, or None for all
+        self.stsc = []              # (first chunk, samples per chunk)
+        self.sample_size = 0        # non-zero when every sample is that size
+        self.sizes = []
+        self.chunks = []            # chunk offsets into the file
 
 
-def _probe_moov(moov, info):
-    for kind, box in _boxes(moov, 1):
-        if kind == "mvhd":
-            version = box.u8()
-            box.skip(3)
-            if version == 1:
-                box.skip(16)
-                timescale = box.u32be()
-                duration = box.u64be()
-            else:
-                box.skip(8)
-                timescale = box.u32be()
-                duration = box.u32be()
-            if timescale:
-                info.duration = duration / timescale
-        elif kind == "trak":
-            _probe_trak(box, info)
+def _parse_mp4(data):
+    """Every track in the file, plus the movie's own duration in seconds."""
+    duration = 0.0
+    tracks = []
+    for kind, box in _boxes(_Reader(data)):
+        if kind != "moov":
+            continue
+        for sub_kind, sub in _boxes(box, 1):
+            if sub_kind == "mvhd":
+                version = sub.u8()
+                sub.skip(3)
+                if version == 1:
+                    sub.skip(16)
+                    timescale = sub.u32be()
+                    ticks = sub.u64be()
+                else:
+                    sub.skip(8)
+                    timescale = sub.u32be()
+                    ticks = sub.u32be()
+                if timescale:
+                    duration = ticks / timescale
+            elif sub_kind == "trak":
+                tracks.append(_parse_trak(sub))
+    return duration, tracks
 
 
-def _probe_trak(trak, info):
+def _parse_trak(trak):
+    track = _Mp4Track()
     for kind, box in _boxes(trak, 2):
         if kind == "tkhd":
             version = box.u8()
@@ -800,32 +1131,314 @@ def _probe_trak(trak, info):
             width = box.u32be() / 65536.0
             height = box.u32be() / 65536.0
             if width >= 1 and height >= 1:
-                info.width = int(round(width))
-                info.height = int(round(height))
+                track.display_width = int(round(width))
+                track.display_height = int(round(height))
         elif kind == "mdia":
-            for sub_kind, sub in _boxes(box, 3):
-                if sub_kind == "minf":
-                    for m_kind, m in _boxes(sub, 4):
-                        if m_kind == "stbl":
-                            _probe_stbl(m, info)
+            _parse_mdia(box, track)
+    return track
 
 
-def _probe_stbl(stbl, info):
+def _parse_mdia(mdia, track):
+    for kind, box in _boxes(mdia, 3):
+        if kind == "mdhd":
+            version = box.u8()
+            box.skip(3)
+            box.skip(16 if version == 1 else 8)
+            track.timescale = box.u32be()
+            track.duration_ticks = box.u64be() if version == 1 else box.u32be()
+        elif kind == "hdlr":
+            box.skip(8)                      # version/flags, pre_defined
+            track.handler = box.fourcc()
+        elif kind == "minf":
+            for m_kind, m in _boxes(box, 4):
+                if m_kind == "stbl":
+                    _parse_stbl(m, track)
+
+
+def _parse_stbl(stbl, track):
     for kind, box in _boxes(stbl, 5):
-        if kind != "stsd":
-            continue
-        box.skip(4)                          # version + flags
-        count = box.u32be()
-        for _ in range(min(count, 16)):
-            if box.remaining() < 8:
+        if kind == "stsd":
+            _parse_stsd(box, track)
+        elif kind == "stts":
+            box.skip(4)
+            for _ in range(_table_count(box, 8)):
+                count = box.u32be()
+                delta = box.u32be()
+                track.stts.append((count, delta))
+        elif kind == "stss":
+            box.skip(4)
+            sync = set()
+            for _ in range(_table_count(box, 4)):
+                sync.add(box.u32be())
+            track.sync = sync
+        elif kind == "stsc":
+            box.skip(4)
+            for _ in range(_table_count(box, 12)):
+                first = box.u32be()
+                per_chunk = box.u32be()
+                box.skip(4)                  # sample description index
+                track.stsc.append((first, per_chunk))
+        elif kind == "stsz":
+            box.skip(4)
+            # stsz is the one table whose count is not the first field, so it
+            # cannot go through _table_count -- a constant sample size means
+            # there is no per-sample list to bound against at all.
+            track.sample_size = box.u32be()
+            declared = box.u32be()
+            if track.sample_size:
+                track.sizes = [track.sample_size] * min(declared, MAX_FRAMES)
+            else:
+                room = box.remaining() // 4
+                for _ in range(min(declared, room, MAX_FRAMES)):
+                    track.sizes.append(box.u32be())
+        elif kind in ("stco", "co64"):
+            box.skip(4)
+            wide = kind == "co64"
+            for _ in range(_table_count(box, 8 if wide else 4)):
+                track.chunks.append(box.u64be() if wide else box.u32be())
+
+
+def _table_count(box, entry_bytes):
+    """How many entries a sample-table box really has.
+
+    The declared count is read and then clamped to what is left in the box,
+    because it is a 32-bit number a stranger wrote: a `stsz` claiming four
+    billion samples is otherwise four billion `u32be()` calls before the
+    first short read stops it.
+    """
+    declared = box.u32be()
+    return min(declared, box.remaining() // entry_bytes, MAX_FRAMES)
+
+
+def _parse_stsd(stsd, track):
+    stsd.skip(4)                             # version + flags
+    count = stsd.u32be()
+    for _ in range(min(count, 16)):
+        if stsd.remaining() < 8:
+            break
+        entry_size = stsd.u32be()
+        fourcc = stsd.fourcc()
+        if not track.codec:
+            track.codec = fourcc
+        body = min(max(entry_size - 8, 0), stsd.remaining())
+        entry = _Reader(stsd.data, stsd.pos, stsd.pos + body)
+        # 78 bytes is exactly a VisualSampleEntry with nothing appended.
+        # Anything shorter is a sound or hint entry, or a truncated one, and
+        # reading a picture size out of it would invent numbers.
+        if track.handler in ("vide", "") and body >= 78:
+            # VisualSampleEntry: 6 reserved, 2 data reference index, then
+            # 16 bytes of pre_defined/reserved before the stored size.
+            entry.skip(24)
+            track.width = entry.u16be()
+            track.height = entry.u16be()
+            entry.skip(14)                   # resolutions, reserved, frames
+            entry.skip(32)                   # compressor name (Pascal string)
+            track.depth = entry.u16be()
+        stsd.skip(body)
+
+
+def _mp4_samples(track):
+    """Join the sample tables into (offset, length, keyframe) per frame.
+
+    The one subtlety is `stsc`: it is run-length coded over *chunks*, and the
+    run ends where the next entry's first chunk begins, so the last entry
+    silently means "and all the remaining chunks too".
+    """
+    sizes = track.sizes
+    total = len(sizes)
+    if not total or not track.chunks or not track.stsc:
+        raise MediaError("MP4 track has no usable sample table")
+    if total > MAX_FRAMES:
+        raise MediaError("MP4 track has more than %d samples" % MAX_FRAMES)
+    samples = []
+    index = 0
+    for i, (first, per_chunk) in enumerate(track.stsc):
+        if per_chunk <= 0 or first <= 0:
+            raise MediaError("MP4 stsc entry of %d samples in chunk %d"
+                             % (per_chunk, first))
+        last = track.stsc[i + 1][0] - 1 if i + 1 < len(track.stsc) \
+            else len(track.chunks)
+        for chunk_no in range(first, min(last, len(track.chunks)) + 1):
+            offset = track.chunks[chunk_no - 1]
+            for _ in range(per_chunk):
+                if index >= total:
+                    break
+                size = sizes[index]
+                if size > MAX_FRAME_BYTES:
+                    raise MediaError("MP4 sample %d is %d bytes"
+                                     % (index, size))
+                keyframe = track.sync is None or (index + 1) in track.sync
+                samples.append((offset, size, keyframe))
+                offset += size
+                index += 1
+        if index >= total:
+            break
+    if not samples:
+        raise MediaError("MP4 track has no samples")
+    if not samples[0][2]:
+        samples[0] = (samples[0][0], samples[0][1], True)
+    return samples
+
+
+def _mp4_times(track, count):
+    """Per-sample (pts, duration) in seconds, from `stts`."""
+    timescale = track.timescale or 600
+    times = []
+    ticks = 0
+    for run, delta in track.stts:
+        for _ in range(min(run, count - len(times))):
+            times.append((ticks / timescale, delta / timescale))
+            ticks += delta
+        if len(times) >= count:
+            break
+    # A short or missing stts: hold the last duration for the rest. Better
+    # than dropping the frames, which is what a strict reading would do.
+    tail = times[-1][1] if times else (1.0 / MJPEG_DEFAULT_FPS)
+    while len(times) < count:
+        times.append((ticks / timescale, tail))
+        ticks += tail * timescale
+    return times
+
+
+class _QuickTimeRaw(_Codec):
+    """QuickTime `raw `: uncompressed, top-down, and not the byte order the
+    Windows DIB above uses. 24-bit samples are R, G, B in that order and
+    32-bit ones are A, R, G, B -- the alpha comes first, which is the detail
+    that turns a picture into a colour-shifted one if you assume otherwise."""
+
+    def __init__(self, width, height, depth):
+        _check_size(width, height)
+        if depth not in (24, 32):
+            raise MediaError("QuickTime raw video at %d bits per pixel is "
+                             "not supported" % depth)
+        self.width = width
+        self.height = height
+        self.depth = depth
+
+    def reset(self):
+        pass
+
+    def decode(self, packet, keyframe):
+        if not packet:
+            return None
+        step = self.depth // 8
+        need = self.width * self.height * step
+        if len(packet) < need:
+            raise MediaError("raw frame short: %d bytes, need %d"
+                             % (len(packet), need))
+        out = bytearray(self.width * self.height * 4)
+        if step == 3:
+            for i in range(self.width * self.height):
+                s, d = i * 3, i * 4
+                out[d] = packet[s]
+                out[d + 1] = packet[s + 1]
+                out[d + 2] = packet[s + 2]
+                out[d + 3] = 255
+        else:
+            for i in range(self.width * self.height):
+                s, d = i * 4, i * 4
+                out[d] = packet[s + 1]
+                out[d + 1] = packet[s + 2]
+                out[d + 2] = packet[s + 3]
+                out[d + 3] = 255
+        return bytes(out)
+
+
+class _PngFrames(_Codec):
+    """QuickTime `png `: a whole PNG per frame. Lossless MJPEG, essentially,
+    and free here because the PNG decoder was already written for `<img>`."""
+
+    def __init__(self, width, height):
+        _check_size(width, height)
+        self.width = width
+        self.height = height
+
+    def reset(self):
+        pass
+
+    def decode(self, packet, keyframe):
+        if not packet:
+            return None
+        try:
+            width, height, rgba = imagecodec.decode_png(packet)
+        except imagecodec.ImageError as exc:
+            raise MediaError("PNG frame: %s" % exc)
+        if (width, height) != (self.width, self.height):
+            _check_size(width, height)
+            rgba = imagecodec.resize(rgba, width, height,
+                                     self.width, self.height)
+        return rgba
+
+
+def _open_mp4(data, container="MP4"):
+    """A `VideoTrack` over an MP4/MOV, or `_Unsupported` carrying what we
+    learned about it. Both paths run the same parse, so the numbers in the
+    "no decoder" box are the numbers a player that had one would use."""
+    movie_duration, tracks = _parse_mp4(data)
+    video = None
+    for track in tracks:
+        if track.handler == "vide":
+            video = track
+            break
+    if video is None:
+        # No handler said "video". Some very old QuickTime files leave hdlr
+        # out of mdia entirely, so fall back to the first track that named a
+        # picture size -- stored or displayed -- rather than giving up on a
+        # file we can still report the shape of.
+        for track in tracks:
+            if (track.width or track.display_width) \
+                    and (track.height or track.display_height):
+                video = track
                 break
-            entry_size = box.u32be()
-            fourcc = box.fourcc()
-            if fourcc in ("avc1", "hvc1", "hev1", "mp4v", "vp09", "av01"):
-                info.codec = fourcc
-            if entry_size < 8:
-                break
-            box.skip(min(entry_size - 8, box.remaining()))
+    if video is None:
+        raise MediaError("%s has no video track" % container)
+
+    width = video.width or video.display_width
+    height = video.height or video.display_height
+    codec = video.codec or ""
+    duration = movie_duration
+    if video.timescale and video.duration_ticks:
+        duration = video.duration_ticks / video.timescale
+
+    info = MediaInfo(container, codec, width, height, duration, 0)
+    try:
+        samples = _mp4_samples(video)
+    except MediaError as exc:
+        info.reason = KNOWN_UNDECODABLE.get(
+            codec, "no decoder for %s" % (codec or "this file's video codec"))
+        if codec in MJPEG_FOURCCS or codec in ("raw ", "png "):
+            info.reason = str(exc)
+        raise _Unsupported(info)
+    info.frame_count = len(samples)
+    times = _mp4_times(video, len(samples))
+    if duration <= 0 and times:
+        duration = times[-1][0] + times[-1][1]
+        info.duration = duration
+    frame_rate = len(samples) / duration if duration > 0 else 0.0
+    if frame_rate <= 0 or frame_rate > 1000:
+        frame_rate = MJPEG_DEFAULT_FPS
+
+    if codec in MJPEG_FOURCCS:
+        decoder = _Mjpeg(width, height)
+    elif codec == "raw ":
+        decoder = _QuickTimeRaw(width, height, video.depth)
+    elif codec == "png ":
+        decoder = _PngFrames(width, height)
+    else:
+        info.reason = KNOWN_UNDECODABLE.get(
+            codec, "no decoder for %s" % (codec or "this file's video codec"))
+        raise _Unsupported(info)
+    _check_size(width, height)
+    info.supported = True
+    return VideoTrack(data, info, samples, decoder, frame_rate,
+                      [i for i, s in enumerate(samples) if s[2]], times=times)
+
+
+def _probe_mp4(data, container="MP4"):
+    try:
+        return _open_mp4(data, container).info
+    except _Unsupported as exc:
+        return exc.info
 
 
 # -- WebM / Matroska (probe only) --------------------------------------------
@@ -945,7 +1558,54 @@ def _probe_webm(data):
     return info
 
 
+# -- a bare MJPEG stream -----------------------------------------------------
+
+def _open_mjpeg_stream(data):
+    """A file that is nothing but JPEGs, one after another.
+
+    This is what a network camera serves and what a capture card writes, and
+    it is the least a video file can be: no header, no index, no timing, no
+    audio -- just pictures. Everything the container would have told us has to
+    be inferred, so the size comes from the first frame's own header and the
+    rate from `MJPEG_DEFAULT_FPS`, which is a guess and is documented as one.
+    """
+    frames = []
+    size = None
+    pos = 0
+    while pos < len(data):
+        sos_at, end, dims = _jpeg_scan(data, pos)
+        if sos_at is None:
+            break
+        if size is None and dims:
+            size = dims
+        frames.append((pos, end - pos, True))
+        if len(frames) > MAX_FRAMES:
+            raise MediaError("MJPEG stream has more than %d frames"
+                             % MAX_FRAMES)
+        nxt = data.find(b"\xff\xd8\xff", end)
+        if nxt < 0:
+            break
+        pos = nxt
+    if not frames or size is None:
+        raise MediaError("MJPEG stream has no complete frame in it")
+    width, height = size
+    _check_size(width, height)
+    frame_rate = MJPEG_DEFAULT_FPS
+    info = MediaInfo("MJPEG", "MJPG", width, height,
+                     len(frames) / frame_rate, len(frames))
+    info.supported = True
+    return VideoTrack(data, info, frames, _Mjpeg(width, height), frame_rate,
+                      list(range(len(frames))))
+
+
 # -- entry points ------------------------------------------------------------
+
+# Box types that can legally open an ISO/QuickTime file. A .mov out of an old
+# camera often has no `ftyp` at all -- that box was invented for MP4 and
+# retrofitted -- so the first box's *type* is what identifies the family.
+_ISO_LEADERS = ("ftyp", "moov", "mdat", "wide", "free", "skip", "pnot",
+                "PICT")
+
 
 def sniff(data):
     """The container this looks like, or "" -- by magic bytes only, because
@@ -954,10 +1614,18 @@ def sniff(data):
         return ""
     if data[:4] == b"RIFF" and data[8:12] == b"AVI ":
         return "AVI"
-    if data[4:8] == b"ftyp":
-        return "MP4"
+    if data[:3] == b"\xff\xd8\xff":
+        return "MJPEG"
     if data[:4] == b"\x1a\x45\xdf\xa3":
         return "WebM"
+    leader = data[4:8].decode("latin-1")
+    if leader in _ISO_LEADERS:
+        # `ftyp` carries the brand, and QuickTime's is the four characters
+        # "qt  ". Telling the two apart is cosmetic -- the parser is the same
+        # -- but a box that says MOV when the file is a .mov is worth having.
+        if leader == "ftyp" and data[8:12] != b"qt  ":
+            return "MP4"
+        return "MOV"
     return ""
 
 
@@ -970,14 +1638,13 @@ def probe(data):
     container that is malformed.
     """
     kind = sniff(data)
-    if kind == "AVI":
+    if kind in ("AVI", "MJPEG"):
         try:
-            track = _open_avi(data)
+            return open_video(data).info
         except _Unsupported as exc:
             return exc.info
-        return track.info
-    if kind == "MP4":
-        return _probe_mp4(data)
+    if kind in ("MP4", "MOV"):
+        return _probe_mp4(data, kind)
     if kind == "WebM":
         return _probe_webm(data)
     raise MediaError("not a media container we recognise")
@@ -990,7 +1657,10 @@ def open_video(data):
     `probe()` result is still worth showing.
     """
     kind = sniff(data)
-    if kind != "AVI":
-        info = probe(data)
-        raise _Unsupported(info)
-    return _open_avi(data)
+    if kind == "AVI":
+        return _open_avi(data)
+    if kind == "MJPEG":
+        return _open_mjpeg_stream(data)
+    if kind in ("MP4", "MOV"):
+        return _open_mp4(data, kind)
+    raise _Unsupported(probe(data))

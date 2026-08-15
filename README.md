@@ -77,6 +77,9 @@ To render a page to a PNG without opening a window:
 - Open tabs, back/forward, reload, bookmarks, history, and page source
 - Fill in forms, follow links, search from the address bar
 - Download files, watching them arrive — `Ctrl-J` shows the manager
+- Play a `<video>`, so long as it is Motion JPEG, uncompressed or RLE —
+  with play/pause and a scrubber, and no sound at all
+  ([the honest list](docs/media.md#what-is-not-supported))
 - Add extensions ("toes") — open **`toe://hub`** in the browser
 - Restyle the browser with **Shoes** themes — open **`about:shoes`**
   (`Ctrl+Shift+S`)
@@ -89,7 +92,7 @@ To render a page to a PNG without opening a window:
 - [Architecture — how the engine works](docs/architecture.md)
 - [The rendering engine — fonts, rasteriser, pixels](docs/rendering.md)
 - [The Zig JavaScript engine](docs/jszig.md)
-- [Video — what decodes, and what a real codec would need](docs/media.md)
+- [Video — Motion JPEG, and what a real codec would need](docs/media.md)
 - [Extensions (Toes & ToeHub)](docs/toes.md)
 - [What it does and doesn't do](docs/limitations.md)
 - [Running the tests](docs/testing.md)
