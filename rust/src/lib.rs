@@ -1,7 +1,16 @@
 mod ast;
 mod css;
 mod dom;
+// The arena-backed DOM that replaces the `dom` proxy above. It is compiled
+// and tested from Phase 1, but nothing is wired onto it until the HTML tree
+// builder (Phase 2) and the interpreter (Phase 3) land; `dom` stays the live
+// path until then.
+mod domtree;
 mod font;
+// The WHATWG tokeniser and tree builder (Phase 2). Like `domtree`, it is
+// compiled and tested but not yet on the live path; `feetbrowser/htmlparser.py`
+// stays in charge until Phase 3 rewires the browser onto it.
+mod html;
 mod image;
 mod interp;
 mod parser;
