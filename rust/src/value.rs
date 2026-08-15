@@ -16,6 +16,11 @@ pub const MAX_STRING_OUT: usize = 32_000_000;
 pub const MAX_TIMERS: usize = 10_000;
 pub const MAX_DRAIN: usize = 1_000_000;
 
+/// The property-map key used for `Symbol.iterator`. Symbols are stored in
+/// property maps by their unique key string, and the well-known iterator
+/// symbol always uses this one.
+pub const SYMBOL_ITERATOR: &str = "@@iterator";
+
 #[derive(Debug, Clone)]
 pub enum JsError {
     /// An ordinary JS error (JSException-like).
@@ -143,6 +148,10 @@ pub enum JsValue {
     Date(Rc<RefCell<JsDate>>),
     Regex(Rc<RefCell<JsRegex>>),
     Error(Rc<RefCell<JsHostError>>),
+    /// A symbol value. `key` is the string used to address the symbol inside
+    /// property maps (well-known symbols use fixed keys like `"@@iterator"`),
+    /// and `desc` is what `Symbol(desc)` shows.
+    Symbol(Rc<JsSymbol>),
     /// Not a value a program can ever hold: it is what sits in a property slot
     /// that was defined with `get`/`set`, and `js_get`/`js_set` unwrap it by
     /// running the accessor. Storing it inline like this is what lets objects,
@@ -174,6 +183,7 @@ impl std::fmt::Debug for JsValue {
             JsValue::Date(_) => write!(f, "Date"),
             JsValue::Regex(_) => write!(f, "RegExp"),
             JsValue::Error(_) => write!(f, "Error"),
+            JsValue::Symbol(s) => write!(f, "Symbol({})", s.desc),
             JsValue::Accessor(_) => write!(f, "accessor"),
             JsValue::Super(_) => write!(f, "super"),
             JsValue::Native(n) => write!(f, "function {}", n.name),
@@ -348,6 +358,7 @@ pub fn map_key(v: &JsValue) -> String {
         JsValue::Date(d) => format!("obj:{:p}", Rc::as_ptr(d)),
         JsValue::Regex(r) => format!("obj:{:p}", Rc::as_ptr(r)),
         JsValue::Error(e) => format!("obj:{:p}", Rc::as_ptr(e)),
+        JsValue::Symbol(s) => format!("sym:{}", s.key),
         JsValue::Accessor(a) => format!("obj:{:p}", Rc::as_ptr(a)),
         JsValue::Super(s) => format!("obj:{:p}", Rc::as_ptr(s)),
         JsValue::Native(n) => format!("obj:{:p}", Rc::as_ptr(n)),
@@ -414,6 +425,7 @@ pub fn same_ref(a: &JsValue, b: &JsValue) -> bool {
         (Date(x), Date(y)) => Rc::ptr_eq(x, y),
         (Regex(x), Regex(y)) => Rc::ptr_eq(x, y),
         (Error(x), Error(y)) => Rc::ptr_eq(x, y),
+        (Symbol(x), Symbol(y)) => Rc::ptr_eq(x, y),
         (Super(x), Super(y)) => Rc::ptr_eq(x, y),
         (Native(x), Native(y)) => Rc::ptr_eq(x, y),
         (Host(x), Host(y)) => x.is(y),
@@ -476,6 +488,7 @@ pub fn js_typeof(v: &JsValue) -> &'static str {
         JsValue::Bool(_) => "boolean",
         JsValue::Str(_) => "string",
         JsValue::Number(_) => "number",
+        JsValue::Symbol(_) => "symbol",
         JsValue::Function(_) => "function",
         JsValue::Class(_)
         | JsValue::Instance(_)
@@ -811,6 +824,21 @@ pub struct JsSuper {
     pub this: JsValue,
     pub parent_proto: JsValue,
     pub parent_ctor: JsValue,
+}
+
+/// A symbol value. The unique `key` is what addresses it inside property maps
+/// and Map/Set -- `obj[Symbol.iterator]` and `m.get(someSymbol)` both go
+/// through it -- while `desc` is what `Symbol(desc)` shows and `description`
+/// reports. Fresh `Symbol("x")` values get a globally unique key so they can
+/// never collide with each other or with strings; `Symbol.for` hands out the
+/// same symbol for the same key; and well-known symbols pin fixed keys
+/// (`Symbol.iterator` -> `"@@iterator"`), which is what lets the iterator
+/// protocol find them through the same string-keyed property maps everything
+/// else uses.
+#[derive(Debug)]
+pub struct JsSymbol {
+    pub key: String,
+    pub desc: String,
 }
 
 /// A Map keyed by `map_key`'s string form of the key, holding the key itself

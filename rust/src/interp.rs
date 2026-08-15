@@ -361,6 +361,7 @@ impl Interpreter {
                 let e = e.borrow();
                 format!("{}: {}", e.name, e.message)
             }
+            JsValue::Symbol(s) => format!("Symbol({})", s.desc),
             JsValue::Super(_) => "super".to_string(),
             JsValue::Native(n) => format!("function {}", n.name),
             JsValue::Callback(_) => "function".to_string(),
@@ -552,6 +553,9 @@ fn py_args(this: &Rc<Interpreter>, py: Python<'_>, args: &[JsValue]) -> PyResult
 pub fn index_name(this: &Interpreter, value: &JsValue) -> String {
     match value {
         JsValue::Str(s) => s.to_string(),
+        // A symbol is addressed by its unique key, which is how
+        // `obj[Symbol.iterator]` reaches the `"@@iterator"` property slot.
+        JsValue::Symbol(s) => s.key.clone(),
         _ => this.repr(value),
     }
 }
@@ -1315,6 +1319,7 @@ pub fn js_get(this: &Rc<Interpreter>, obj: &JsValue, name: &str) -> Result<JsVal
         JsValue::Date(d) => Ok(as_method(obj, name, date_get(this, d, name))),
         JsValue::Regex(r) => Ok(as_method(obj, name, regex_get(this, r, name))),
         JsValue::Error(e) => Ok(as_method(obj, name, error_get(e, name))),
+        JsValue::Symbol(s) => Ok(symbol_get(s, name)),
         JsValue::Super(s) => Ok(super_get(s, name)),
         JsValue::Native(n) => {
             if matches!(name, "call" | "apply" | "bind") {
@@ -2100,6 +2105,13 @@ pub fn list_get(
                 })
             }));
         }
+        SYMBOL_ITERATOR => {
+            let a2 = a.clone();
+            return JsValue::Callback(Rc::new(move |i: &Rc<Interpreter>, _args: Vec<JsValue>| -> EvResult {
+                let out = array_iterator(i, a2.clone());
+                Box::pin(async move { Ok(out) })
+            }));
+        }
         _ => {}
     }
     if let Some(index) = int_index(name) {
@@ -2463,6 +2475,13 @@ pub fn string_get(this: &Rc<Interpreter>, text: &Rc<str>, name: &str) -> JsValue
                 Box::pin(async move { Ok(JsValue::Str(t2)) })
             }));
         }
+        SYMBOL_ITERATOR => {
+            let t2 = t.clone();
+            return JsValue::Callback(Rc::new(move |i: &Rc<Interpreter>, _args: Vec<JsValue>| -> EvResult {
+                let out = string_iterator(i, t2.clone());
+                Box::pin(async move { Ok(out) })
+            }));
+        }
         _ => {}
     }
     if let Some(index) = int_index(name) {
@@ -2616,6 +2635,13 @@ pub fn map_get(this: &Rc<Interpreter>, m: &Rc<RefCell<JsMap>>, name: &str) -> Js
                 Box::pin(async move { Ok(out) })
             }));
         }
+        SYMBOL_ITERATOR => {
+            let m2 = m.clone();
+            return JsValue::Callback(Rc::new(move |i: &Rc<Interpreter>, _args: Vec<JsValue>| -> EvResult {
+                let out = map_iterator(i, m2.clone());
+                Box::pin(async move { Ok(out) })
+            }));
+        }
         _ => JsValue::Undefined,
     }
 }
@@ -2704,6 +2730,13 @@ pub fn set_get(this: &Rc<Interpreter>, s: &Rc<RefCell<JsSet>>, name: &str) -> Js
                 } else {
                     vals
                 });
+                Box::pin(async move { Ok(out) })
+            }));
+        }
+        SYMBOL_ITERATOR => {
+            let s2 = s.clone();
+            return JsValue::Callback(Rc::new(move |i: &Rc<Interpreter>, _args: Vec<JsValue>| -> EvResult {
+                let out = set_iterator(i, s2.clone());
                 Box::pin(async move { Ok(out) })
             }));
         }
@@ -2965,6 +2998,31 @@ pub fn error_get(e: &Rc<RefCell<JsHostError>>, name: &str) -> JsValue {
         "stack" => {
             let e = e.borrow();
             JsValue::str(format!("{}: {}", e.name, e.message))
+        }
+        _ => JsValue::Undefined,
+    }
+}
+
+pub fn symbol_get(s: &Rc<JsSymbol>, name: &str) -> JsValue {
+    match name {
+        "description" => JsValue::str(s.desc.clone()),
+        "toString" => {
+            let desc = s.desc.clone();
+            JsValue::Callback(Rc::new(
+                move |_i: &Rc<Interpreter>, _args: Vec<JsValue>| -> EvResult {
+                    let out = JsValue::str(format!("Symbol({desc})"));
+                    Box::pin(async move { Ok(out) })
+                },
+            ))
+        }
+        "valueOf" => {
+            let s2 = s.clone();
+            JsValue::Callback(Rc::new(
+                move |_i: &Rc<Interpreter>, _args: Vec<JsValue>| -> EvResult {
+                    let out = JsValue::Symbol(s2.clone());
+                    Box::pin(async move { Ok(out) })
+                },
+            ))
         }
         _ => JsValue::Undefined,
     }
@@ -3654,6 +3712,34 @@ pub fn make_iterator(items: Vec<JsValue>) -> JsValue {
     JsValue::Object(map)
 }
 
+/// An array's iterator: `[Symbol.iterator]()` and `values()` hand it out, and
+/// `for...of` / spread / `Array.from` walk it. The elements are collected up
+/// front, exactly as a generator's yields are, and walked once.
+fn array_iterator(_this: &Rc<Interpreter>, arr: Rc<JsArray>) -> JsValue {
+    make_iterator(arr.borrow().clone())
+}
+
+/// A string's iterator: walks its code points, which is the one place a string
+/// iterates differently from the way it indexes.
+fn string_iterator(_this: &Rc<Interpreter>, text: Rc<str>) -> JsValue {
+    make_iterator(text.chars().map(|c| JsValue::str(c.to_string())).collect())
+}
+
+/// A Map's iterator: one `[key, value]` pair per step.
+fn map_iterator(_this: &Rc<Interpreter>, m: Rc<RefCell<JsMap>>) -> JsValue {
+    make_iterator(
+        map_entries(&m)
+            .into_iter()
+            .map(|(k, v)| JsValue::array(vec![k, v]))
+            .collect(),
+    )
+}
+
+/// A Set's iterator: one value per step.
+fn set_iterator(_this: &Rc<Interpreter>, s: Rc<RefCell<JsSet>>) -> JsValue {
+    make_iterator(set_values(&s))
+}
+
 fn start_async_call(
     this: &Rc<Interpreter>,
     fn_: &Rc<JSFunction>,
@@ -4004,7 +4090,7 @@ async fn eval_inner(
                     }
                     ObjectPair::Computed(key_expr, expr) => {
                         let k = eval(this, key_expr, env.clone()).await?;
-                        let key = this.repr(&k);
+                        let key = index_name(this, &k);
                         let v = eval(this, expr, env.clone()).await?;
                         out.borrow_mut().insert(key, v);
                     }
@@ -4014,7 +4100,7 @@ async fn eval_inner(
                     }
                     ObjectPair::ComputedAccessor { key_expr, kind, func } => {
                         let k = eval(this, key_expr, env.clone()).await?;
-                        let key = this.repr(&k);
+                        let key = index_name(this, &k);
                         let f = JsValue::Function(js_function_from(func, env.clone()));
                         set_accessor(&out, &key, kind, f);
                     }
@@ -4588,9 +4674,9 @@ async fn eval_class(
         });
         // A computed name is an expression evaluated once, as the class is
         // defined -- `[Symbol.iterator]` is the case that matters, and it has
-        // to resolve to the same string the iteration protocol looks for.
+        // to resolve to the same key the iteration protocol looks for.
         let member_name = match &m.key {
-            Some(k) => this.repr(&eval(this, k, env.clone()).await?),
+            Some(k) => index_name(this, &eval(this, k, env.clone()).await?),
             None => m.name.clone(),
         };
         if let Some(kind) = &m.accessor {
@@ -5528,7 +5614,15 @@ async fn exec_for_of(
     env: Env,
 ) -> Result<(), JsError> {
     let obj = eval(this, iterable, env.clone()).await?;
-    let items = iterate(this, &obj).await?.unwrap_or_default();
+    let items = match iterate(this, &obj).await? {
+        Some(items) => items,
+        None => {
+            return Err(JsError::js(format!(
+                "{} is not iterable",
+                this.repr(&obj)
+            )));
+        }
+    };
     for item in items {
         let child = Environment::new(Some(env.clone()));
         bind_loop_target(this, &child, var_kind, target, item).await?;

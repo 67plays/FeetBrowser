@@ -6,6 +6,7 @@ use crate::value::*;
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 // -- helpers ---------------------------------------------------------------
 
@@ -1770,55 +1771,100 @@ fn date_get(_this: &Rc<Interpreter>, _obj: &JsValue, name: &str) -> Result<JsVal
 
 // -- Symbol ----------------------------------------------------------------
 
-// A symbol here is a string with a name no source file can spell. Real symbols
-// are a value type of their own, kept out of `Object.keys` and reported by
-// `typeof` as "symbol"; ours are strings, so they show up in a key listing and
-// `typeof` calls them strings. That is the whole of the compromise, and what it
-// buys is everything symbols are actually used for on a page: a property name
-// that will not collide, `Symbol.iterator` as a well-known key, and a `Symbol`
-// global that exists at all -- transpiled bundles test for it and take a much
-// worse path when it is missing, and Google's opens by handing it to a helper
-// that then calls it, so its absence took the whole script down.
+// A symbol is a value type of its own: `typeof Symbol()` is "symbol", two
+// `Symbol("x")` calls are distinct values, and `Symbol.for` shares one value
+// per key. What a page actually uses symbols for is a property name that
+// cannot collide with a string, with `Symbol.iterator` as the well-known key
+// the iterator protocol is wired through -- transpiled bundles test for the
+// `Symbol` global and take a much worse path when it is missing, and Google's
+// opens by handing it to a helper that then calls it, so its absence took the
+// whole script down.
 //
-// The well-known ones are spelled "@@iterator" and so on, which is the name
-// every polyfill of the last decade has used for the same reason.
+// Symbols are stored in property maps by their unique key string -- the
+// well-known ones pin fixed keys like `"@@iterator"`, which is the name every
+// polyfill of the last decade has used -- so `obj[Symbol.iterator]` reaches
+// the same `"@@iterator"` slot that `iterate()` reads, and no page-visible
+// symbol ever collides with a string key.
+static SYMBOL_SEQ: AtomicUsize = AtomicUsize::new(0);
+
 thread_local! {
-    static SYMBOL_SEQ: Cell<u64> = const { Cell::new(0) };
+    /// `Symbol.for`'s registry: one symbol per key, shared across the page.
+    static SYMBOL_REGISTRY: RefCell<BTreeMap<String, Rc<JsSymbol>>> = RefCell::new(BTreeMap::new());
+    /// The well-known symbols, cached so `Symbol.iterator === Symbol.iterator`.
+    static WELL_KNOWN: RefCell<BTreeMap<String, Rc<JsSymbol>>> = RefCell::new(BTreeMap::new());
+}
+
+/// A well-known symbol, cached per key so identity is stable: `Symbol.iterator`
+/// read twice is the same symbol, which is what `===` and `Symbol.keyFor` rely
+/// on.
+fn well_known(name: &str) -> JsValue {
+    let key = format!("@@{name}");
+    WELL_KNOWN.with(|w| {
+        if let Some(s) = w.borrow().get(&key) {
+            return JsValue::Symbol(s.clone());
+        }
+        let sym = Rc::new(JsSymbol {
+            key: key.clone(),
+            desc: format!("Symbol.{name}"),
+        });
+        w.borrow_mut().insert(key, sym.clone());
+        JsValue::Symbol(sym)
+    })
+}
+
+/// A fresh, page-unique symbol: `Symbol(desc)`.
+fn new_symbol(desc: &str) -> JsValue {
+    let key = format!("@@sym{}", SYMBOL_SEQ.fetch_add(1, Ordering::Relaxed));
+    JsValue::Symbol(Rc::new(JsSymbol {
+        key,
+        desc: desc.to_string(),
+    }))
 }
 
 fn symbol_call(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
     let this = this.clone();
     Box::pin(async move {
-        let n = SYMBOL_SEQ.with(|c| {
-            c.set(c.get() + 1);
-            c.get()
-        });
         let desc = match args.first() {
-            Some(JsValue::Undefined) | None => String::new(),
-            Some(v) => this.repr(v),
+            Some(v) if !nullish(v) => this.repr(v),
+            _ => String::new(),
         };
-        Ok(JsValue::str(format!("@@sym:{n}:{desc}")))
+        Ok(new_symbol(&desc))
     })
 }
 
-/// `Symbol.for` shares one symbol per key across the whole page, which for a
-/// string-backed symbol is just a name derived from the key.
+/// `Symbol.for` shares one symbol per key across the whole page.
 fn symbol_for(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
     let this = this.clone();
     Box::pin(async move {
-        let key = this.repr(&first(&args));
-        Ok(JsValue::str(format!("@@for:{key}")))
+        let key = match args.first() {
+            Some(v) if !nullish(v) => this.repr(v),
+            _ => String::new(),
+        };
+        if let Some(s) = SYMBOL_REGISTRY.with(|r| r.borrow().get(&key).cloned()) {
+            return Ok(JsValue::Symbol(s));
+        }
+        let sym = Rc::new(JsSymbol {
+            key: key.clone(),
+            desc: key.clone(),
+        });
+        SYMBOL_REGISTRY.with(|r| r.borrow_mut().insert(key, sym.clone()));
+        Ok(JsValue::Symbol(sym))
     })
 }
 
-fn symbol_key_for(this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
-    let this = this.clone();
+fn symbol_key_for(_this: &Rc<Interpreter>, _obj: &JsValue, args: Vec<JsValue>) -> EvResult {
     Box::pin(async move {
-        let s = this.repr(&first(&args));
-        Ok(match s.strip_prefix("@@for:") {
-            Some(k) => JsValue::str(k.to_string()),
-            None => JsValue::Undefined,
-        })
+        match args.first() {
+            Some(JsValue::Symbol(s)) => {
+                let registered = SYMBOL_REGISTRY.with(|r| r.borrow().contains_key(&s.key));
+                if registered {
+                    Ok(JsValue::str(s.desc.clone()))
+                } else {
+                    Ok(JsValue::Undefined)
+                }
+            }
+            _ => Err(JsError::js("Symbol.keyFor requires a symbol argument")),
+        }
     })
 }
 
@@ -1826,7 +1872,7 @@ fn symbol_get(_this: &Rc<Interpreter>, _obj: &JsValue, name: &str) -> Result<JsV
     Ok(match name {
         "iterator" | "asyncIterator" | "hasInstance" | "toPrimitive" | "toStringTag"
         | "species" | "isConcatSpreadable" | "unscopables" | "match" | "replace"
-        | "search" | "split" => JsValue::str(format!("@@{name}")),
+        | "search" | "split" => well_known(name),
         "for" => native("for", symbol_for),
         "keyFor" => native("keyFor", symbol_key_for),
         _ => JsValue::Undefined,
