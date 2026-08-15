@@ -98,6 +98,103 @@ def _linespace(font):
     return _metrics(font, "linespace")
 
 
+# `line-height` values that mean "use the font's own idea of a line".
+_LINE_HEIGHT_AUTO = frozenset({
+    "", "normal", "auto", "inherit", "initial", "unset", "revert",
+})
+
+
+def _line_height(node, font):
+    """The used `line-height` for an inline box, in px (CSS 2.1 sec. 10.8).
+
+    Four forms, and the difference between them is *what inherits*:
+
+    * `normal` -- the face's own line spacing, ascent + descent + the line gap
+      the designer put in the font. That is what `_linespace` reads out of
+      hhea, and for a typical text face it lands near 1.12-1.15em, which is
+      also where Chrome lands. Nothing is hardcoded here.
+    * a bare number (`1.5`) -- the *factor* is what inherits, not the result,
+      so it is multiplied by each box's own font-size afresh. A 32px heading
+      inside a `line-height: 1.5` body gets 48px, not 24px.
+    * a length (`24px`, `1.5em`) -- computes to a length on the element that
+      declares it, and that length is what inherits.
+    * a percentage (`150%`) -- likewise resolved against the declaring
+      element's font-size, with the *result* inherited.
+
+    The last two are why `_lh_font_size` exists: the cascade hands every
+    descendant the same declaration text, so `em` and `%` have to be resolved
+    against the element the declaration came from rather than the box using
+    it.
+    """
+    style = getattr(node, "style", None) or {}
+    raw = style.get("line-height") or "normal"
+    # The overwhelmingly common value, and it arrives already normalised from
+    # the cascade's defaults, so spend nothing on it.
+    if raw == "normal" or raw.strip().lower() in _LINE_HEIGHT_AUTO:
+        return float(_linespace(font))
+    raw = raw.strip()
+    cached = getattr(node, "_ftbs_lh", None)
+    if cached is not None and cached[0] == raw and cached[1] is font:
+        return cached[2]
+    value = _compute_line_height(node, raw, font)
+    try:
+        # Keyed by the declaration and the font, so a restyle or a font-size
+        # change recomputes. Only a change to an *ancestor's* font-size that
+        # leaves this box's own untouched can go stale, and that combination
+        # needs a length line-height declared upstream of a JS font-size
+        # change -- rare enough to be worth one attribute lookup per word.
+        node._ftbs_lh = (raw, font, value)
+    except AttributeError:
+        pass
+    return value
+
+
+def _compute_line_height(node, raw, font):
+    low = raw.lower()
+    try:
+        # A unitless number is a factor on this box's own font-size.
+        return float(low) * float(font.size)
+    except ValueError:
+        pass
+    if low.endswith("%"):
+        try:
+            return float(low[:-1]) / 100.0 * _lh_font_size(node, raw, font)
+        except ValueError:
+            return float(_linespace(font))
+    if low.endswith("em") and not low.endswith("rem"):
+        try:
+            return float(low[:-2]) * _lh_font_size(node, raw, font)
+        except ValueError:
+            return float(_linespace(font))
+    # px, rem, pt, vw/vh -- absolute once computed, so parse_px is enough.
+    value = parse_px(raw, -1.0)
+    if value < 0:
+        return float(_linespace(font))  # negative or unparseable: invalid
+    return value
+
+
+def _lh_font_size(node, raw, font):
+    """Font-size, in px, of the element a `line-height` declaration came from.
+
+    Inheritance copies the declaration text unchanged, so every box under a
+    `line-height: 1.2em` carries the identical string. The element that wrote
+    it is therefore the topmost of the unbroken run of ancestors carrying it,
+    and its font-size is the one the length resolves against.
+    """
+    owner = None
+    n = node
+    while n is not None:
+        style = getattr(n, "style", None) or {}
+        if (style.get("line-height") or "").strip() != raw:
+            break
+        if isinstance(n, Element):
+            owner = n
+        n = n.parent
+    if owner is None:
+        return float(font.size)
+    return float(_node_font(owner).size)
+
+
 def _warm_chars(font, chars):
     """Measure every character in `chars` that is not cached yet.
 
@@ -1660,6 +1757,34 @@ class _LineItem:
             return 0.0
         return _metrics(self.font, "descent")
 
+    # -- half-leading (CSS 2.1 sec. 10.8.1) ------------------------------
+    #
+    # A text run's box is `line-height` tall, and the difference between that
+    # and the font's own ascent + descent is the leading, split evenly above
+    # and below. What `extents` returns is how far the run reaches from the
+    # baseline once that split is applied; the line box is the union over its
+    # items. Half the leading can be negative -- `line-height: 1` on a face
+    # whose ascent + descent exceeds its em, or anything smaller -- and the
+    # lines then overlap, which is what the author asked for, not something
+    # to clamp away.
+    def extents(self):
+        """How far this item reaches above and below the baseline.
+
+        Both at once, and reading each font metric once: `flush` asks every
+        item on every line, and a long article is a great many lines.
+        """
+        if self.kind == "text" or self.kind == "pill":
+            font = self.font
+            ascent = _metrics(font, "ascent")
+            descent = _metrics(font, "descent")
+            half = (_line_height(self.node, font)
+                    - (ascent + descent)) / 2.0
+            return ascent + half, descent + half
+        # An atomic inline (image, video, inline-block, expanded <select>) is
+        # not a text run: line-height does not apply to it, its own box is
+        # what joins the line, so it reaches exactly ascent/descent.
+        return self.ascent, self.descent
+
 
 class BlockLayout(LayoutBox):
     def _parent_content_box(self):
@@ -3091,15 +3216,22 @@ class BlockLayout(LayoutBox):
             advance = 0.0
             if force:
                 font = _node_font(self.node)
-                advance = 1.25 * (_metrics(font, "ascent")
-                                  + _metrics(font, "descent"))
+                advance = _line_height(self.node, font)
             self.cursor_y = line_top + max(advance, control_h)
             self.cursor_x = self._line_bounds()[0]
             return
 
-        max_ascent = max(item.ascent for item in self.line)
-        max_descent = max(item.descent for item in self.line)
-        baseline = self.cursor_y + 1.25 * max_ascent
+        # The line box holds every inline box on it, each reaching `above` the
+        # baseline and `below` it once its own half-leading is counted. The
+        # baseline sits far enough down that the tallest of them fits.
+        max_above = max_below = None
+        for item in self.line:
+            above, below = item.extents()
+            if max_above is None or above > max_above:
+                max_above = above
+            if max_below is None or below > max_below:
+                max_below = below
+        baseline = self.cursor_y + max_above
         # Underlines join up word by word along a line; a new line starts a
         # new run even if the same link continues onto it.
         self._underline_run = None
@@ -3176,8 +3308,7 @@ class BlockLayout(LayoutBox):
                 # An image or a form control breaks the run: browsers do not
                 # rule a line under a button that happens to sit in a link.
                 self._underline_run = None
-        self.cursor_y = max(baseline + 1.25 * max_descent,
-                            line_top + control_h)
+        self.cursor_y = max(baseline + max_below, line_top + control_h)
         self.cursor_x = self._line_bounds()[0]
         self.line = []
 

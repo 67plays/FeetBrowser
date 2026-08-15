@@ -403,6 +403,106 @@ def test_pseudo_class_structural_and_not():
     eq(lis[2].style["font-weight"], "bold", ":not(.skip) matches others")
 
 
+def _only_selector(css):
+    """The one selector `css` parses to, or None when the rule was dropped."""
+    rules = CSSParser(css).parse()
+    return rules[0][0] if rules else None
+
+
+def test_escaped_class_selector_keeps_the_whole_name():
+    """A utility-class sheet names classes with characters that are syntax to
+    the selector grammar -- `:` `/` `[` `]` -- and escapes them. Matching the
+    name with a plain character class does not fail on those, it matches the
+    prefix: `.hover\\:bg-red` became `.hover`, a selector that is wrong rather
+    than absent. Two thirds of Vimeo's stylesheet went that way."""
+    cases = {
+        r".md\:flex": "md:flex",
+        r".hover\:bg-red": "hover:bg-red",
+        r".w-1\/2": "w-1/2",
+        r".p-\[10px\]": "p-[10px]",
+        r".top-\[-1px\]": "top-[-1px]",
+        r".md\:hover\:bg-blue-500": "md:hover:bg-blue-500",
+    }
+    for text, name in cases.items():
+        sel = _only_selector(text + " { color: red }")
+        assert sel is not None, "%s must not drop the rule" % text
+        eq(sel.kind, "class", "%s is a class selector" % text)
+        eq(sel.cls, name, "%s keeps its whole name" % text)
+
+
+def test_escaped_class_does_not_match_its_own_truncation():
+    """The dangerous half of the old bug: the truncated selector still
+    matched, so `.md\\:flex` styled every `.md` on the page."""
+    rules = CSSParser(r".md\:flex { color: red }").parse()
+    eq(len(rules), 1, "the escaped rule survives parsing")
+    dom = HTMLParser('<div class="md">a</div>'
+                     '<div class="md:flex">b</div>').parse()
+    style(dom, rules)
+    divs = [n for n in tree_to_list(dom, [])
+            if isinstance(n, Element) and n.tag == "div"]
+    eq(divs[0].style["color"], "black", ".md is not what .md\\:flex means")
+    eq(divs[1].style["color"], "red", "the escaped class matches class=md:flex")
+
+
+def test_escape_sequences_follow_the_syntax_spec():
+    """CSS Syntax 4.3.7: a backslash takes the next character literally, or
+    1-6 hex digits name a code point (with one trailing space swallowed as the
+    delimiter). Zero, a surrogate, past the Unicode maximum, or nothing at all
+    is U+FFFD."""
+    cases = {
+        r".\41": "A",                    # hex escape, no delimiter needed
+        ".\\41 b": "Ab",                 # trailing space is the delimiter
+        ".\\31 23": "123",               # a name may not start with a digit
+        r".a\ b": "a b",                 # escaped space is a name character
+        r".\.dot": ".dot",               # non-hex: taken literally
+        r".\0": "\ufffd",                # NUL
+        r".\d800": "\ufffd",             # lone surrogate
+        r".\110000": "\ufffd",           # past U+10FFFF
+    }
+    for text, name in cases.items():
+        sel = _only_selector(text + " { color: red }")
+        assert sel is not None, "%r must parse" % text
+        eq(sel.cls, name, "%r unescapes" % text)
+    # A backslash with nothing after it: the parser must not run off the end.
+    eq(CSSParser("").selector(".\\").cls, "\ufffd",
+       "a trailing backslash is U+FFFD")
+
+
+def test_escapes_in_ids_attributes_and_element_names():
+    """The same assumption was repeated for every kind of identifier, so the
+    fix has to be too."""
+    sel = _only_selector(r"#a\:b { color: red }")
+    eq(sel.kind, "id", "escaped id parses")
+    eq(sel.id, "a:b", "escaped id keeps its whole name")
+    sel = _only_selector(r"[data-x=a\/b] { color: red }")
+    eq(sel.kind, "attr", "escaped attribute value parses")
+    eq((sel.attr, sel.op, sel.value), ("data-x", "=", "a/b"),
+       "attribute value unescapes")
+    sel = _only_selector('[data-x="a\\3a b"] { color: red }')
+    eq(sel.value, "a:b", "hex escape inside a quoted attribute value")
+    sel = _only_selector(r"li\:first { color: red }")
+    eq(sel.kind, "tag", "escaped element name parses")
+    eq(sel.tag, "li:first", "escaped element name keeps its whole name")
+    # And the plain forms still work exactly as they did.
+    eq(_only_selector("[disabled] { color: red }").op, None,
+       "presence-only attribute selector")
+    eq(_only_selector("a[href^='https'] { color: red }").parts[1].value,
+       "https", "quoted prefix-match value")
+
+
+def test_escaped_punctuation_is_not_selector_syntax():
+    """An escaped `>` is three glyphs of a class name, not a child
+    combinator; an escaped `[` is not a bracket to balance; an escaped comma
+    (written `\\2c `) does not end the selector."""
+    sel = _only_selector(r".\[\&\>li\]\:mt-2 { color: red }")
+    eq(sel.kind, "class", "arbitrary-variant class is one compound")
+    eq(sel.cls, "[&>li]:mt-2", "escaped > and [ ] stay in the name")
+    sel = _only_selector(r".rgb-\(0\2c 0\) { color: red }")
+    eq(sel.cls, "rgb-(0,0)", "escaped comma does not split the selector list")
+    rules = CSSParser(r".a\,b { color: red } .c { color: blue }").parse()
+    eq(len(rules), 2, "an escaped comma leaves both rules intact")
+
+
 def test_data_uri_background_parsed():
     css = ('p { background: url(data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg"></svg>) }')
     rules = CSSParser(css).parse()
@@ -454,6 +554,102 @@ def test_empty_inline_block_still_paints_its_box():
     box = swatches[0]
     eq(box.right - box.left, 26, "swatch keeps its declared width")
     eq(box.bottom - box.top, 12, "swatch keeps its declared height")
+
+
+def _box_heights(css, html, width=620):
+    """Lay out `html` under `css` and return {class name: box height}."""
+    from feetbrowser.layout import DocumentLayout
+    dom = HTMLParser(html).parse()
+    style(dom, CSSParser(css).parse())
+    doc = DocumentLayout(dom, width)
+    doc.layout()
+    out, stack = {}, [doc]
+    while stack:
+        box = stack.pop()
+        node = box.node
+        if isinstance(node, Element):
+            for cls in node.attributes.get("class", "").split():
+                out[cls] = box.height
+        stack.extend(box.children)
+    return out
+
+
+def test_line_height_number_sets_the_line_box():
+    """Three lines at line-height 1 are three font-sizes tall, and at
+    line-height 3 they are nine. The engine used to hardcode 1.25 x (ascent +
+    descent) and render both blocks byte-identically."""
+    heights = _box_heights(
+        ".tight { line-height: 1 } .loose { line-height: 3 }",
+        "<div class=tight>one<br>two<br>three</div>"
+        "<div class=loose>one<br>two<br>three</div>")
+    eq(heights["tight"], 48.0, "3 lines x 16px")     # Chrome: 48
+    eq(heights["loose"], 144.0, "3 lines x 48px")    # Chrome: 144
+
+
+def test_line_height_number_inherits_as_a_factor():
+    """A unitless line-height inherits as the *number*, not as the length it
+    worked out to on the ancestor: a 32px child of a `line-height: 1.5` body
+    gets 48px lines, not 24px ones."""
+    heights = _box_heights(
+        ".outer { line-height: 1.5 } .inner { font-size: 32px }",
+        "<div class=outer>x<div class=inner>y</div></div>")
+    eq(heights["inner"], 48.0, "1.5 recomputed against the child's 32px")
+
+
+def test_line_height_length_and_percentage_inherit_their_result():
+    """A length or a percentage computes to a length on the element that
+    declares it, and *that* is what inherits -- so the same 32px child gets
+    24px lines, the opposite of the unitless case above."""
+    for declaration in ("150%", "1.5em", "24px"):
+        heights = _box_heights(
+            ".outer { font-size: 16px; line-height: %s } "
+            ".inner { font-size: 32px }" % declaration,
+            "<div class=outer>x<div class=inner>y</div></div>")
+        eq(heights["outer"], 48.0,
+           "%s: the declaring element's own line is 24px, twice" % declaration)
+        eq(heights["inner"], 24.0,
+           "%s: the computed 24px is what inherited" % declaration)
+
+
+def test_line_height_normal_comes_from_the_font():
+    """`normal` is the face's own line spacing -- ascent + descent + the line
+    gap in the font -- not a constant. The old 1.25 multiplier worked out to
+    about 1.33em against Chrome's ~1.15em, so even unstyled text was 15%
+    over-leaded."""
+    from feetbrowser.layout import _linespace, _metrics
+    font = get_font(16, "normal", "roman", "")
+    heights = _box_heights("", "<div class=plain>one</div>")
+    eq(heights["plain"], float(_linespace(font)),
+       "an unstyled line is exactly the font's line spacing")
+    ratio = heights["plain"] / 16.0
+    assert 1.0 <= ratio <= 1.3, \
+        "normal line-height %.3fem is not a plausible font metric" % ratio
+    old = 1.25 * (_metrics(font, "ascent") + _metrics(font, "descent"))
+    assert heights["plain"] < old, \
+        "still using the hardcoded 1.25 leading (%r)" % old
+
+
+def test_line_height_smaller_than_the_font_is_allowed_to_overlap():
+    """CSS 2.1 10.8.1 splits the leading evenly above and below the text box,
+    and half of it is negative when line-height is under the font's own
+    height. Lines then overlap, which is what the author asked for; clamping
+    it would put every tight-leaded heading back where it started."""
+    from feetbrowser.layout import DocumentLayout
+    heights = _box_heights(".squash { line-height: 4px }",
+                           "<div class=squash>one<br>two</div>")
+    eq(heights["squash"], 8.0, "two 4px lines, overlapping, not clamped")
+    dom = HTMLParser("<div style='line-height:4px'>one<br>two</div>").parse()
+    style(dom, [])
+    doc = DocumentLayout(dom, 620)
+    doc.layout()
+    cmds, stack = [], [doc]
+    while stack:
+        box = stack.pop()
+        cmds.extend(box.paint())
+        stack.extend(box.children)
+    tops = sorted(c.top for c in cmds if isinstance(c, DrawText))
+    eq(len(tops), 2, "both lines drawn")
+    eq(tops[1] - tops[0], 4.0, "baselines advance by the line-height")
 
 
 def test_pre_whitespace_does_not_wrap():
