@@ -73,6 +73,24 @@ INTER_VECTORS = [
     ("cavlc-8x8", 128, 96, 8, "CAVLC 8x8: four 4x4 blocks, four nC"),
 ]
 
+# The B vectors. These are the first streams in this suite whose decode
+# order is not their presentation order, which is the whole point of them:
+# a B picture is coded after the future picture it predicts from and shown
+# before it. FFmpeg wrote its raw output in presentation order, so the test
+# below sorts what comes out of the decoder by picture order count before
+# comparing -- exactly the job a container does with its composition
+# offsets, done here with the decoder's own numbers so that a wrong POC is
+# a test failure and not a silently reordered success.
+B_VECTORS = [
+    ("b-basic", 128, 96, 12, "IBBP: one list-1 reference, no pyramid"),
+    ("b-pyramid", 128, 96, 16, "B pyramid: B pictures used as references"),
+    ("b-direct-spatial", 112, 80, 14, "spatial direct, 8.4.1.2.2"),
+    ("b-direct-temporal", 112, 80, 14,
+     "temporal direct on identical content, 8.4.1.2.3"),
+    ("b-weightb", 112, 80, 14, "implicit weighted bi-prediction, 8.4.2.3.2"),
+    ("b-skip", 128, 96, 14, "long runs of B_Skip over a still background"),
+]
+
 
 def _stream(name):
     with open(os.path.join(FIXTURES, name + ".264"), "rb") as handle:
@@ -184,6 +202,55 @@ def test_every_inter_vector_is_pixel_exact_on_every_frame():
             assert got == want, "%s (%s) frame %d: %s" % (
                 name, what, i, _first_difference(got, want, width, height))
         print("  ok  %-12s %4dx%-4d %2d frames  %s"
+              % (name, width, height, frames, what))
+
+
+def test_every_b_vector_is_pixel_exact_on_every_frame():
+    """B pictures, compared frame for frame after reordering by POC.
+
+    The reordering is the only difference from the P test above, and it is
+    done the strict way: the picture order counts the decoder reports must
+    be distinct and must sort into exactly the presentation order FFmpeg
+    wrote, so a decoder that got the POCs wrong fails here even if every
+    sample it produced was right. Sorting the decoded pictures by anything
+    softer -- their own content, say -- would turn this test into one that
+    cannot fail.
+    """
+    if _skip():
+        return
+    for name, width, height, frames, what in B_VECTORS:
+        stream = _stream(name)
+        ref = _truth(name)
+        size = width * height * 3 // 2
+        assert len(ref) == frames * size, (
+            "%s: ground truth is %d bytes, not %d frames of %d"
+            % (name, len(ref), frames, size))
+        units = _access_units(stream)
+        assert len(units) == frames, (
+            "%s: %d access units, %d frames of ground truth"
+            % (name, len(units), frames))
+        decoder = h264.Decoder()
+        decoded = []
+        for i, unit in enumerate(units):
+            got_width, got_height, got = decoder.decode_i420(unit)
+            assert (got_width, got_height) == (width, height), (
+                "%s unit %d: decoded %dx%d, expected %dx%d"
+                % (name, i, got_width, got_height, width, height))
+            decoded.append((decoder.poc, i, got))
+        pocs = [poc for poc, _i, _p in decoded]
+        assert len(set(pocs)) == frames, (
+            "%s: %d access units but only %d distinct picture order counts %r"
+            % (name, frames, len(set(pocs)), pocs))
+        assert pocs != sorted(pocs), (
+            "%s: decode order and presentation order agree, so this vector "
+            "has no B pictures in it and is testing nothing: %r"
+            % (name, pocs))
+        for shown, (_poc, unit, got) in enumerate(sorted(decoded)):
+            want = ref[shown * size:(shown + 1) * size]
+            assert got == want, "%s (%s) frame %d (access unit %d): %s" % (
+                name, what, shown, unit,
+                _first_difference(got, want, width, height))
+        print("  ok  %-16s %4dx%-4d %2d frames  %s"
               % (name, width, height, frames, what))
 
 
@@ -377,6 +444,88 @@ def test_an_inter_coded_mp4_plays_all_the_way_through():
     assert track.frame(1).rgba == frames[1], (
         "frame 1 came out differently when seeked to than when played to")
     print("  ok  IDR + 3 P frames decode, in order and seeked")
+
+
+def test_an_mp4_with_b_frames_comes_out_in_presentation_order():
+    """The container half of B frames, which is a separate bug from the
+    decoder half and fails in a way that looks like nothing much: the file
+    plays, every frame is a real frame, and the motion stutters back and
+    forth because frames are shown in the order they were coded.
+
+    So the check is against pixels and not against a picture merely being
+    there. `bframes.i420.z` is FFmpeg's decode of this exact MP4, in
+    presentation order, and every frame of it has to match sample for
+    sample after the RGB conversion -- which means `ctts` was read, the
+    samples were sorted by composition time, and the reorder buffer handed
+    them out in that order rather than in decode order.
+
+    Then the seek, twice over. Backwards past the reorder buffer has to
+    reset and replay; forwards into a frame that is still buffered has to
+    come out of the buffer rather than being decoded a second time. Both
+    have to produce the same bytes as playing straight through, because a
+    frame that depends on how you arrived at it is the whole failure mode
+    this is guarding."""
+    with open(os.path.join(FIXTURES, "bframes.mp4"), "rb") as handle:
+        data = handle.read()
+    info = mediacodec.probe(data)
+    assert info.codec == "avc1", info
+    assert (info.width, info.height) == (128, 96), info
+    if _skip():
+        assert not info.supported, "no decoder, but the file was accepted"
+        assert "H.264" in info.reason, info.reason
+        return
+    assert info.supported, "an H.264 MP4 with B frames was refused: %s" % (
+        info.reason,)
+    width, height, count = 128, 96, 12
+    track = mediacodec.open_video(data)
+    assert track.frame_count == count, track.frame_count
+    # The file is IBBP, so decode order is not presentation order and the
+    # track has to say so. If this is an identity mapping the test below
+    # still runs but proves nothing, which is the trap worth failing on.
+    assert track._order is not None and track._order != list(range(count)), (
+        "the track thinks decode order is presentation order: %r"
+        % (track._order,))
+    ref = _truth("bframes")
+    size = width * height * 3 // 2
+    luma = width * height
+    cw, ch = width // 2, height // 2
+    assert len(ref) == count * size, len(ref)
+    played = []
+    for i in range(count):
+        frame = track.frame(i)
+        played.append(bytes(frame.rgba))
+        for y in range(0, height, 7):
+            for x in range(0, width, 5):
+                yy = ref[i * size + y * width + x]
+                cb = ref[i * size + luma + (y // 2) * cw + x // 2] - 128
+                cr = ref[i * size + luma + cw * ch
+                         + (y // 2) * cw + x // 2] - 128
+                base = 298 * (yy - 16)
+                want = (max(0, min(255, (base + 409 * cr + 128) >> 8)),
+                        max(0, min(255, (base - 100 * cb - 208 * cr + 128)
+                                   >> 8)),
+                        max(0, min(255, (base + 516 * cb + 128) >> 8)))
+                at = (y * width + x) * 4
+                got = (frame.rgba[at], frame.rgba[at + 1], frame.rgba[at + 2])
+                assert got == want, (
+                    "frame %d (%d,%d): got %r, expected %r -- the frames are "
+                    "in the wrong order or decoded wrong" % (i, x, y, got,
+                                                             want))
+    # Times have to be presentation times too: a `ctts` read and then
+    # ignored leaves them in decode order and they stop being sorted.
+    times = [track.frame_time(i) for i in range(count)]
+    assert times == sorted(times), "presentation times run backwards: %r" % (
+        times,)
+    for jumps in ([5, 2, 11, 0, 7, 3], [11, 10, 9, 8, 1, 0], [3, 3, 4]):
+        track.reset()
+        for i in jumps:
+            assert bytes(track.frame(i).rgba) == played[i], (
+                "frame %d differs when reached by %r" % (i, jumps))
+    fresh = mediacodec.open_video(data)
+    for i in [7, 1, 7, 6, 2]:
+        assert bytes(fresh.frame(i).rgba) == played[i], (
+            "frame %d differs when seeked to without a reset" % i)
+    print("  ok  IBBP MP4: 12 frames in presentation order, and seeked")
 
 
 def test_a_machine_without_gfortran_still_has_a_browser():

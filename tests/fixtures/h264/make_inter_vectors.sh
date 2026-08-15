@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 #
-# Regenerate the inter-coded (P slice) test vectors in this directory.
+# Regenerate the inter-coded (P and B slice) test vectors in this directory.
 #
 # THIS IS A ONE-OFF OFFLINE TOOL. It is not run by test.sh, it is not a
 # dependency of anything, and nothing in the browser or the test suite needs
 # ffmpeg or x264 to be installed. What ships is the output: each `.264`
-# stream and, beside it, the exact I420 bytes FFmpeg 7.1 decoded it to,
-# zlib-deflated. tests/test_h264.py compares against those bytes and never
-# shells out to anything.
+# stream (and one `.mp4`) and, beside it, the exact I420 bytes FFmpeg 7.1
+# decoded it to, zlib-deflated. tests/test_h264.py compares against those
+# bytes and never shells out to anything.
 #
 # It exists because a decoder tested against its own output is tested against
 # nothing, and because six months from now somebody will want to know what
@@ -36,11 +36,11 @@ out="${1:-$(cd "$(dirname "$0")" && pwd)}"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 
-# Common encoder settings. --bframes 0 because B slices are out of scope;
-# --keyint infinite --no-scenecut so that exactly one IDR appears and every
-# other frame is a P frame (a second IDR would silently hide a reference
-# picture bug behind a fresh start); --tune psnr to keep psy-rd from making
-# the mode decisions depend on x264's visual model.
+# Common encoder settings. --bframes 0 is what the P vectors want and every B
+# vector below overrides it; --keyint infinite --no-scenecut so that exactly
+# one IDR appears and every other frame is an inter frame (a second IDR would
+# silently hide a reference picture bug behind a fresh start); --tune psnr to
+# keep psy-rd from making the mode decisions depend on x264's visual model.
 common="--bframes 0 --keyint infinite --no-scenecut --tune psnr --quiet"
 
 # $1 name  $2 WxH  $3 frames  $4 lavfi graph  $5 extra x264 options
@@ -178,3 +178,90 @@ print("%-14s (existing stream) %7d -> %6d bytes"
 }
 
 truth_only qcif-cavlc
+# -- B slices ----------------------------------------------------------------
+#
+# Everything below overrides --bframes 0, so each one passes its own --bframes
+# and, where it matters, its own --b-pyramid, --direct and --weightb. Note that
+# ffmpeg writes its raw output in presentation order while the .264 stream is
+# in decode order: tests/test_h264.py reorders by picture order count before
+# comparing, which is the same job a container does with its composition
+# offsets and is worth exercising here rather than only on an MP4.
+
+# IBBP: one I frame and then a steady pattern of two B frames between each pair
+# of P frames. No pyramid, so no B frame is ever a reference and list 1 has
+# exactly one entry. The smallest stream that has a B slice in it at all.
+vector b-basic 128x96 12 \
+  "testsrc2=size=256x192:rate=25" \
+  "--bframes 2 --b-pyramid none --ref 2 --partitions all --no-8x8dct --qp 26 --weightp 0 --no-weightb"
+
+# B frames used as references for other B frames. The decoded picture buffer
+# then holds pictures that are neither purely past nor purely future, list 0
+# and list 1 both have several entries, and the two lists are genuinely
+# different orderings of the same set rather than reverses of each other.
+vector b-pyramid 128x96 16 \
+  "testsrc2=size=256x192:rate=25,rotate=a='0.25*sin(2*PI*t*2)':c=black" \
+  "--bframes 3 --b-pyramid normal --ref 4 --partitions all --8x8dct --subme 9 --me umh --qp 24"
+
+# Spatial direct with a lot of small motion, so that B_Skip and B_Direct_8x8
+# are chosen often and the minimum-over-neighbours derivation has real indices
+# to choose between rather than a picture full of zeroes.
+vector b-direct-spatial 112x80 14 \
+  "mandelbrot=size=112x80:rate=25:maxiter=200" \
+  "--bframes 2 --b-pyramid none --direct spatial --ref 3 --partitions all --8x8dct --subme 9 --me umh --qp 24"
+
+# Temporal direct: the same content, so the two vectors differ only in the
+# derivation. This is the one that scales a colocated vector by the ratio of
+# two picture order count differences, and a decoder that gets the arithmetic
+# subtly wrong still produces a plausible picture.
+vector b-direct-temporal 112x80 14 \
+  "mandelbrot=size=112x80:rate=25:maxiter=200" \
+  "--bframes 2 --b-pyramid none --direct temporal --ref 3 --partitions all --8x8dct --subme 9 --me umh --qp 24"
+
+# A fade with implicit weighted bi-prediction. The weights are not in the
+# bitstream at all: both sides derive them from where the B frame sits between
+# its two references, so an off-by-one in the picture order count arithmetic
+# shows up as a wrong picture and nothing else.
+vector b-weightb 112x80 14 \
+  "testsrc2=size=112x80:rate=25,fade=t=out:st=0.1:d=0.45" \
+  "--bframes 3 --b-pyramid none --ref 3 --partitions all --no-8x8dct --qp 24 --weightb"
+
+# A still background with one small thing crossing it, with B frames. Almost
+# every macroblock is B_Skip, which reads no syntax element at all beyond the
+# skip flag and derives its motion from the direct process.
+#
+# --b-adapt 0 is load-bearing: with the adaptive decision left on, x264 looks
+# at content this static and concludes that B frames buy it nothing, and the
+# vector comes out as all-P and tests the P path a seventh time. Turning the
+# decision off forces the requested cadence whether it pays or not, which is
+# the point here.
+vector b-skip 128x96 14 \
+  "color=c=0x1a3050:size=128x96:rate=25[bg];testsrc2=size=24x24:rate=25[fg];[bg][fg]overlay=x='8+t*90':y=40" \
+  "--bframes 3 --b-adapt 0 --b-pyramid none --direct spatial --ref 2 --partitions all --no-8x8dct --qp 24 --weightp 0 --no-weightb"
+
+# -- and one of them in a container ------------------------------------------
+#
+# bframes.mp4 is the same IBBP content as b-basic, but muxed rather than raw,
+# because decode order and presentation order being two different things is
+# only half a problem in a `.264` file and a whole one in an MP4: the `ctts`
+# box is where the composition offsets live and tests/test_h264.py checks that
+# the container layer puts the frames back in the order a viewer sees them.
+#
+# It is encoded straight to MP4 rather than muxed from b-basic.264, which is
+# deliberate: ffmpeg's raw H.264 demuxer hands the muxer pts == dts, so
+# `-c copy` from a `.264` writes a file with no `ctts` at all and every frame
+# declared in the wrong place. A file that lies about its own order would make
+# this test pass for the wrong reason. Its truth file is ffmpeg's decode of
+# the MP4, which is in presentation order.
+mp4_out="$out/bframes.mp4"
+ffmpeg -v error -y -f lavfi -i "testsrc2=size=256x192:rate=25" \
+       -vf "format=yuv420p,scale=128:96" -frames:v 12 \
+       -c:v libx264 -preset medium \
+       -x264-params "bframes=2:b-adapt=0:b-pyramid=none:ref=2:keyint=infinite:no-scenecut=1:qp=26:weightp=0:weightb=0:8x8dct=0:tune=psnr" \
+       -f mp4 "$mp4_out"
+ffmpeg -v error -y -i "$mp4_out" -pix_fmt yuv420p -f rawvideo "$work/truth.i420"
+python3 -c 'import sys, zlib
+raw = open(sys.argv[1], "rb").read()
+open(sys.argv[2], "wb").write(zlib.compress(raw, 9))
+print("%-14s %s %2d frames  %7d -> %6d bytes"
+      % ("bframes.mp4", "128x96", 12, len(raw), len(zlib.compress(raw, 9))))' \
+    "$work/truth.i420" "$out/bframes.i420.z"

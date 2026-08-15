@@ -33,6 +33,8 @@ C     is ever referred to again.
          DPID(K) = -1
    10 CONTINUE
       RL0N = 0
+      RL1N = 0
+      COLSL = 0
       RETURN
       END
 
@@ -54,12 +56,11 @@ C     next, back to its start-of-stream value.
 C     8.2.1, the picture order count of the picture now being decoded.
 C
 C     Nothing in a P slice reads it -- 8.2.4.2.1 orders a P list by
-C     FrameNumWrap and not by POC, and we hand pictures out in decoding
-C     order because there is no reordering without B slices.  It is
-C     computed and stored anyway because it is the number that says which
-C     picture is which when there is one, and because a decoder that
-C     computes it only when it needs it computes it wrong the first time
-C     it needs it.
+C     FrameNumWrap and not by POC.  A B slice reads little else: both of
+C     its lists are ordered by it (8.2.4.2.3), temporal direct scales its
+C     vectors by differences of it (8.4.1.2.3), the implicit bipred
+C     weights are derived from it (8.4.2.3.1), and the container hands
+C     pictures out in the order it gives.
       SUBROUTINE H2CPOC
       IMPLICIT NONE
       INCLUDE 'h264com.inc'
@@ -135,8 +136,7 @@ C     through whatever reordering the slice header asked for.
       IMPLICIT NONE
       INCLUDE 'h264com.inc'
       INTEGER ST
-      INTEGER K, I, J, N, BEST, BK, PRED, NOWRAP, PICX, IDX, SLOT
-      INTEGER TMP(0:31), M
+      INTEGER K, I, N, BEST, BK
       ST = 0
       CALL H2FNW
       N = 0
@@ -181,16 +181,140 @@ C     damage made it wrong.
          RL0(I) = RL0(N - 1)
    50 CONTINUE
       RL0N = NREF0
+      CALL H2RMOD(1, RL0, RL0N, ST)
+      RETURN
+      END
 
-      IF (NRMOP .LE. 0) RETURN
+C     8.2.4.2.3 and 8.2.4.2.4: the two reference lists of a B slice.
+C
+C     A B list is ordered by picture order count and not by frame number,
+C     because the point of it is "the nearest picture before me" and "the
+C     nearest picture after me", which is a statement about display order.
+C     List 0 runs backwards through the past and then forwards through
+C     the future; list 1 does the opposite.  When both come out identical
+C     -- which happens whenever there is exactly one picture on each side
+C     -- 8.2.4.2.3 swaps the first two entries of list 1, so that a
+C     macroblock indexing 0 in each list still reaches two pictures.
+C
+C     The swap is on the initialised list, before it is cut to
+C     num_ref_idx_l1_active, because the comparison in the standard is
+C     over the initialisation and not over the slice's window into it.
+      SUBROUTINE H2BLST(ST)
+      IMPLICIT NONE
+      INCLUDE 'h264com.inc'
+      INTEGER ST
+      INTEGER K, I, N, SAME, T
+      ST = 0
+      CALL H2FNW
+      N = 0
+      CALL H2POCS(1, -1, RL0, N)
+      CALL H2POCS(0, 1, RL0, N)
+      IF (N .EQ. 0) THEN
+         ST = -51
+         RETURN
+      END IF
+      RL0N = N
+      N = 0
+      CALL H2POCS(0, 1, RL1, N)
+      CALL H2POCS(1, -1, RL1, N)
+      RL1N = N
+      IF (RL1N .GT. 1) THEN
+         SAME = 1
+         DO 10 I = 0, RL1N - 1
+            IF (RL0(I) .NE. RL1(I)) SAME = 0
+   10    CONTINUE
+         IF (RL0N .NE. RL1N) SAME = 0
+         IF (SAME .NE. 0) THEN
+            T = RL1(0)
+            RL1(0) = RL1(1)
+            RL1(1) = T
+         END IF
+      END IF
+      DO 20 I = RL0N, NREF0 - 1
+         RL0(I) = RL0(RL0N - 1)
+   20 CONTINUE
+      DO 30 I = RL1N, NREF1 - 1
+         RL1(I) = RL1(RL1N - 1)
+   30 CONTINUE
+      RL0N = NREF0
+      RL1N = NREF1
+      CALL H2RMOD(1, RL0, RL0N, ST)
+      IF (ST .NE. 0) RETURN
+      CALL H2RMOD(2, RL1, RL1N, ST)
+      IF (ST .NE. 0) RETURN
+C     RefPicList1[0] is the colocated picture of 8.4.1.2.1, and it is the
+C     modified list that names it: a slice that reordered list 1 moved
+C     the picture its direct macroblocks read their motion out of.
+      COLSL = RL1(0)
+      RETURN
+      END
+
+C     Append the reference slots whose POC is on one side of the current
+C     picture's, in one direction.  SIDE 1 means "before me", 0 means
+C     "after me"; DIR -1 sorts descending and 1 ascending.  Between them
+C     the four calls of H2BLST spell out both halves of both lists.
+      SUBROUTINE H2POCS(SIDE, DIR, LST, N)
+      IMPLICIT NONE
+      INCLUDE 'h264com.inc'
+      INTEGER SIDE, DIR, N
+      INTEGER LST(0:31)
+      INTEGER K, I, BK, BEST, WANT
+      DO 20 I = 1, MXREF
+         BK = 0
+         BEST = 0
+         DO 10 K = 1, MXREF
+            IF (DPUSE(K) .GT. 0) THEN
+               WANT = 0
+               IF (SIDE .EQ. 1 .AND. DPPOC(K) .LT. CURPOC) WANT = 1
+               IF (SIDE .EQ. 0 .AND. DPPOC(K) .GT. CURPOC) WANT = 1
+               IF (WANT .NE. 0) THEN
+                  IF (BK .EQ. 0) THEN
+                     BK = K
+                     BEST = DPPOC(K)
+                  ELSE IF (DIR .LT. 0 .AND. DPPOC(K) .GT. BEST) THEN
+                     BK = K
+                     BEST = DPPOC(K)
+                  ELSE IF (DIR .GT. 0 .AND. DPPOC(K) .LT. BEST) THEN
+                     BK = K
+                     BEST = DPPOC(K)
+                  END IF
+               END IF
+            END IF
+   10    CONTINUE
+         IF (BK .EQ. 0) GOTO 30
+         IF (N .GT. 31) GOTO 30
+         LST(N) = BK
+         N = N + 1
+         DPUSE(BK) = -DPUSE(BK)
+   20 CONTINUE
+   30 CONTINUE
+      DO 40 K = 1, MXREF
+         IF (DPUSE(K) .LT. 0) DPUSE(K) = -DPUSE(K)
+   40 CONTINUE
+      RETURN
+      END
+
+C     8.2.4.3.1, the modification commands the slice header recorded.
+C     Shared by both lists and by both slice types, because the
+C     derivation is written once in the standard and differs only in
+C     which list it is handed.
+      SUBROUTINE H2RMOD(L, LST, LN, ST)
+      IMPLICIT NONE
+      INCLUDE 'h264com.inc'
+      INTEGER L, LN, ST
+      INTEGER LST(0:31)
+      INTEGER K, I, J, PRED, NOWRAP, PICX, IDX, SLOT, M
+      INTEGER TMP(0:31)
+      ST = 0
+      IF (NRMOP(L) .LE. 0) RETURN
       PRED = FRNUM
       IDX = 0
-      DO 90 J = 1, NRMOP
-         IF (RMOP(J) .EQ. 0) THEN
-            NOWRAP = PRED - RMVAL(J)
+      DO 90 J = 1, NRMOP(L)
+         IF (RMOP(J,L) .EQ. 0) THEN
+            NOWRAP = PRED - RMVAL(J,L)
             IF (NOWRAP .LT. 0) NOWRAP = NOWRAP + MXFNUM
          ELSE
-            NOWRAP = PRED + RMVAL(J)
+            NOWRAP = PRED + RMVAL(J,L)
             IF (NOWRAP .GE. MXFNUM) NOWRAP = NOWRAP - MXFNUM
          END IF
          PRED = NOWRAP
@@ -207,18 +331,18 @@ C     damage made it wrong.
 C     8-38: put the named picture at the current index, push everything
 C     from there down one place, and drop the copy of it that was
 C     already somewhere further down the list.
-         DO 70 I = 0, RL0N - 1
-            TMP(I) = RL0(I)
+         DO 70 I = 0, LN - 1
+            TMP(I) = LST(I)
    70    CONTINUE
-         IF (IDX .GT. RL0N - 1) THEN
+         IF (IDX .GT. LN - 1) THEN
             ST = -52
             RETURN
          END IF
-         RL0(IDX) = SLOT
+         LST(IDX) = SLOT
          M = IDX + 1
-         DO 80 I = IDX, RL0N - 1
+         DO 80 I = IDX, LN - 1
             IF (TMP(I) .NE. SLOT) THEN
-               IF (M .LE. RL0N - 1) RL0(M) = TMP(I)
+               IF (M .LE. LN - 1) LST(M) = TMP(I)
                M = M + 1
             END IF
    80    CONTINUE
@@ -235,7 +359,7 @@ C     further from the encoder with every frame.
       SUBROUTINE H2STOR(K)
       IMPLICIT NONE
       INCLUDE 'h264com.inc'
-      INTEGER K, X, Y, R, SC, V
+      INTEGER K, X, Y, R, SC, V, MB, L, B, Q, RI
       SC = MXW / 2
       DO 20 Y = 0, PICH - 1
          R = Y * MXW
@@ -256,6 +380,36 @@ C     further from the encoder with every frame.
             DPV(R + X + 1, K) = V
    30    CONTINUE
    40 CONTINUE
+C     The motion field goes with the samples.  8.4.1.2.1 reads it out of
+C     this picture again later, when some future B slice makes it
+C     RefPicList1[0], and by then the working arrays have been overwritten
+C     several times over.  The vectors are clamped into INTEGER*2 rather
+C     than truncated into it: Annex A bounds them well inside the range,
+C     so the clamp only ever fires on a stream that was already lying,
+C     and a clamped vector predicts from the wrong place where a wrapped
+C     one predicts from the wrong place *and* reads out of bounds.
+      DO 70 MB = 1, MBN
+         CLINT(MB, K) = MINT(MB)
+         DO 60 L = 1, 2
+            DO 50 B = 1, 16
+               V = MMVX(B, L, MB)
+               IF (V .LT. -32768) V = -32768
+               IF (V .GT. 32767) V = 32767
+               CLMVX(B, L, MB, K) = V
+               V = MMVY(B, L, MB)
+               IF (V .LT. -32768) V = -32768
+               IF (V .GT. 32767) V = 32767
+               CLMVY(B, L, MB, K) = V
+   50       CONTINUE
+            DO 55 Q = 1, 4
+               RI = MREF(Q, L, MB)
+               IF (RI .LT. -1) RI = -1
+               IF (RI .GT. 31) RI = 31
+               CLREF(Q, L, MB, K) = RI
+               CLPIC(Q, L, MB, K) = MRPI(Q, L, MB)
+   55       CONTINUE
+   60    CONTINUE
+   70 CONTINUE
       DPFN(K) = FRNUM
       DPPOC(K) = CURPOC
       DPID(K) = CURID

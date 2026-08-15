@@ -74,15 +74,17 @@ bare `.mjpeg` file of JPEGs end to end), along with uncompressed `BI_RGB`,
 run-length `BI_RLE8`, and QuickTime's `raw ` and `png `. It plays and pauses
 on a click, and `<video controls>` gets a real transport bar with a play
 button, a scrubber you can seek with and a time readout. H.264 decodes too,
-but only as far as its decoder goes: `fortran/` is an I-frame decoder, exact
-to the sample against a reference one, with no P or B slices and no CAVLC
-yet. An ordinary web MP4 is one I frame followed by P frames, so it is
-refused up front rather than played for a frame and then frozen. What is
-still missing is therefore the format the web actually uses: no inter
-prediction, no VP8, VP9 or AV1, no MPEG-4 ASP, so most MP4s and every WebM
-are identified and measured but not decoded, and an element carrying one
-draws a correctly sized box saying which codec it is and why it is not
-playing. YouTube and its neighbours do not work. There is also **no audio**
+by the decoder in `fortran/`, exact to the sample against a reference one:
+I, P and B slices, which is what an ordinary well-compressed web MP4 is
+made of, including the reordering that B frames force between decode order
+and the order a viewer sees. What is missing there is CAVLC, so a Baseline
+or `-coder 0` file is refused up front rather than played for a frame and
+then frozen, as are SP and SI slices. Beyond H.264 there is no VP8, VP9,
+AV1 or MPEG-4 ASP at all, so every WebM is identified and measured but not
+decoded, and an element carrying one draws a correctly sized box saying
+which codec it is and why it is not playing. YouTube and its neighbours do
+not work, for want of streaming rather than for want of a codec. There is
+also **no audio**
 anywhere in the browser: nothing in the project opens an output device on
 any platform, so a clip with a soundtrack plays silently. The design, the
 exact unsupported list and the ordered next steps are in
