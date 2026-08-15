@@ -1,0 +1,121 @@
+name: Sync fork
+
+# This file exists only on 67plays/FeetBrowser. It is not upstream's and it
+# should never be merged into JuiceyDew/FeetBrowser -- if you are reading it
+# in a pull request diff against upstream, something merged this fork's main
+# into a feature branch by accident and this file is the part to drop.
+#
+# What it solves: a fork's main does not follow its parent. Ours drifted 189
+# commits behind before anyone noticed, and the way we noticed was a
+# maintainer resolving conflicts on one of our pull requests by merging our
+# main into it -- which quietly reintroduced the state of the tree from
+# months earlier and had to be untangled by hand. A fork that is behind is
+# not a dormant inconvenience; it is a loaded footgun pointed at whoever
+# touches it next.
+#
+# So main here is a mirror. It carries upstream's history and exactly one
+# extra commit: the one that adds this file. That is why the sync is a
+# rebase and not a merge. A merge would leave a merge commit on every run
+# and, within a few months, a main whose history no longer resembles the
+# repository it is a fork of. Rebasing replays our single commit onto the
+# new upstream tip, so the difference between our main and theirs stays one
+# file forever, and `git log` stays readable.
+#
+# The rebase cannot conflict in normal operation: our one commit adds a file
+# upstream does not have, and touches nothing else. If it ever does conflict,
+# somebody has committed to this fork's main directly, and the job fails
+# rather than guessing -- see the last step.
+
+on:
+  # Upstream is actively developed but not minute-to-minute, and a fork that
+  # is at most six hours stale has never caused a problem. Hourly would just
+  # be four times the runs for the same answer.
+  schedule:
+    - cron: '17 */6 * * *'
+  # For when you know something landed upstream and want it now, and so that
+  # the job is runnable at all if GitHub disables the schedule (it does that
+  # to forks after 60 days of repository inactivity).
+  workflow_dispatch:
+
+# Two syncs racing each other would both force-push, and the loser's
+# --force-with-lease would fail on a stale ref for no useful reason.
+concurrency:
+  group: sync-fork
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  sync:
+    name: Rebase main onto upstream
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          # A rebase needs the commits it is replaying and the ones it is
+          # replaying them onto, so the usual depth-1 checkout is useless here.
+          fetch-depth: 0
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/JuiceyDew/FeetBrowser.git
+          git fetch --quiet upstream main
+
+      - name: Report the gap
+        id: gap
+        run: |
+          # rev-list --left-right counts both directions in one pass: how far
+          # ahead of upstream we are, and how far behind.
+          read -r ahead behind < <(git rev-list --left-right --count HEAD...upstream/main)
+          echo "ahead=$ahead"   >> "$GITHUB_OUTPUT"
+          echo "behind=$behind" >> "$GITHUB_OUTPUT"
+          echo "main is $ahead ahead of and $behind behind upstream/main"
+
+          # Anything past our one workflow commit means a human pushed to this
+          # fork's main. Rebasing would rewrite their commit under them and
+          # force-pushing would publish the rewrite, so stop and let a person
+          # look at it.
+          if [ "$ahead" -gt 1 ]; then
+            echo "::error::main is $ahead commits ahead of upstream; expected at most 1 (the commit adding this workflow). Refusing to rebase -- someone has pushed to this fork's main directly."
+            exit 1
+          fi
+
+      - name: Rebase onto upstream/main
+        if: steps.gap.outputs.behind != '0'
+        run: |
+          git config user.name  'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+          # If this fails it is a genuine conflict, which per the header means
+          # something unexpected is on main. Leave the repository alone and let
+          # the run go red.
+          if ! git rebase upstream/main; then
+            git rebase --abort || true
+            echo "::error::Rebase onto upstream/main conflicted. Resolve this fork's main by hand."
+            exit 1
+          fi
+
+      - name: Push
+        if: steps.gap.outputs.behind != '0'
+        run: |
+          # A rebase rewrites our commit, so this has to be a force push.
+          # --force-with-lease makes it a force push that still refuses to
+          # clobber a main that moved while we were working, which is the
+          # difference between "rewrite what I just rebased" and "overwrite
+          # whatever is there now".
+          #
+          # Pushes authenticated with GITHUB_TOKEN deliberately do not trigger
+          # other workflows, so replaying a large backlog does not also start
+          # a CI run per commit.
+          git push --force-with-lease origin main
+          echo "Synced main to $(git rev-parse --short upstream/main) (${{ steps.gap.outputs.behind }} commits)."
+
+      - name: Already up to date
+        if: steps.gap.outputs.behind == '0'
+        run: echo "main already matches upstream/main; nothing to do."
