@@ -13,7 +13,7 @@ from feetbrowser.window import Tk
 from feetbrowser import net as net_mod
 from feetbrowser.net import URL
 from feetbrowser.htmlparser import HTMLParser, Element, Text
-from feetbrowser.cssparser import CSSParser, style
+from feetbrowser.cssparser import CSSParser, parse_inline, style
 from feetbrowser.layout import DrawText, get_font, _measure, field_checked, \
     selected_options, option_value, option_label, listbox_rows, \
     listbox_scroll, listbox_active, LISTBOX_ROW_H, LISTBOX_PAD
@@ -357,6 +357,53 @@ def test_pseudo_element_rule_dropped():
     eq(t.style["height"], "100px", "::after height must not leak onto .t")
     rules = CSSParser(".t::after { position: absolute; height: 1px }").parse()
     eq(rules, [], "::after-only rule is dropped entirely")
+
+
+def test_nested_rule_does_not_stall_the_parser():
+    """CSS nesting -- a rule inside a rule -- is what docs.python.org's theme
+    and most Tailwind output are written in now:
+
+        .box { color: red; & + div pre { border: none } font-size: 2px }
+
+    The declaration scanner stopped dead on that inner '{': there is no ':'
+    in front of it, so it read no property, and the ';' that would have moved
+    it on was not there either. The loop then saw the same brace for ever,
+    inside a load callback, where settle()'s deadline could never reach it --
+    one site in five hung the whole browser on exactly this.
+
+    Nesting is not implemented: flattening it needs the parent selector
+    threaded through, which is a feature, not a parse fix. What is required
+    here is that the block is *consumed* and the declarations around it
+    survive.
+    """
+    rules = CSSParser(
+        ".box { color: red; & + div pre { border: none } font-size: 2px }"
+    ).parse()
+    eq(len(rules), 1, "the outer rule survives")
+    eq(rules[0][1], {"color": "red", "font-size": "2px"},
+       "declarations either side of the nested rule are kept")
+    # The bare form, with no colon anywhere in the prelude, is the one that
+    # spun; so is a nested at-rule, and so is a nested rule inside @layer.
+    for css in (".a { .b { color: red } }",
+                ".a { color: red; @media screen { color: blue } }",
+                "@layer base { .c { .d { x: 1 } color: green } }",
+                ".a { &:hover { color: red } margin: 1px }"):
+        rules = CSSParser(css).parse()
+        assert isinstance(rules, list), css
+
+
+def test_a_stylesheet_always_finishes_parsing():
+    """A stylesheet is bytes off the network. Every loop that walks one has
+    to end on every input, including inputs no one would write."""
+    for css in ("{", "}", "a{", "a{{", "a{;{", "a{x", "@", "@x", "@x{",
+                "a{b:c{", "/*", "a{/*}", 'a{background:url(x{y);color:red}',
+                "a{content:'}';color:red}"):
+        rules = CSSParser(css).parse()
+        assert isinstance(rules, list), css
+    eq(CSSParser('a{background:url(x{y);color:red}').parse()[0][1]["color"],
+       "red", "a brace inside url() is not a nested rule")
+    eq(parse_inline("color: red; margin: 0"),
+       {"color": "red", "margin": "0"}, "ordinary inline styles are unharmed")
 
 
 def test_combinators_do_not_crash_and_match():
@@ -990,6 +1037,27 @@ def test_css_does_arithmetic():
     ]
     for value, base, want in cases:
         eq(_resolve_len(value, base, -1), want, value)
+
+
+def test_calc_tokenising_always_advances():
+    """`calc(100% -1px)` -- a sign with a space in front of it but none
+    behind -- is neither the subtraction operator (CSS wants the space on
+    both sides) nor anything the operand scan would accept, so the scan broke
+    on the very character it started at, emitted a zero-width token and left
+    the cursor where it was. Every length in the sheet went through here, so
+    one such value in one stylesheet was a browser that never came back.
+    """
+    from feetbrowser.layout import _calc_tokens, _resolve_len
+    eq(_calc_tokens("100% -1px"), ["100%", "-1px"],
+       "a sign glued to its number is part of the operand")
+    eq(_calc_tokens("100% - 1px"), ["100%", "-", "1px"],
+       "spaced either side, it is still the operator")
+    eq(_resolve_len("calc(100px -10px)", 0, -1), 100.0,
+       "an unspaced sign reads as one negative operand, not a subtraction")
+    for expr in ("-", " - ", "+", "100% -", "- 1px", "()", "(", ")",
+                 "1px --2px", "a-b", "* 2", "100%-", "-1px -2px"):
+        _calc_tokens(expr)
+        _resolve_len("calc(%s)" % expr, 800.0, 0.0)
 
 
 def test_a_calculated_width_is_used():

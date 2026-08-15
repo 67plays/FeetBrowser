@@ -318,6 +318,18 @@ class Tab:
         self._video_failures = deque()
         self._image_queue = []
         self._image_results = deque()
+        # Absolute URLs whose bytes arrived and could not be turned into
+        # pixels -- an SVG, a format we have no decoder for, a 404 page served
+        # as the image. They are as finished as a decoded one: there is
+        # nothing further to wait for and nothing to gain by asking again.
+        # Without this, _missing_images() saw a source that was neither
+        # cached nor queued and started the fetch over, several times a
+        # second, for as long as the tab was open -- so pending_images() was
+        # never false and settle() spent its whole timeout on a page that had
+        # in fact finished. A dict, not a set, for the same reason the cache
+        # beside it is one: insertion order is what makes "drop the oldest" a
+        # sentence rather than a coin toss.
+        self._image_undecodable = {}
         self._image_root = None
         self._image_done = None
         # Console output accumulated from JS (errors + console.log lines).
@@ -926,6 +938,17 @@ class Tab:
         script or click handler finished mutating the DOM."""
         if self.nodes is None:
             return
+        # Consume the flag. The DOM bindings set it on every mutating call
+        # and nothing cleared it, so the first line of script that touched
+        # the document left the tab restyling and re-laying-out the whole
+        # page on every 60 ms poll, for as long as it was open -- and, with
+        # _fetch_js_added_images() on the end of that, re-scanning for images
+        # sixteen times a second as well. Clearing it here rather than at the
+        # two call sites keeps it true that this method is the only consumer;
+        # a mutation made *during* the restyle sets it again and is picked up
+        # on the next pass, which is what it is for.
+        if self._js_doc is not None:
+            self._js_doc._flag["dirty"] = False
         # style() reassigns node.style and recomputes inheritance, so JS-driven
         # overrides must be folded into the inline style attribute first (this
         # also keeps them winning over author rules on restyle).
@@ -1146,10 +1169,11 @@ class Tab:
 
     def _missing_images(self, skip=()):
         """Yield ``(key, url)`` for every <img> source that is neither decoded
-        nor on its way: not in the image cache and not in `skip` (keys already
-        being fetched). Shared by the initial scan (load_images) and the
-        re-scan after a script adds elements (_fetch_js_added_images)."""
-        skip = set(skip)
+        nor on its way: not in the image cache, not already found undecodable,
+        and not in `skip` (keys already being fetched). Shared by the initial
+        scan (load_images) and the re-scan after a script adds elements
+        (_fetch_js_added_images)."""
+        skip = set(skip) | set(self._image_undecodable)
         if self.nodes is None:
             return
         for node in tree_to_list(self.nodes, []):
@@ -1237,15 +1261,24 @@ class Tab:
             self._decode_and_finish(key, data, ctype)
 
     def _decode_and_finish(self, key, data, ctype):
-        if data:
-            photo = self._decode_image(data, ctype)
-            if photo is not None:
-                self.image_cache[key] = photo
-                # Bound the per-tab image cache so long browsing sessions
-                # cannot grow it (and the X/PhotoImage resources behind it)
-                # without limit. Dict preserves insertion order: drop oldest.
-                while len(self.image_cache) > MAX_CACHED_IMAGES:
-                    self.image_cache.pop(next(iter(self.image_cache)))
+        photo = self._decode_image(data, ctype) if data else None
+        if photo is not None:
+            self.image_cache[key] = photo
+            # Bound the per-tab image cache so long browsing sessions
+            # cannot grow it (and the X/PhotoImage resources behind it)
+            # without limit. Dict preserves insertion order: drop oldest.
+            while len(self.image_cache) > MAX_CACHED_IMAGES:
+                self.image_cache.pop(next(iter(self.image_cache)))
+        else:
+            # This source is settled too -- it just settled on a placeholder.
+            # Recording that is what stops the next re-scan (a script mutates,
+            # so _fetch_js_added_images runs again) seeing an <img> that is in
+            # neither the cache nor the queue and fetching it all over again,
+            # for ever. Same ceiling as the cache, for the same reason.
+            self._image_undecodable[key] = True
+            while len(self._image_undecodable) > MAX_CACHED_IMAGES:
+                self._image_undecodable.pop(
+                    next(iter(self._image_undecodable)))
         # Remove this URL (not necessarily the head); background threads
         # finish in arbitrary order, so popping the head would reorder the
         # remaining queue and skip images.
@@ -4617,12 +4650,24 @@ class Browser:
 
         Returns True if everything settled, False if the timeout arrived
         first (a page can always point at an image that never answers).
+
+        False is a verdict, not a failure: the tab is left drawable either
+        way. Every render this call reached has already run, the timers it
+        did not get to are still on the queue with their due times intact,
+        and draw() paints the last complete display list. Giving up on a page
+        that will not stop working and showing what there is beats a browser
+        that never comes back -- which is what the alternative actually is.
+
+        The deadline reaches the timer queue as well as this loop. A batch of
+        due timers is unbounded work -- a callback can fetch and parse a
+        stylesheet or lay out the document -- so bounding only the loop
+        around it bounds nothing.
         """
+        deadline = time.monotonic() + timeout
         if not self._polling_images:
             self._poll_images()
-        deadline = time.monotonic() + timeout
         while True:
-            wait = self.window.flush_timers()
+            wait = self.window.flush_timers(deadline)
             if not self.busy():
                 return True
             if time.monotonic() >= deadline:

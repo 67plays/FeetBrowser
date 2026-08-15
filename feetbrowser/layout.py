@@ -690,7 +690,17 @@ def _calc_tokens(expr):
             tokens.append(ch)
             i += 1
             continue
-        j = i
+        # An operand is at least one character long, and the character at `i`
+        # is that one: everything the scan below breaks on -- whitespace, a
+        # paren, a comma, an operator -- was already handled above, so
+        # whatever is here belongs to this token whatever it looks like.
+        # Starting at `i` instead let `calc(100% -1px)` break immediately (a
+        # '-' after a space, but without one after it, is not the operator
+        # the branch above accepts), emit a zero-width token, and leave `i`
+        # where it was: an infinite loop reached from every length in the
+        # sheet. It also read expr[-1] -- the far end of the string -- when
+        # the expression began with one.
+        j = i + 1
         depth = 0
         while j < n:
             c = expr[j]

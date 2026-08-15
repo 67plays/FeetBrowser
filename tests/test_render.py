@@ -1172,6 +1172,37 @@ def test_window_timer_not_yet_due_is_kept():
     assert wait is not None and wait > 1, "should report the time remaining"
 
 
+def test_window_timer_batch_stops_at_a_deadline():
+    """A batch of due timers is unbounded work -- each callback can fetch a
+    stylesheet or lay the page out -- so settle() bounding only the loop
+    around the batch bounded nothing. Past the deadline the rest of the batch
+    goes back on the queue rather than running."""
+    w = Window()
+    fired = []
+    for i in range(5):
+        w.after(0, lambda n=i: fired.append(n))
+    # A deadline already in the past: nothing in this batch should run.
+    w.flush_timers(time.monotonic() - 1)
+    assert fired == [], fired
+    # ...and nothing was lost or reordered: the next unbounded flush runs
+    # every one of them, once, in the order they were scheduled.
+    w.flush_timers()
+    assert fired == [0, 1, 2, 3, 4], fired
+
+
+def test_window_deadline_does_not_resurrect_a_cancelled_timer():
+    """Deferred timers are pushed back by handle, and a cancelled handle must
+    stay cancelled across the push-back."""
+    w = Window()
+    fired = []
+    w.after(0, lambda: fired.append("kept"))
+    handle = w.after(0, lambda: fired.append("cancelled"))
+    w.after_cancel(handle)
+    w.flush_timers(time.monotonic() - 1)
+    w.flush_timers()
+    assert fired == ["kept"], fired
+
+
 def test_window_geometry_and_resize_event():
     w = Window()
     seen = []
@@ -1336,6 +1367,75 @@ def test_settle_waits_for_images_a_finished_document_asked_for():
                              IMAGE_RGB) == IMAGE_SIZE * IMAGE_SIZE
     finally:
         shutil.rmtree(work, ignore_errors=True)
+
+
+def test_an_undecodable_image_settles_instead_of_being_refetched_for_ever():
+    """A picture we cannot decode is finished, not outstanding.
+
+    An <img> pointing at an SVG (or anything else with no decoder here) never
+    reaches the image cache. A scripted page re-scans for images whenever the
+    DOM is marked dirty, and that scan looked for sources that were in
+    neither the cache nor the fetch queue -- which is exactly what an
+    undecodable one is, for ever. So it was fetched again, and again, several
+    times a second: pending_images() never went false, settle() spent its
+    whole timeout, and the site got hammered for as long as the tab was open.
+    sqlite.org, go.dev and www.w3.org all sat in that loop.
+
+    The second half of the same story is the dirty flag. The DOM bindings set
+    it on every mutating call and nothing cleared it, so one line of script
+    was enough to restyle and re-lay-out the whole page on every poll -- which
+    is what drove the re-scan in the first place.
+    """
+    import http.server
+    import threading
+    import time as _time
+    from feetbrowser.browser import Browser
+
+    hits = []
+    page = (b'<!doctype html><div id="wrap"><img src="/logo.svg"></div>'
+            b'<script>document.getElementById("wrap").className = "x";'
+            b'</script>')
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            hits.append(self.path)
+            if self.path.endswith(".svg"):
+                body = b'<svg xmlns="http://www.w3.org/2000/svg"></svg>'
+                ctype = "image/svg+xml"
+            else:
+                body, ctype = page, "text/html"
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        browser = Browser()
+        browser.new_tab("http://127.0.0.1:%d/" % server.server_address[1])
+        started = _time.monotonic()
+        assert browser.settle(20.0), \
+            "an image that cannot be decoded still finishes the page"
+        assert _time.monotonic() - started < 10, \
+            "and it finishes promptly, not on the timeout"
+        tab = browser.tabs[0]
+        assert not tab.pending_images(), "nothing is left outstanding"
+        # Keep pumping the way a live browser does. The count must not move.
+        svg_hits = [h for h in hits if h.endswith(".svg")]
+        for _ in range(40):
+            browser.window.flush_timers()
+        assert [h for h in hits if h.endswith(".svg")] == svg_hits, \
+            "the failed image is not fetched again on every poll"
+        assert len(svg_hits) == 1, ("fetched once", svg_hits)
+        assert not tab._js_doc._flag["dirty"], \
+            "the mutation flag is consumed, not left set for every poll"
+    finally:
+        server.shutdown()
 
 
 def test_script_created_images_are_fetched_and_painted():
