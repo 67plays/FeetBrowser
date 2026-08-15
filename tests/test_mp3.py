@@ -89,7 +89,7 @@ import zlib
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from feetbrowser import ball
+from feetbrowser import ball, mediacodec
 
 FIXTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                         "fixtures", "mp3")
@@ -1067,9 +1067,64 @@ def test_a_machine_without_gfortran_still_has_a_browser():
         lines = []
         assert ball.check([], out=lines.append) == 1
         assert "gfortran" in lines[0], lines
+        # And the media stack above it: an MP3 is still identified, still
+        # named, and still refused with a sentence rather than a traceback.
+        data = _stream("tone")
+        assert mediacodec.sniff(data) == "MP3"
+        info = mediacodec.probe_audio(data)
+        assert info.container == "MP3" and info.codec == "MP3"
+        assert not info.supported and "gfortran" in info.reason, info.reason
+        try:
+            mediacodec.open_audio(data)
+        except mediacodec.MediaError as exc:
+            assert "gfortran" in str(exc), exc
+        else:
+            raise AssertionError("opened an MP3 with no decoder")
         print("  ok  no toolchain: refused, and said which toolchain")
     finally:
         ball._loaded, ball._lib, ball._load_error = saved
+
+
+def test_the_media_stack_reaches_the_decoder():
+    """A bare `.mp3` through `mediacodec`, which is the only way anything
+    above this ever sees it.
+
+    Sniffed by its frame header, because a URL's extension is a claim;
+    probed for a rate, a channel count and a duration accumulated frame by
+    frame rather than divided out of the first frame's bitrate, which is
+    what a variable-bitrate file needs; and opened to an `AudioTrack` whose
+    samples have to be the decoder's own, byte for byte, or something
+    between the two is quietly changing them.
+
+    `probe()` is asked as well. An MP3 is a container with no picture in
+    it, and the honest answer to "what is this video" is a MediaInfo saying
+    so, not an exception that a caller has to know to catch.
+    """
+    if _skip():
+        return
+    data = _stream("stereo")
+    assert mediacodec.sniff(data) == "MP3"
+    picture = mediacodec.probe(data)
+    assert not picture.supported and "no picture" in picture.reason
+    info = mediacodec.probe_audio(data)
+    assert info.supported and info.codec == "MP3", info
+    assert info.sample_rate == 44100 and info.channels == 2, info
+    assert info.frame_count == 17, info
+    assert abs(info.duration - 17 * 1152 / 44100.0) < 1e-6, info.duration
+    track = mediacodec.open_audio(data)
+    through = b"".join(track.frame(i).samples
+                       for i in range(track.sample_count))
+    direct = ball.Decoder().decode_stream(data)[2]
+    assert through == direct, "the track and the decoder disagree"
+    # An ID3v2 tag in front of the audio is the usual state of an MP3 in
+    # the wild, and it must not move a single sample.
+    tagged = b"ID3\x03\x00\x00\x00\x00\x02\x01" + b"\0" * 257 + data
+    assert mediacodec.sniff(tagged) == "MP3"
+    tagged_track = mediacodec.open_audio(tagged)
+    assert tagged_track.sample_count == track.sample_count
+    assert tagged_track.frame(0).samples == track.frame(0).samples
+    print("  ok  sniffed, probed and opened through mediacodec: %d frames, "
+          "%.3f s, identical samples" % (info.frame_count, info.duration))
 
 
 def test_the_build_entry_point_is_what_the_packaging_calls():

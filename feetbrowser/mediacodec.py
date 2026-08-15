@@ -834,6 +834,54 @@ class _Aac:
             raise MediaError(_aac_reason(exc))
 
 
+def _mp3_module():
+    """The MPEG Layer III decoder, imported at the moment it is needed, for
+    the same reason `_aac_module` is."""
+    try:
+        from . import ball
+    except Exception as exc:        # not just ImportError: a broken build
+        raise MediaError("MP3: no decoder (%s)" % exc)
+    return ball
+
+
+class _Mp3:
+    """MPEG Layer III, decoded by the Fortran decoder in ``fortran/``.
+
+    Stateful for one more reason than AAC is. The transform overlap and the
+    filterbank history join each frame to the next as they do there, and on
+    top of that Layer III has a bit reservoir: a frame's main data may
+    physically live in frames already gone past. So a decoder handed frame
+    N with nothing before it does not merely start attenuated, it may have
+    no main data to read at all -- which it reports as silence rather than
+    as an error, and which is why `AudioTrack.frame()` replays from zero.
+    """
+
+    def __init__(self):
+        ball = _mp3_module()
+        self._ball = ball
+        try:
+            self._decoder = ball.Decoder()
+        except ball.Mp3Error as exc:
+            raise MediaError(_mp3_reason(exc))
+        self.sample_rate = 0
+        self.channels = 0
+
+    def reset(self):
+        self._decoder.reset()
+
+    def decode(self, packet):
+        """(samples per channel, channels, interleaved float32 bytes)."""
+        if not packet:
+            return 0, self.channels, b""
+        try:
+            out = self._decoder.decode(packet)
+        except self._ball.Mp3Error as exc:
+            raise MediaError(_mp3_reason(exc))
+        self.sample_rate = self._decoder.sample_rate
+        self.channels = self._decoder.channels
+        return out
+
+
 # The fourccs that mean H.264. `avc1` and `avc3` are the MP4 spellings and
 # differ only in where the parameter sets live -- in the `avcC` box for the
 # first, inline in the stream for the second, and the decoder takes both.
@@ -1529,6 +1577,18 @@ def _aac_reason(exc):
     """
     text = str(exc)
     return text if text.startswith("AAC") else "AAC: %s" % text
+
+
+def _mp3_reason(exc):
+    """And again for Layer III.
+
+    The frame walk and the header reader live in the decoder library, so on a
+    machine with no compiler they raise before a single frame is found. That
+    is a sentence to put in front of somebody whose file will not play, not
+    an exception type the media stack has any reason to know about.
+    """
+    text = str(exc)
+    return text if text.startswith("MP3") else "MP3: %s" % text
 
 
 def _annexb_track(data, samples, extradata):
@@ -2241,6 +2301,61 @@ def _open_mp4(data, container="MP4"):
                       times=times, order=order)
 
 
+def _open_mp3(data):
+    """An `AudioTrack` over a bare MPEG Layer III stream.
+
+    There is no container here to hold a duration or a frame table, so both
+    are built by walking the frames: each header says how long its frame is
+    and how many samples it carries, and a stream is allowed to change
+    bitrate between frames, which is what a variable-bitrate file is. The
+    times are accumulated rather than divided out of one rate for the same
+    reason `AudioTrack` carries `stts` verbatim -- a length computed from
+    the first frame's bitrate is wrong for every VBR file there is.
+
+    A frame this walk cannot use is skipped rather than fatal: an ID3v1 tag
+    at the end, a stray byte between frames, or rubbish appended by
+    something that thought the file was text are all things a player is
+    expected to keep playing through.
+    """
+    ball = _mp3_module()
+    packets = []
+    times = []
+    clock = 0.0
+    rate = 0
+    channels = 0
+    try:
+        for offset, length in ball.frames(data):
+            header = ball.frame_header(data[offset:offset + 4])
+            if header is None or not header["sample_rate"]:
+                continue
+            rate = header["sample_rate"]
+            channels = header["channels"]
+            duration = header["samples"] / float(rate)
+            packets.append((offset, length, True))
+            times.append((clock, duration))
+            clock += duration
+    except ball.Mp3Error as exc:
+        raise MediaError(_mp3_reason(exc))
+    if not packets:
+        raise MediaError("MP3: no frames in this file")
+    info = AudioInfo("MP3", codec="MP3", sample_rate=rate, channels=channels,
+                     duration=clock, frame_count=len(packets), supported=True)
+    return AudioTrack(data, info, packets, _Mp3(), times=times)
+
+
+def _probe_mp3(data):
+    """What a bare Layer III stream is, whether or not we can decode it.
+
+    A machine with no gfortran still has to be able to say "MP3, and here is
+    why it will not play", so the failure to build a track is turned into a
+    reason rather than raised.
+    """
+    try:
+        return _open_mp3(data).info
+    except MediaError as exc:
+        return AudioInfo("MP3", codec="MP3", reason=str(exc))
+
+
 def _probe_mp4(data, container="MP4"):
     try:
         return _open_mp4(data, container).info
@@ -2544,6 +2659,31 @@ _ISO_LEADERS = ("ftyp", "moov", "mdat", "wide", "free", "skip", "pnot",
                 "PICT")
 
 
+def _looks_like_mp3(data):
+    """Is there an MPEG audio frame header at the front of this?
+
+    Pure Python, and a duplicate of a few lines the Fortran already has, on
+    purpose: sniffing is what `probe()` does on a machine with no gfortran,
+    and a sniffer that needed the decoder would make an MP3 unidentifiable
+    on exactly the machines where saying what it is matters most.
+
+    Only the fields that cannot legally hold their reserved value are
+    checked. That is enough to reject text and pictures and not enough to
+    accept a false sync inside audio data as a whole file -- but nothing
+    here has to: this decides which parser looks next, and that parser
+    finds the real frames itself.
+    """
+    if len(data) >= 10 and data[:3] == b"ID3":
+        return True
+    if len(data) < 4 or data[0] != 0xFF or (data[1] & 0xE0) != 0xE0:
+        return False
+    version = (data[1] >> 3) & 3
+    layer = (data[1] >> 1) & 3
+    bitrate = (data[2] >> 4) & 15
+    rate = (data[2] >> 2) & 3
+    return version != 1 and layer != 0 and bitrate != 15 and rate != 3
+
+
 def sniff(data):
     """The container this looks like, or "" -- by magic bytes only, because
     a URL's extension is a claim and the first twelve bytes are evidence."""
@@ -2555,6 +2695,12 @@ def sniff(data):
         return "MJPEG"
     if data[:4] == b"\x1a\x45\xdf\xa3":
         return "WebM"
+    # Last of the four-byte tests, because an MPEG audio frame header is the
+    # weakest evidence of the four: eleven bits of sync and a handful of
+    # fields that merely have to be legal. Everything with a real magic
+    # number has already had its say.
+    if _looks_like_mp3(data):
+        return "MP3"
     leader = data[4:8].decode("latin-1")
     if leader in _ISO_LEADERS:
         # `ftyp` carries the brand, and QuickTime's is the four characters
@@ -2584,6 +2730,10 @@ def probe(data):
         return _probe_mp4(data, kind)
     if kind == "WebM":
         return _probe_webm(data)
+    if kind == "MP3":
+        return MediaInfo("MP3", codec="MP3",
+                         reason="an MP3 is sound and nothing else: there is "
+                                "no picture in it")
     raise MediaError("not a media container we recognise")
 
 
@@ -2623,6 +2773,8 @@ def probe_audio(data):
         return AudioInfo("MJPEG",
                          reason="a bare MJPEG stream is pictures and nothing "
                                 "else: there is no audio in it")
+    if kind == "MP3":
+        return _probe_mp3(data)
     raise MediaError("not a media container we recognise")
 
 
@@ -2635,4 +2787,6 @@ def open_audio(data):
     kind = sniff(data)
     if kind in ("MP4", "MOV"):
         return _open_mp4_audio(data, kind)
+    if kind == "MP3":
+        return _open_mp3(data)
     raise _Unsupported(probe_audio(data))

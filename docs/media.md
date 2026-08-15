@@ -95,9 +95,12 @@ without the other two, and only the last one knows what a canvas is.
 Containers and codecs. No clocks, no threads, no canvas, no imports from the
 browser. Everything in it is a pure function of a `bytes` object.
 
-- `sniff(data)` returns `"AVI"`, `"MJPEG"`, `"MOV"`, `"MP4"`, `"WebM"` or
-  `""` from the magic. `"MJPEG"` is the containerless case: a file that
-  begins with a JPEG and holds nothing but JPEGs.
+- `sniff(data)` returns `"AVI"`, `"MJPEG"`, `"MOV"`, `"MP3"`, `"MP4"`,
+  `"WebM"` or `""` from the magic. `"MJPEG"` and `"MP3"` are the
+  containerless cases: a file that begins with a JPEG and holds nothing but
+  JPEGs, and a file that is a run of MPEG audio frames with nothing wrapped
+  around them. Both are recognised last, because neither has magic so much
+  as a shape, and a real container should win first.
 - `probe(data)` returns a `MediaInfo` (container, codec fourcc or name,
   width, height, duration, frame count, `supported`, and a `reason` when it
   is not. It does not raise for a file it merely cannot decode, because "an
@@ -858,22 +861,29 @@ needs the third of those where AAC needed only the first.
 **What it is not.** Layer I, Layer II, free-format bitrates and more than
 two channels are each refused by name, with a status code and a sentence
 that says what to do -- because "unsupported" on its own is a useless
-thing to tell somebody whose file will not play. It is not yet wired into
-`mediacodec.py`, so nothing plays an `.mp3` through it yet.
+thing to tell somebody whose file will not play.
+
+**How it is reached.** `mediacodec.sniff()` recognises a bare MP3 by its
+ID3 tag or by a frame header that is self-consistent, `probe_audio()`
+names it, and `open_audio()` walks the frames into an `AudioTrack` whose
+packets and timestamps come from the headers. That is the whole of it: an
+MP3 carried inside an MP4 as `mp4a` is still named and not decoded, and
+the `<audio>` element does not exist, so an `.mp3` opened through
+`mediacodec` is the only route in.
 
 ## What is not supported
 
 Bluntly, because a foundation that overstates itself is worse than none:
 
-- **MP4 is the only container with sound in it.** An MP4 with an AAC-LC
-  track plays, in sync -- see [Sound and pictures
+- **MP4 is the only container with sound *and* pictures in it.** An MP4
+  with an AAC-LC track plays, in sync -- see [Sound and pictures
   together](#sound-and-pictures-together). Nothing else does. AVI and WebM
   audio streams are named by `probe_audio` and not decoded: WebM for want
   of a Vorbis or Opus decoder, AVI for want of a demuxer that reaches its
-  audio. There is now an MPEG Layer III decoder -- see [MPEG Layer III, in
-  Fortran](#mpeg-layer-iii-in-fortran) -- but nothing calls it yet: it is
-  not wired into `mediacodec.py`, so an `.mp3` still does not play. The
-  `<audio>` element is not implemented at all, so sound arrives only
+  audio. A bare `.mp3` opens and decodes -- see [MPEG Layer III, in
+  Fortran](#mpeg-layer-iii-in-fortran) -- but an MP3 stored inside an MP4
+  under `mp4a` is still named and not decoded, and the `<audio>` element is
+  not implemented at all, so within a page sound still arrives only
   alongside a picture.
 - **Layer III only, of the MPEG audio layers.** Layer I, Layer II, a
   free-format bitrate and more than two channels are each refused by name
