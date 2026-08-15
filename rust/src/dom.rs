@@ -1112,6 +1112,16 @@ fn element_set(
             attrs.set_item("value", str_of(py, value)?)?;
             mark_dirty(&flag);
         }
+        // The same attribute round-trip for the URL attributes scripts assign
+        // (`img.src = ...`, `a.href = ...`). element_get already falls back to
+        // the attribute dictionary for any name it does not know, so dropping
+        // the write here left the element permanently bare: a script-created
+        // <img> rendered as "[img]" because its src never landed anywhere.
+        "src" | "href" => {
+            let attrs = node_attributes(&node)?;
+            attrs.set_item(name, str_of(py, value)?)?;
+            mark_dirty(&flag);
+        }
         _ => {}
     }
     Ok(())
