@@ -92,6 +92,8 @@ rem there, so this usually checks that the browser survives not having one.
 %RUN% tests\test_h264.py || exit /b 1
 rem The Fortran AAC decoder, and the same arrangement about gfortran.
 %RUN% tests\test_aac.py || exit /b 1
+rem The Fortran MPEG Layer III decoder, and the same arrangement again.
+%RUN% tests\test_mp3.py || exit /b 1
 %RUN% tests\smoke.py || exit /b 1
 
 rem The Go port of the transport layer (net/) is a separate toolchain, so it is
