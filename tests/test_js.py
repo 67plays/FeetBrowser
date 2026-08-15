@@ -1523,6 +1523,187 @@ def test_a_multiple_listbox_reads_its_first_chosen_value():
        ".value on a multi-choice select is its first chosen option")
 
 
+# The tests below each hold one snippet reduced from a script a real site
+# serves. The comment above each says where it came from, because the shape of
+# minified code is the whole reason these cases exist: nobody writes a regex
+# hard up against a closing brace by hand.
+
+
+def test_js_regex_literal_after_a_closing_brace():
+    # vimeo.com, fb6eed97-*.js: `...continue}}}/^.+[.-]min\.js$/.test(x)`.
+    # Read as division, the slash swallowed the rest of the file and the
+    # parser reported a stray backslash three hundred lines later.
+    interp = Interpreter()
+    interp.run(r"""
+        var hits = 0;
+        for (var i = 0; i < 3; i++) { if (i === 0) { continue } hits++ }
+        /^.+[.-]min\.js$/.test("a.min.js") && (hits += 10);
+        var divided = (function(){ var n = 8; return n }() / 2);
+    """)
+    g = interp.globals
+    eq(g["hits"], 12, "a regex may start a statement right after a block")
+    eq(g["divided"], 4, "and a real division still divides")
+
+
+def test_js_tagged_templates():
+    # developer.mozilla.org, index.*.js: lit-html spells every piece of markup
+    # as (0,a.qy)`<span>${x}</span>`, so a tag call was most of the file.
+    interp = Interpreter()
+    interp.run(r"""
+        function tag(strings) {
+            var subs = Array.prototype.slice.call(arguments, 1);
+            return strings.raw[0] + "|" + strings[0] + "|" + subs.join(",");
+        }
+        var t = tag`a\nb${1}c${2}`;
+        var raw = String.raw`C:\new\table${1}`;
+        var lib = { qy: function(s){ return "<" + s.join("_") + ">"; } };
+        var member = (0, lib.qy)`x${9}y`;
+    """)
+    g = interp.globals
+    eq(g["t"], "a\\nb|a\nb|1,2", "a tag sees both the raw and the cooked text")
+    eq(g["raw"], r"C:\new\table1", "String.raw leaves the backslashes alone")
+    eq(g["member"], "<x_y>", "a tag may be a member expression")
+
+
+def test_js_class_fields_and_private_names():
+    # developer.mozilla.org, 18376: a class whose whole state is `#e;#t;#o;`
+    # declared above the constructor, plus `static styles=r.A` on the button.
+    interp = Interpreter()
+    interp.run("""
+        class Counter {
+            #n = 0;
+            step = 2;
+            static kind = "counter";
+            #bump() { this.#n += this.step; return this.#n; }
+            get value() { return this.#bump(); }
+        }
+        var c = new Counter();
+        var first = c.value;
+        var second = c.value;
+        var kind = Counter.kind;
+        var has = ("#n" in {}) === false;
+    """)
+    g = interp.globals
+    eq(g["first"], 2, "an instance field initialises before the constructor")
+    eq(g["second"], 4, "a private field is state like any other")
+    eq(g["kind"], "counter", "a static field lives on the class")
+    assert g["has"] is True, "and a private name is not a name anything else can spell"
+
+
+def test_js_computed_class_and_object_members():
+    # developer.mozilla.org, 5909: `[Symbol.toPrimitive](e){...}`, and
+    # vimeo.com, fb6eed97: `{*entries(){...}, [Symbol.iterator]: () => i()}`.
+    interp = Interpreter()
+    interp.run("""
+        var KEY = "shout";
+        class Words {
+            constructor(list) { this.list = list; }
+            [KEY]() { return this.list.join("!"); }
+            [Symbol.iterator]() { return this.pairs(); }
+            *pairs() { yield this.list[0]; yield this.list[1]; }
+        }
+        var w = new Words(["a", "b"]);
+        var shouted = w.shout();
+        var spread = [...w].join("-");
+        var lit = { *entries() { yield 1; yield 2; }, [KEY]: 7 };
+        var fromLit = [...lit.entries()].join("+");
+        var litKey = lit.shout;
+    """)
+    g = interp.globals
+    eq(g["shouted"], "a!b", "a computed method name is the string it evaluates to")
+    eq(g["spread"], "a-b", "a class may spell Symbol.iterator that way")
+    eq(g["fromLit"], "1+2", "an object literal may hold a generator method")
+    eq(g["litKey"], 7, "and a computed key beside it")
+
+
+def test_js_generators():
+    # vimeo.com, 9192: `for (let n of function*(e){ ... yield t ... }(x))`.
+    interp = Interpreter()
+    interp.run("""
+        function* count(n) { for (var i = 0; i < n; i++) { yield i; } }
+        var listed = [...count(4)].join(",");
+        function* both() { yield "a"; yield* count(2); }
+        var delegated = Array.from(both()).join(",");
+        var stepped = count(2);
+        var one = stepped.next().value;
+        var two = stepped.next().value;
+        var done = stepped.next().done;
+        var inline = [...function*(){ yield 9; }()].join("");
+    """)
+    g = interp.globals
+    eq(g["listed"], "0,1,2,3", "a generator is iterable")
+    eq(g["delegated"], "a,0,1", "yield* hands on everything the inner one yields")
+    eq(g["one"], 0, "next() walks it a step at a time")
+    eq(g["two"], 1, "and keeps its place")
+    assert g["done"] is True, "and says when it is finished"
+    eq(g["inline"], "9", "a generator expression may be called where it stands")
+
+
+def test_js_destructuring_assignment_onto_properties():
+    # vimeo.com, fb6eed97: `({comparer: f.moduleSpecifierComparer} = eaL(_, u))`
+    # -- a destructuring assignment whose targets are properties, not names.
+    interp = Interpreter()
+    interp.run("""
+        var out = {};
+        ({ a: out.first, b: out.second } = { a: 1, b: 2 });
+        [out.third] = [3];
+        var swap = { x: 1, y: 2 };
+        [swap.x, swap.y] = [swap.y, swap.x];
+    """)
+    g = interp.globals
+    eq(g["out"]["first"], 1, "an object pattern may target a property")
+    eq(g["out"]["third"], 3, "and so may an array pattern")
+    eq(g["swap"]["x"], 2, "which is enough to swap two of them")
+
+
+def test_js_uncurried_prototype_methods():
+    # vimeo.com, polyfills-*.js (core-js): every method it ships is built by
+    #   var call = Function.prototype.call;
+    #   var uncurryThis = function (fn) {
+    #     return function () { return call.apply(fn, arguments); };
+    #   };
+    # so a method taken off one value has to run against another.
+    interp = Interpreter()
+    interp.run("""
+        var g = Function.prototype, call = g.call;
+        function uncurry(fn) {
+            return function () { return call.apply(fn, arguments); };
+        }
+        var classOf = uncurry({}.toString);
+        var slice = uncurry("".slice);
+        var join = uncurry([].join);
+        var tagArray = classOf([]);
+        var tagNull = classOf(null);
+        var cut = slice("hello", 1, 3);
+        var joined = join([1, 2, 3], "-");
+        var bound = g.bind.call(function () { return this.z; }, { z: 9 })();
+    """)
+    g = interp.globals
+    eq(g["tagArray"], "[object Array]",
+       "Object.prototype.toString stays itself when it changes hands")
+    eq(g["tagNull"], "[object Null]", "including for the values that have no methods")
+    eq(g["cut"], "el", "an uncurried string method runs on the string it is given")
+    eq(g["joined"], "1-2-3", "and an array method on the array")
+    eq(g["bound"], 9, "bind reaches through the same path")
+
+
+def test_js_error_subclasses():
+    # vimeo.com, polyfills-*.js: `jt = TypeError` ... `new jt(...)`, which is
+    # how every guard in that bundle reports a bad argument.
+    interp = Interpreter()
+    interp.run("""
+        var names = [], msg = "";
+        [TypeError, RangeError, SyntaxError, ReferenceError].forEach(function (E) {
+            try { throw new E("bad"); } catch (e) { names.push(e.name); msg = e.message; }
+        });
+        var joined = names.join(",");
+    """)
+    g = interp.globals
+    eq(g["joined"], "TypeError,RangeError,SyntaxError,ReferenceError",
+       "each error constructor names itself")
+    eq(g["msg"], "bad", "and carries the message it was given")
+
+
 def main():
     root = Tk(); root.withdraw()
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
