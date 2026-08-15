@@ -421,16 +421,24 @@ that has to succeed, and nothing in `rust/Cargo.toml` or `pyproject.toml`
 that mentions it.
 
 The packaged applications are the exception, and they have to be: a user has
-no gfortran, so a bundle that carried only the sources carried no video at
-all. Each of the three packaging scripts compiles the video decoder on the
-build machine through `python3 -m feetbrowser.h264 --build`, ships the result
-inside the package, and checks with `otool -L`, `ldd` or a stripped `PATH`
-that gfortran's runtime went in with it rather than being left behind as a
-dependency on the build machine. So gfortran is a build-time requirement for
-packaging on all three platforms, and a run-time requirement nowhere. The
-sound decoder is not shipped that way yet and still compiles on demand,
-which means a packaged build has pictures and no sound; that is the next
-thing the packaging scripts want.
+no gfortran, so a bundle that carried only the sources carried no video and
+no sound at all. Each of the three packaging scripts compiles both decoders
+on the build machine through `python3 -m feetbrowser.h264 --build` and
+`python3 -m feetbrowser.aac --build`, ships the results inside the package
+next to the modules that load them, and checks with `otool -L`, `ldd` or a
+stripped `PATH` that gfortran's runtime went in with them rather than being
+left behind as a dependency on the build machine. So gfortran is a build-time
+requirement for packaging on all three platforms, and a run-time requirement
+nowhere.
+
+Each script then asks the thing it has just built, rather than trusting that
+the copy succeeded: `--check-video` and `--check-audio` run inside the
+bundle with `PATH` cut back to the system directories, decode a fixture and
+compare the result against what a reference decoder produced. They are two
+questions because they are two libraries built from two sets of sources, and
+the failure that only the second one catches is the quiet one -- a bundle
+carrying the video decoder and not the sound decoder installs, starts,
+renders, plays a video, and is silent.
 
 Missing compiler, failed compile or an ABI mismatch all resolve to
 `h264.available()` or `aac.available()` being false, at which point the file

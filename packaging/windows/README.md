@@ -37,20 +37,25 @@ Three things in one directory:
    `.pyd` at the root of the wheel will bundle just as happily; what it
    insists on is that there is exactly one engine `.pyd` in there.
 
-4. **The H.264 decoder**: `feetbrowser\_h264_<digest>.dll`, compiled from
-   `fortran\` by gfortran at packaging time, with `fortran\` itself shipped
-   beside the package. `feetbrowser\h264.py` otherwise compiles those
+4. **The decoders**: `feetbrowser\_h264_<digest>.dll` and
+   `feetbrowser\_aac_<digest>.dll`, compiled from `fortran\` by gfortran at
+   packaging time, with `fortran\` itself shipped beside the package.
+   `feetbrowser\h264.py` and `feetbrowser\aac.py` otherwise compile those
    sources on demand, which is right for a checkout and impossible on a
    user's machine -- and the failure was silent to everyone who had a
-   compiler, which is everyone who develops the browser. The DLL is named
-   after a hash of the sources it was built from and the loader recomputes
-   it, so a stale one is not preferred over the sources, it is not found.
-   Whether gfortran's runtime ends up inside that DLL or beside it is
-   decided by reading the finished file's import table: `build_library`
+   compiler, which is everyone who develops the browser. Shipping the video
+   one alone left the same bug wearing a quieter costume: a bundle that
+   plays pictures with no sound. Each DLL is named after a hash of the
+   sources it was built from and the loader recomputes it, so a stale one is
+   not preferred over the sources, it is not found.
+   Whether gfortran's runtime ends up inside those DLLs or beside them is
+   decided by reading each finished file's import table: `build_library`
    tries `-static` first and falls back through the narrower static flags,
    and copies whatever it still could not link in -- `libgfortran-5.dll`
    and its own dependencies -- next to the decoder, where
-   `LOAD_WITH_ALTERED_SEARCH_PATH` finds them. It is a build-time check
+   `LOAD_WITH_ALTERED_SEARCH_PATH` finds them. Both decoders land in the
+   same directory and want the same runtime, so whichever is built second
+   finds those DLLs already there. It is a build-time check
    rather than a claim because the flags that fail here fail invisibly:
    every one of them links, and the difference only shows up on a machine
    that has no compiler. The verification job is what proves it, running
@@ -369,9 +374,11 @@ The checks are:
    producing a real `HWND` within a minute;
 9. `--check-video` finds the prebuilt H.264 decoder, loads it, decodes
    `mb1.264` and compares the result with the picture a reference decoder
-   produced, byte for byte. The two fixtures travel with this script in the
-   `verify-script` artifact, because the job that runs it has no checkout to
-   take them from.
+   produced, byte for byte; `--check-audio` does the same for the AAC
+   decoder with `lowrate.aac`, numerically rather than byte for byte,
+   because AAC is not a bit-exact format. All four fixtures travel with this
+   script in the `verify-script` artifact, because the job that runs it has
+   no checkout to take them from.
 
 In CI all of this happens twice, on a runner that never checks the repository
 out: once from `C:\Program Files\FeetBrowser`, and once from a directory

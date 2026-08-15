@@ -16,10 +16,12 @@ toes/*
 # per-toe persisted settings
 toes/*/settings.json
 
-# the H.264 decoder, when it has been built for shipping. The packaging puts
-# one here; it is a build product, it is platform-specific, and it is named
-# after a hash of fortran/ so a committed one would go stale silently.
+# The two Fortran decoders, when they have been built for shipping. The
+# packaging puts them here; they are build products, they are platform-
+# specific, and each is named after a hash of fortran/ so a committed one
+# would go stale silently.
 feetbrowser/_h264_*
+feetbrowser/_aac_*
 
 # screenshots written by the CI end-to-end check
 blank.png

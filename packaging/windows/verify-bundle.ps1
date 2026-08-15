@@ -22,7 +22,7 @@
       6  https works, OpenSSL and the Windows certificate store included
       7  a page fetched over a socket renders to the right pixels
       8  launching it the way Explorer does opens a real window
-      9  it can decode H.264, on a machine with no gfortran
+      9  it can decode H.264 and AAC, on a machine with no gfortran
 
 .PARAMETER Root
     The unpacked bundle -- the directory with FeetBrowser.exe in it.
@@ -40,6 +40,11 @@
     it. They travel beside this script -- the CI job that runs it has no
     checkout to take them from. Without them check 9 still proves the
     decoder loads; with them it proves what it decodes.
+
+.PARAMETER AacVector
+.PARAMETER AacTruth
+    The same pair for sound: an ADTS stream and the float32 samples a
+    reference decoder produced from it.
 #>
 [CmdletBinding()]
 param(
@@ -47,7 +52,9 @@ param(
     [string]$Evidence,
     [switch]$SkipNetwork,
     [string]$H264Vector = (Join-Path $PSScriptRoot 'h264\mb1.264'),
-    [string]$H264Truth  = (Join-Path $PSScriptRoot 'h264\mb1.i420.z')
+    [string]$H264Truth  = (Join-Path $PSScriptRoot 'h264\mb1.i420.z'),
+    [string]$AacVector  = (Join-Path $PSScriptRoot 'aac\lowrate.aac'),
+    [string]$AacTruth   = (Join-Path $PSScriptRoot 'aac\lowrate.f32.z')
 )
 
 Set-StrictMode -Version Latest
@@ -194,30 +201,43 @@ Check "--version" {
 }
 
 # ---------------------------------------------------------------------------
-# The check this file was extended for. feetbrowser\h264.py falls back to
-# compiling fortran\ with gfortran, which every developer has and no user
-# does, so a bundle that shipped no decoder passes every other check here,
-# installs, starts, renders, and only admits it to whoever opens a video --
-# by which time it is a download. PATH is already cut back to the system
-# directories in CI, so nothing on this machine can supply a compiler or a
-# MinGW runtime DLL: what answers is what shipped.
+# The check this file was extended for. feetbrowser\h264.py and
+# feetbrowser\aac.py fall back to compiling fortran\ with gfortran, which
+# every developer has and no user does, so a bundle that shipped no decoder
+# passes every other check here, installs, starts, renders, and only admits it
+# to whoever opens a video -- by which time it is a download. PATH is already
+# cut back to the system directories in CI, so nothing on this machine can
+# supply a compiler or a MinGW runtime DLL: what answers is what shipped.
+#
+# Both decoders, one check each. A bundle carrying the video library and not
+# the sound one plays pictures in silence, and it passed this file until the
+# second Check below was added.
 # ---------------------------------------------------------------------------
-Check "it can decode H.264" {
-    $lib = @(Get-ChildItem -Path (Join-Path $Root 'feetbrowser') -File -Filter '_h264_*.dll')
-    if ($lib.Count -ne 1) { throw "expected one prebuilt H.264 decoder in feetbrowser\, found $($lib.Count)" }
+function Check-Decoder {
+    param($What, $Glob, $Module, $Flag, $Vector, $Truth)
+    $lib = @(Get-ChildItem -Path (Join-Path $Root 'feetbrowser') -File -Filter $Glob)
+    if ($lib.Count -ne 1) { throw "expected one prebuilt $What decoder in feetbrowser\, found $($lib.Count)" }
     if (-not (Test-Path (Join-Path $Root 'fortran'))) {
-        throw "no fortran\ beside the package; h264.py cannot match the decoder against its sources"
+        throw "no fortran\ beside the package; $Module cannot match the decoder against its sources"
     }
-    $checkArgs = @('--check-video')
-    if ((Test-Path $H264Vector) -and (Test-Path $H264Truth)) {
-        $checkArgs += @($H264Vector, $H264Truth)
+    $checkArgs = @($Flag)
+    if ((Test-Path $Vector) -and (Test-Path $Truth)) {
+        $checkArgs += @($Vector, $Truth)
     } else {
-        Write-Host "   no test vector beside this script: checking that the decoder loads, not what it decodes"
+        Write-Host "   no $What test vector beside this script: checking that the decoder loads, not what it decodes"
     }
     $r = Invoke-Exe $Exe $checkArgs 120
-    Assert-ExitZero $r '--check-video'
+    Assert-ExitZero $r $Flag
     Write-Host ("   " + ($r.Out.Trim() -replace "`r?`n", "`n   "))
     Write-Host "   $($lib[0].Name), $([int]($lib[0].Length / 1KB)) KB"
+}
+
+Check "it can decode H.264" {
+    Check-Decoder 'H.264' '_h264_*.dll' 'h264.py' '--check-video' $H264Vector $H264Truth
+}
+
+Check "it can decode AAC" {
+    Check-Decoder 'AAC' '_aac_*.dll' 'aac.py' '--check-audio' $AacVector $AacTruth
 }
 
 Check "--help" {

@@ -61,9 +61,14 @@ import math
 import os
 import sys
 import time
+import types
 import zlib
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# And this directory, so that the shipping checks at the end of this file can
+# import test_h264's fakes of Windows and of gfortran rather than growing a
+# second copy of them.
+sys.path.insert(1, os.path.dirname(os.path.abspath(__file__)))
 
 from feetbrowser import aac, mediacodec
 
@@ -818,6 +823,405 @@ def test_a_machine_without_gfortran_still_has_a_browser():
         print("  ok  no toolchain: probed, refused, said why")
     finally:
         aac._loaded, aac._lib, aac._load_error = saved
+
+
+# -- the shipping checks -----------------------------------------------------
+#
+# The sound decoder ships inside the packaged applications the same way the
+# video one does, and it can fail to ship in the same three ways: a library
+# that links on the build machine and will not load on the user's, a runtime
+# DLL left behind beside the compiler, a flag set that was never tried.
+#
+# None of these can run on the platform that breaks -- the Windows bundle is
+# built by CI, and the failure shows up two jobs later as "could not find
+# module (or one of its dependencies)" -- so the PE reader is fed files made
+# here, byte by byte, with the answer known in advance, and the flag selection
+# is driven with a compiler that is a Python script.
+#
+# The fixtures come from test_h264 rather than being written again. They are
+# fakes of Windows and of gfortran, not of anything either decoder does, and
+# two copies of a fake that drift apart would leave one of these suites
+# testing a Windows that no longer exists. _fake_compiler in particular keys
+# off os.name because tests in this file monkeypatch platform.system, and a
+# second copy would be the one that got that wrong.
+from test_h264 import _fake_compiler, _fake_pe, _write     # noqa: E402
+
+
+def test_the_pe_reader_names_every_dll_the_sound_decoder_depends_on():
+    """aac._pe_imports, against files whose import table this test wrote."""
+    import tempfile
+
+    wanted = ["KERNEL32.dll", "libgfortran-5.dll", "libwinpthread-1.dll",
+              "api-ms-win-crt-runtime-l1-1-0.dll"]
+    with tempfile.TemporaryDirectory() as tmp:
+        got = aac._pe_imports(_write(tmp, _fake_pe(wanted)))
+        assert got == wanted, got
+        # PE32 as well as PE32+: the data directories sit sixteen bytes
+        # earlier and everything found above would be found in the wrong
+        # place if that offset were wrong.
+        got = aac._pe_imports(_write(tmp, _fake_pe(wanted, magic=0x10B)))
+        assert got == wanted, got
+        # A library that imports nothing is not an error.
+        assert aac._pe_imports(_write(tmp, _fake_pe([]))) == []
+
+        # And a file it cannot read raises rather than answering "nothing":
+        # an empty answer is what the caller reads as "fit to ship".
+        good = _fake_pe(["KERNEL32.dll"])
+        cases = [
+            ("not a PE file at all", b"#!/bin/sh\n" + good[10:]),
+            ("no PE signature", good[:0x80] + b"XX\0\0" + good[0x84:]),
+            ("an unknown optional header magic",
+             good[:0x98] + b"\x0c\x02" + good[0x9A:]),
+            ("a file cut off inside the import table",
+             _fake_pe(["a.dll", "b.dll"])[:0x400 + 10]),
+            ("a file cut off before its import names",
+             _fake_pe(["a.dll", "b.dll"])[:0x400 + 20]),
+        ]
+        for what, data in cases:
+            try:
+                aac._pe_imports(_write(tmp, data))
+            except aac.AacError:
+                pass
+            else:
+                raise AssertionError("read imports out of %s" % what)
+    print("  ok  PE import table read, PE32 and PE32+, and refused when torn")
+
+
+def test_only_dependencies_the_system_lacks_are_reported():
+    """_dangling's rule, which is the whole judgement: what the system
+    directory has is the system's, and the rest is ours to ship."""
+    import tempfile
+
+    saved = aac.platform.system
+    with tempfile.TemporaryDirectory() as tmp:
+        system32 = os.path.join(tmp, "System32")
+        os.makedirs(system32)
+        for present in ("KERNEL32.dll", "msvcrt.dll"):
+            open(os.path.join(system32, present), "wb").close()
+        data = _fake_pe(["KERNEL32.dll", "msvcrt.dll",
+                         "api-ms-win-crt-runtime-l1-1-0.dll",
+                         "libgfortran-5.dll", "libwinpthread-1.dll"])
+        path = _write(tmp, data)
+        try:
+            aac.platform.system = lambda: "Windows"
+            os.environ["SystemRoot"] = tmp
+            assert aac._dangling(path) == ["libgfortran-5.dll",
+                                           "libwinpthread-1.dll"], \
+                aac._dangling(path)
+            # Everywhere else a shared library states its own dependencies and
+            # the loader resolves them; there is nothing here to have an
+            # opinion about, and answering "these are missing" would reject
+            # every library the macOS and Linux builds produce.
+            aac.platform.system = lambda: "Darwin"
+            assert aac._dangling(path) == []
+        finally:
+            aac.platform.system = saved
+            os.environ.pop("SystemRoot", None)
+    print("  ok  system DLLs and API sets ignored, the compiler's reported")
+
+
+def test_the_runtime_shipped_beside_the_decoder_is_the_whole_chain():
+    """The last resort, when no flag set produced a self-contained library.
+
+    It has to be transitive. libgfortran needs libquadmath, which needs
+    libwinpthread, and a bundle that copies the first and stops fails in
+    exactly the way copying it was meant to prevent -- and fails identically,
+    with the loader naming the decoder and not the DLL it could not find."""
+    import tempfile
+
+    saved_system, saved_path = aac.platform.system, os.environ.get("PATH", "")
+    with tempfile.TemporaryDirectory() as tmp:
+        binaries = os.path.join(tmp, "bin")
+        system32 = os.path.join(tmp, "System32")
+        package = os.path.join(tmp, "feetbrowser")
+        for directory in (binaries, system32, package):
+            os.makedirs(directory)
+        open(os.path.join(system32, "KERNEL32.dll"), "wb").close()
+
+        chain = {
+            "libgfortran-5.dll": ["libquadmath-0.dll", "KERNEL32.dll"],
+            "libquadmath-0.dll": ["libwinpthread-1.dll"],
+            "libwinpthread-1.dll": ["KERNEL32.dll"],
+        }
+        for name, needs in chain.items():
+            with open(os.path.join(binaries, name), "wb") as handle:
+                handle.write(_fake_pe(needs))
+        out = os.path.join(package, "_aac_deadbeef.dll")
+        with open(out, "wb") as handle:
+            handle.write(_fake_pe(["libgfortran-5.dll", "KERNEL32.dll"]))
+        try:
+            aac.platform.system = lambda: "Windows"
+            os.environ["SystemRoot"] = tmp
+            os.environ["PATH"] = binaries
+            assert aac._dangling(out) == ["libgfortran-5.dll"]
+            copied, missing = aac._ship_runtime_beside(out, None,
+                                                       aac._dangling(out))
+            assert copied == sorted(chain), copied
+            assert missing == [], missing
+            assert aac._dangling(out) == [], "still dangling after the copy"
+
+            # And what cannot be found anywhere is reported by name rather
+            # than shipped as a hole in the bundle. A second package, because
+            # the first now has the chain in it and nothing would be looked
+            # for at all.
+            second = os.path.join(tmp, "feetbrowser2")
+            os.makedirs(second)
+            other = os.path.join(second, "_aac_deadbeef.dll")
+            with open(other, "wb") as handle:
+                handle.write(_fake_pe(["libgfortran-5.dll", "KERNEL32.dll"]))
+            os.remove(os.path.join(binaries, "libwinpthread-1.dll"))
+            copied, missing = aac._ship_runtime_beside(other, None,
+                                                       ["libgfortran-5.dll"])
+            assert missing == ["libwinpthread-1.dll"], missing
+            assert copied == ["libgfortran-5.dll", "libquadmath-0.dll"], copied
+        finally:
+            aac.platform.system = saved_system
+            os.environ["PATH"] = saved_path
+            os.environ.pop("SystemRoot", None)
+    print("  ok  the compiler's runtime ships beside the decoder, transitively")
+
+
+def test_a_flag_set_that_links_but_does_not_ship_is_not_used():
+    """The reason _compile takes a check at all.
+
+    Every Windows flag set links. Only some of them produce a library that
+    will load on a machine without the compiler, and the link succeeding says
+    nothing about which. This drives _compile with a compiler that always
+    succeeds and a check that only accepts the third flag set, and asserts it
+    got there rather than stopping at the first."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        fc = _fake_compiler(tmp)
+        out = os.path.join(tmp, "lib.so")
+        attempts = (["-first"], ["-second"], ["-third"])
+
+        def only_the_third(path):
+            with open(path) as handle:
+                if "-third" in handle.read():
+                    return []
+            return ["still needs libgfortran-5.dll"]
+
+        used = aac._compile(fc, out, attempts, only_the_third)
+        assert used == ["-third"], used
+        assert os.path.exists(out)
+        # And a tried-and-rejected attempt leaves nothing behind: the .tmp
+        # files would otherwise pile up inside the package being built.
+        leftovers = [n for n in os.listdir(tmp) if ".tmp" in n]
+        assert not leftovers, leftovers
+
+        # When nothing satisfies the check, it fails -- naming every flag set
+        # and what was still wrong with it, because a packaging log that says
+        # only "could not build" is a log nobody can act on.
+        try:
+            aac._compile(fc, out, attempts, lambda p: ["needs libquadmath"])
+        except aac.AacError as exc:
+            assert "-first" in str(exc) and "-third" in str(exc), exc
+            assert "libquadmath" in str(exc), exc
+        else:
+            raise AssertionError("shipped a library nothing accepted")
+    print("  ok  _compile walks past a flag set whose output would not load")
+
+
+def test_the_flag_sets_answer_each_platforms_own_problem():
+    """Windows leaves libwinpthread behind unless everything is static;
+    manylinux cannot link libgfortran.a into a shared object at all."""
+    windows = aac._ship_attempts("Windows")
+    assert windows[0] == ["-static"], windows
+    linux = aac._ship_attempts("Linux")
+    assert "-static-libgfortran" not in linux[-1], linux
+    assert "-static-libgfortran" in linux[0], linux
+    for system in ("Windows", "Linux", "Darwin"):
+        sets = aac._ship_attempts(system)
+        # -march=native is right for the temporary library a checkout builds
+        # for itself and wrong for one that ships: it produces a decoder that
+        # is illegal on a machine older than the build runner, and the
+        # instruction it dies on is not one the loader can name.
+        assert "-march=native" not in sum(sets, []), system
+        # A fallback that is the same as what it falls back from is not a
+        # fallback, it is the same link done twice.
+        assert len(set(map(tuple, sets))) == len(sets), (system, sets)
+    print("  ok  Windows tries -static first, Linux falls back to dynamic")
+
+
+def test_a_decoder_shipped_beside_this_module_is_used_before_any_compiler():
+    """Which of the two ways to get a library is tried first, and why.
+
+    A bundle has no compiler, so the shipped library is not an optimisation
+    there, it is the only path. In a checkout both exist, and preferring the
+    shipped one is what makes a packaged build testable from a checkout at
+    all -- the file the packaging just wrote is the file that answers."""
+    import tempfile
+
+    saved = (aac._HERE, aac._load, aac._find_gfortran, aac._compile,
+             aac.tempfile)
+    with tempfile.TemporaryDirectory() as tmp:
+        try:
+            aac._HERE = tmp
+            # The compile cache lives in the system temporary directory, and
+            # this machine may well have a real one in it already -- which
+            # would be found, loaded, and would make the fallback below look
+            # like it never ran.
+            aac.tempfile = types.SimpleNamespace(gettempdir=lambda: tmp)
+            opened = []
+
+            def fake_load(path):
+                opened.append(path)
+                return "the library"
+
+            def refuse(*args, **kwargs):
+                raise AssertionError("compiled with a decoder already shipped")
+
+            compiler = os.path.join(tmp, "gfortran")
+            aac._load = fake_load
+            aac._find_gfortran = lambda: compiler
+            aac._compile = refuse
+
+            shipped = os.path.join(tmp, aac.prebuilt_name())
+            assert aac.prebuilt_path() == shipped
+            open(shipped, "wb").close()
+            assert aac._open_library() == "the library"
+            assert opened == [shipped], opened
+
+            # With nothing shipped and a compiler present, it compiles --
+            # into a name carrying both the sources' digest and the
+            # compiler's identity, so two gfortrans cannot collide in one
+            # temporary directory.
+            os.remove(shipped)
+            opened[:] = []
+            built = []
+            aac._compile = lambda fc, out: built.append(out)
+            aac._open_library()
+            assert len(built) == 1 and built == opened, (built, opened)
+            assert built[0] != shipped
+            # Both halves of the name. The digest says which sources it was
+            # built from; the compiler's identity says which gfortran built
+            # it, and without that half two toolchains on one machine write
+            # the same filename and the second one silently loads the first
+            # one's library.
+            name = os.path.basename(built[0])
+            assert aac._digest() in name, name
+            assert aac._compiler_id(compiler) in name, name
+        finally:
+            (aac._HERE, aac._load, aac._find_gfortran, aac._compile,
+             aac.tempfile) = saved
+    print("  ok  the shipped decoder answers first; a compiler is the fallback")
+
+
+class _FakeFunction:
+    """One entry point of a library that is not a library."""
+
+    def __init__(self, call):
+        self._call = call
+        self.restype = None
+
+    def __call__(self, *args):
+        return self._call(*args)
+
+
+class _FakeLibrary:
+    """What ctypes.CDLL would have returned, reporting the ABI it is told to.
+
+    Enough of a shared library to walk _load: every entry point resolves,
+    instep_version writes through the byref it is handed, and instep_reset
+    records that it was called -- an unreset decoder is one that starts
+    mid-stream with the previous file's overlap still in it.
+    """
+
+    def __init__(self, version):
+        self.version = version
+        self.called = []
+
+    def __getattr__(self, name):
+        if not name.startswith("instep_"):
+            raise AttributeError(name)
+
+        def call(*args):
+            self.called.append(name)
+            if name == "instep_version":
+                args[0]._obj.value = self.version
+        return _FakeFunction(call)
+
+
+def test_every_way_the_decoder_can_be_missing_says_which_one():
+    """available() is False and unavailable_reason() is actionable for each.
+
+    Four failures, four sentences, because they want four different things
+    done about them. The one that matters most is the one a checkout never
+    sees: a bundle whose shipped library will not load has to say so with the
+    library's name in it, or the report is "this machine has no gfortran",
+    which is true of every machine the bundle was built for.
+    """
+    import ctypes
+    import tempfile
+
+    saved = (aac._HERE, aac._find_gfortran, aac._compile, aac._loaded,
+             aac._lib, aac._load_error, aac.tempfile, ctypes.CDLL)
+
+    def reason_now():
+        # A fresh answer rather than the one cached at import time.
+        aac._loaded, aac._lib, aac._load_error = False, None, None
+        try:
+            assert not aac.available(), "available() with no decoder"
+            return aac.unavailable_reason()
+        finally:
+            aac._loaded, aac._lib, aac._load_error = False, None, None
+
+    with tempfile.TemporaryDirectory() as tmp:
+        try:
+            aac._HERE = tmp
+            # As above: a real cached library in the real temporary directory
+            # would answer case 2 instead of the stub.
+            aac.tempfile = types.SimpleNamespace(gettempdir=lambda: tmp)
+
+            # 1. No compiler, and nothing shipped. The only one of the four a
+            # user can do something about, so it says what to do.
+            aac._find_gfortran = lambda: None
+            why = reason_now()
+            assert "no gfortran on PATH" in why, why
+            assert "packaged build" in why, why
+
+            # 2. A compiler that cannot build it. The compiler's own words,
+            # with the flag sets that were tried, not "could not build".
+            aac._find_gfortran = lambda: "gfortran"
+
+            def fails(fc, out, *rest):
+                raise aac.AacError("gfortran is on PATH but could not build "
+                                   "the AAC decoder.\nundefined reference to "
+                                   "`_gfortran_st_write'")
+            aac._compile = fails
+            why = reason_now()
+            assert "could not build" in why, why
+            assert "_gfortran_st_write" in why, why
+
+            # 3. A shipped library that will not load. Named, because the
+            # bundle is what has to be rebuilt.
+            shipped = os.path.join(tmp, aac.prebuilt_name())
+            open(shipped, "wb").close()
+            aac._find_gfortran = lambda: None
+            why = reason_now()
+            assert aac.prebuilt_name() in why, why
+            assert "did not load" in why, why
+
+            # 4. A library that loads and is the wrong one. A stale file to
+            # delete, and the message says so; ABI numbers are what tell the
+            # sources apart when the digest in the name was outrun by hand.
+            ctypes.CDLL = lambda path, **kwargs: _FakeLibrary(aac._ABI + 6)
+            why = reason_now()
+            assert "ABI %d" % (aac._ABI + 6) in why, why
+            assert "Delete it" in why, why
+
+            # And the same fake, reporting the ABI this Python was written
+            # against, loads -- otherwise the four failures above would pass
+            # against a _load that rejects everything.
+            ctypes.CDLL = lambda path, **kwargs: _FakeLibrary(aac._ABI)
+            library = aac._load(shipped)
+            assert aac._ABI == library.version
+            assert "instep_reset" in library.called, library.called
+        finally:
+            (aac._HERE, aac._find_gfortran, aac._compile, aac._loaded,
+             aac._lib, aac._load_error, aac.tempfile, ctypes.CDLL) = saved
+    print("  ok  no compiler, failed compile, bad bundle and wrong ABI differ")
 
 
 def main():
