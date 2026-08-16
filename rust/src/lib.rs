@@ -51,6 +51,7 @@ fn feetbrowser_engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(image::py_decode, m)?)?;
     m.add_function(wrap_pyfunction!(image::py_decode_png, m)?)?;
     m.add_function(wrap_pyfunction!(image::py_decode_gif, m)?)?;
+    m.add_function(wrap_pyfunction!(image::py_decode_gif_frames, m)?)?;
     m.add_function(wrap_pyfunction!(image::py_decode_jpeg, m)?)?;
     m.add_function(wrap_pyfunction!(image::py_decode_pnm, m)?)?;
     m.add_function(wrap_pyfunction!(image::py_sniff, m)?)?;

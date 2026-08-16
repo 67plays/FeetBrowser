@@ -1278,6 +1278,25 @@ class Tab:
             threading.Thread(
                 target=self._fetch_image, args=(key, url), daemon=True).start()
 
+    def tick_images(self):
+        """Move every animated GIF on to the frame that is due now.
+
+        Returns True when something on screen changed, exactly like
+        `tick_videos`, and is called from the same frame timer -- an animated
+        GIF is a video that happens to arrive through `<img>`, and giving it
+        its own clock would mean two timers disagreeing about what "now" is.
+
+        Deliberately not part of `busy()`: a GIF looping for ever is the
+        normal case, and a browser that called that "still working" would
+        never let `settle()` return.
+        """
+        now = time.monotonic()
+        changed = False
+        for photo in self.image_cache.values():
+            if getattr(photo, "animated", False) and photo.advance(now):
+                changed = True
+        return changed
+
     def pending_images(self):
         """True while image fetches started by load_images() are outstanding.
 
@@ -4750,7 +4769,13 @@ class Browser:
         one-line change once the decoders are fast enough to deserve it.
         """
         for tab in self.tabs:
-            if tab.tick_videos() and tab is self.active_tab:
+            # Both, every tick, and not short-circuited: `or` would stop
+            # asking the images the moment a video said yes, and an animated
+            # GIF on a page with a film on it would freeze whenever the film
+            # was playing.
+            moved = tab.tick_videos()
+            moved = tab.tick_images() or moved
+            if moved and tab is self.active_tab:
                 self._repaint_needed = True
         self.window.after(VIDEO_TICK_MS, self._video_tick)
 

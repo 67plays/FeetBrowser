@@ -17,8 +17,9 @@ pixel, which is what raster.Surface.blit_rgba consumes.
 """
 
 from feetbrowser_engine import (MAX_INFLATED, MAX_PIXELS, ImageError, decode,
-                                decode_gif, decode_jpeg, decode_png,
-                                decode_pnm, resize, sniff)
+                                decode_gif, decode_gif_frames, decode_jpeg,
+                                decode_png, decode_pnm, resize, sniff)
 
 __all__ = ["ImageError", "MAX_PIXELS", "MAX_INFLATED", "decode", "decode_png",
-           "decode_gif", "decode_jpeg", "decode_pnm", "sniff", "resize"]
+           "decode_gif", "decode_gif_frames", "decode_jpeg", "decode_pnm",
+           "sniff", "resize"]
