@@ -107,6 +107,16 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         self._head(200, len(body))
         self.wfile.write(body)
 
+    def route_bad_request(self):
+        # 400 exactly, with a body and a Content-Disposition, because that
+        # is the shape that gets saved to disk if the status is not checked
+        # -- an error page wearing the filename the user asked for.
+        body = b"<h1>400 Bad Request</h1>"
+        self._head(400, len(body), ctype="text/html",
+                   extra=[("Content-Disposition",
+                           'attachment; filename="report.pdf"')])
+        self.wfile.write(body)
+
     def route_named(self):
         body = payload(1024)
         self._head(200, len(body), ctype="text/plain",
@@ -398,6 +408,26 @@ def test_a_dropped_connection_fails_the_download_and_leaves_nothing():
     assert download.path is None
     assert leftovers() == [], "a broken transfer left %s" % leftovers()
     print("  mid-transfer hangup -> failed (%s)" % download.error)
+
+
+def test_a_400_fails_the_download_rather_than_saving_the_error_page():
+    """400 exactly, which is the edge of the check and the one status no
+    other test here uses.
+
+    `_transfer` refuses a download with `if stream.status >= 400`. Change
+    that to `> 400` or `>= 401` and every other test in this file still
+    passes -- the 404 above goes on failing -- while a Bad Request quietly
+    becomes a saved file, because the error page arrives with a body and a
+    Content-Disposition and nothing downstream looks at the status again.
+    The user gets a report.pdf containing an HTML error.
+    """
+    download = run("/bad-request")
+    assert download.state == FAILED, (download.state, download.error)
+    assert "400" in (download.error or ""), download.error
+    assert download.path is None, \
+        "the error page was saved as %r" % (download.path,)
+    assert leftovers() == [], "a refused download left %s" % leftovers()
+    print("  400 -> failed (%s)" % download.error)
 
 
 def test_a_404_fails_the_download():
