@@ -4263,6 +4263,10 @@ class _TabBrowser(Browser):
         self._tab_drag = None
         self._drag_moved = False
         self._click_count = 0
+        # close_tab() cancels any coasting scroll, and _cancel_momentum()
+        # reads this. A fake that subclasses Browser without running its
+        # __init__ has to carry every field the handlers it drives touch.
+        self._momentum_job = None
         self.paints = 0
         self.canvas = type("C", (), {"winfo_width": lambda s: 1000,
                                      "winfo_height": lambda s: 720})()
