@@ -758,6 +758,90 @@ def live_our_own_resize_reaches_the_server():
         eq(wait_geometry(win, (300, 220)), (300, 220))
 
 
+# -- dense displays --------------------------------------------------------
+#
+# X measures everything in device pixels -- the window it creates, the sizes
+# in a ConfigureNotify, the coordinates on every event -- and the browser
+# measures everything in CSS pixels. The conversion happens in this backend
+# and nowhere else. FEETBROWSER_SCALE stands in for an Xft.dpi of 192: a CI
+# runner's Xvfb has no resource database and so reports nothing, which is the
+# 1x case every other test here already covers.
+
+class _DenseSession(_Session):
+    """A live window on a pretend 2x display."""
+
+    def __enter__(self):
+        self.saved = os.environ.get("FEETBROWSER_SCALE")
+        os.environ["FEETBROWSER_SCALE"] = "2"
+        try:
+            return super().__enter__()
+        except Exception:
+            self._restore()
+            raise
+
+    def _restore(self):
+        if self.saved is None:
+            os.environ.pop("FEETBROWSER_SCALE", None)
+        else:
+            os.environ["FEETBROWSER_SCALE"] = self.saved
+
+    def __exit__(self, *exc):
+        try:
+            return super().__exit__(*exc)
+        finally:
+            self._restore()
+
+
+def live_a_dense_frame_lands_one_pixel_for_one():
+    """The window really is twice the size the browser thinks it is, and the
+    frame in it was read back off the server -- which is the only way to tell
+    a blit that landed one to one from one the display stretched.
+
+    A rectangle 10 CSS pixels across has to reach device pixel 19 and stop
+    before device pixel 21. With a buffer allocated in CSS pixels it covered
+    ten device pixels and the server scaled nothing, so pixel 19 was
+    background -- which is what the whole page looked like.
+    """
+    with _DenseSession(320, 240) as win:
+        eq(win.scale, 2.0, "the scale never reached the window")
+        eq(geometry(win), (640, 480), "the server was asked in CSS pixels")
+        canvas = canvasmod.Canvas(win, width=320, height=240, bg="#3366cc")
+        canvas.pack()
+        pump(win)
+        eq((win.width, win.height), (320, 240),
+           "a ConfigureNotify in device pixels resized the page")
+        eq(canvas.device_size(), (640, 480), "the buffer is not the window")
+        canvas.create_rectangle(0, 0, 10, 10, fill="#ff0000", width=0)
+        win.present()
+        eq(win._frame_dims, (640, 480), "the frame is not the window's size")
+        same_colour(pixel(win, 19, 19), (0xFF, 0x00, 0x00),
+                    "the rectangle stopped short of its device pixels")
+        same_colour(pixel(win, 21, 21), (0x33, 0x66, 0xCC),
+                    "the rectangle ran past its device pixels")
+
+
+def live_a_click_at_a_device_pixel_lands_on_its_css_pixel():
+    """Hit testing, which is the half that a sharper buffer alone would
+    break: the server points at a device pixel and the browser has to be
+    handed the CSS pixel containing it."""
+    with _DenseSession(320, 240) as win:
+        seen = []
+        win.bind("<Button-1>", lambda e: seen.append((e.x, e.y)))
+        win.bind("<Motion>", lambda e: seen.append((e.x, e.y)))
+        for point in ((0, 0), (1, 1), (240, 80), (639, 479)):
+            send(win, button_event(win, 1, point[0], point[1]),
+                 x11.BUTTON_PRESS_MASK)
+        motion = x11.XEvent()
+        motion.xmotion.type = x11.MOTION_NOTIFY
+        motion.xmotion.display = win._display
+        motion.xmotion.window = win._window
+        motion.xmotion.x, motion.xmotion.y = 300, 200
+        send(win, motion, x11.POINTER_MOTION_MASK)
+        pump(win)
+        eq(seen, [(0, 0), (0, 0), (120, 40), (319, 239), (150, 100)],
+           "device pixels reached the browser unconverted")
+
+
 # -- event translation -----------------------------------------------------
 
 def live_every_mouse_gesture_reaches_its_binding():
