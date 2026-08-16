@@ -723,8 +723,6 @@ def _declare():
         ("XSelectInput", cint, [Display, XID, clong]),
         ("XMapWindow", cint, [Display, XID]),
         ("XUnmapWindow", cint, [Display, XID]),
-        ("XRaiseWindow", cint, [Display, XID]),
-        ("XLowerWindow", cint, [Display, XID]),
         ("XResizeWindow", cint, [Display, XID, cuint, cuint]),
         ("XStoreName", cint, [Display, XID, ctypes.c_char_p]),
         ("XSetWMNormalHints", cint,
@@ -1365,16 +1363,6 @@ class X11Window(Window):
     def deiconify(self):
         super().deiconify()
         _libs["x11"].XMapWindow(self._display, self._window)
-        _libs["x11"].XFlush(self._display)
-
-    def lift(self, *_args):
-        if QUIET:
-            return      # asking to be looked at is the one thing QUIET drops
-        _libs["x11"].XRaiseWindow(self._display, self._window)
-        _libs["x11"].XFlush(self._display)
-
-    def lower(self, *_args):
-        _libs["x11"].XLowerWindow(self._display, self._window)
         _libs["x11"].XFlush(self._display)
 
     # -- clipboard ---------------------------------------------------------

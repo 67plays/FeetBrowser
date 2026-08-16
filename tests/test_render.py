@@ -1704,9 +1704,24 @@ def test_window_binding_errors_do_not_escape():
     """Tk reported handler exceptions and carried on; so must we, or one bad
     plugin takes down the browser."""
     w = Window()
-    w.on_callback_error = lambda where, exc: None
+    seen = []
+    w.on_callback_error = lambda where, exc: seen.append((where, exc))
+    reached = []
     w.bind("<Key>", lambda e: 1 // 0)
-    w.dispatch("<Key>", Event(keysym="a"))
+    # Bound after the broken one, so it only runs if the raise was caught
+    # inside the loop rather than out of it. This is the half of the
+    # docstring's promise ("must not take down the loop") that the rest of
+    # the assertions cannot see.
+    w.bind("<Key>", lambda e: reached.append(e.keysym), add=True)
+
+    ran = w.dispatch("<Key>", Event(keysym="a"))
+
+    assert ran is True, "dispatch said nothing was bound"
+    assert len(seen) == 1, "reported %d errors, wanted 1" % len(seen)
+    where, exc = seen[0]
+    assert where == "<Key>", "reported against %r" % where
+    assert isinstance(exc, ZeroDivisionError), "reported %r" % (exc,)
+    assert reached == ["a"], "the later handler saw %r" % (reached,)
 
 
 def test_window_timers_run_in_order():

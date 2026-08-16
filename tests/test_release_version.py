@@ -47,8 +47,15 @@ def test_every_way_of_asking_means_the_same_release():
 
 
 def test_a_pre_release_suffix_survives():
-    for asked in ("v1.2.3rc1", "refs/tags/v1.2.3.dev4", "10.0.1-beta"):
-        release_version.requested_version(asked)
+    """The name is the assertion: the suffix has to come back out. It used
+    to only be called, and the result thrown away, so a version reader that
+    quietly returned "1.2.3" for "v1.2.3rc1" -- cutting the release over
+    the top of the real one -- passed this test."""
+    for asked, want in (("v1.2.3rc1", "1.2.3rc1"),
+                        ("refs/tags/v1.2.3.dev4", "1.2.3.dev4"),
+                        ("10.0.1-beta", "10.0.1-beta")):
+        got = release_version.requested_version(asked)
+        assert got == want, "%r gave %r, wanted %r" % (asked, got, want)
 
 
 def test_something_that_is_not_a_version_is_refused():

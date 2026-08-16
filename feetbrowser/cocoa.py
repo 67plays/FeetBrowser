@@ -599,18 +599,12 @@ class CocoaWindow(Window):
         super().deiconify()
         self._order_in()
 
-    def lift(self, *_args):
-        self._order_in()
-
     def _order_in(self):
         if QUIET:
             msg(self._window, "orderBack:", None, argtypes=(ctypes.c_void_p,))
         else:
             msg(self._window, "makeKeyAndOrderFront:", None,
                 argtypes=(ctypes.c_void_p,))
-
-    def lower(self, *_args):
-        msg(self._window, "orderBack:", None, argtypes=(ctypes.c_void_p,))
 
     # -- clipboard ---------------------------------------------------------
 

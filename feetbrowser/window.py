@@ -200,12 +200,6 @@ class Window:
     def resizable(self, *_args):
         return None
 
-    def lower(self, *_args):
-        return None
-
-    def lift(self, *_args):
-        return None
-
     def withdraw(self):
         self.visible = False
 

@@ -120,7 +120,6 @@ SW_HIDE, SW_SHOW, SW_RESTORE = 0, 5, 9
 # wherever the user left it.
 SW_SHOWNOACTIVATE = 4
 SWP_NOMOVE, SWP_NOZORDER, SWP_NOACTIVATE = 0x0002, 0x0004, 0x0010
-HWND_BOTTOM, HWND_TOP = 1, 0
 PM_REMOVE = 0x0001
 
 # Messages.
@@ -1088,18 +1087,6 @@ class Win32Window(Window):
         super().deiconify()
         _libs["user32"].ShowWindow(
             self._hwnd, SW_SHOWNOACTIVATE if QUIET else SW_SHOW)
-
-    def lift(self, *_args):
-        if QUIET:
-            return      # asking to be looked at is the one thing QUIET drops
-        user32 = _libs["user32"]
-        user32.SetWindowPos(self._hwnd, HWND_TOP, 0, 0, 0, 0,
-                            SWP_NOMOVE | 0x0001)   # | SWP_NOSIZE
-        user32.SetForegroundWindow(self._hwnd)
-
-    def lower(self, *_args):
-        _libs["user32"].SetWindowPos(self._hwnd, HWND_BOTTOM, 0, 0, 0, 0,
-                                     SWP_NOMOVE | 0x0001 | SWP_NOACTIVATE)
 
     # -- clipboard ---------------------------------------------------------
 
