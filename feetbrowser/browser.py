@@ -2655,32 +2655,38 @@ class ContextMenu:
         if not self.open_:
             return
         c = canvas
+        # Tagged so a repaint can replace the menu rather than stack a fresh
+        # copy of it over the one a page/chrome redraw has just covered.
+        c.delete("menu")
         x, y = self.x, self.y
         c.create_rectangle(x - 1, y - 1, x + self.width + 1,
                            y + self.height + 1, fill=self.c("menu_shadow"),
-                           width=0)
+                           width=0, tags=("menu",))
         c.create_rectangle(x, y, x + self.width, y + self.height,
                            fill=self.c("menu_bg"),
-                           outline=self.c("menu_border"), width=1)
+                           outline=self.c("menu_border"), width=1,
+                           tags=("menu",))
         y0 = y + self.PAD
         for i, item in enumerate(self.items):
             if item is None:
                 y0 += self.SEP / 2
                 c.create_line(x + 8, y0, x + self.width - 8, y0,
-                              fill=self.c("menu_sep"), width=1)
+                              fill=self.c("menu_sep"), width=1,
+                              tags=("menu",))
                 y0 += self.SEP / 2
                 continue
             label, _callback, enabled = item
             if i == self.hover and enabled:
                 c.create_rectangle(x + 1, y0, x + self.width - 1,
                                    y0 + self.ITEM_H, fill=self.c("menu_hover"),
-                                   width=0)
+                                   width=0, tags=("menu",))
                 color = self.c("menu_bg")
             else:
                 color = self.c("menu_text" if enabled else "menu_disabled")
             c.create_text(x + self.PAD_X, y0 + self.ITEM_H / 2, text=label,
                           anchor="w", font=get_font(12, "normal", "roman",
-                                                    "Helvetica"), fill=color)
+                                                    "Helvetica"), fill=color,
+                          tags=("menu",))
             y0 += self.ITEM_H
 
 
@@ -4891,8 +4897,9 @@ class Browser:
         # panel is mistaken for chrome and wiped by the next chrome repaint.
         self.downloads_panel.draw(self.canvas)
         self._draw_select_popup()
-        # The settings menu hangs off the toolbar into the chrome band, so a
-        # chrome repaint would paint over it; draw it back on top.
+        # The settings menu hangs off the toolbar into the chrome band, and
+        # the context menu floats over the page; a chrome repaint would paint
+        # over either, so draw them back on top.
         self.context_menu.draw(self.canvas)
 
     def _repaint_selection(self):
