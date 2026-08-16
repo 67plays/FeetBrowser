@@ -308,7 +308,14 @@ def test_a_server_that_is_really_gone_is_not_waited_on_for_ever():
     eq(lib.calls, 5, "it tried exactly as often as it was told to")
     eq(err, 2, "the last errno is what gets reported")
     assert spent < 1.0, "five attempts a millisecond apart took %.2f s" % spent
-    assert waited < spent, "it cannot have waited longer than it ran"
+    # The wait it reports is the doubling series it was told to use -- 1, 2,
+    # 4 and 8 ms, with no sleep after the attempt it does not retry. That is
+    # arithmetic, so it is checked as arithmetic. Comparing it against
+    # `spent` instead checks the clock: `time.monotonic` moves in steps of
+    # 15.6 ms on Windows, which is longer than this whole budget, so the
+    # elapsed time of a run that really did sleep for 15 ms reads as zero
+    # about as often as not.
+    eq(round(waited, 6), 0.015, "the pauses it reports are not the ones set")
 
 
 def test_a_connection_that_works_first_time_costs_nothing():

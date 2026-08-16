@@ -2124,7 +2124,14 @@ def live_a_real_device_consumes_frames_in_real_time():
     crystal, it is an operating system that never asked, so a device like
     that is dropped and another opened rather than failed on. Where the line
     sits, and why it cannot swallow a real fault, is pinned by
-    `test_a_device_that_never_ran_is_told_apart_from_a_slow_clock`."""
+    `test_a_device_that_never_ran_is_told_apart_from_a_slow_clock`.
+
+    And the third thing it does is hand out a device that runs, but not yet:
+    the first callback lands, then nothing much for a sixth of a second,
+    then perfect time. `_device_window` opens its window after that rather
+    than at the first callback, and
+    `test_a_device_is_measured_after_it_primes_and_not_across_it` is why
+    that is not the same as looking away from a slow one."""
     dead = []
     for _ in range(3):
         run = _device_window()
@@ -2185,8 +2192,79 @@ def test_a_device_that_never_ran_is_told_apart_from_a_slow_clock():
     assert _device_ran({"played": 0.50, "wall": 0.5})
 
 
-def _device_window(seconds=0.25):
+class _PrimingClock:
+    """A clock that stands still for its first `prime` seconds and then
+    keeps perfect time -- CI's macOS device, in eight lines.
+
+    The stalling is all at the front, which is the shape the failing run
+    had: the smallest lag over the whole sampling window was 0.170 s and so
+    was the lag at the end of it, and two equal lags mean the time between
+    them was kept exactly. The deficit was banked before the sampling
+    started, not accumulated during it.
+    """
+
+    def __init__(self, prime):
+        self.started = time.monotonic()
+        self.prime = prime
+
+    def now(self):
+        return max(0.0, time.monotonic() - self.started - self.prime)
+
+
+def test_a_device_is_measured_after_it_primes_and_not_across_it():
+    prime = 0.2
+    clock = _PrimingClock(prime)
+    # The old shape, which is what failed on CI: read the base at the first
+    # callback and sample from a quarter second later. The priming is then
+    # under every sample taken, so a clock keeping perfect time reads a
+    # fifth of a second late and no amount of sampling can see past it.
+    started, base = time.monotonic(), clock.now()
+    time.sleep(0.25)
+    early, _ = clock_lag(clock, started, base, window=0.3)
+    assert early > prime * 0.8, \
+        "the priming this test exists for never happened: %.3f" % early
+    # The same clock, still running, measured the way the rate test now
+    # measures a device.
+    run = _measure_clock(_PrimingClock(prime), warm=0.25, window=0.3)
+    assert run["lag"] < 0.02, \
+        "a clock keeping perfect time read %.3f s late" % run["lag"]
+    assert run["played"] > 0.25, \
+        "the window saw only %.3f s of a clock that ran" % run["played"]
+
+
+def _measure_clock(clock, warm=0.25, window=0.5, at_start=None):
+    """Let a running clock settle, then measure a window of it.
+
+    The window opens `warm` seconds after this is called, not at it. A
+    device is not at its rate the moment it first asks for samples: on CI's
+    macOS runners the first callback has been seen to land a sixth of a
+    second before the stream really starts moving, after which the same
+    device keeps perfect time. Timing from the first callback charges that
+    priming to the crystal, and `clock_lag` cannot take it back out -- it
+    keeps the smallest lag it sees, and a deficit banked before the first
+    reading is under every reading afterwards. So warm up first, then read
+    both ends of the measurement inside the settled part of the run, which
+    is the same care `start()` already gets one callback earlier.
+
+    `at_start` is called as the window opens and whatever it returns comes
+    back under "start", for readings that belong inside the window rather
+    than around the warm-up.
+    """
+    time.sleep(warm)
+    started = time.monotonic()
+    base = clock.now()
+    start = at_start() if at_start is not None else None
+    lag, ahead = clock_lag(clock, started, base, window=window)
+    return {"lag": lag, "ahead": ahead, "start": start,
+            "played": clock.now() - base,
+            "wall": time.monotonic() - started}
+
+
+def _device_window(warm=0.25, window=0.5):
     """Play a quiet tone on a real device and measure a window of the run.
+
+    The window is `_measure_clock`'s: it opens after the device has had
+    `warm` seconds to settle, for the reasons set out there.
 
     Everything is read before the output is closed and returned as plain
     numbers, so the assertions above run against a device that has already
@@ -2198,25 +2276,22 @@ def _device_window(seconds=0.25):
         assert not output.silent, \
             "available() said yes and open_output said no"
         source = output.add_source(44100, channels=1, gain=0.2, name="live")
-        source.write(heel.tone(1.0, 440.0, 44100, 1, amplitude=0.2),
+        # Two seconds for a run that is now three quarters of one, so that
+        # running out of tone cannot be mistaken for the device stalling.
+        source.write(heel.tone(2.0, 440.0, 44100, 1, amplitude=0.2),
                      fmt="float")
         output.start()
         deadline = time.monotonic() + 1.0
         while not output.clock.frames and time.monotonic() < deadline:
             time.sleep(0.005)
         assert output.clock.frames, "the device never asked for a sample"
-        started = time.monotonic()
-        base = output.clock.now()
-        before = output.clock.underruns
-        time.sleep(seconds)
-        lag, ahead = clock_lag(output.clock, started, base)
-        return {"lag": lag, "ahead": ahead,
-                "played": output.clock.now() - base,
-                "wall": time.monotonic() - started,
-                "underruns": output.clock.underruns - before,
-                "failure": output.device.failure,
-                "latency": output.device.latency,
-                "state": clock_state(output.clock)}
+        run = _measure_clock(output.clock, warm, window,
+                             at_start=lambda: output.clock.underruns)
+        run["underruns"] = output.clock.underruns - run.pop("start")
+        run["failure"] = output.device.failure
+        run["latency"] = output.device.latency
+        run["state"] = clock_state(output.clock)
+        return run
     finally:
         output.close()
 
