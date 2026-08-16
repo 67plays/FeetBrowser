@@ -282,6 +282,7 @@ def test_browser_tab_cycle_wraps():
     # Switching tabs takes any open <select> list down with it.
     stub.select_popup = SelectPopup()
     stub._dismiss_select_popup = lambda: Browser._dismiss_select_popup(stub)
+    stub._update_presence = lambda: None  # no RPC on this bare stub
 
     def draw():
         stub.draw_calls += 1

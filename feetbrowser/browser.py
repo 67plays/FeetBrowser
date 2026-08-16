@@ -3440,7 +3440,7 @@ class Browser:
         self.active_tab.stop_videos()
         self.tabs.remove(self.active_tab)
         if not self.tabs:
-            if self.rpc:
+            if getattr(self, "rpc", None):
                 self.rpc.close()
                 self.rpc = None
             self.window.destroy()
@@ -4872,8 +4872,10 @@ class Browser:
 
         Cheap: only a queue put, and the RPC thread coalesces and throttles
         the actual socket writes. Called whenever the active tab's title or
-        the tab set changes."""
-        if not self.rpc or not self.active_tab:
+        the tab set changes. getattr: the tab-drag stubs in the test suite
+        carry no rpc at all, and the absence is the same as being disabled."""
+        rpc = getattr(self, "rpc", None)
+        if not rpc or not self.active_tab:
             return
         tab = self.active_tab
         title = (tab.title or "").strip()
@@ -4881,7 +4883,7 @@ class Browser:
             title = str(tab.url) if tab.url else "FeetBrowser"
         n = len(self.tabs)
         state = f"{title[:100]} · {n} tab{'s' if n != 1 else ''} open"
-        self.rpc.set_activity(
+        rpc.set_activity(
             "A completely from-scratch web browser", state, self._started_at)
 
     def _dispatch_toe_draw(self, c, chrome):
@@ -5324,7 +5326,7 @@ class Browser:
         self._poll_images()
         self._ensure_video_tick()
         self.window.mainloop()
-        if self.rpc:
+        if getattr(self, "rpc", None):
             self.rpc.close()
             self.rpc = None
 
