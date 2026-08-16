@@ -73,6 +73,7 @@ $run tests/test_x11.py     # opens real windows under X11, skips elsewhere
 $run tests/test_win32.py   # opens real windows on Windows, skips elsewhere
 $run tests/test_audio.py   # plays real sound where there is a device, skips elsewhere
 $run tests/test_units.py
+$run tests/test_release_version.py  # the guard release.yml runs first
 $run tests/test_js.py
 $run tests/test_shoes.py
 $run tests/test_e2e.py     # a fixture page in, its pixels back out

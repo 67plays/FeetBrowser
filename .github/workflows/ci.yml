@@ -85,6 +85,12 @@ jobs:
       - name: Unit tests
         run: $PY tests/test_units.py
 
+      # Small, and it runs on every platform for one reason: the release
+      # workflow calls it on whichever runner picks up the version job, and
+      # a guard that only works on Linux is not a guard.
+      - name: The release version guard
+        run: $PY tests/test_release_version.py
+
       # The engine answers to one contract, and the same suite holds it to it.
       - name: JS engine tests
         run: $PY tests/test_js.py

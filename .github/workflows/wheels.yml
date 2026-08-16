@@ -284,6 +284,12 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           ls -l dist
+          # --draft, because release.yml is building the three applications
+          # for this same tag and will want to put its notes on the release
+          # and a person's eye over it before anybody can download anything.
+          # Whichever of the two workflows gets here first creates it; the
+          # other finds it and adds to it. A release nobody has published is
+          # the one thing both of them are allowed to write to.
           gh release view "$TAG" >/dev/null 2>&1 \
-            || gh release create "$TAG" --title "$TAG" --generate-notes
+            || gh release create "$TAG" --draft --title "$TAG" --generate-notes
           gh release upload "$TAG" dist/* --clobber

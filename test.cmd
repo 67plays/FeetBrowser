@@ -78,6 +78,8 @@ rem The audio stack. The waveOut backend is the one that only runs here; the
 rem live half needs a real output device and skips when there is not one.
 %RUN% tests\test_audio.py || exit /b 1
 %RUN% tests\test_units.py || exit /b 1
+rem The version guard release.yml runs before it builds anything.
+%RUN% tests\test_release_version.py || exit /b 1
 %RUN% tests\test_js.py || exit /b 1
 %RUN% tests\test_shoes.py || exit /b 1
 rem A fixture page in, its pixels back out.

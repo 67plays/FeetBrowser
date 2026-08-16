@@ -3,19 +3,34 @@ name: Package (macOS)
 # The .app and the .dmg. Not on every push: it downloads a 60 MB CPython and
 # compiles the engine twice, which is a lot of runner minutes to spend on a
 # commit that changed the CSS parser. It runs when the packaging is what
-# changed, when a version is tagged, and whenever anyone asks for it.
+# changed, whenever anyone asks for it, and as one of the three halves of a
+# release -- release.yml calls this workflow rather than reproducing it, so
+# what a user downloads is what these jobs have always built.
 on:
   workflow_dispatch:
-  push:
-    tags:
-      - 'v*'
+  # Tags belong to release.yml, which calls this. Firing on them here as
+  # well would build the same .dmg twice for the same tag.
+  workflow_call:
+    inputs:
+      version:
+        description: >
+          Set by release.yml. It names the artifact and nothing else -- the
+          .dmg is named from __version__ by build.sh either way -- so a
+          release run leaves FeetBrowser-0.6.0-macos-dmg where a run started
+          by hand leaves FeetBrowser-macos-dmg.
+        required: false
+        type: string
+        default: ''
   pull_request:
     paths:
       - 'packaging/macos/**'
       - '.github/workflows/package-macos.yml'
 
+# Named rather than ${{ github.workflow }}: when a workflow is called,
+# github.workflow is the *caller's* name, so all three Package workflows
+# would land in one group and take turns instead of running at once.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: package-macos-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 defaults:
@@ -146,7 +161,7 @@ jobs:
       - name: Upload the disk image
         uses: actions/upload-artifact@v4
         with:
-          name: FeetBrowser-macos-dmg
+          name: FeetBrowser${{ inputs.version && format('-{0}', inputs.version) || '' }}-macos-dmg
           path: packaging/macos/dist/*.dmg
           if-no-files-found: error
 
@@ -179,7 +194,7 @@ jobs:
 
       - uses: actions/download-artifact@v4
         with:
-          name: FeetBrowser-macos-dmg
+          name: FeetBrowser${{ inputs.version && format('-{0}', inputs.version) || '' }}-macos-dmg
           path: dmg
 
       - name: This runner is Intel
