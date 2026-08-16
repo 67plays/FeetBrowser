@@ -266,6 +266,12 @@ jobs:
           RUSTFLAGS: -D warnings
         run: cargo check --manifest-path rust/Cargo.toml --all-targets
 
+      # `cargo check --all-targets` compiles the tests but never runs them,
+      # so for a long time all 122 of them -- including the html5lib tree
+      # construction suite -- were only ever type-checked. They take 0.07s.
+      - name: Rust tests
+        run: cargo test --manifest-path rust/Cargo.toml
+
   # This job used to install Pillow and cairosvg so the JPEG, WebP and SVG
   # branches behind them ran at least once. There are no such branches now:
   # JPEG is decoded here and the rest draw as alt text. Every job above runs
