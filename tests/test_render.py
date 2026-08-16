@@ -2459,6 +2459,78 @@ def _span(tab):
     return tab.content_height() - tab.tab_height
 
 
+def _thumb_columns(browser):
+    """The x range the thumb is actually painted across, off the pixels."""
+    rgb = tuple(canvasmod.color(browser.c("scroll_thumb"))[:3])
+    surface = browser.canvas.render()
+    cols = set()
+    for y in range(surface.height):
+        for x in range(surface.width):
+            if _pixel(surface, x, y) == rgb:
+                cols.add(x)
+    return min(cols), max(cols)
+
+
+def test_every_column_the_thumb_is_painted_on_answers_to_a_press():
+    """Drawing and hit-testing keep two separate copies of where the
+    scrollbar is: _scrollbar_geometry() measures the thumb back from the
+    right edge with SCROLLBAR_RIGHT, and _in_scrollbar() measures the
+    grabbable gutter back with SCROLLBAR_GUTTER_W. Nothing made them agree.
+
+    This does not care what those numbers are -- a bar one pixel further
+    left is a design decision, not a bug -- it cares that the strip the
+    reader can see and the strip that answers a press are the same strip.
+    Widen the drawn thumb, or narrow the gutter, and the two part company:
+    a press lands on a visible thumb and starts a text selection instead.
+    """
+    browser, _tab = _scrollable_browser()
+    left, right = _thumb_columns(browser)
+    for x in range(left, right + 1):
+        assert browser._in_scrollbar_gutter(x), \
+            "the thumb is painted across x=%d..%d but a press at x=%d " \
+            "misses it, in a window %d wide" \
+            % (left, right, x, browser.canvas.winfo_width())
+    middle = browser.canvas.winfo_width() // 2
+    assert not browser._in_scrollbar_gutter(middle), \
+        "x=%d is the middle of the page and a press there was taken " \
+        "for the scrollbar" % middle
+
+
+def test_the_page_starts_at_the_row_the_chrome_stops_being_drawn_on():
+    """chrome_height() is what every hit test subtracts to turn a window
+    click into a page coordinate, and the chrome is drawn by a separate
+    pile of arithmetic. If the drawing ever ran a pixel past what
+    chrome_height() reports, every click below it would land one pixel out
+    for the rest of the session -- and the whole suite would stay green,
+    because nothing compared the two.
+    """
+    from feetbrowser.browser import Browser
+
+    browser = Browser()
+    browser.new_tab("data:text/html,"
+                    + "".join("<p>line %d</p>" % i for i in range(300)))
+    browser.draw()
+    surface = browser.canvas.render()
+    edge = browser.chrome_height()
+    x = browser.canvas.winfo_width() // 2
+    # The log strip is the bottom band of the chrome, so its last row is the
+    # row above the page -- unless a toe has added a band below it, which no
+    # toe has here. Checking that rather than assuming it means this fails
+    # with a sentence instead of a mystery if the chrome is ever restacked.
+    from feetbrowser import toes
+    assert toes.band_height(browser.chrome_bands()) == 0, \
+        "a toe band is drawn below the log strip, so the log strip is no " \
+        "longer the bottom of the chrome and this test needs rewriting"
+    log = tuple(canvasmod.color(browser.c("log_bg"))[:3])
+    assert _pixel(surface, x, edge - 1) == log, \
+        "chrome_height() says the chrome ends at y=%d, but y=%d is %s, not " \
+        "the log strip -- the chrome is drawn shorter than it is measured" \
+        % (edge, edge - 1, _pixel(surface, x, edge - 1))
+    assert _pixel(surface, x, edge) != log, \
+        "chrome_height() says the page starts at y=%d, but the chrome is " \
+        "still painted there, so every click below it lands a row out" % edge
+
+
 def test_dragging_the_scrollbar_scrolls_the_page():
     """The bug: the bar was painted and nothing hit-tested it, so a press on
     it started a text selection and the page never moved."""

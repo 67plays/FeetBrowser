@@ -4517,6 +4517,67 @@ def test_reordering_leaves_no_stale_tab_index():
        "closing handed the strip to the tab at the old index")
 
 
+# -- the command line ------------------------------------------------------
+#
+# `python3 -m feetbrowser` is the entry point every user types and the one
+# the packaging scripts drive, and none of it was exercised anywhere: the
+# whole of feetbrowser/__main__.py had no test at all. Changing its very
+# first statement from `sys.argv[1:]` to `sys.argv[2:]` -- which makes
+# every flag below fall through and open a browser window instead -- left
+# the entire suite green.
+#
+# These run the real thing in a subprocess, because a flag that is supposed
+# to exit is only proved to exit by a process that ends. Each has a timeout
+# for the same reason: the failure mode of a mis-dispatched flag is not a
+# wrong string, it is a browser that opens and waits.
+
+_CLI_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _cli(*args, **kwargs):
+    """Run `python3 -m feetbrowser ARGS` and return (exit code, stdout)."""
+    import subprocess
+    proc = subprocess.run(
+        [sys.executable, "-m", "feetbrowser"] + list(args),
+        cwd=_CLI_ROOT, stdin=subprocess.DEVNULL,
+        capture_output=True, text=True,
+        # These take 0.04s each. The timeout is not a performance budget,
+        # it is how a flag that opens a browser instead of exiting turns
+        # into a failure rather than a hung suite.
+        timeout=kwargs.get("timeout", 30),
+        env=dict(os.environ, FEETBROWSER_QUIET="1"))
+    return proc.returncode, proc.stdout
+
+
+def test_the_version_flag_prints_the_version_and_stops():
+    import feetbrowser
+    for flag in ("-v", "--version"):
+        code, out = _cli(flag)
+        eq(code, 0, "%s exited %d" % (flag, code))
+        eq(out.strip(), "FeetBrowser %s" % feetbrowser.__version__,
+           "%s printed the wrong thing" % flag)
+
+
+def test_the_help_flag_prints_the_usage_and_stops():
+    for flag in ("-h", "--help"):
+        code, out = _cli(flag)
+        eq(code, 0, "%s exited %d" % (flag, code))
+        assert out.startswith("usage: python3 -m feetbrowser"), \
+            "%s printed %r" % (flag, out[:60])
+        assert "--version" in out, "%s left --version out of the usage" % flag
+
+
+def test_a_toe_flag_that_wants_a_name_and_has_none_is_an_error():
+    """The half-typed form of every toe flag: usage on stdout, non-zero
+    out. Silently doing nothing and exiting 0 would be worse than the
+    error, because a packaging script would not notice."""
+    for flag in ("--toe-search", "--toe-install", "--toe-uninstall",
+                 "--toe-enable", "--toe-disable", "--new-toe"):
+        code, out = _cli(flag)
+        assert code != 0, "%s with no name exited 0" % flag
+        assert flag in out, "%s did not say how to use it: %r" % (flag, out)
+
+
 def main():
     root = Tk(); root.withdraw()
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
