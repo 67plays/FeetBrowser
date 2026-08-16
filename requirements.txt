@@ -1,0 +1,30 @@
+# The one thing FeetBrowser installs that it did not write in this repository.
+#
+# feetplayer is the media stack: the H.264, AAC and MPEG Layer III decoders
+# (FORTRAN 77, compiled by gfortran when the package is installed), the
+# container readers behind them, and the three audio output backends. It used
+# to live here, in feetbrowser/ and fortran/, and it is the same code with the
+# same authors -- it was split out because 25,000 lines of codec is not
+# browser, and because a decoder is exactly the kind of thing that is easier
+# to trust when it is a package with its own test suite than when it is
+# another directory in a repository that already has too many.
+#
+# There is no pyproject.toml, setup.py or setup.cfg in this repository to
+# declare a dependency in, and there is not going to be one: the browser is
+# run from a checkout and the Rust engine is installed imperatively, by
+# run.sh, test.sh, run.cmd, test.cmd and .github/actions/build. So this file
+# is where the dependency lives, and every one of those installs it from here
+# -- `pip install -r requirements.txt` -- rather than repeating the URL.
+#
+# Pinned to a full commit sha rather than to a branch, for two reasons. pip
+# only caches a VCS checkout when the URL cannot change under it, so a branch
+# means a clone on every run of every script. And an unpinned decoder means
+# the browser decodes differently after somebody else pushes, on a commit
+# that touched nothing here -- which is the kind of failure nobody thinks to
+# look outside the repository for.
+#
+# To move to a newer feetplayer, put its sha here and nowhere else:
+#
+#     gh api repos/67plays/feetplayer/commits/main --jq .sha
+#
+feetplayer @ git+https://github.com/67plays/feetplayer@734c8da4ee6312bfb723412f30905c2c50d73cf0

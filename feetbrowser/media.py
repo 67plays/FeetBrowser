@@ -1,7 +1,7 @@
 """Playback: turning decoded frames into the right frame at the right time.
 
-`mediacodec.py` answers "what does frame 37 look like". This module answers
-the two questions that make it playback rather than decoding:
+`feetplayer.mediacodec` answers "what does frame 37 look like". This module
+answers the two questions that make it playback rather than decoding:
 
   *when* is frame 37 due, and what do we do when we cannot decode it in time.
 
@@ -44,18 +44,28 @@ and most people will not see it, a gap in the sound is a click and everybody
 hears every one of them -- and because `position()` here is
 `_offset + (clock.now() - _origin)`, a clock that already reports media time
 makes both of those terms cancel and needs no other change at all. That clock
-is `_AudioClock`, `attach_audio()` installs it, and `arch.AudioPlayer` is
-what it reads. Without one, or with an output device nobody can hear, none of
-this module behaves any differently from the day it had no audio in it.
+is `_AudioClock`, `attach_audio()` installs it, and the `AudioPlayer` in
+`feetplayer.arch` is what it reads. Without one, or with an output device
+nobody can hear, none of this module behaves any differently from the day it
+had no audio in it.
+
+This module is the browser's half of the seam with feetplayer, which is where
+the decoders, the container readers and the audio backends went (see
+requirements.txt). It stayed because of one line: every presented frame
+becomes a `canvas.PhotoImage`, and the rasteriser that class belongs to is
+the browser's. Everything below the seam takes bytes and returns pixels and
+samples; everything here is about *when*.
 """
 
 import threading
 import time
 from collections import deque
 
-from . import imagecodec, mediacodec
+from feetplayer import mediacodec
+from feetplayer.mediacodec import MediaError
+
+from . import imagecodec
 from .canvas import PhotoImage
-from .mediacodec import MediaError
 
 __all__ = ["Clock", "SystemClock", "ManualClock", "VideoPlayer", "Scheduler",
            "MediaError", "QUEUE_DEPTH", "RESYNC_FRAMES"]
@@ -97,10 +107,10 @@ class _AudioClock(Clock):
     a clock reporting media time cancels them both and the scheduler is left
     asking the sound where it is.
 
-    What it must read is `heel.Source.position()`, which
+    What it must read is `feetplayer.heel.Source.position()`, which
     `AudioPlayer.position()` is derived from -- the *stream* timeline, with
     the ring backlog and the device latency already taken off. The other
-    audio clock in the tree, `heel.AudioClock.now()`, is the device timeline:
+    audio clock over there, `heel.AudioClock.now()`, is the device timeline:
     a fine number, an entirely wrong one to put here, and wrong in a way that
     raises nothing and sounds perfect. It would put every picture a buffer's
     depth ahead of its sound for the length of the film.
@@ -377,7 +387,8 @@ class VideoPlayer:
 
         `player` is anything with `start(position)`, `stop()`, `seek(seconds)`,
         `set_gain(gain)`, `set_rate(rate)` and `position()` --
-        `arch.AudioPlayer` in the browser, a handful of lines in a test.
+        `feetplayer.arch.AudioPlayer` in the browser, a handful of lines in a
+        test.
         Returns True when the sound is now driving.
 
         It declines in the two cases where following the sound would be worse

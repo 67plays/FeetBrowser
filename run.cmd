@@ -17,8 +17,12 @@ if errorlevel 1 (
   exit /b 1
 )
 
-rem Already importable, because someone installed it into this Python? Run.
-python -c "import feetbrowser_engine" >nul 2>&1
+rem Already importable, because someone installed it into this Python? Run --
+rem but both halves have to be there. Before feetplayer was its own repository
+rem the media stack was these files, so the engine was the whole test; now it
+rem is a package, and a Python with the engine but no feetplayer would give
+rem you a browser that plays no video. The venv below has both.
+python -c "import feetbrowser_engine, feetplayer" >nul 2>&1
 if not errorlevel 1 (
   call :warmfortran python
   python -m feetbrowser %*
@@ -61,22 +65,46 @@ echo.
 echo FeetBrowser: engine built. Starting.
 
 :run
+call :ensureplayer
 call :warmfortran ".venv\Scripts\python.exe"
 ".venv\Scripts\python.exe" -m feetbrowser %*
 exit /b %errorlevel%
 
-rem The H.264 and AAC decoders are Fortran (see fortran\, feetbrowser\h264.py
-rem and feetbrowser\aac.py), built on demand by gfortran into a cache keyed on
-rem the sources. Building them here rather than on the first <video> costs a
-rem second or two once per checkout and saves a stall in the middle of a page.
-rem Everything about it is optional: no gfortran, or a build that fails, means
-rem the browser reports H.264 and AAC as codecs it does not have, which is
-rem what it did before this existed. So nothing here is allowed to change the
-rem exit status.
+rem feetplayer is the media stack -- the container readers, the audio output
+rem and the Fortran decoders -- pinned to a commit in requirements.txt. pip
+rem compiles the Fortran during the install, so this is the minute the
+rem decoders cost, and it is paid once per pin rather than once per start:
+rem "pip freeze" prints a VCS install as the requirement line that produced
+rem it, so the pin installed and the pin asked for compare as plain strings.
+rem Failing to install it is not fatal -- the browser then reports H.264 and
+rem AAC as codecs it does not have, and everything else still works.
+:ensureplayer
+for /f "usebackq delims=" %%L in (`findstr /v /r /c:"^ *#" /c:"^ *$" requirements.txt`) do set "WANT=%%L"
+".venv\Scripts\python.exe" -m pip freeze 2>nul | findstr /x /c:"%WANT%" >nul
+if not errorlevel 1 goto :eof
+echo FeetBrowser: installing feetplayer, the media stack. This compiles its
+echo Fortran decoders, so expect a minute -- and only when the pin moves.
+echo.
+".venv\Scripts\python.exe" -m pip install -q -r requirements.txt
+if errorlevel 1 call :say_noplayer 1>&2
+goto :eof
+
+rem Loading the decoders here rather than on the first <video> costs nothing
+rem when they are already built and saves a stall in the middle of a page.
+rem Everything about it is optional: no feetplayer, or a library that will not
+rem load, means the browser reports H.264 and AAC as codecs it does not have,
+rem which is what it did before any of this existed. So nothing here is
+rem allowed to change the exit status.
 :warmfortran
-where /q gfortran
-if errorlevel 1 goto :eof
-%1 -c "import feetbrowser.h264 as v, feetbrowser.aac as a; v.available(); a.available()" >nul 2>&1
+%1 -c "import feetplayer.h264 as v, feetplayer.aac as a; v.available(); a.available()" >nul 2>&1
+goto :eof
+
+:say_noplayer
+echo.
+echo FeetBrowser: feetplayer did not install, so this run has no video and no
+echo sound. Everything else works. The install needs git and gfortran; see
+echo requirements.txt.
+echo.
 goto :eof
 
 rem The two failures worth explaining, both written to stderr by redirecting

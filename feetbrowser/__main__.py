@@ -45,7 +45,7 @@ def check_video(args):
     decoder that loads and returns rubbish has passed no test worth having.
     """
     import os
-    from . import h264
+    from feetplayer import h264
 
     reason = h264.unavailable_reason()
     if reason is not None:
@@ -140,7 +140,7 @@ def main():
         # is that module's to give -- and because a bundle that plays
         # pictures with no sound is a bundle that passes every other check
         # in this file.
-        from . import aac
+        from feetplayer import aac
         sys.exit(aac.check(args[1:]))
     # Anything else is a URL passed to the browser.
     from .browser import main as browser_main

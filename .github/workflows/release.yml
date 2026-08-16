@@ -120,8 +120,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # The venv, the engine, the fonts and gfortran -- exactly as every CI
-      # job gets them.
+      # The venv, the engine, the fonts, gfortran and feetplayer -- exactly as
+      # every CI job gets them.
       - uses: ./.github/actions/build
         with:
           python-version: ${{ matrix.python }}

@@ -98,12 +98,15 @@ jobs:
           maturin build --release --manifest-path rust/Cargo.toml --out dist
           Get-ChildItem dist
 
-      # gfortran, for the H.264 decoder. It is a build tool exactly like cargo
-      # -- what ships is our own Fortran, compiled, with the compiler's
-      # runtime linked in statically -- and the runner image is not promised
-      # to have one, so it is asked for by name rather than hoped for. A
-      # bundle built without it would be a browser that cannot play video and
-      # says so only to the user, so build.ps1 fails rather than skips.
+      # gfortran, for the decoders in feetplayer. It is a build tool exactly
+      # like cargo -- what ships is our own Fortran, compiled, with the
+      # compiler's runtime linked in statically -- and the runner image is not
+      # promised to have one, so it is asked for by name rather than hoped
+      # for. A bundle built without it would be a browser that cannot play
+      # video and says so only to the user, so build.ps1 fails rather than
+      # skips. It has to be here before build.ps1 runs, because that script
+      # pip-installs feetplayer into the bundle and then compiles the three
+      # libraries into the installed package.
       - name: gfortran
         run: |
           $found = (Get-Command gfortran -ErrorAction SilentlyContinue).Source

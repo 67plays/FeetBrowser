@@ -18,7 +18,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import media_fixtures
 from feetbrowser import canvas as canvasmod
-from feetbrowser import fontengine, gui, imagecodec, media, mediacodec, raster
+from feetbrowser import fontengine, gui, imagecodec, media, raster
+from feetplayer import mediacodec
 from feetbrowser.net import URL
 from feetbrowser.window import Event, Window
 
@@ -3901,7 +3902,7 @@ def test_audio_decoding_replays_from_the_start_because_there_is_no_keyframe():
 
 
 class _StubAacModule:
-    """A stand-in for `feetbrowser.aac`, installed for the length of one test.
+    """A stand-in for `feetplayer.aac`, installed for the length of one test.
 
     The real decoder is Fortran and its own suite tests it. What is tested
     here is the seam: that `open_audio` hands the AudioSpecificConfig over,
@@ -3943,12 +3944,12 @@ class _StubAacModule:
 
 
 def _with_stub_aac(module, run):
-    import feetbrowser
-    key = "feetbrowser.aac"
+    import feetplayer
+    key = "feetplayer.aac"
     had_module = sys.modules.get(key)
-    had_attribute = getattr(feetbrowser, "aac", None)
+    had_attribute = getattr(feetplayer, "aac", None)
     sys.modules[key] = module
-    feetbrowser.aac = module
+    feetplayer.aac = module
     try:
         return run()
     finally:
@@ -3957,10 +3958,10 @@ def _with_stub_aac(module, run):
         else:
             sys.modules[key] = had_module
         if had_attribute is None:
-            if hasattr(feetbrowser, "aac"):
-                delattr(feetbrowser, "aac")
+            if hasattr(feetplayer, "aac"):
+                delattr(feetplayer, "aac")
         else:
-            feetbrowser.aac = had_attribute
+            feetplayer.aac = had_attribute
 
 
 def test_open_audio_hands_the_config_over_and_names_the_codec_when_it_fails():
@@ -4323,7 +4324,7 @@ def _av_page(work, audible):
     wraps it, the browser attaches it, and the null device keeps real time
     by design, so positions still mean something.
     """
-    from feetbrowser import arch
+    from feetplayer import arch
     from feetbrowser.browser import Browser
     shutil.copy(os.path.join(_FIXTURES, "video", "av.mp4"),
                 os.path.join(work, "av.mp4"))

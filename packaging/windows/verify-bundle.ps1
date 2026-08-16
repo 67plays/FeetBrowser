@@ -149,7 +149,8 @@ Check "the folder is complete" {
                           'feetbrowser\win32.py', 'feetbrowser\ua.css', '_ssl.pyd',
                           'libssl-3.dll', 'libcrypto-3.dll', '_socket.pyd', '_ctypes.pyd',
                           'libffi-8.dll', 'vcruntime140.dll', 'README-FIRST.txt',
-                          'install.ps1', 'uninstall.ps1')) {
+                          'install.ps1', 'uninstall.ps1',
+                          'feetplayer\__init__.py', 'feetplayer\mediacodec.py')) {
         if (-not (Test-Path (Join-Path $Root $needed))) { throw "missing $needed" }
     }
     # -match rather than -Filter: in a Windows wildcard '?' also matches zero
@@ -201,13 +202,17 @@ Check "--version" {
 }
 
 # ---------------------------------------------------------------------------
-# The check this file was extended for. feetbrowser\h264.py and
-# feetbrowser\aac.py fall back to compiling fortran\ with gfortran, which
+# The check this file was extended for. feetplayer\h264.py and
+# feetplayer\aac.py fall back to compiling their Fortran with gfortran, which
 # every developer has and no user does, so a bundle that shipped no decoder
 # passes every other check here, installs, starts, renders, and only admits it
 # to whoever opens a video -- by which time it is a download. PATH is already
 # cut back to the system directories in CI, so nothing on this machine can
 # supply a compiler or a MinGW runtime DLL: what answers is what shipped.
+#
+# Now that the media stack is a pip dependency there is a second way to get
+# this wrong -- shipping no feetplayer at all -- and it fails here too, in the
+# folder check above and in the missing library below.
 #
 # Both decoders, one check each. A bundle carrying the video library and not
 # the sound one plays pictures in silence, and it passed this file until the
@@ -215,10 +220,10 @@ Check "--version" {
 # ---------------------------------------------------------------------------
 function Check-Decoder {
     param($What, $Glob, $Module, $Flag, $Vector, $Truth)
-    $lib = @(Get-ChildItem -Path (Join-Path $Root 'feetbrowser') -File -Filter $Glob)
-    if ($lib.Count -ne 1) { throw "expected one prebuilt $What decoder in feetbrowser\, found $($lib.Count)" }
-    if (-not (Test-Path (Join-Path $Root 'fortran'))) {
-        throw "no fortran\ beside the package; $Module cannot match the decoder against its sources"
+    $lib = @(Get-ChildItem -Path (Join-Path $Root 'feetplayer') -File -Filter $Glob)
+    if ($lib.Count -ne 1) { throw "expected one prebuilt $What decoder in feetplayer\, found $($lib.Count)" }
+    if (-not (Test-Path (Join-Path $Root 'feetplayer\fortran'))) {
+        throw "no fortran\ inside feetplayer\; $Module cannot match the decoder against its sources"
     }
     $checkArgs = @($Flag)
     if ((Test-Path $Vector) -and (Test-Path $Truth)) {
@@ -233,11 +238,11 @@ function Check-Decoder {
 }
 
 Check "it can decode H.264" {
-    Check-Decoder 'H.264' '_h264_*.dll' 'h264.py' '--check-video' $H264Vector $H264Truth
+    Check-Decoder 'H.264' '_h264_*.dll' 'feetplayer\h264.py' '--check-video' $H264Vector $H264Truth
 }
 
 Check "it can decode AAC" {
-    Check-Decoder 'AAC' '_aac_*.dll' 'aac.py' '--check-audio' $AacVector $AacTruth
+    Check-Decoder 'AAC' '_aac_*.dll' 'feetplayer\aac.py' '--check-audio' $AacVector $AacTruth
 }
 
 Check "--help" {
