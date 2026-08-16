@@ -2,6 +2,11 @@
 # ever used on Windows. Everything else keeps LF whatever the checkout.
 *.cmd text eol=crlf
 
+# Fortran 77 common blocks are included with .inc, an extension shared with
+# Pascal/Delphi, which makes Linguist guess and then misreport the language
+# breakdown. These three headers are Fortran; say so.
+fortran/*.inc linguist-language=Fortran
+
 # The H.264, AAC and MP3 test vectors, and the pictures and samples a reference
 # decoder made from them. A newline translated anywhere in any of these is a
 # decoder bug that only appears on one platform, so none of them is ever
