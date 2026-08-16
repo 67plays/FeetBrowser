@@ -86,7 +86,8 @@ WebKit, Gecko, or any HTTP library; it implements its own:
   that layout renders; `feetbrowser/jsdom.py` is a thin shim that delegates
   to the Rust functions.
 
-Beyond the engine extension, which is our own code in another language, no
+Beyond the engine extension, which is our own code in another language, and
+feetplayer, which is our own code in another repository, no third-party
 Python package is used at all, and that now includes the pixels: there is no
 Tk, Qt, GTK, SDL, Cairo, FreeType or Pillow anywhere, and the only thing the
 renderer asks of the operating system is a font file to parse. Nothing is
@@ -135,14 +136,13 @@ rust/
   font.rs        TrueType tables, cmap, metrics, outlines, flattening
   image.rs       PNG / GIF / PNM decoders and nearest-neighbour resize
   pyutil.rs      shared argument conversions (bytes, coordinates, strings)
-fortran/         two decoders. h264*.f is H.264: NAL/SPS/PPS, CABAC, intra
-                 and inter prediction, the inverse transforms, deblocking and
-                 YUV->RGBA. inst*.f is AAC-LC ("the instep"): bitstream,
-                 Huffman, dequantisation, TNS, the stereo tools and the
-                 inverse MDCT, out to PCM. Compiled on demand by
-                 feetbrowser/h264.py and feetbrowser/aac.py and loaded with
-                 ctypes; the browser works without a Fortran compiler.
-                 See docs/media.md.
+(feetplayer)     not in this repository. The media stack -- the containers,
+                 the three FORTRAN 77 decoders (H.264, AAC-LC, MPEG Layer
+                 III) and the audio output -- is a package of its own,
+                 pinned to a commit sha in requirements.txt and installed
+                 beside the engine. feetbrowser/media.py imports it. The
+                 browser works without a Fortran compiler; it does not work
+                 without feetplayer. See docs/media.md.
 toes/            user-installed toes (gitignored; empty on a fresh checkout)
 tests/
   test_render.py offline tests for fonts, rasteriser, image codecs, canvas

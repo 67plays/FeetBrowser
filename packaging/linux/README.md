@@ -52,11 +52,16 @@ FeetBrowser.AppDir/
   usr/lib/python3.12/                 its standard library
       site-packages/feetbrowser/      this repository's package
       site-packages/feetbrowser_engine/  the Rust extension
-      site-packages/feetbrowser/_h264_<digest>.so
+      site-packages/feetplayer/       the media stack, pip-installed from
+                                      the commit pinned in requirements.txt
+      site-packages/feetplayer/_h264_<digest>.so
                                       the H.264 decoder, compiled
-      site-packages/feetbrowser/_aac_<digest>.so
+      site-packages/feetplayer/_aac_<digest>.so
                                       the AAC decoder, the same way
-      site-packages/fortran/          the Fortran both were built from
+      site-packages/feetplayer/_mp3_<digest>.so
+                                      and MPEG Layer III, likewise
+      site-packages/feetplayer/fortran/
+                                      the Fortran all three were built from
   usr/lib/*.so.*                      the private libraries CPython needs:
                                       libssl, libcrypto, libffi, ...
   usr/lib/feetbrowser/launcher.py     bundled-font wiring, then __main__
@@ -103,6 +108,38 @@ libc, libm, libpthread, libdl, librt, libgcc_s and libstdc++ are deliberately
 *not* bundled. Every glibc system has them, and giving a process an older copy
 of its own C library or its own unwinder is worse than any version skew it
 could fix.
+
+### The media stack comes from another repository
+
+The decoders are no longer in this repository. `feetplayer` holds them, and
+`build-appimage.sh` installs it into the bundle's `site-packages` with
+
+```
+pip install --target site-packages -r requirements.txt
+```
+
+from the commit `requirements.txt` pins -- a full sha, not a branch, so a
+given FeetBrowser commit always packages a known decoder. The container's pip
+does that; the interpreter built above deliberately has none, and does not
+need one, because feetplayer is pure Python plus Fortran and `--target` lays
+down the same directory whichever python runs it.
+
+That install compiles the decoders already, inside the container, against the
+same glibc floor as everything else in the bundle. The script then builds all
+three again anyway, explicitly, with `python -m feetplayer.<module> --build`
+for `h264`, `aac` and `ball`: an install that quietly found no gfortran
+leaves a package that imports perfectly and decodes nothing, and the build
+has to stop at that rather than ship it. The library names are digests of the
+Fortran sources, so the rebuild lands on the same filenames and cannot leave
+a stale second copy behind. All three, not just video, because an image that
+plays pictures in silence reads as a broken player rather than as a missing
+decoder. A library in `feetplayer/` that is not one of the three fails the
+build rather than shipping, which is what would happen if feetplayer grew a
+fourth decoder and nobody here noticed.
+
+`feetplayer/fortran/` stays in the bundle. It is small, and it is what the
+`--build` path needs if anyone ever wants to rebuild a decoder from a
+finished AppImage.
 
 ## X11, and what happens under Wayland
 

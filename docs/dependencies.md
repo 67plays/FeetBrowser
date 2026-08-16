@@ -12,9 +12,28 @@ person to pick one of these up starts from a real number.
 
 ## Where it stands
 
-No Python package is *required*. `feetbrowser/` imports the standard library
-and `feetbrowser_engine`, which is our own code in another language. One
-Python package is optional, and the browser runs without it:
+No *third-party* Python package is required. `feetbrowser/` imports the
+standard library, `feetbrowser_engine` -- which is our own code in another
+language -- and `feetplayer`, which is our own code in another repository.
+
+`feetplayer` is required, and that is a change worth stating plainly rather
+than burying: `feetbrowser/media.py` imports it at the top of the file, so
+the browser does not start without it installed. It is the media stack --
+the container readers, the three Fortran decoders and the audio output --
+extracted so that the browser is a browser and the codecs are a library. It
+has no dependencies of its own, it is not on PyPI, and it is pinned to a full
+commit sha in `requirements.txt`, which is the only place the sha appears;
+`test.sh`, `run.sh`, `test.cmd`, `run.cmd`, `.github/actions/build` and all
+three packagers install from that file rather than naming a revision of their
+own. There is still no `pyproject.toml` at the root of this repository.
+
+What it costs to remove is therefore not the usual question. It is our code
+and it is auditable in full; what a reader should check is that the pin is a
+sha and not a branch, because a branch would make every build a different
+browser. See [Fortran](#fortran) below for the compiler that pip needs while
+installing it.
+
+One third-party Python package is optional, and the browser runs without it:
 
 | package | what it buys | without it |
 | --- | --- | --- |
@@ -27,10 +46,9 @@ will need, but they describe finished work rather than open questions.
 
 The build side is heavier than the run side, and that is where most of the
 cost actually is: Rust with five crates, `maturin` and a virtualenv to install
-the extension into, `pyflakes` for lint, and `gfortran` for the H.264 and AAC
-decoders. The last of those is the only compiler here that is genuinely optional
-at runtime; see
-[Fortran](#fortran) below.
+the extension into, `pyflakes` for lint, and `gfortran` for the decoders in
+feetplayer. The last of those is the only compiler here that is genuinely
+optional at runtime; see [Fortran](#fortran) below.
 
 ## The Rust crates
 
@@ -404,28 +422,36 @@ are self-documenting comments and nothing more.
 
 ## Fortran
 
-`fortran/` is fixed-form FORTRAN 77 and holds two decoders that share
-nothing but the build machinery: eleven sources and an include file for
-H.264, five and an include file for AAC-LC, described in
-[media.md](media.md#h264-in-fortran) and
-[media.md](media.md#aac-in-fortran). Neither has dependencies of any kind
-(no library, no package manager, no lock file, nothing linked but `libc`),
-so the only entry they earn in this file is a compiler on the build side,
-and even that is conditional.
+The Fortran is not in this repository any more. It is `fortran/` inside
+feetplayer -- fixed-form FORTRAN 77, three decoders that share nothing but
+the build machinery: eleven sources and an include file for H.264, five and
+an include file for AAC-LC, and the Layer III set beside them, described in
+[media.md](media.md#h264-in-fortran),
+[media.md](media.md#aac-in-fortran) and
+[media.md](media.md#mpeg-layer-iii-in-fortran). None of them has dependencies
+of any kind (no library, no package manager, no lock file, nothing linked but
+`libc`), so the only entry they earn in this file is a compiler on the build
+side, and even that is conditional.
 
-`feetbrowser/h264.py` and `feetbrowser/aac.py` each shell out to whatever
-`gfortran` they can find, compile their own sources into a shared library in
-the temporary directory named after a hash of them and of the compiler, and
-load it with `ctypes`. There is no build step in `run.sh`, no target in CI
-that has to succeed, and nothing in `rust/Cargo.toml` or `pyproject.toml`
-that mentions it.
+What changed with the split is *when* the compile happens. pip runs it while
+it installs feetplayer, so a checkout that has a `gfortran` gets its
+libraries once, at install time, in the installed package directory. A
+checkout that has no `gfortran` gets a feetplayer with no libraries beside
+it, and `feetplayer/h264.py`, `aac.py` and `ball.py` fall back to what they
+always did: shell out to whatever `gfortran` they can find, compile their own
+sources into a shared library in the temporary directory named after a hash
+of them and of the compiler, and load it with `ctypes`. There is still no
+build step in `run.sh`, no target in CI that has to succeed, and nothing in
+`rust/Cargo.toml` that mentions it.
 
 The packaged applications are the exception, and they have to be: a user has
 no gfortran, so a bundle that carried only the sources carried no video and
-no sound at all. Each of the three packaging scripts compiles both decoders
-on the build machine through `python3 -m feetbrowser.h264 --build` and
-`python3 -m feetbrowser.aac --build`, ships the results inside the package
-next to the modules that load them, and checks with `otool -L`, `ldd` or a
+no sound at all. Each of the three packaging scripts installs feetplayer into
+the bundle from `requirements.txt`, then compiles all three decoders on the
+build machine through `python3 -m feetplayer.h264 --build`,
+`python3 -m feetplayer.aac --build` and `python3 -m feetplayer.ball --build`,
+overwriting whatever pip's own install left there, ships the results inside
+the installed package next to the modules that load them, and checks with `otool -L`, `ldd` or a
 stripped `PATH` that gfortran's runtime went in with them rather than being
 left behind as a dependency on the build machine. So gfortran is a build-time
 requirement for packaging on all three platforms, and a run-time requirement
@@ -441,11 +467,12 @@ carrying the video decoder and not the sound decoder installs, starts,
 renders, plays a video, and is silent.
 
 Missing compiler, failed compile or an ABI mismatch all resolve to
-`h264.available()` or `aac.available()` being false, at which point the file
-is named and refused the way it was before the decoders were written.
-`tests/test_h264.py` and `tests/test_aac.py` assert that path by forcing it,
-so it is a tested behaviour rather than an intention, and the whole suite
-passes on a machine with no Fortran toolchain.
+`h264.available()`, `aac.available()` or `ball.available()` being false, at
+which point the file is named and refused the way it was before the decoders
+were written. feetplayer's own `test_h264.py`, `test_aac.py` and
+`test_mp3.py` assert that path by forcing it, so it is a tested behaviour
+rather than an intention, and this repository's suite passes on a machine
+with no Fortran toolchain.
 
 The choice of language is worth one line each, because it is the obvious
 question. The CABAC decode-decision loop is a dependent chain of integer
@@ -459,9 +486,12 @@ with no crates to audit.
 
 **Verdict: optional to run, required to package.** `dnf install
 gcc-gfortran` in the AppImage container, `brew install gcc` on both macOS
-runners, and MinGW-w64 on the Windows one. No runtime dependency on any of
-them: what ships is the compiled library, and the compiler's own runtime is
-linked into it statically.
+runners, and MinGW-w64 on the Windows one. CI installs it on Linux as well,
+in `.github/actions/build`, so that pip compiles the decoders while it
+installs feetplayer and the suite exercises the decoders rather than the
+graceful degradation. No runtime dependency on any of them: what ships is the
+compiled library, and the compiler's own runtime is linked into it
+statically.
 
 ## Suggested order
 

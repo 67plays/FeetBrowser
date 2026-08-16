@@ -36,23 +36,44 @@ Three things in one directory:
    `.pyd` at the root of the wheel will bundle just as happily; what it
    insists on is that there is exactly one engine `.pyd` in there.
 
-4. **The decoders**: `feetbrowser\_h264_<digest>.dll` and
-   `feetbrowser\_aac_<digest>.dll`, compiled from `fortran\` by gfortran at
-   packaging time, with `fortran\` itself shipped beside the package.
-   `feetbrowser\h264.py` and `feetbrowser\aac.py` otherwise compile those
-   sources on demand, which is right for a checkout and impossible on a
-   user's machine -- and the failure was silent to everyone who had a
-   compiler, which is everyone who develops the browser. Shipping the video
-   one alone left the same bug wearing a quieter costume: a bundle that
-   plays pictures with no sound. Each DLL is named after a hash of the
-   sources it was built from and the loader recomputes it, so a stale one is
-   not preferred over the sources, it is not found.
+4. **`feetplayer\`**, the media stack, which is not in this repository any
+   more. `build.ps1` pip-installs it into the bundle with the *host*
+   interpreter (`FEETBROWSER_PYTHON`, or whichever of `python`, `python3`
+   and `py` it finds first) and `--target`, from the commit pinned in
+   `requirements.txt` -- a full sha, not a branch. The bundled interpreter
+   cannot do this itself: the embeddable package has no pip and no
+   `ensurepip`, which is the whole reason step 3 unzips a wheel by hand
+   rather than installing one. `feetplayer` is pure Python plus Fortran, so
+   `--target` produces the same directory whichever python lays it down.
+
+5. **The decoders**: `feetplayer\_h264_<digest>.dll`,
+   `feetplayer\_aac_<digest>.dll` and `feetplayer\_mp3_<digest>.dll`,
+   compiled from `feetplayer\fortran\` by gfortran at packaging time, with
+   `fortran\` itself shipped beside the package. `feetplayer`'s `h264.py`,
+   `aac.py` and `ball.py` otherwise compile those sources on demand, which
+   is right for a checkout and impossible on a user's machine -- and the
+   failure was silent to everyone who had a compiler, which is everyone who
+   develops the browser. Shipping the video one alone left the same bug
+   wearing a quieter costume: a bundle that plays pictures with no sound.
+   Each DLL is named after a hash of the sources it was built from and the
+   loader recomputes it, so a stale one is not preferred over the sources,
+   it is not found.
+
+   The pip install above has already compiled all three, with the host
+   machine's gfortran and none of the flags below. They are built again
+   here, explicitly, for two reasons: an install that quietly found no
+   gfortran leaves a package that imports perfectly and decodes nothing, and
+   the flags are the whole point. Because the names are source digests, the
+   rebuild overwrites rather than accumulates. A DLL in `feetplayer\` that
+   is not one of the three stops the build, which is what would happen if
+   feetplayer grew a fourth decoder and nobody here noticed.
+
    Whether gfortran's runtime ends up inside those DLLs or beside them is
    decided by reading each finished file's import table: `build_library`
    tries `-static` first and falls back through the narrower static flags,
    and copies whatever it still could not link in -- `libgfortran-5.dll`
    and its own dependencies -- next to the decoder, where
-   `LOAD_WITH_ALTERED_SEARCH_PATH` finds them. Both decoders land in the
+   `LOAD_WITH_ALTERED_SEARCH_PATH` finds them. All three land in the
    same directory and want the same runtime, so whichever is built second
    finds those DLLs already there. It is a build-time check
    rather than a claim because the flags that fail here fail invisibly:
@@ -121,11 +142,13 @@ no user site directory. `sys.path` becomes exactly the lines in the file,
 resolved relative to the directory the file is in.
 
 For us, those two lines already say the right thing. `python313.zip` is the
-standard library; `.` is the bundle directory, which is where `feetbrowser\`
-and `feetbrowser_engine\` are. So the "how do we get our package
-importable given that the embeddable package has no pip and no site-packages"
-problem has a one-word answer: we don't need to, they are already on the
-path.
+standard library; `.` is the bundle directory, which is where `feetbrowser\`,
+`feetbrowser_engine\` and `feetplayer\` are. So the "how do we get our
+packages importable given that the embeddable package has no pip and no
+site-packages" problem has a one-word answer: we don't need to, they are
+already on the path. It is also why `feetplayer` is installed with
+`--target` into that same directory rather than as a normal dependency:
+there is no site-packages for pip to aim at.
 
 `build.ps1` writes a second copy called `FeetBrowser._pth`. CPython looks for
 a `._pth` named after the DLL *and* one named after the running executable,
@@ -302,8 +325,10 @@ blob.
 
 On Windows, with Rust, a gfortran (MSYS2's, Strawberry Perl's, or
 `choco install mingw` -- `build.ps1` looks for all three and takes
-`FEETBROWSER_GFORTRAN` over any of them) and a Python whose minor version
-matches the pinned one (3.13):
+`FEETBROWSER_GFORTRAN` over any of them), a Python whose minor version
+matches the pinned one (3.13), and network access for the pip install of
+`feetplayer` (that Python's pip does it; `FEETBROWSER_PYTHON` picks a
+different interpreter for the job):
 
 ```powershell
 python -m pip install maturin
@@ -378,7 +403,15 @@ The checks are:
    decoder with `lowrate.aac`, numerically rather than byte for byte,
    because AAC is not a bit-exact format. All four fixtures travel with this
    script in the `verify-script` artifact, because the job that runs it has
-   no checkout to take them from.
+   no checkout to take them from; they are also why those four files are
+   still committed in `tests/fixtures/` when no suite in this repository
+   reads them.
+
+   Before either of those, the script checks that there is a `feetplayer\`
+   in the bundle at all, with its `mediacodec.py` and its `fortran\`. That
+   is the new way to get this wrong: the media stack arrives by pip now, and
+   a pip step that silently did nothing produces a bundle that starts,
+   renders, browses, and cannot open a video.
 
 In CI all of this happens twice, on a runner that never checks the repository
 out: once from `C:\Program Files\FeetBrowser`, and once from a directory
