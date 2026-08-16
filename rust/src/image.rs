@@ -158,6 +158,25 @@ pub fn py_decode_gif(py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<(i64, 
     Ok((w, h, PyBytes::new(py, &rgba).unbind()))
 }
 
+/// Every frame of a GIF: `(width, height, [(rgba, delay_ms)], loop_count)`.
+///
+/// A still GIF comes back as a one-frame animation rather than as an error,
+/// so a caller does not have to know which it has before it asks.
+#[pyfunction]
+#[pyo3(name = "decode_gif_frames")]
+pub fn py_decode_gif_frames(
+    py: Python<'_>,
+    data: &Bound<'_, PyAny>,
+) -> PyResult<(i64, i64, Vec<(Py<PyBytes>, i64)>, i64)> {
+    let buf = bytes_arg(data)?;
+    let (w, h, frames, loops) = gif_frames(&buf, None)?;
+    let out = frames
+        .into_iter()
+        .map(|f| (PyBytes::new(py, &f.rgba).unbind(), f.delay_ms))
+        .collect();
+    Ok((w, h, out, loops))
+}
+
 #[pyfunction]
 #[pyo3(name = "decode_jpeg")]
 pub fn py_decode_jpeg(py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<(i64, i64, Py<PyBytes>)> {
@@ -511,9 +530,43 @@ fn to_rgba(
 
 // -- GIF -------------------------------------------------------------------
 
-/// Decode a GIF's first frame. Animation is out of scope, as it was for Tk's
-/// PhotoImage, which also showed only the first frame.
+/// One frame of a GIF: the whole logical screen as it looks once this frame
+/// has been composited onto what came before, and how long it stays there.
+///
+/// Whole-screen rather than just the sub-rectangle the file stored, because
+/// that rectangle is a compression detail and not a picture: a frame of an
+/// animation is routinely a dozen pixels in one corner, meaning "and
+/// everything else is as it was". Handing that to a caller as an image would
+/// be handing it a dozen pixels.
+pub struct GifFrame {
+    pub rgba: Vec<u8>,
+    /// What the file asked for, in milliseconds, faithfully -- including the
+    /// zero that means "as fast as you can", which is a request no browser
+    /// grants. Deciding what to do about that is animation policy and lives
+    /// with the animation, in `canvas.PhotoImage`; the decoder's job is to
+    /// report what the bytes said.
+    pub delay_ms: i64,
+}
+
+/// Decode a GIF's first frame, at the size of its logical screen.
 fn gif(data: &[u8]) -> PyResult<(i64, i64, Vec<u8>)> {
+    let (w, h, mut frames, _loops) = gif_frames(data, Some(1))?;
+    let first = frames
+        .drain(..)
+        .next()
+        .ok_or_else(|| bad("GIF contains no image"))?;
+    Ok((w, h, first.rgba))
+}
+
+/// Decode a GIF, composited frame by frame onto its logical screen.
+///
+/// `limit` stops after that many frames, which is what the still-image entry
+/// point passes: the frames after the first cost their own LZW pass and a
+/// screen-sized copy each, and nothing is going to look at them.
+///
+/// Returns the screen size, the frames, and the loop count the file asked
+/// for: 0 for "for ever", -1 when the file never said.
+fn gif_frames(data: &[u8], limit: Option<usize>) -> PyResult<(i64, i64, Vec<GifFrame>, i64)> {
     if !signature_gif(data) {
         return Err(bad("not a GIF"));
     }
@@ -521,6 +574,7 @@ fn gif(data: &[u8]) -> PyResult<(i64, i64, Vec<u8>)> {
     let screen_h = le16(data, 8).ok_or_else(|| malformed("unpack requires a buffer of 7 bytes"))? as i64;
     let flags = at(data, 10).ok_or_else(|| malformed("unpack requires a buffer of 7 bytes"))?;
     at(data, 12).ok_or_else(|| malformed("unpack requires a buffer of 7 bytes"))?;
+    check_size(screen_w, screen_h)?;
     let mut pos: usize = 13;
     let mut global_table: &[u8] = b"";
     if flags & 0x80 != 0 {
@@ -529,7 +583,21 @@ fn gif(data: &[u8]) -> PyResult<(i64, i64, Vec<u8>)> {
         pos += size;
     }
 
+    // The screen starts transparent rather than filled with the background
+    // colour the header names. That is what browsers show, and it is also the
+    // only choice that composites: a GIF laid over a page has to let the page
+    // through where it never drew.
+    let pixels = (screen_w as usize).saturating_mul(screen_h as usize);
+    let mut canvas = vec![0u8; pixels.saturating_mul(4)];
+    let mut frames: Vec<GifFrame> = Vec::new();
+    let mut loops: i64 = -1;
+
+    // Graphic control state. The spec scopes it to the single image that
+    // follows, so it is cleared after each one rather than carried.
     let mut transparent: Option<u8> = None;
+    let mut delay_cs: i64 = 0;
+    let mut disposal: u8 = 0;
+
     while pos < data.len() {
         let block = data[pos];
         if block == 0x21 {
@@ -538,10 +606,14 @@ fn gif(data: &[u8]) -> PyResult<(i64, i64, Vec<u8>)> {
             pos += 2;
             if label == 0xF9 && at(data, pos).ok_or_else(|| malformed("index out of range"))? >= 4 {
                 let gflags = at(data, pos + 1).ok_or_else(|| malformed("index out of range"))?;
+                disposal = (gflags >> 2) & 0x07;
+                delay_cs = le16(data, pos + 2).unwrap_or(0) as i64;
                 if gflags & 0x01 != 0 {
                     transparent =
                         Some(at(data, pos + 4).ok_or_else(|| malformed("index out of range"))?);
                 }
+            } else if label == 0xFF {
+                loops = netscape_loops(data, pos).unwrap_or(loops);
             }
             pos = skip_blocks(data, pos);
         } else if block == 0x2C {
@@ -570,19 +642,152 @@ fn gif(data: &[u8]) -> PyResult<(i64, i64, Vec<u8>)> {
                 chunks.extend_from_slice(slice(data, pos + 1, pos + 1 + n));
                 pos += 1 + n;
             }
+            pos = pos.saturating_add(1); // the block terminator
             let expected = (w as usize).saturating_mul(h as usize);
             let mut indices = lzw(&chunks, min_code, expected)?;
             if iflags & 0x40 != 0 {
                 indices = deinterlace(&indices, w as usize, h as usize);
             }
-            return Ok(gif_to_rgba(&indices, w, h, table, transparent));
+            // A frame that means to put back what was underneath it needs a
+            // copy of that taken before it draws, not after.
+            let saved = if disposal == 3 {
+                Some(canvas.clone())
+            } else {
+                None
+            };
+            gif_blit(
+                &mut canvas, screen_w, screen_h, &indices, left, top, w, h, table, transparent,
+            );
+            // Every frame is a screen-sized copy, so a file with a large
+            // canvas and a great many frames is a decompression bomb with a
+            // palette. Same ceiling as the one inflate answers to.
+            if frames.len().saturating_add(1).saturating_mul(canvas.len()) > MAX_INFLATED {
+                return Err(bad("animated GIF expands too far"));
+            }
+            frames.push(GifFrame {
+                rgba: canvas.clone(),
+                delay_ms: delay_cs.saturating_mul(10),
+            });
+            if let Some(max) = limit {
+                if frames.len() >= max {
+                    break;
+                }
+            }
+            match disposal {
+                2 => gif_clear(&mut canvas, screen_w, screen_h, left, top, w, h),
+                3 => {
+                    if let Some(previous) = saved {
+                        canvas = previous;
+                    }
+                }
+                _ => {}
+            }
+            transparent = None;
+            delay_cs = 0;
+            disposal = 0;
         } else if block == 0x3B {
             break; // trailer
         } else {
             return Err(bad(format!("unexpected GIF block 0x{:02X}", block)));
         }
     }
-    Err(bad("GIF contains no image"))
+    if frames.is_empty() {
+        return Err(bad("GIF contains no image"));
+    }
+    Ok((screen_w, screen_h, frames, loops))
+}
+
+/// The loop count out of a NETSCAPE2.0 application extension, if this is one.
+///
+/// `pos` is the first sub-block's length byte, just past the 0xFF label. The
+/// extension is eleven bytes of identifier followed by a three-byte
+/// sub-block: a 1, then the count little-endian. Anything else shaped like an
+/// application extension -- XMP, ImageMagick's own -- is not this and is left
+/// to `skip_blocks`.
+fn netscape_loops(data: &[u8], pos: usize) -> Option<i64> {
+    if at(data, pos)? != 11 || slice(data, pos + 1, pos + 12) != b"NETSCAPE2.0" {
+        return None;
+    }
+    let sub = pos + 12;
+    if at(data, sub)? < 3 || at(data, sub + 1)? != 1 {
+        return None;
+    }
+    Some(le16(data, sub + 2)? as i64)
+}
+
+/// Draw one sub-image onto the screen, clipped, skipping the index the file
+/// declared transparent -- which is what leaves the previous frame showing
+/// through, and is the whole of how a GIF animates without storing every
+/// pixel every time.
+#[allow(clippy::too_many_arguments)]
+fn gif_blit(
+    canvas: &mut [u8],
+    screen_w: i64,
+    screen_h: i64,
+    indices: &[u8],
+    left: i64,
+    top: i64,
+    w: i64,
+    h: i64,
+    table: &[u8],
+    transparent: Option<u8>,
+) {
+    for row in 0..h {
+        let y = top + row;
+        if y < 0 || y >= screen_h {
+            continue;
+        }
+        for col in 0..w {
+            let x = left + col;
+            if x < 0 || x >= screen_w {
+                continue;
+            }
+            let idx = match indices.get((row.saturating_mul(w) + col) as usize) {
+                Some(v) => *v,
+                None => continue,
+            };
+            if Some(idx) == transparent {
+                continue;
+            }
+            let o = idx as usize * 3;
+            let d = ((y.saturating_mul(screen_w) + x) as usize).saturating_mul(4);
+            if d + 3 >= canvas.len() {
+                continue;
+            }
+            // A palette index past the end of the table draws black and
+            // opaque, which is what the still decoder has always done.
+            if o + 2 < table.len() {
+                canvas[d] = table[o];
+                canvas[d + 1] = table[o + 1];
+                canvas[d + 2] = table[o + 2];
+            } else {
+                canvas[d] = 0;
+                canvas[d + 1] = 0;
+                canvas[d + 2] = 0;
+            }
+            canvas[d + 3] = 255;
+        }
+    }
+}
+
+/// Disposal method 2: put the frame's own rectangle back to transparent.
+fn gif_clear(canvas: &mut [u8], screen_w: i64, screen_h: i64, left: i64, top: i64, w: i64, h: i64) {
+    for row in 0..h {
+        let y = top + row;
+        if y < 0 || y >= screen_h {
+            continue;
+        }
+        for col in 0..w {
+            let x = left + col;
+            if x < 0 || x >= screen_w {
+                continue;
+            }
+            let d = ((y.saturating_mul(screen_w) + x) as usize).saturating_mul(4);
+            if d + 3 < canvas.len() {
+                canvas[d..d + 4].copy_from_slice(&[0, 0, 0, 0]);
+            }
+        }
+    }
 }
 
 fn skip_blocks(data: &[u8], mut pos: usize) -> usize {
@@ -608,29 +813,6 @@ fn deinterlace(indices: &[u8], w: usize, h: usize) -> Vec<u8> {
         }
     }
     out
-}
-
-fn gif_to_rgba(
-    indices: &[u8],
-    w: i64,
-    h: i64,
-    table: &[u8],
-    transparent: Option<u8>,
-) -> (i64, i64, Vec<u8>) {
-    let n = (w as usize).saturating_mul(h as usize);
-    let mut rgba = vec![0u8; n * 4];
-    for i in 0..std::cmp::min(indices.len(), n) {
-        let idx = indices[i];
-        let o = idx as usize * 3;
-        let d = i * 4;
-        if o + 2 < table.len() {
-            rgba[d] = table[o];
-            rgba[d + 1] = table[o + 1];
-            rgba[d + 2] = table[o + 2];
-        }
-        rgba[d + 3] = if Some(idx) == transparent { 0 } else { 255 };
-    }
-    (w, h, rgba)
 }
 
 /// GIF's variable-width LZW. Codes are packed little-endian, least

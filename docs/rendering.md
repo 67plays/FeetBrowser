@@ -150,8 +150,14 @@ Everything returns `(width, height, rgba)`.
   and Adam7 interlacing. An inflate with a ceiling on it does the
   decompression; the rest is ours.
 - **GIF**: a hand-written variable-width LZW decoder, global and local colour
-  tables, transparency index, and interlacing. First frame only: an animated
-  GIF shows its first frame and does not move.
+  tables, transparency index, and interlacing. Animation as well: every frame
+  is composited onto the logical screen with the disposal method the file
+  asked for (leave it, clear it back to transparent, put back what was
+  underneath), and the NETSCAPE2.0 loop count is read. `decode` still hands
+  back one frame, because most callers want a picture; `decode_gif_frames`
+  hands back all of them with their delays, and `canvas.PhotoImage` is what
+  turns that into an animation. See
+  [Animation](#animation-lives-in-photoimage-not-in-layout) below.
 - **JPEG**: Huffman-coded 8-bit frames, baseline (SOF0), extended sequential
   (SOF1) and progressive (SOF2), one component or three, any sampling factors
   the file declares, and restart intervals. The inverse transform is the AAN
@@ -185,6 +191,56 @@ decodes in about 6.5 ms.
 
 Scaling is nearest-neighbour, matching the `subsample`/`zoom` semantics the
 browser already relied on.
+
+### Animation lives in PhotoImage, not in layout
+
+`docs/media.md` proposed running animated GIF through the video player, as a
+codec adapter plus a layout rule. It is not built that way, because the draw
+path made a much smaller change possible: `DrawImage` blits whatever
+`photo.rgba` currently is, so replacing those bytes is already enough to
+change what the next repaint shows. Nothing in layout, in the display list or
+in the element tree needs to know that an image moves. A GIF is also an
+`<img>` rather than a `<video>` -- it has no sound, no playhead and no
+controls -- and giving it a `VideoPlayer` would have meant giving it all
+three.
+
+So `canvas.PhotoImage` holds the frames and their delays, and `advance(now)`
+moves to whichever frame is due at that instant, taking `now` rather than
+reading a clock so the behaviour is testable and so every image on a page
+moves against one timestamp. `Tab.tick_images()` calls it for everything in
+the image cache, off `Browser._video_tick`, which was already running for
+video; a tick that changes any image on the active tab asks for a repaint.
+Two consequences worth stating:
+
+- **An animation is never "busy".** `Browser.busy()` does not count animated
+  images, exactly as it does not count playing video. A GIF that loops for
+  ever is the ordinary case, and counting it would mean `settle()` and
+  `--screenshot` never returned on most of the web.
+- **A late tick does not stretch the animation.** The frame deadline advances
+  by the delay, not to the moment the tick arrived, so a stalled tab catches
+  up rather than replaying every frame it missed -- and `advance` walks at
+  most one pass round the frames per call, so an hour of missed ticks costs
+  one tick's work.
+
+Two policies sit on the Python side of that line rather than in the decoder.
+The decoder reports the delay the file asked for, including the zero that
+means "as fast as you can"; `PhotoImage` rounds anything under 20 ms up to
+100 ms, which is what Chrome, Firefox and Safari all do and what those files
+-- almost always written that way by accident -- have looked like since the
+1990s. And the NETSCAPE2.0 loop count is the extension's own arithmetic: 0
+means for ever, and `n` means `n` repeats *after* the first pass, so a file
+written with ImageMagick's `-loop 3` stores 2 and plays three times. When the
+last pass ends the animation stops on its final frame and stops costing
+repaints.
+
+The vectors are seven animations from two encoders, checked frame for frame
+against ImageMagick 7's `-coalesce`, which performs exactly this operation.
+FFmpeg is deliberately not the reference: its GIF decoder resamples variable
+delays onto a constant frame rate, so it does not even agree about how many
+frames a file has, and it clears a disposed region to the header's background
+colour where every browser clears it to transparent. It contributes a
+bitstream instead. `tests/fixtures/gif/make_gif_vectors.sh` rebuilds them all
+and records the argument.
 
 This is the code in the browser most likely to be handed something written
 specifically to break it, so two limits are hard-coded and enforced before any
@@ -422,8 +478,11 @@ argued about with.
 - No kerning or ligatures; deliberately, see the invariant above.
 - No right-to-left or complex-script shaping. Characters advance
   left-to-right, one glyph each.
-- Animated GIFs show their first frame.
 - No SVG, and no WebP, BMP, ICO or TIFF. Those draw as their alt text.
+- `subsample`/`zoom` of an animated GIF give a still: they resample the frame
+  that is current and the copy has no frames of its own. Nothing on the
+  `<img>` path calls them today -- an image draws at the size the file says --
+  so this is a limit of the scaling API rather than one a page can see.
 - The JPEG modes listed above (arithmetic coding, CMYK, 12-bit, lossless,
   hierarchical) are refused rather than approximated.
 - No native Wayland backend. Wayland desktops get the X11 window through

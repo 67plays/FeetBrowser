@@ -330,11 +330,38 @@ def _resolve_face(family, bold, italic):
 
 # -- images ----------------------------------------------------------------
 
+# A GIF's delays are a request, not an instruction. Files written with 0 --
+# "as fast as the machine can" -- are everywhere, mostly by accident, and no
+# browser has honoured them since the 1990s: Chrome, Firefox and Safari all
+# round anything under 20 ms up to 100 ms, so that is what we do. The decoder
+# reports what the file said; the clamp lives here, with the animation.
+MIN_GIF_DELAY_MS = 20
+DEFAULT_GIF_DELAY_MS = 100
+
+
 class PhotoImage:
-    """Holds decoded RGBA pixels; the API surface is width()/height()."""
+    """Holds decoded RGBA pixels; the API surface is width()/height().
+
+    A GIF may hold more than one frame, and then this object is the animation
+    rather than a picture: `frames` is every frame composited onto the logical
+    screen, `rgba` is whichever of them is showing, and `advance(now)` moves
+    that on when the frame's time is up. Nothing that draws needs to know --
+    a repaint blits `rgba` either way, which is the whole reason the animation
+    lives in the image and not in the display list.
+    """
 
     def __init__(self, data=None, file=None, width=None, height=None,
                  **_ignored):
+        self.frames = ()
+        self.delays = ()
+        self.frame_index = 0
+        # The count from the file's NETSCAPE2.0 extension: 0 for "for ever",
+        # -1 when the file never said, and otherwise the number of times to
+        # repeat *after* the first pass -- which is the extension's own
+        # wording, and is what ImageMagick writes (`-loop 3` comes back as 2).
+        self.loop_count = -1
+        self.loops_done = 0
+        self._frame_started = None
         if file is not None:
             with open(file, "rb") as handle:
                 data = handle.read()
@@ -352,12 +379,84 @@ class PhotoImage:
             except Exception:
                 data = data.encode("latin-1", "replace")
         try:
-            self._width, self._height, self.rgba = imagecodec.decode(data)
+            if data[:6] in (b"GIF87a", b"GIF89a"):
+                self._decode_gif(data)
+            else:
+                self._width, self._height, self.rgba = imagecodec.decode(data)
         except imagecodec.ImageError as exc:
             raise CanvasError(str(exc))
         # Checked once here so every blit can take the fast row-copy path;
         # most photos on the web have no transparency at all.
         self.opaque = self.rgba[3::4].count(255) == self._width * self._height
+
+    def _decode_gif(self, data):
+        width, height, frames, loops = imagecodec.decode_gif_frames(data)
+        self._width, self._height = width, height
+        self.frames = tuple(rgba for rgba, _delay in frames)
+        self.delays = tuple(
+            (delay if delay >= MIN_GIF_DELAY_MS else DEFAULT_GIF_DELAY_MS)
+            for _rgba, delay in frames)
+        self.loop_count = loops
+        self.rgba = self.frames[0]
+
+    @property
+    def animated(self):
+        """True when there is a second frame to move on to. A still GIF
+        decodes to a one-frame animation, and is not one."""
+        return len(self.frames) > 1 and not self.finished
+
+    @property
+    def finished(self):
+        """True once a file with a finite loop count has run out of them and
+        is holding its last frame. A file that never said loops once."""
+        if self.loop_count == 0:
+            return False
+        passes = 1 if self.loop_count < 0 else 1 + self.loop_count
+        return (self.loops_done >= passes
+                and self.frame_index == len(self.frames) - 1)
+
+    def advance(self, now):
+        """Show the frame due at `now` (a monotonic clock, in seconds).
+
+        Returns True when the visible frame changed, which is what tells the
+        caller to repaint. The first call only starts the clock: an animation
+        begins when something first asks it to, not when it was decoded, so a
+        GIF that was fetched while the tab was in the background does not
+        arrive already several seconds in.
+        """
+        if not self.animated:
+            return False
+        if self._frame_started is None:
+            self._frame_started = now
+            return False
+        changed = False
+        # Bounded by the frame count: a tab that was asleep for an hour comes
+        # back to the right frame without walking an hour of them, and a file
+        # of 10 ms frames cannot make one tick do unbounded work.
+        for _ in range(len(self.frames)):
+            due = self.delays[self.frame_index] / 1000.0
+            if now - self._frame_started < due:
+                break
+            nxt = self.frame_index + 1
+            if nxt >= len(self.frames):
+                if self.finished:
+                    break
+                self.loops_done += 1
+                nxt = 0
+                if self.finished:
+                    # The last pass ends on the last frame, not back at the
+                    # first: a three-loop animation stops where it stopped.
+                    break
+            self.frame_index = nxt
+            self._frame_started += due
+            changed = True
+        else:
+            # Fell behind by more than one pass; re-anchor rather than keep
+            # a start time that is now history.
+            self._frame_started = now
+        if changed:
+            self.rgba = self.frames[self.frame_index]
+        return changed
 
     def width(self):
         return self._width
@@ -374,11 +473,22 @@ class PhotoImage:
                             self._height * max(1, y or x))
 
     def _scaled(self, width, height):
+        """A resized copy of the frame showing now.
+
+        A still, even when the original animates: resizing every frame of an
+        animation is work for a picture nobody asked to keep moving, and the
+        one caller of this is the compatibility API that toe plugins use to
+        put a thumbnail somewhere.
+        """
         clone = PhotoImage.__new__(PhotoImage)
         clone.rgba = imagecodec.resize(self.rgba, self._width, self._height,
                                        width, height)
         clone._width, clone._height = max(1, width), max(1, height)
         clone.opaque = self.opaque
+        clone.frames = clone.delays = ()
+        clone.frame_index = clone.loops_done = 0
+        clone.loop_count = -1
+        clone._frame_started = None
         return clone
 
 
