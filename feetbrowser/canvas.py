@@ -557,12 +557,6 @@ class Canvas:
     def winfo_height(self):
         return self._height
 
-    def winfo_reqwidth(self):
-        return self._width
-
-    def winfo_reqheight(self):
-        return self._height
-
     def device_size(self):
         """The framebuffer's size in device pixels.
 
