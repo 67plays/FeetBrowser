@@ -10,9 +10,10 @@ measures them with our own font engine, and are cached here.
 """
 
 import copy
+import math
 import re
 from collections import namedtuple
-from .canvas import CanvasError, Font
+from .canvas import CanvasError, Font, color as canvas_color
 from . import cssparser
 
 from .htmlparser import Text, Element
@@ -993,6 +994,151 @@ def _color_function_args(name, func):
     return [a for a in args if a]
 
 
+# The colour spaces color-mix() interpolates in, grouped by what we have to do
+# to reach them. Gamma-encoded sRGB is where the bytes already are; its
+# linear-light sibling is one transfer function away; everything else goes
+# through Oklab. Oklab is both what real stylesheets ask for -- it is the
+# space every one of the thousand-odd color-mix() declarations on discord.com
+# names -- and a defensible stand-in for the spaces we do not implement, since
+# the polar ones (oklch, lch, hsl, hwb) differ from their rectangular
+# counterparts only in going round the hue circle instead of across it, and
+# that difference disappears entirely at the 0%/100% weightings that make up
+# nearly all of the color-mix() actually on the web.
+_MIX_GAMMA_SRGB = frozenset(("srgb", "hsl", "hwb"))
+_MIX_LINEAR_SRGB = frozenset(("srgb-linear",))
+
+# A percentage beside a colour in a color-mix() argument. The grammar lets it
+# come before the colour as well as after, and taking both costs one regex.
+_MIX_PCT_TAIL_RE = re.compile(r"\s+(-?[0-9.]+)%$")
+_MIX_PCT_HEAD_RE = re.compile(r"^(-?[0-9.]+)%\s+")
+
+
+def _srgb_to_linear(c):
+    """One 0-255 sRGB channel as linear light, 0-1."""
+    c = c / 255.0
+    if c <= 0.04045:
+        return c / 12.92
+    return ((c + 0.055) / 1.055) ** 2.4
+
+
+def _linear_to_srgb(c):
+    """One linear-light channel back to a 0-255 sRGB byte.
+
+    Clamped, because a mix in a wider space can land outside the sRGB cube and
+    the canvas has nowhere to put a negative channel. The low branch is what
+    keeps the fractional power from seeing a negative number at all.
+    """
+    if c <= 0.0031308:
+        c = c * 12.92
+    else:
+        c = 1.055 * (c ** (1 / 2.4)) - 0.055
+    return max(0, min(255, int(round(c * 255))))
+
+
+def _linear_to_oklab(r, g, b):
+    """Linear-light sRGB to Oklab, by Bjorn Ottosson's matrices (the ones CSS
+    Color 4 sec. 9.3 normatively reproduces)."""
+    lo = 0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b
+    me = 0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b
+    sh = 0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b
+    # The cube root is signed: an out-of-gamut colour can push a cone response
+    # below zero, and `(-x) ** (1/3)` is a complex number in Python.
+    lo, me, sh = (math.copysign(abs(v) ** (1 / 3.0), v)
+                  for v in (lo, me, sh))
+    return (0.2104542553 * lo + 0.7936177850 * me - 0.0040720468 * sh,
+            1.9779984951 * lo - 2.4285922050 * me + 0.4505937099 * sh,
+            0.0259040371 * lo + 0.7827717662 * me - 0.8086757660 * sh)
+
+
+def _oklab_to_linear(lightness, a, b):
+    """Oklab back to linear-light sRGB."""
+    lo = lightness + 0.3963377774 * a + 0.2158037573 * b
+    me = lightness - 0.1055613458 * a - 0.0638541728 * b
+    sh = lightness - 0.0894841775 * a - 1.2914855480 * b
+    lo, me, sh = lo ** 3, me ** 3, sh ** 3
+    return (4.0767416621 * lo - 3.3077115913 * me + 0.2309699292 * sh,
+            -1.2684380046 * lo + 2.6097574011 * me - 0.3413193965 * sh,
+            -0.0041960863 * lo - 0.7034186147 * me + 1.7076147010 * sh)
+
+
+def _mix_operand(text):
+    """A color-mix() argument split into its colour and its percentage.
+
+    The percentage is optional, and returns as None when it is absent -- which
+    is not the same as 0%, because the two ends of the mix fill in for each
+    other and an absent one has to be told apart from a zero one to do that.
+    """
+    m = _MIX_PCT_TAIL_RE.search(text)
+    if m:
+        text = text[:m.start()]
+    else:
+        m = _MIX_PCT_HEAD_RE.match(text)
+        if m:
+            text = text[m.end():]
+    return text.strip(), float(m.group(1)) if m else None
+
+
+def _rgb_triple(name):
+    """`name` as an (r, g, b) triple, or None if it is not a flat colour."""
+    resolved = resolve_color(name)
+    if resolved is None:
+        return None
+    try:
+        return canvas_color(resolved)
+    except CanvasError:
+        return None
+
+
+def _color_mix(name):
+    """`color-mix(in <space>, <color> <pct>?, <color> <pct>?)` as a hex
+    string, or None if it is not a mix we can carry out."""
+    args = _color_function_args(name, "color-mix")
+    if not args or len(args) != 3:
+        return None
+    head = args[0].split()
+    if len(head) < 2 or head[0] != "in":
+        return None
+    space = head[1]
+    first, p1 = _mix_operand(args[1])
+    second, p2 = _mix_operand(args[2])
+    # CSS Color 5 sec. 3.2: an omitted percentage is whatever is left over of
+    # 100, both omitted is an even mix, and a pair that does not add up to 100
+    # is normalised. A pair summing to less than 100 is also supposed to leave
+    # the result partly transparent; that part we drop, for the same reason
+    # rgba()'s fourth channel is dropped -- nothing downstream composites.
+    if p1 is None and p2 is None:
+        p1 = p2 = 50.0
+    elif p1 is None:
+        p1 = 100.0 - p2
+    elif p2 is None:
+        p2 = 100.0 - p1
+    total = p1 + p2
+    if total <= 0:
+        return None
+    weight = p2 / total
+    left, right = _rgb_triple(first), _rgb_triple(second)
+    # A side we cannot resolve -- `transparent`, `currentColor`, a function we
+    # have no answer for -- leaves the other side standing rather than voiding
+    # the whole declaration. Mixing towards transparent is exactly the case
+    # the rest of this function already ignores the alpha of.
+    if left is None or right is None:
+        keep = right if left is None else left
+        return None if keep is None else "#%02x%02x%02x" % keep
+    if space in _MIX_GAMMA_SRGB:
+        return "#%02x%02x%02x" % tuple(
+            max(0, min(255, int(round(a + (b - a) * weight))))
+            for a, b in zip(left, right))
+    lin_l = [_srgb_to_linear(c) for c in left]
+    lin_r = [_srgb_to_linear(c) for c in right]
+    if space in _MIX_LINEAR_SRGB:
+        mixed = [a + (b - a) * weight for a, b in zip(lin_l, lin_r)]
+    else:
+        ends = (_linear_to_oklab(*lin_l), _linear_to_oklab(*lin_r))
+        mixed = _oklab_to_linear(
+            *[a + (b - a) * weight for a, b in zip(*ends)])
+    return "#%02x%02x%02x" % tuple(_linear_to_srgb(c) for c in mixed)
+
+
 def resolve_color(name):
     if not name:
         return None
@@ -1006,6 +1152,8 @@ def resolve_color(name):
     if name.startswith("light-dark("):
         args = _color_function_args(name, "light-dark")
         return resolve_color(args[0]) if args else None
+    if name.startswith("color-mix("):
+        return _color_mix(name)
     # Gradients / image() / url() are not flat colors; hand them to the
     # caller (or ignore them) rather than paint an unreadable black box.
     if "gradient(" in name or name.startswith("url(") \
