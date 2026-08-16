@@ -226,6 +226,61 @@ def test_page_scroll_shortcuts_call_scroll():
     eq(stub.calls, [580, -580], "page shortcuts use viewport-sized steps")
 
 
+def _velocity_stub(*ago):
+    """A scroll-tracking stub whose history already holds ticks of 30
+    pixels, each the given number of seconds old."""
+    stub = type("Stub", (), {})()
+    stub.SCROLL_VELOCITY_WINDOW = Browser.SCROLL_VELOCITY_WINDOW
+    now = time.monotonic()
+    stub._scroll_ticks = [(30, now - t) for t in sorted(ago, reverse=True)]
+    stub._scroll_velocity = 0.0
+    return stub
+
+
+def test_scroll_velocity_is_a_speed_not_a_mean_of_the_ticks():
+    # Three 30-pixel ticks over a tenth of a second is 900 px/s. The mean
+    # of the same three ticks is 30 whatever the wheel was doing, which is
+    # why the mean cannot drive a momentum curve.
+    stub = _velocity_stub(0.10, 0.05)
+    Browser._track_scroll_velocity(stub, 30)
+    assert 850 < stub._scroll_velocity < 950, stub._scroll_velocity
+    fast = _velocity_stub(0.02, 0.01)
+    Browser._track_scroll_velocity(fast, 30)
+    assert fast._scroll_velocity > 3 * stub._scroll_velocity, \
+        "a flick three times as quick read the same: %.0f / %.0f" \
+        % (fast._scroll_velocity, stub._scroll_velocity)
+
+
+def test_a_single_scroll_tick_has_no_speed_yet():
+    stub = _velocity_stub()
+    Browser._track_scroll_velocity(stub, 30)
+    eq(stub._scroll_velocity, 0.0, "one tick spans no time")
+    eq(len(stub._scroll_ticks), 1, "the tick was still recorded")
+
+
+def test_the_scroll_history_does_not_grow_for_the_whole_session():
+    # Five hundred ticks from five seconds ago: a browser left scrolling
+    # all afternoon must not still be carrying them, nor summing them.
+    stub = _velocity_stub(*[5.0] * 500)
+    Browser._track_scroll_velocity(stub, 30)
+    eq(len(stub._scroll_ticks), 1, "ticks outside the window were kept")
+    # One inside the window is a different matter -- that one is the flick.
+    stub = _velocity_stub(Browser.SCROLL_VELOCITY_WINDOW / 2)
+    Browser._track_scroll_velocity(stub, 30)
+    eq(len(stub._scroll_ticks), 2, "a tick inside the window was dropped")
+
+
+def test_tracking_a_scroll_does_not_start_a_thread_per_tick():
+    # Fifty ticks is a second of a wheel being spun. The tolerance is for
+    # threads other tests left starting, not for one of ours.
+    before = threading.active_count()
+    stub = _velocity_stub()
+    for _ in range(50):
+        Browser._track_scroll_velocity(stub, 30)
+    assert threading.active_count() <= before + 2, \
+        "%d threads before, %d after" % (before, threading.active_count())
+
+
 def test_error_page_fallback():
     tab = Tab(700)
     # A bad scheme raises in URL(); load() must render an error page, not crash.
@@ -3070,6 +3125,9 @@ class _SelectBrowser(Browser):
         self.active_tab = tab
         self.focus = None
         self.select_popup = SelectPopup()
+        # Real _scroll() tracks velocity, and this double reaches it.
+        self._scroll_ticks = []
+        self._scroll_velocity = 0.0
         self.paints = 0
         self.canvas = type("C", (), {"winfo_width": lambda s: 1000,
                                      "winfo_height": lambda s: 720})()
