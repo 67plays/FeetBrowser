@@ -38,8 +38,8 @@ defaults:
     shell: bash
 
 jobs:
-  # The x86_64 halves of the H.264 and AAC decoders, built on an Intel Mac
-  # because nothing else can build them. gfortran is a real cross-compiler in
+  # The x86_64 halves of feetplayer's decoders, built on an Intel Mac because
+  # nothing else can build them. gfortran is a real cross-compiler in
   # principle and Homebrew's is not one in practice: `brew install gcc` on
   # Apple silicon produces a gfortran that targets aarch64-apple-darwin and
   # nothing else, and Fortran has no equivalent of clang's -arch flag to reach
@@ -56,14 +56,26 @@ jobs:
       - name: gfortran
         run: brew install gcc
 
+      # The sources live in feetplayer now, so they arrive by pip rather than
+      # with the checkout. A venv, because a Homebrew python refuses to
+      # install into itself; the decoders this install compiles are thrown
+      # away and rebuilt below, with the deployment floor on.
+      - name: feetplayer
+        run: |
+          python3 -m venv .venv
+          .venv/bin/python -m pip install --quiet -r requirements.txt
+          echo "PKG=$(.venv/bin/python -c \
+            'import feetplayer, os; print(os.path.dirname(feetplayer.__file__))')" \
+            >> "$GITHUB_ENV"
+
       - name: Build the x86_64 decoders
         run: |
           mkdir -p slice
-          for module in h264 aac; do
-            name=$(python3 -m "feetbrowser.$module" --name)
+          for module in h264 aac ball; do
+            name=$(.venv/bin/python -m "feetplayer.$module" --name)
             # The same floor build.sh gives the x86_64 half of everything else.
             MACOSX_DEPLOYMENT_TARGET=10.13 \
-              python3 -m "feetbrowser.$module" --build "slice/$name"
+              .venv/bin/python -m "feetplayer.$module" --build "slice/$name"
             file "slice/$name"
             lipo -archs "slice/$name"
             otool -L "slice/$name"
@@ -74,10 +86,10 @@ jobs:
       # sees the finished app it is too late to be cheap.
       - name: Decode with them
         run: |
-          cp slice/*.dylib feetbrowser/
-          env PATH=/usr/bin:/bin:/usr/sbin:/sbin python3 -m feetbrowser \
+          cp slice/*.dylib "$PKG/"
+          env PATH=/usr/bin:/bin:/usr/sbin:/sbin .venv/bin/python -m feetbrowser \
             --check-video tests/fixtures/h264/mb1.264 tests/fixtures/h264/mb1.i420.z
-          env PATH=/usr/bin:/bin:/usr/sbin:/sbin python3 -m feetbrowser \
+          env PATH=/usr/bin:/bin:/usr/sbin:/sbin .venv/bin/python -m feetbrowser \
             --check-audio tests/fixtures/aac/lowrate.aac tests/fixtures/aac/lowrate.f32.z
 
       - uses: actions/upload-artifact@v4
@@ -112,6 +124,7 @@ jobs:
         run: |
           echo "FEETBROWSER_H264_X86_64=$PWD/$(echo fortran-x86_64/_h264_*.dylib)" >> "$GITHUB_ENV"
           echo "FEETBROWSER_AAC_X86_64=$PWD/$(echo fortran-x86_64/_aac_*.dylib)" >> "$GITHUB_ENV"
+          echo "FEETBROWSER_BALL_X86_64=$PWD/$(echo fortran-x86_64/_mp3_*.dylib)" >> "$GITHUB_ENV"
 
       # The CPython .pkg is pinned by version and by SHA-256 in build.sh, so
       # a cache hit is the same bytes the hash check would have accepted.

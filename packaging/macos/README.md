@@ -35,18 +35,23 @@ FeetBrowser.app/Contents/
   Resources/lib/feetbrowser/     the browser
   Resources/lib/feetbrowser_engine/
                                  the Rust extension, universal2
-  Resources/lib/feetbrowser/_h264_<digest>.dylib
+  Resources/lib/feetplayer/      the media stack, pip-installed from
+                                 requirements.txt
+  Resources/lib/feetplayer/_h264_<digest>.dylib
                                  the H.264 decoder, compiled, universal2
-  Resources/lib/feetbrowser/_aac_<digest>.dylib
+  Resources/lib/feetplayer/_aac_<digest>.dylib
                                  the AAC decoder, the same way
-  Resources/lib/fortran/         the Fortran both were built from
+  Resources/lib/feetplayer/_mp3_<digest>.dylib
+                                 the MPEG Layer III decoder, the same way
+  Resources/lib/feetplayer/fortran/
+                                 the Fortran all three were built from
   Resources/lib/toes/            where discover_toes() looks
   Frameworks/Python.framework/   CPython 3.13, pruned
 ```
 
 ### Video and sound
 
-`feetbrowser/h264.py` and `feetbrowser/aac.py` compile `fortran/` with
+`feetplayer/h264.py`, `aac.py` and `ball.py` compile their Fortran with
 gfortran the first time a video plays. That is right for a checkout, where
 there is a compiler, and impossible here. Until this was fixed every shipped
 copy of the browser answered `[video: H.264: no gfortran on PATH]` to anyone
@@ -54,30 +59,49 @@ who opened a video, which no developer ever saw, because developers run from
 a checkout. Fixing that for the video decoder alone left the quieter half of
 the same bug: a bundle that played pictures in silence.
 
-So both libraries are built at packaging time -- step 6 -- and ship inside
-the package. Both architectures each: the arm64 halves from the build
-machine's own gfortran, the x86_64 halves from `FEETBROWSER_H264_X86_64` and
-`FEETBROWSER_AAC_X86_64`, which the workflow fills in from a job on
-`macos-15-intel`. gfortran is not a cross-compiler in any form Homebrew
-ships, so the alternative was shipping one architecture's media and not the
-other's.
+feetplayer itself is installed into the bundle in step 6, with pip, from
+`requirements.txt` -- a throwaway venv does the installing, because the
+runner's `python3` is externally managed and `--target` needs a pip that will
+run. That install may well produce libraries of its own, if the build machine
+has a gfortran on PATH, and they are *thin*: pip compiles for the machine it
+is running on and nothing else.
 
-Each is named after a hash of the sources it was built from, and those
-sources ship beside the package. The loader recomputes the hash: a library
-built from a different `fortran/`, or for a different ABI, is not preferred
-over the sources -- it is not found. `-static-libgfortran -static-libgcc
--static-libquadmath` mean neither needs anything from the compiler
-installation, and build.sh checks that with `otool -L` rather than assuming
-it. It also deletes the `LC_RPATH` entries gfortran writes pointing at its
-own Cellar.
+So all three libraries are built again at packaging time and overwrite what
+pip left. Both architectures each: the arm64 halves from the build machine's
+own gfortran, the x86_64 halves from `FEETBROWSER_H264_X86_64`,
+`FEETBROWSER_AAC_X86_64` and `FEETBROWSER_BALL_X86_64`, which the workflow
+fills in from a job on `macos-15-intel`, and `lipo` joins each pair. gfortran
+is not a cross-compiler in any form Homebrew ships, so the alternative was
+shipping one architecture's media and not the other's.
+
+**This is why a pip dependency did not cost universal2.** feetplayer ships
+its Fortran as package data and keeps the `--name` / `--build` interface, so
+the build machine can still produce a slice per architecture; the overwrite
+cannot miss, because the filename is a digest of the sources. `verify.sh`
+fails any Mach-O in the bundle that is missing either architecture, and it
+looks inside `feetplayer/` -- so a build that silently shipped pip's thin
+libraries fails there rather than on a user's Intel Mac.
+
+Each library is named after a hash of the sources it was built from, and
+those sources ship inside the package. The loader recomputes the hash: a
+library built from a different `fortran/`, or for a different ABI, is not
+preferred over the sources -- it is not found. `-static-libgfortran
+-static-libgcc -static-libquadmath` mean none of them needs anything from the
+compiler installation, and build.sh checks that with `otool -L` rather than
+assuming it. It also deletes the `LC_RPATH` entries gfortran writes pointing
+at its own Cellar. A library that appears in `feetplayer/` and is not one of
+the three fails the build by name, because a fourth decoder added upstream
+would otherwise ship for one architecture in silence.
 
 To build them by hand:
 
 ```
-python3 -m feetbrowser.h264 --name              # what it has to be called
-python3 -m feetbrowser.h264 --build path/to/it  # make one
-python3 -m feetbrowser.aac --name               # and the same two for sound
-python3 -m feetbrowser.aac --build path/to/it
+python3 -m feetplayer.h264 --name              # what it has to be called
+python3 -m feetplayer.h264 --build path/to/it  # make one
+python3 -m feetplayer.aac --name               # and the same two for sound
+python3 -m feetplayer.aac --build path/to/it
+python3 -m feetplayer.ball --name              # and for Layer III
+python3 -m feetplayer.ball --build path/to/it
 ```
 
 ### The launcher is a real executable, not a script
@@ -217,15 +241,17 @@ x86_64 and `11.0` for arm64, which is when the hardware arrived -- and
 `lipo`'d. CPython comes universal2 from python.org.
 
 The Fortran decoders are the one thing the build machine cannot produce both
-halves of. gfortran targets the machine it was installed on and Homebrew
-ships no cross-compiler, so the workflow builds the x86_64 slices in a
-separate job on `macos-15-intel`, uploads them, and `build.sh` takes them
-through `FEETBROWSER_H264_X86_64` and `FEETBROWSER_AAC_X86_64` and `lipo`s
-each with the arm64 half it built itself. Building them by hand needs the
-same: two machines, or one and a pair of slices from somewhere. Everything
-else about them -- the flags, the names, the ABI checks -- is the same on
-both architectures and for both decoders, because all four slices go through
-`python3 -m feetbrowser.<module> --build`.
+halves of, and a pip install cannot either: pip compiles for the machine it
+runs on. gfortran targets the machine it was installed on and Homebrew ships
+no cross-compiler, so the workflow builds the x86_64 slices in a separate job
+on `macos-15-intel`, uploads them, and `build.sh` takes them through
+`FEETBROWSER_H264_X86_64`, `FEETBROWSER_AAC_X86_64` and
+`FEETBROWSER_BALL_X86_64` and `lipo`s each with the arm64 half it built
+itself, over the top of whatever the install left. Building them by hand
+needs the same: two machines, or one and a set of slices from somewhere.
+Everything else about them -- the flags, the names, the ABI checks -- is the
+same on both architectures and for all three decoders, because all six slices
+go through `python3 -m feetplayer.<module> --build`.
 
 `lipo -archs` proves a slice exists, not that it works, so
 `.github/workflows/package-macos.yml` mounts the image on an Intel runner
@@ -313,7 +339,13 @@ Run either by hand against any bundle, including one copied off a mounted
   compares the frame it decodes with the picture in `tests/fixtures/h264/`
   byte for byte and the samples it decodes with the reference floats in
   `tests/fixtures/aac/`. Two checks, because they are two libraries, and
-  because a bundle with only the first one plays pictures in silence,
+  because a bundle with only the first one plays pictures in silence. Those
+  four fixtures are committed in this repository for this reason and are read
+  by nothing in `tests/`,
+* a bundle with no `feetplayer` in it at all, which is the new way to get
+  this wrong now that the media stack is a pip dependency: `verify.sh`
+  requires `Resources/lib/feetplayer/mediacodec.py` and the Fortran sources
+  beside it, and the decode checks above fail without them,
 * Tcl, Tk or `_tkinter`.
 
 Paths belonging to *upstream* CPython's own build machine are reported and

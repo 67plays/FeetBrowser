@@ -71,7 +71,8 @@ for want in \
   "Resources/FeetBrowser.icns" \
   "Resources/certs/cacert.pem" \
   "Frameworks/Python.framework/Versions/3.13/Python" \
-  "Resources/lib/feetbrowser/__main__.py" ; do
+  "Resources/lib/feetbrowser/__main__.py" \
+  "Resources/lib/feetplayer/mediacodec.py" ; do
   if [ -e "$contents/$want" ]; then note "ok  $want"; else bad "missing $want"; fi
 done
 engine=$(find "$contents/Resources/lib" -name 'feetbrowser_engine*.so' | head -1)
@@ -90,27 +91,33 @@ done
 
 echo
 echo "== video and sound"
-# The regression this exists for is invisible from a checkout. h264.py and
-# aac.py fall back to compiling fortran/ with gfortran, which every developer
-# has and no user does, so a bundle that shipped no decoder passes every
-# other check here, starts, renders, and only admits it when somebody opens a
-# video -- by which time it is a download. So the app is asked, in the app.
+# The regression this exists for is invisible from a checkout. feetplayer's
+# h264.py and aac.py fall back to compiling their Fortran with gfortran, which
+# every developer has and no user does, so a bundle that shipped no decoder
+# passes every other check here, starts, renders, and only admits it when
+# somebody opens a video -- by which time it is a download. So the app is
+# asked, in the app.
 #
 # Both decoders, separately. They are two libraries built from two sets of
 # sources, and a bundle that carries one of them is the failure that reads as
 # "the video player is broken" rather than as "this app cannot decode AAC":
 # pictures, and silence.
-if [ -d "$contents/Resources/lib/fortran" ]; then
-  note "ok  Resources/lib/fortran (the sources the decoders' names are a hash of)"
+#
+# feetplayer is a pip dependency rather than part of this repository, so the
+# whole of it -- the package, the libraries and the sources their names are a
+# hash of -- is installed into Resources/lib and this is where that install is
+# checked to have happened.
+if [ -d "$contents/Resources/lib/feetplayer/fortran" ]; then
+  note "ok  Resources/lib/feetplayer/fortran (the sources the decoders' names are a hash of)"
 else
-  bad "missing Resources/lib/fortran"
+  bad "missing Resources/lib/feetplayer/fortran"
 fi
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # what it is called, which prebuilt to look for, and the fixtures that prove
 # what it decodes rather than merely that it loaded.
 check_decoder() {
   local what="$1" glob="$2" flag="$3" vector="$4" truth="$5" found args out
-  found=$(find "$contents/Resources/lib/feetbrowser" -name "$glob" -type f | head -1)
+  found=$(find "$contents/Resources/lib/feetplayer" -name "$glob" -type f | head -1)
   if [ -n "$found" ]; then
     note "ok  ${found#"$app"/}"
   else

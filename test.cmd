@@ -50,6 +50,17 @@ rem watchdog turns a hang into every thread's stack and a non-zero exit.
 rem See tests\watchdog.py; FEETBROWSER_TEST_TIMEOUT overrides the number.
 set RUN=%PY% tests\watchdog.py 900
 
+rem feetplayer, the media stack: the container readers, the audio output and
+rem the Fortran decoders, which used to live in this tree and are their own
+rem repository now. requirements.txt pins it to a commit; pip compiles the
+rem Fortran during the install, which takes a minute, so the pin installed is
+rem compared against the pin asked for and nothing is done when they agree.
+rem "pip freeze" prints a VCS install as the requirement line that produced
+rem it, which is why the comparison is a plain string match.
+for /f "usebackq delims=" %%L in (`findstr /v /r /c:"^ *#" /c:"^ *$" requirements.txt`) do set "WANT=%%L"
+"%PY%" -m pip freeze 2>nul | findstr /x /c:"%WANT%" >nul
+if errorlevel 1 "%PY%" -m pip install -q -r requirements.txt || exit /b 1
+
 rem Ensure the Rust JS engine (feetbrowser_engine) is built in the local venv.
 "%PY%" -c "import feetbrowser_engine" >nul 2>&1
 if not errorlevel 1 goto built
@@ -85,8 +96,8 @@ rem one that skips everywhere else.
 %RUN% tests\test_cocoa.py || exit /b 1
 %RUN% tests\test_x11.py || exit /b 1
 %RUN% tests\test_win32.py || exit /b 1
-rem The audio stack. The waveOut backend is the one that only runs here; the
-rem live half needs a real output device and skips when there is not one.
+rem A <video> element's soundtrack, and the pictures that follow it. The
+rem audio stack itself is feetplayer's now, and is tested there.
 %RUN% tests\test_audio.py || exit /b 1
 %RUN% tests\test_units.py || exit /b 1
 rem The version guard release.yml runs before it builds anything.
@@ -101,16 +112,6 @@ rem A fixture page in, its pixels back out.
 rem No assembler here, so this checks the pure-Python fallback.
 %RUN% tests\test_asmx11.py || exit /b 1
 %RUN% tests\test_asmselect.py || exit /b 1
-rem The Fortran H.264 decoder. Windows has no gfortran unless someone put one
-rem there, so this usually checks that the browser survives not having one.
-%RUN% tests\test_h264.py || exit /b 1
-rem The Fortran AAC decoder, and the same arrangement about gfortran.
-%RUN% tests\test_aac.py || exit /b 1
-rem The Fortran MPEG Layer III decoder, and the same arrangement again.
-%RUN% tests\test_mp3.py || exit /b 1
-rem PCM, which needs no compiler anywhere: the fixtures are containers and
-rem the truth beside them, and the assertions are equalities.
-%RUN% tests\test_pcm.py || exit /b 1
 %RUN% tests\smoke.py || exit /b 1
 exit /b 0
 

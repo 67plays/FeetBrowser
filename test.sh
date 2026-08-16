@@ -41,6 +41,18 @@ elif grep -qi '^include-system-site-packages *= *false' .venv/pyvenv.cfg 2>/dev/
   python3 -m venv --system-site-packages .venv
 fi
 
+# feetplayer, in the same venv: the H.264, AAC and MP3 decoders, the container
+# readers and the three audio backends, which used to live in this tree and
+# are their own repository now. requirements.txt pins it to a commit; pip
+# compiles its Fortran during the install, which takes a minute, so the pin
+# already installed is compared against the pin asked for and nothing is done
+# when they agree. `pip freeze` prints a VCS install as the requirement line
+# that produced it, which is why the comparison is a plain string match.
+want=$(grep -v '^[[:space:]]*#' requirements.txt | grep -v '^[[:space:]]*$')
+if ! .venv/bin/python -m pip freeze 2>/dev/null | grep -qxF "$want"; then
+  .venv/bin/python -m pip install -q -r requirements.txt
+fi
+
 # The Rust engine, in the venv the rest of the suite runs from, rebuilt
 # whenever rust/ has moved on since. Importing it successfully is not enough.
 # An extension compiled from an older tree runs perfectly well and fails the
@@ -81,7 +93,7 @@ $run tests/test_render.py
 $run tests/test_cocoa.py   # opens real windows on macOS, skips elsewhere
 $run tests/test_x11.py     # opens real windows under X11, skips elsewhere
 $run tests/test_win32.py   # opens real windows on Windows, skips elsewhere
-$run tests/test_audio.py   # plays real sound where there is a device, skips elsewhere
+$run tests/test_audio.py   # a <video> element's soundtrack, and the pictures that follow it
 $run tests/test_units.py
 $run tests/test_release_version.py  # the guard release.yml runs first
 $run tests/test_js.py
@@ -92,10 +104,6 @@ $run tests/test_nav.py
 $run tests/test_toes.py
 $run tests/test_asmx11.py    # raw assembly on Linux/x86-64, Python elsewhere
 $run tests/test_asmselect.py # the selection nearest-boundary kernel
-$run tests/test_h264.py      # the Fortran H.264 decoder, or the skip where there is no gfortran
-$run tests/test_aac.py       # the Fortran AAC decoder, against FFmpeg's samples
-$run tests/test_mp3.py       # the Fortran MPEG Layer III decoder, likewise
-$run tests/test_pcm.py       # uncompressed sound, against the waveform it was made from
 $run tests/smoke.py
 
 

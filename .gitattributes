@@ -2,27 +2,17 @@
 # ever used on Windows. Everything else keeps LF whatever the checkout.
 *.cmd text eol=crlf
 
-# Fortran 77 common blocks are included with .inc, an extension shared with
-# Pascal/Delphi, which makes Linguist guess and then misreport the language
-# breakdown. These three headers are Fortran; say so.
-fortran/*.inc linguist-language=Fortran
-
-# The H.264, AAC and MP3 test vectors, and the pictures and samples a reference
+# The H.264 and AAC test vectors, and the picture and the samples a reference
 # decoder made from them. A newline translated anywhere in any of these is a
 # decoder bug that only appears on one platform, so none of them is ever
 # text.
+#
+# Four files, and they are here because the packagers decode them inside a
+# finished bundle -- see docs/testing.md. The rest of the media vectors moved
+# to feetplayer along with the decoders, and the rules that keep them binary
+# moved with them -- as did the linguist-language rule for fortran/*.inc,
+# because there is no fortran/ in this repository for it to apply to now.
 *.264 binary
 *.i420.z binary
-*.mp4 binary
 *.aac binary
-*.mp3 binary
 *.f32.z binary
-
-# And the PCM vectors, for the same reason twice over: a container whose
-# byte offsets moved is not a container, and the whole point of the source
-# waveform beside them is that it is compared sample for sample.
-*.mov binary
-*.avi binary
-*.wav binary
-*.s16le.z binary
-*.u8.z binary

@@ -40,7 +40,7 @@ from . import shoes as shoes
 from . import settings as settings
 from . import downloads as downloads
 from . import media
-from . import arch
+from feetplayer import arch
 from .jsdom import JSDocument, JSLocation, _JSStaticProps, _JSComputedStyle
 from .jsengine import Interpreter, JSException, UNDEFINED
 from . import toes as toes

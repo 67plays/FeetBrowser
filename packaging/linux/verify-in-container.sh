@@ -91,9 +91,11 @@ ls -l "$OUT/images.png"
 
 say "video and sound, on a machine with no compiler"
 # The part of the browser that used to be missing from every shipped copy and
-# from no checkout. h264.py and aac.py fall back to compiling fortran/ with
-# gfortran, which every developer has and this container does not, so a
-# bundle that shipped no decoder would pass every other check above, start,
+# from no checkout. feetplayer's h264.py and aac.py fall back to compiling
+# their Fortran with gfortran, which every developer has and this container
+# does not, so a bundle that shipped no decoder -- or that shipped no
+# feetplayer at all, which is the new way to get this wrong now that it is a
+# pip dependency -- would pass every other check above, start,
 # render, and only admit it to a user who opened a video. --check-video
 # decodes tests/fixtures/h264/mb1.264 inside the bundle and compares the
 # result with the picture a reference decoder produced, byte for byte: a

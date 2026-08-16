@@ -33,11 +33,15 @@ run.cmd                  :: Windows: the same script for cmd.exe
 run.cmd https://example.com
 ```
 
-No GUI toolkit to install: just Python 3 and a system font. The one thing
-that does get built is the engine: `run.sh` and `run.cmd` compile the Rust
-extension (`feetbrowser_engine`) into a local `.venv` when it isn't
-importable, so a first run needs the Rust toolchain (the script installs
-`maturin` into the venv for you). On Windows it needs a C++ linker as well,
+No GUI toolkit to install: just Python 3 and a system font. Two things do
+get installed into a local `.venv` on a first run, and the scripts do both
+for you: the Rust extension (`feetbrowser_engine`) is compiled there when it
+isn't importable, so a first run needs the Rust toolchain (the script
+installs `maturin` into the venv for you); and
+[feetplayer](https://github.com/67plays/feetplayer) -- the media stack, our
+own code in a repository of its own -- is installed from
+[`requirements.txt`](requirements.txt), which pins it to a commit sha.
+On Windows the first run needs a C++ linker as well,
 which rustup does not bring with it; [usage.md](docs/usage.md) has the one
 download and the one checkbox. Once the extension is built and installed
 for the interpreter you're invoking, `python3 -m feetbrowser <url>` works
@@ -89,7 +93,8 @@ To render a page to a PNG without opening a window:
 - [Usage & shortcuts](docs/usage.md)
 - [Architecture: how the engine works](docs/architecture.md)
 - [The rendering engine: fonts, rasteriser, pixels](docs/rendering.md)
-- [Video: Motion JPEG, H.264 in Fortran, and the gaps](docs/media.md)
+- [Video: Motion JPEG, H.264 in Fortran, and the gaps](docs/media.md) --
+  and where the decoders now live
 - [Extensions (Toes & ToeHub)](docs/toes.md)
 - [What it does and doesn't do](docs/limitations.md)
 - [Running the tests](docs/testing.md)

@@ -29,14 +29,23 @@ first `run.cmd` stops at ``error: linker `link.exe` not found`` until the
 Visual Studio build tools are installed. See [usage.md](usage.md) for the
 exact download and the one workload to tick.
 
+The media stack is a second thing to install, and it is not optional: the
+decoders, the containers and the audio output live in
+[feetplayer](https://github.com/67plays/feetplayer), pinned to a commit sha
+in `requirements.txt`, and `feetbrowser/media.py` imports it. `run.sh` and
+`run.cmd` install it into the same `.venv` they build the engine into, and
+say so if they cannot.
+
 `gfortran` is a second compiler the build can use, and unlike Rust it is
-optional in the real sense: the H.264 decoder in `fortran/` is compiled on
-demand and cached, and a machine without a Fortran compiler gets a browser
-that reports H.264 as a codec it does not have. Nothing else in the tree
-depends on it, and the test suite passes either way. It is not optional for
+optional in the real sense: the decoders inside feetplayer are Fortran,
+compiled while pip installs the package or on demand afterwards and cached,
+and a machine without a Fortran compiler gets a browser that reports H.264,
+AAC and MP3 as codecs it does not have. Nothing else in the tree depends on
+it, and the test suite passes either way. It is not optional for
 *packaging*, though: the `.app`, the AppImage and the Windows bundle each
-compile the decoder at build time and ship it, because a user has no
-compiler and a bundle without it is a browser that cannot play video.
+compile the decoders at build time and ship them inside the installed
+feetplayer, because a user has no compiler and a bundle without them is a
+browser that cannot play video.
 
 The GNU toolchain is a real alternative rather than a dead end, which is worth
 saying because the opposite is usually assumed: official CPython is built with
@@ -77,7 +86,7 @@ bare `.mjpeg` file of JPEGs end to end), along with uncompressed `BI_RGB`,
 run-length `BI_RLE8`, and QuickTime's `raw ` and `png `. It plays and pauses
 on a click, and `<video controls>` gets a real transport bar with a play
 button, a scrubber you can seek with and a time readout. H.264 decodes too,
-by the decoder in `fortran/`, exact to the sample against a reference one:
+by feetplayer's Fortran decoder, exact to the sample against a reference one:
 I, P and B slices, which is what an ordinary well-compressed web MP4 is
 made of, including the reordering that B frames force between decode order
 and the order a viewer sees. What is missing there is CAVLC, so a Baseline

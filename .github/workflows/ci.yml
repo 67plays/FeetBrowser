@@ -77,11 +77,12 @@ jobs:
           $PY tests/test_x11.py
           $PY tests/test_win32.py
 
-      # The audio stack. Its pure half -- ring, resampler, mixer, clock --
-      # is nearly all of it and runs everywhere; the live half needs an
-      # output device that actually consumes samples, which no runner has,
-      # so it skips and says so. What this checks on a runner is that a
-      # machine with no sound card ends up silent-but-working.
+      # The browser's half of the audio seam: a <video> element that has a
+      # soundtrack, and the pictures that have to follow it. The audio stack
+      # itself -- ring, resampler, mixer, clock, backends -- is feetplayer's
+      # now and is tested in that repository. One of these decodes real AAC
+      # out of a real MP4 with the Fortran decoder, on all three runners, so
+      # this is also where the installed feetplayer is proved to work.
       - name: Audio tests
         run: $PY tests/test_audio.py
 
@@ -113,42 +114,6 @@ jobs:
         run: $PY tests/test_asmx11.py
       - name: Assembly selection nearest-boundary kernel
         run: $PY tests/test_asmselect.py
-
-      # The Fortran H.264 decoder, against pixel-exact ground truth from a
-      # reference decoder. All three runners turn out to have a gfortran,
-      # so all three decode, and the vectors are checked against three
-      # compilers on three operating systems rather than one. The other
-      # half, a machine with no Fortran toolchain at all, is not something
-      # a runner can be relied on to be: test_h264.py takes the loaded
-      # library away itself and asserts the browser still works without it.
-      - name: H.264 decoder
-        run: $PY tests/test_h264.py
-
-      # The Fortran AAC-LC decoder, against PCM from the same reference
-      # decoder. Three compilers on three operating systems is worth more
-      # here than it is for H.264: AAC is not a bit-exact standard, so what
-      # is being checked across the three is that the transform lands inside
-      # the same tolerance wherever it is built, not just on the machine the
-      # vectors were measured on.
-      - name: AAC decoder
-        run: $PY tests/test_aac.py
-
-      # The Fortran MPEG Layer III decoder, on the same argument, and with
-      # one more reason behind it: Layer III's bit reservoir means a frame's
-      # main data can live in frames already gone past, so a build whose
-      # integer arithmetic differs anywhere does not merely drift, it reads
-      # the wrong bytes. Eighteen vectors, each held to a threshold set from
-      # what it measured, catch that on whichever machine it happens on.
-      - name: MP3 decoder
-        run: $PY tests/test_mp3.py
-
-      # Uncompressed sound in MP4/MOV, AVI and WAV. Unlike AAC this is exact
-      # everywhere -- there is no transform in it to round differently on a
-      # different compiler -- so a disagreement between the three operating
-      # systems here would be a byte-order bug in the reader, which is the
-      # one thing about PCM worth running on three machines to catch.
-      - name: PCM audio
-        run: $PY tests/test_pcm.py
 
       # The check this whole file was rebuilt for. A page with text, a PNG,
       # a GIF, a background and a border is fetched from a local server and

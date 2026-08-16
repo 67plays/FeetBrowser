@@ -12,15 +12,18 @@
 # codesign, iconutil, hdiutil, security -- ships with macOS. What the build
 # machine needs beyond that is a C compiler (the Command Line Tools, which
 # building the Rust engine already requires), a Rust toolchain with both
-# Apple targets installed, and a gfortran for the H.264 and AAC decoders
-# (brew install gcc). gfortran only ever targets the machine it is on, so the
-# other architecture's half of each decoder has to be built on the other
-# architecture and handed over -- see step 6.
+# Apple targets installed, a pip that can reach the network (feetplayer is a
+# dependency now, not a directory in this checkout -- see step 6), and a
+# gfortran for the decoders inside it (brew install gcc). gfortran only ever
+# targets the machine it is on, so the other architecture's half of each
+# decoder has to be built on the other architecture and handed over.
 #
 #   packaging/macos/build.sh              build the .app and the .dmg
 #   FEETBROWSER_SKIP_DMG=1 ...build.sh    stop after the .app
 #   FEETBROWSER_H264_X86_64=/path/to/lib  the x86_64 decoder, built elsewhere
 #   FEETBROWSER_H264_ARM64=/path/to/lib   the arm64 one, likewise
+#   FEETBROWSER_AAC_*, FEETBROWSER_BALL_* the same, for sound and for MP3
+#   FEETBROWSER_PYTHON=/path/to/python3   the python that installs feetplayer
 #
 # Everything lands in packaging/macos/build (working files, including a cache
 # of the downloaded CPython) and packaging/macos/dist (the .app and .dmg).
@@ -288,39 +291,75 @@ find "$applib/feetbrowser" -name __pycache__ -type d -exec rm -rf {} +
 mkdir -p "$applib/toes"
 cp "$root/toes/README.md" "$applib/toes/"
 
-# -- 6. the Fortran decoders -------------------------------------------------
+# -- 6. feetplayer and its Fortran decoders ----------------------------------
 #
-# fortran/ is FORTRAN 77: eleven sources and an include file that
-# feetbrowser/h264.py compiles the first time a video plays, and five and an
-# include file that feetbrowser/aac.py compiles the first time one has sound.
+# feetplayer is the media stack -- the container readers, the audio output and
+# the H.264, AAC and MPEG Layer III decoders. It used to be part of this tree
+# and is a separate repository now, pinned to a commit in requirements.txt, so
+# it is installed into the bundle like the dependency it became rather than
+# copied out of the checkout.
+#
+# The decoders in it are FORTRAN 77, and pip compiles them while it installs.
 # That works from a checkout, where there is a compiler; it cannot work in a
 # shipped app, where there is not. Left alone the app starts, renders, and
 # says "[video: H.264: no gfortran on PATH]" the first time anyone opens a
 # video -- which no developer ever sees, because developers run from a
 # checkout.
 #
-# Both decoders, and for the same reason. Shipping only the video half is
-# not half a fix: it produces an app that plays pictures in silence, which
-# looks like a bug in the player rather than like a missing decoder, and it
-# is the state this section was in until the sound half was added.
+# All three, and for the same reason. Shipping only the video half is not
+# half a fix: it produces an app that plays pictures in silence, which looks
+# like a bug in the player rather than like a missing decoder, and it is the
+# state this section was in until the sound half was added.
 #
-# So the libraries are built here, by a gfortran only this machine needs, and
-# ship inside the package under the names h264.py and aac.py look for. The
-# sources ship as well, beside the package like toes/ -- 250K, and each name
-# is a hash of them, so the two cannot come apart. See prebuilt_name() for
-# why that is the whole guarantee.
+# universal2 is the part the move nearly cost and did not. The install runs
+# one gfortran, this machine's, which targets one architecture, so the
+# libraries pip leaves behind are thin -- and a thin library in a universal
+# app is exactly the regression that ships quietly. They are not what ships.
+# feetplayer carries its Fortran sources as package data and keeps the same
+# `--name` and `--build` command line this section has always used, so every
+# slice is still built right here, per architecture, and lipo'd over the thin
+# one pip left. Each name is a digest of the sources it was built from, so
+# the overwrite is guaranteed to land on the file the loader will open, and a
+# library and its sources cannot come apart. See prebuilt_name() for why that
+# is the whole guarantee.
 #
-# Both architectures, like everything else in here. The build machine's
-# gfortran only targets its own -- gfortran does not cross-compile on Darwin
-# and Homebrew's does not pretend to -- so the other half comes from
-# FEETBROWSER_H264_<ARCH> and FEETBROWSER_AAC_<ARCH> when they are set, which
-# is how the workflow hands the x86_64 slices over from the Intel runner, and
-# otherwise from any gfortran on PATH that targets it.
+# verify.sh then requires both architectures of every Mach-O in the bundle,
+# which is what keeps this honest: a slice that failed to be replaced fails
+# the build rather than reaching a user with half a decoder.
+#
+# The build machine's gfortran only targets its own architecture -- gfortran
+# does not cross-compile on Darwin and Homebrew's does not pretend to -- so
+# the other half comes from FEETBROWSER_H264_<ARCH>, FEETBROWSER_AAC_<ARCH>
+# and FEETBROWSER_BALL_<ARCH> when they are set, which is how the workflow
+# hands the x86_64 slices over from the Intel runner, and otherwise from any
+# gfortran on PATH that targets it.
+
+say "installing feetplayer"
+# A throwaway venv rather than the host's pip or the bundled interpreter's.
+# The bundled one has had ensurepip pruned out of it above; the host's is
+# refused outright by any python installed from Homebrew or a distribution,
+# which mark themselves externally managed. A venv's pip is neither, and
+# which interpreter does the installing does not matter: feetplayer has no C
+# extension in it -- the Fortran is loaded with ctypes from beside the package
+# -- so --target lays down the same directory whichever python runs it, and
+# every compiled thing in that directory is replaced below anyway.
+"${FEETBROWSER_PYTHON:-python3}" -m venv "$work/pip"
+"$work/pip/bin/python" -m pip install --quiet --target "$applib" \
+  --no-compile -r "$root/requirements.txt"
+find "$applib" -maxdepth 1 -name '*.dist-info' -type d -exec rm -r {} +
+find "$applib/feetplayer" -name __pycache__ -type d -exec rm -r {} +
+# The sources, not only the libraries: they are what the slices below are
+# built from, and their absence would otherwise be discovered one line later
+# as a confusing gfortran error.
+[ -d "$applib/feetplayer/fortran" ] || {
+  echo "feetplayer installed without its Fortran sources" >&2
+  exit 1
+}
 
 say "the Fortran decoders"
-ditto "$root/fortran" "$applib/fortran"
-h264name=$(PYTHONPATH="$applib" "$pybin" -m feetbrowser.h264 --name)
-aacname=$(PYTHONPATH="$applib" "$pybin" -m feetbrowser.aac --name)
+h264name=$(PYTHONPATH="$applib" "$pybin" -m feetplayer.h264 --name)
+aacname=$(PYTHONPATH="$applib" "$pybin" -m feetplayer.aac --name)
+ballname=$(PYTHONPATH="$applib" "$pybin" -m feetplayer.ball --name)
 
 # The first gfortran on PATH that targets $1, or nothing. gfortran calls
 # arm64 aarch64, hence the second pattern.
@@ -373,7 +412,7 @@ decoder_slice() {
     }
     echo "$module $arch: $("$fc" -dumpmachine) ($fc)"
     MACOSX_DEPLOYMENT_TARGET=$min PYTHONPATH="$applib" \
-      "$pybin" -m "feetbrowser.$module" --build "$slice" --fc "$fc" >/dev/null
+      "$pybin" -m "feetplayer.$module" --build "$slice" --fc "$fc" >/dev/null
   fi
   # gfortran writes the path to its own runtime into the library as an
   # LC_RPATH -- on this machine, a directory under whoever's Homebrew Cellar
@@ -409,25 +448,46 @@ for arch in arm64 x86_64; do
     arm64)  min=$MIN_MACOS_ARM
             h264slice="${FEETBROWSER_H264_ARM64:-}"
             aacslice="${FEETBROWSER_AAC_ARM64:-}"
+            ballslice="${FEETBROWSER_BALL_ARM64:-}"
             hint="${FEETBROWSER_GFORTRAN_ARM64:-}" ;;
     x86_64) min=$MIN_MACOS_X86
             h264slice="${FEETBROWSER_H264_X86_64:-}"
             aacslice="${FEETBROWSER_AAC_X86_64:-}"
+            ballslice="${FEETBROWSER_BALL_X86_64:-}"
             hint="${FEETBROWSER_GFORTRAN_X86_64:-}" ;;
   esac
   decoder_slice h264 "$h264name" "$arch" "$min" "$hint" "$h264slice"
   decoder_slice aac  "$aacname"  "$arch" "$min" "$hint" "$aacslice"
+  decoder_slice ball "$ballname" "$arch" "$min" "$hint" "$ballslice"
 done
 
-for module in h264 aac; do
+# Over the top of the thin ones pip left behind, and under the same names,
+# because a name is a digest of the sources both were built from -- so this
+# cannot miss, and cannot land on something built from anything else.
+for module in h264 aac ball; do
   case $module in
     h264) name=$h264name ;;
     aac)  name=$aacname ;;
+    ball) name=$ballname ;;
   esac
   lipo -create "$work/$module/arm64/$name" "$work/$module/x86_64/$name" \
-    -output "$applib/feetbrowser/$name"
-  lipo -info "$applib/feetbrowser/$name"
+    -output "$applib/feetplayer/$name"
+  lipo -info "$applib/feetplayer/$name"
 done
+
+# Nothing thin may survive into the bundle, and the one way one could is a
+# library pip built whose name no loop above knows -- a decoder added to
+# feetplayer since this script was last read. verify.sh catches it at the end
+# by refusing any Mach-O that is not both architectures; saying so here says
+# which file it is and what to do about it.
+while IFS= read -r stray; do
+  case "$(basename "$stray")" in
+    "$h264name"|"$aacname"|"$ballname") continue ;;
+  esac
+  echo "feetplayer installed $stray, which this script does not build" >&2
+  echo "add it to the loops above, or it ships for one architecture" >&2
+  exit 1
+done < <(find "$applib/feetplayer" \( -name '*.dylib' -o -name '*.so' \) -type f)
 
 # -- 7. certificates ---------------------------------------------------------
 #

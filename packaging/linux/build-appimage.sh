@@ -151,38 +151,71 @@ rm -rf "$SITE"/*.dist-info
 
 cp "$SRC/packaging/linux/launcher.py" "$APPDIR/usr/lib/feetbrowser/launcher.py"
 
-# The two Fortran decoders. feetbrowser/h264.py and feetbrowser/aac.py compile
-# fortran/ with gfortran the first time a video or a soundtrack plays, which
-# is fine in a checkout and impossible in an AppImage: the image is read-only
-# and the user has no compiler. Left alone the browser starts, renders, and
-# says "[video: H.264: no gfortran on PATH]" to anyone who opens a video -- a
+# feetplayer, and the Fortran decoders inside it. It is the media stack --
+# the container readers, the audio output and the H.264, AAC and MPEG Layer
+# III decoders -- and it used to be part of this tree. It is a separate
+# repository now, pinned to a commit in requirements.txt, so it arrives by pip
+# rather than out of the checkout. The container's pip does the installing;
+# the interpreter built above has none, on purpose, and does not need one
+# here: feetplayer has no C extension in it, so --target lays down the same
+# directory whichever python runs it.
+#
+# The decoders it carries are compiled by gfortran, which is fine in a
+# checkout and impossible in an AppImage: the image is read-only and the user
+# has no compiler. Left alone the browser starts, renders, and says
+# "[video: H.264: no gfortran on PATH]" to anyone who opens a video -- a
 # failure no developer ever sees, because developers have gfortran.
 #
-# Both of them, because shipping only the video half produces an AppImage
-# that plays pictures in silence, which reads as a broken player rather than
-# as a missing decoder.
+# All of them, because shipping only the video half produces an AppImage that
+# plays pictures in silence, which reads as a broken player rather than as a
+# missing decoder.
 #
-# So they are compiled here and shipped inside the package, each under a name
-# that is a hash of the sources it was built from; the sources ship beside the
-# package so the loader can recompute those hashes and refuse a mismatch. This
-# runs before the private-library step on purpose: if gfortran's runtime could
-# not be linked in statically -- manylinux_2_28's libgfortran.a is not built
-# -fPIC and cannot go into a shared object at all -- what is left is an
+# pip's install compiles them already. They are built again here anyway, and
+# explicitly: an install that quietly found no gfortran leaves a package that
+# imports perfectly and decodes nothing, and the build has to stop at that
+# rather than ship it. Each is named after a hash of the sources it was built
+# from, and the sources ship inside the package, so the loader can recompute
+# those hashes and refuse a mismatch.
+#
+# This runs before the private-library step on purpose: if gfortran's runtime
+# could not be linked in statically -- manylinux_2_28's libgfortran.a is not
+# built -fPIC and cannot go into a shared object at all -- what is left is an
 # ordinary NEEDED entry, which collect() will bundle and the rpath pass will
 # point at $ORIGIN, and either way nothing outside the image is required.
-step "the Fortran decoders"
-(cd "$SRC" && tar cf - fortran) | (cd "$SITE" && tar xf -)
-H264=$(PYTHONPATH="$SITE" "$PY" -m feetbrowser.h264 --name)
-PYTHONPATH="$SITE" "$PY" -m feetbrowser.h264 --build "$SITE/feetbrowser/$H264"
-AAC=$(PYTHONPATH="$SITE" "$PY" -m feetbrowser.aac --name)
-PYTHONPATH="$SITE" "$PY" -m feetbrowser.aac --build "$SITE/feetbrowser/$AAC"
-for lib in "$H264" "$AAC"; do
-  file "$SITE/feetbrowser/$lib"
+step "feetplayer and the Fortran decoders"
+pip install --quiet --target "$SITE" --no-compile -r "$SRC/requirements.txt"
+rm -rf "$SITE"/*.dist-info
+[ -d "$SITE/feetplayer/fortran" ] || {
+  echo "feetplayer installed without its Fortran sources" >&2
+  exit 1
+}
+built=""
+for module in h264 aac ball; do
+  lib=$(PYTHONPATH="$SITE" "$PY" -m "feetplayer.$module" --name)
+  PYTHONPATH="$SITE" "$PY" -m "feetplayer.$module" --build "$SITE/feetplayer/$lib"
+  file "$SITE/feetplayer/$lib"
   # What it still needs, printed here and dealt with by collect() below. A
   # NEEDED libgfortran.so.5 in this list is expected on manylinux and is not
   # a failure; anything left unresolved after the rpath pass would be, and
   # the self-test at step 9 is what would catch it.
-  ldd "$SITE/feetbrowser/$lib"
+  ldd "$SITE/feetplayer/$lib"
+  built="$built $lib"
+done
+
+# If feetplayer ever grows a fourth decoder, pip will have compiled it with
+# the container's toolchain and the loop above will not have touched it. That
+# is exactly the library that would ship unrebuilt and unchecked, so say so
+# here rather than find out from a user.
+for lib in "$SITE"/feetplayer/*.so; do
+  [ -e "$lib" ] || continue
+  case " $built " in
+    *" $(basename "$lib") "*) ;;
+    *)
+      echo "unexpected library in feetplayer: $(basename "$lib")" >&2
+      echo "the build loop above knows only h264, aac and ball" >&2
+      exit 1
+      ;;
+  esac
 done
 
 # -- 5. fonts ---------------------------------------------------------------

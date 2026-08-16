@@ -1,8 +1,8 @@
 name: Build FeetBrowser
 description: >
   Everything a job needs before it can run a test: an interpreter, a system
-  font, and the Rust JS engine built into a local .venv. Sets $PY to that
-  venv's interpreter, so a step reads the same on every runner.
+  font, feetplayer, and the Rust JS engine built into a local .venv. Sets $PY
+  to that venv's interpreter, so a step reads the same on every runner.
 
 inputs:
   python-version:
@@ -27,18 +27,21 @@ runs:
       with:
         python-version: ${{ inputs.python-version }}
         cache: pip
-        cache-dependency-path: rust/pyproject.toml
+        cache-dependency-path: |
+          rust/pyproject.toml
+          requirements.txt
 
     # No Tk and no Xvfb for most of the suite: rendering is our own and runs
     # with no display. The one outside requirement is a system font, which
     # macOS and Windows ship and a bare Linux image does not.
     #
-    # gfortran is here for the H.264 decoder, which is Fortran compiled on
-    # demand -- see feetbrowser/h264.py. It is a build-time requirement and
-    # never a runtime one: without it the browser reports H.264 as an
-    # undecodable codec and everything else works, which is a path the
-    # suite tests on purpose. Installing it here means CI checks the
-    # decoder rather than the skip.
+    # gfortran is here for the decoders in feetplayer, which are Fortran and
+    # are compiled by pip while it installs the package -- see
+    # requirements.txt. It is an install-time requirement and never a runtime
+    # one: without it feetplayer installs with no libraries beside it, the
+    # browser reports H.264 and AAC as undecodable codecs, and everything
+    # else works. Installing it here means CI checks the decoders rather
+    # than the graceful degradation.
     - name: Install fonts and gfortran
       if: runner.os == 'Linux'
       shell: bash
@@ -77,5 +80,8 @@ runs:
         if [ -d .venv/Scripts ]; then bin="$PWD/.venv/Scripts"; \
           else bin="$PWD/.venv/bin"; fi
         "$bin/pip" install --quiet maturin pyflakes ${{ inputs.extras }}
+        # feetplayer: the media stack, its own repository, pinned to a commit
+        # in requirements.txt. Its Fortran is compiled during this install.
+        "$bin/pip" install --quiet -r requirements.txt
         "$bin/maturin" develop --release --manifest-path rust/Cargo.toml
         echo "PY=$bin/python" >> "$GITHUB_ENV"

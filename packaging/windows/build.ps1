@@ -10,7 +10,11 @@
       * the compiled engine, as the .pyd out of a maturin wheel;
       * FeetBrowser.exe, the launcher crate in launcher/.
 
-    Plus feetbrowser/ itself, which is pure Python and just gets copied.
+    Plus feetbrowser/ itself, which is pure Python and just gets copied, and
+    feetplayer -- the media stack, its own package, pinned to a commit in
+    requirements.txt -- which pip installs into the same directory. Its
+    Fortran decoders are compiled here with gfortran, because the machine
+    that runs the bundle has no compiler.
 
     Nothing is frozen, bytecode-scanned or dependency-analysed. The layout is
     the one the embeddable package was designed for: everything in one
@@ -198,9 +202,18 @@ New-Item -ItemType Directory -Force -Path (Join-Path $stage 'toes') | Out-Null
 Copy-Item (Join-Path $RepoRoot 'toes\README.md') (Join-Path $stage 'toes') -Force
 
 # ---------------------------------------------------------------------------
-# The H.264 and AAC decoders.
+# feetplayer, and the decoders it builds.
 #
-# feetbrowser\h264.py and feetbrowser\aac.py compile fortran\ with gfortran
+# The media stack is its own package now, pinned to a commit in
+# requirements.txt, so it is installed rather than copied: pip puts
+# feetplayer\ beside feetbrowser\ in the bundle, with its fortran\ sources
+# inside it as package data. The install is done with the *host* interpreter,
+# because the embeddable CPython that ships in the bundle has no pip and is
+# not supposed to -- --target makes the destination the bundle regardless of
+# which interpreter runs the install, and feetplayer is pure Python plus
+# Fortran, so nothing architecture-specific comes out of the install itself.
+#
+# feetplayer\h264.py, aac.py and ball.py compile that Fortran with gfortran
 # the first time a video or a soundtrack plays. That works from a checkout,
 # where a developer has a compiler; it cannot work here, where the user has
 # neither gfortran nor any reason to. Left alone the bundle installs, starts,
@@ -208,16 +221,20 @@ Copy-Item (Join-Path $RepoRoot 'toes\README.md') (Join-Path $stage 'toes') -Forc
 # PATH]" -- which no developer ever sees, because developers run from a
 # checkout.
 #
-# Both, in one step, because they are one decision: a bundle with the video
-# library and not the sound one plays pictures in silence, which is read as a
-# broken player rather than as a decoder that was never shipped.
+# All three, in one step, because they are one decision: a bundle with the
+# video library and not the sound one plays pictures in silence, which is read
+# as a broken player rather than as a decoder that was never shipped.
 #
-# So they are compiled now, into the package, each under a name that is a hash
-# of the sources it was built from; fortran\ ships beside the package so the
-# loader can recompute those hashes and refuse anything that does not match.
-# The compiler is a build-machine tool exactly like cargo: nothing it produced
-# is a third-party library, the .dlls are our own Fortran, and the compiler's
-# runtime is no more third-party than libgcc is.
+# So they are compiled now, into the installed package, each under a name that
+# is a hash of the sources it was built from; feetplayer\fortran\ ships inside
+# the package so the loader can recompute those hashes and refuse anything
+# that does not match. pip's own install may already have built them -- it
+# does when the build machine has a gfortran on PATH -- and the explicit build
+# below overwrites whatever it left, at the same hashed names, with the
+# compiler this script chose. The compiler is a build-machine tool exactly
+# like cargo: nothing it produced is a third-party library, the .dlls are our
+# own Fortran, and the compiler's runtime is no more third-party than libgcc
+# is.
 #
 # Whether that runtime ends up inside the .dll or beside it is build_library's
 # decision and not this script's: it reads the finished file's import table,
@@ -230,8 +247,39 @@ Copy-Item (Join-Path $RepoRoot 'toes\README.md') (Join-Path $stage 'toes') -Forc
 # "shipped libgfortran-5.dll beside it" are different bundles and a log that
 # does not distinguish them is a log that cannot explain the next failure.
 # ---------------------------------------------------------------------------
-Step "the H.264 and AAC decoders"
-Copy-Item -Recurse -Force -Path (Join-Path $RepoRoot 'fortran') -Destination $stage
+Step "installing feetplayer"
+# The interpreter that does the installing, which is not the one in the
+# bundle: the embeddable package ships no pip and no ensurepip, on purpose.
+# FEETBROWSER_PYTHON wins, as it does in the macOS script.
+$hostPython = $null
+foreach ($candidate in @($env:FEETBROWSER_PYTHON, 'python', 'python3', 'py')) {
+    if (-not $candidate) { continue }
+    $found = Get-Command $candidate -ErrorAction SilentlyContinue
+    if ($found) { $hostPython = $found.Source; break }
+}
+if (-not $hostPython) {
+    Fail ("no Python on PATH to install feetplayer with. Install one from`n" +
+          "      python.org or point FEETBROWSER_PYTHON at it. The interpreter`n" +
+          "      inside the bundle cannot do it: it has no pip.")
+}
+Write-Host "    installing with: $hostPython"
+& $hostPython -m pip install --disable-pip-version-check --quiet `
+    --target $stage --no-compile -r (Join-Path $RepoRoot 'requirements.txt')
+if ($LASTEXITCODE -ne 0) { Fail "pip could not install feetplayer into the bundle" }
+$player = Join-Path $stage 'feetplayer'
+if (-not (Test-Path $player)) { Fail "pip installed no feetplayer\ into the bundle" }
+# The install describes an installation nobody will consult, and pip writes
+# __pycache__ into a --target even with --no-compile off the wheel's own
+# sources; both go the same way feetbrowser/'s did above.
+Get-ChildItem -Path $stage -Directory -Filter '*.dist-info' | Remove-Item -Recurse -Force
+Get-ChildItem -Path $player -Recurse -Force -Directory |
+    Where-Object { $_.Name -eq '__pycache__' } |
+    Remove-Item -Recurse -Force
+if (-not (Test-Path (Join-Path $player 'fortran'))) {
+    Fail "feetplayer installed without its Fortran sources; nothing could be built"
+}
+
+Step "the H.264, AAC and MP3 decoders"
 $stagedPython = Join-Path $stage 'python.exe'
 if (-not (Test-Path $stagedPython)) { Fail "no python.exe in the embeddable package" }
 # The gfortrans that exist on a Windows build machine, in the order worth
@@ -255,24 +303,38 @@ if (-not $gfortran) {
           "      that cannot play video, and says so only to the user.")
 }
 Write-Host "    gfortran: $gfortran"
+$built = @()
 foreach ($decoder in @(
         @{ Module = 'h264'; What = 'H.264' },
-        @{ Module = 'aac';  What = 'AAC'   })) {
+        @{ Module = 'aac';  What = 'AAC'   },
+        @{ Module = 'ball'; What = 'MPEG Layer III' })) {
     $module = $decoder.Module
-    $name = (& $stagedPython -m "feetbrowser.$module" --name) | Select-Object -Last 1
+    $name = (& $stagedPython -m "feetplayer.$module" --name) | Select-Object -Last 1
     if ($LASTEXITCODE -ne 0 -or -not $name) {
-        Fail "could not ask $module.py for the library name"
+        Fail "could not ask feetplayer.$module for the library name"
     }
-    & $stagedPython -m "feetbrowser.$module" --build (Join-Path $package $name) --fc $gfortran
+    & $stagedPython -m "feetplayer.$module" --build (Join-Path $player $name) --fc $gfortran
     if ($LASTEXITCODE -ne 0) { Fail "gfortran could not build the $($decoder.What) decoder" }
-    Write-Host ("    {0}, {1:N0} KB" -f $name, ((Get-Item (Join-Path $package $name)).Length / 1KB))
+    $built += $name
+    Write-Host ("    {0}, {1:N0} KB" -f $name, ((Get-Item (Join-Path $player $name)).Length / 1KB))
 }
-# Any runtime DLL build_library could not link in went next to the two
+# A library pip built that this script did not. feetplayer names its libraries
+# after a hash of their sources, so the builds above overwrite pip's exactly;
+# anything left over is a decoder that grew in feetplayer and was never added
+# to the loop, and it would ship as whatever pip's compiler happened to
+# produce -- or as nothing at all on a machine where pip found no gfortran.
+$stray = @(Get-ChildItem -Path $player -File -Filter '*.dll' |
+           Where-Object { $_.Name -like '_*' -and $_.Name -notin $built })
+if ($stray.Count -gt 0) {
+    Fail ("feetplayer installed " + (($stray | ForEach-Object { $_.Name }) -join ', ') +
+          ",`n      which this script does not build. Add the module to the loop above.")
+}
+# Any runtime DLL build_library could not link in went next to the three
 # libraries rather than inside them. Listed here because it is the difference
 # between the two bundles the comment above describes, and because the second
 # decoder built finds whatever the first one already copied and says nothing.
-$runtime = @(Get-ChildItem -Path $package -File -Filter '*.dll' |
-             Where-Object { $_.Name -notlike '_h264_*' -and $_.Name -notlike '_aac_*' })
+$runtime = @(Get-ChildItem -Path $player -File -Filter '*.dll' |
+             Where-Object { $_.Name -notin $built })
 if ($runtime.Count -gt 0) {
     Write-Host ("    beside them: " + (($runtime | ForEach-Object { $_.Name }) -join ', '))
 } else {

@@ -15,18 +15,66 @@ ordinary web MP4 comes out as PCM samples in memory, exactly as a reference
 decoder produces them -- see [AAC, in Fortran](#aac-in-fortran) -- there is a
 platform output device on all three platforms, a lock-free ring, a polyphase
 resampler, a mixer with per-source gain and a master volume, and a monotonic
-audio clock, see [Audio output](#audio-output); and `feetbrowser/arch.py`
+audio clock, see [Audio output](#audio-output); and `feetplayer/arch.py`
 pumps one into the other and hangs the pictures off the result, see
 [Sound and pictures together](#sound-and-pictures-together). An MP4 with an
 AAC-LC track plays with sound, and its frames are scheduled against the
 sound rather than against the wall clock. Uncompressed sound plays too, in
 all three of the containers that carry it -- MP4/MOV, AVI and `.wav` -- see
-[PCM](#pcm). What is left is still named and refused: there is no MP3, no
-Vorbis, no Opus, no ADPCM and no mu-law or A-law.
+[PCM](#pcm), and a bare `.mp3` decodes as well, see
+[MPEG Layer III, in Fortran](#mpeg-layer-iii-in-fortran). What is left is
+still named and refused: no Vorbis, no Opus, no ADPCM and no mu-law or A-law.
 
 Read this before adding a codec. The point of writing it down is that the
 hard parts here are not the codec; they are the seams the codec plugs into,
 and those are done.
+
+## Where this code lives
+
+Most of what this page describes is no longer in this repository. The
+decoders, the containers and the audio output moved to
+[feetplayer](https://github.com/67plays/feetplayer), which is a package with
+no dependencies of its own, and the browser installs it: one line in
+`requirements.txt`, pinned to a full commit sha rather than to a branch, and
+`test.sh`, `run.sh`, `test.cmd`, `run.cmd`, the CI build action and all three
+packagers install from that one file. There is no `pyproject.toml` at the
+root of FeetBrowser and this change did not add one.
+
+What moved:
+
+```
+feetplayer/mediacodec.py   containers: MP4/MOV, AVI, WebM, .wav, bare MJPEG
+                           and bare MP3, plus the PCM path
+feetplayer/h264.py         the H.264 decoder's Python side
+feetplayer/aac.py          the AAC-LC decoder's Python side
+feetplayer/ball.py         the MPEG Layer III decoder's Python side
+feetplayer/heel.py         the ring, the resampler, the mixer, the clock
+feetplayer/arch.py         the join: decoded sound into a speaker
+feetplayer/coreaudio.py    the three platform backends
+feetplayer/alsa.py
+feetplayer/winmm.py
+feetplayer/fortran/        ~14,800 lines of FORTRAN 77, the three decoders
+```
+
+What stayed, because it is the browser and not the media stack:
+`feetbrowser/media.py` (the clock, the scheduler, `VideoPlayer`),
+`feetbrowser/imagecodec.py`, the `<video>` box in `layout.py`, the control
+bar and the tick in `browser.py`, and `tests/test_render.py`'s container
+tests -- which now import `feetplayer.mediacodec` and are the proof that the
+seam is real rather than a rename.
+
+The Fortran is compiled by gfortran while pip installs feetplayer, into the
+installed package directory. That is an install-time requirement and never a
+runtime one: without a compiler feetplayer installs with no libraries beside
+it, falls back to compiling on demand, and failing that reports H.264, AAC
+and Layer III as codecs it does not have -- which is the same graceful
+degradation the browser always had, moved one repository over. The three
+packagers do not rely on either path: they compile the libraries explicitly
+on the build machine and ship them inside the installed package, because the
+machine that runs a `.dmg` has no compiler. See the packaging READMEs.
+
+The rest of this page is written as it was, because the code is the same
+code at the same commits; only the paths changed.
 
 ## Why Motion JPEG
 
@@ -91,7 +139,7 @@ in an afternoon is the whole reason to start here.
 The split is deliberate: **bytes**, **time**, **pixels**. Each is testable
 without the other two, and only the last one knows what a canvas is.
 
-### `feetbrowser/mediacodec.py`: bytes
+### `feetplayer/mediacodec.py`: bytes
 
 Containers and codecs. No clocks, no threads, no canvas, no imports from the
 browser. Everything in it is a pure function of a `bytes` object.
@@ -232,7 +280,7 @@ Navigating away or closing a tab stops the decode threads.
 The sections above say twice that H.264 is a multi-month project. They were
 written before anyone started it, and they were right about the size; what
 they got wrong was that the size is a reason not to begin. It is in
-`fortran/`, wrapped by `feetbrowser/h264.py`, and it decodes I, P and B
+feetplayer's `fortran/`, wrapped by `feetplayer/h264.py`, and it decodes I, P and B
 slices to the exact pixels a reference decoder produces.
 
 **Exactly what it does.** Annex B and AVCC framing with emulation-prevention
@@ -285,7 +333,7 @@ the picture at reference index 0 of list 1 as it was when *that* picture was
 decoded, and there is nowhere else to keep it.
 
 Decode order stops being presentation order here, and that half of the
-problem is deliberately not in `fortran/`: the decoder hands pictures over
+problem is deliberately not in the Fortran: the decoder hands pictures over
 in the order they are coded and reports each one's picture order count, and
 `VideoTrack` sorts them into the order they are shown using the container's
 `ctts` composition offsets. A reorder buffer holds the handful of pictures
@@ -322,13 +370,20 @@ package manager and no lock file, which is the standing constraint here.
 
 **How it is built and loaded.** In a packaged application the library is
 already there: the packaging compiled it on the build machine and put it
-inside the package as `_h264_<digest>.dll`/`.dylib`/`.so`, with `fortran/`
-shipped beside the package. `h264.py` prefers it, and the digest is the whole
-check -- it is a hash of the shipped sources and the ABI number, recomputed at
-load, so a library built from a different decoder is not loaded in error, it
-is not found. The `h264_version` check still runs on it.
+inside the installed feetplayer package as
+`_h264_<digest>.dll`/`.dylib`/`.so`, with feetplayer's `fortran/` beside it.
+`h264.py` prefers it, and the digest is the whole check -- it is a hash of the
+shipped sources and the ABI number, recomputed at load, so a library built
+from a different decoder is not loaded in error, it is not found. The
+`h264_version` check still runs on it.
 
-Failing that -- which is to say, from a checkout -- `h264.py` finds a
+From a checkout the library is usually there too, because pip compiles it
+while it installs feetplayer -- see
+[Where this code lives](#where-this-code-lives) -- and it lands in the same
+place under the same digest.
+
+Failing both -- a machine with no gfortran at install time, or a compiler
+that appeared afterwards -- `h264.py` finds a
 `gfortran`, compiles the eleven sources into a shared library in the
 temporary directory under a name keyed on a hash of those sources *and of the
 compiler*, and loads it with `ctypes`. The hash is what makes the cache safe:
@@ -401,7 +456,7 @@ and finished while no audio codec exists.
 
 ### The pieces
 
-- `feetbrowser/heel.py`: the pure engine, and nearly all of it.
+- `feetplayer/heel.py`: the pure engine, and nearly all of it.
   - `Ring` is a single-producer, single-consumer byte ring over one
     preallocated ctypes buffer, with no lock in it. Two monotonically
     increasing byte counters; the producer alone writes one and the consumer
@@ -448,7 +503,7 @@ and finished while no audio codec exists.
     speed. `available()` and `unavailable_reason()` follow `h264.py` --
     probed once, and the answer remembered, so a container with no
     `/dev/snd` is not asked about it once per packet.
-- `feetbrowser/coreaudio.py`, `alsa.py`, `winmm.py`: one per platform,
+- `feetplayer/coreaudio.py`, `alsa.py`, `winmm.py`: one per platform,
   ctypes against the system library, the same shape as `cocoa.py`, `x11.py`
   and `win32.py`. Each knows how to take bytes out of a ring and nothing
   else at all.
@@ -534,17 +589,21 @@ of 39 buffer seams.
 
 ### Testing sound without a sound card
 
-`tests/test_audio.py`, split the way `tests/test_x11.py` is. The pure half
-is the ring (wraparound, underrun, overrun, partial frames, and a real
-two-thread producer/consumer test that checks every byte of a known
-sequence), the filter design, the resampler, the formats, the mixer, the
-clock, and the whole pipeline end to end against a device that keeps what it
-consumed so the mixed bytes can be measured. It runs everywhere, including
-in a container with no sound. The live half opens the real backend, plays
-two hundred milliseconds of something quiet and checks the device consumed
-it in the time it should have; where there is no device it prints why and
-skips. `FEETBROWSER_AUDIO=null` forces the silent path, which is how CI and
-a bug report ask for it.
+feetplayer's own `tests/test_audio.py`, split the way this repository's
+`tests/test_x11.py` is. The pure half is the ring (wraparound, underrun,
+overrun, partial frames, and a real two-thread producer/consumer test that
+checks every byte of a known sequence), the filter design, the resampler,
+the formats, the mixer, the clock, and the whole pipeline end to end against
+a device that keeps what it consumed so the mixed bytes can be measured. It
+runs everywhere, including in a container with no sound. The live half opens
+the real backend, plays two hundred milliseconds of something quiet and
+checks the device consumed it in the time it should have; where there is no
+device it prints why and skips. `FEETBROWSER_AUDIO=null` forces the silent
+path, which is how CI and a bug report ask for it.
+
+This repository's own `tests/test_audio.py` is the browser's half of the
+same seam -- see [Tests](#tests) -- and uses the same environment variable
+for the same reason.
 
 ### Not tested
 
@@ -556,7 +615,7 @@ as carefully-written and unproven. The CoreAudio backend is the one that has
 actually made a noise.
 ## Sound and pictures together
 
-`feetbrowser/arch.py`, the *arch*, because it carries the load between the
+`feetplayer/arch.py`, the *arch*, because it carries the load between the
 heel and the toes. `mediacodec.py` says what frame 37 sounds like and
 `heel.py` says how samples reach a speaker; this is the only module in the
 tree that knows both, and it exists so that neither has to know the other.
@@ -616,7 +675,7 @@ ask the sound card for a second exclusive stream and lose.
 ## AAC, in Fortran
 
 The audio half of an ordinary web MP4, decoded to PCM. It is in
-`fortran/inst*.f`, wrapped by `feetbrowser/aac.py`, and it is called the
+feetplayer's `fortran/inst*.f`, wrapped by `feetplayer/aac.py`, and it is called the
 *instep* -- the top of the foot, over the arch that carries the weight. It
 shares nothing with the H.264 decoder next door but the build machinery: `IP*` routines and `/IP*/`
 COMMON blocks against H.264's `H2*` and `/H2*/`, because Fortran has one
@@ -654,9 +713,11 @@ frame per channel against the 23 milliseconds a frame plays for. That is the
 number that matters, because what will consume this is a mixer on a
 deadline.
 
-**Ground truth.** `tests/fixtures/aac` holds fourteen ADTS streams and,
-beside each, the exact float samples FFmpeg 7.1 decoded it to,
-zlib-compressed. They cover a pure tone, broadband noise, a stereo file the
+**Ground truth.** feetplayer's `tests/fixtures/aac` holds fourteen ADTS
+streams and, beside each, the exact float samples FFmpeg 7.1 decoded it to,
+zlib-compressed. Two of them, `lowrate.aac` and `lowrate.f32.z`, are also
+committed here, because the packagers decode them inside a finished bundle
+-- see [Tests](#tests). They cover a pure tone, broadband noise, a stereo file the
 encoder really does code in mid/side, a transient that forces all four
 window sequences, 32 kbit/s stereo under bit starvation, 320 kbit/s where
 the quantised coefficients run into the thousands and codebook 11's escape
@@ -758,7 +819,7 @@ is silent rather than folded.
 ## MPEG Layer III, in Fortran
 
 The other half of the web's audio, and the older half. It is in
-`fortran/ball*.f`, wrapped by `feetbrowser/ball.py`, and it is called the
+feetplayer's `fortran/ball*.f`, wrapped by `feetplayer/ball.py`, and it is called the
 *ball of the foot* -- the pad behind the toes that takes the push. `BL*`
 routines and `/BL*/` COMMON blocks, against AAC's `IP*` and H.264's `H2*`,
 for the same reason as before: Fortran has one global namespace, this
@@ -794,8 +855,8 @@ noise that no comparison against a whole file would ever show.
 Measured on this machine, one core: 0.11 ms for a 44.1 kHz stereo frame,
 which plays for 26.1 ms -- about 225x realtime.
 
-**Ground truth.** `tests/fixtures/mp3` holds eighteen streams and, beside
-each, the exact float samples FFmpeg 7.1 decoded it to, zlib-compressed.
+**Ground truth.** feetplayer's `tests/fixtures/mp3` holds eighteen streams
+and, beside each, the exact float samples FFmpeg 7.1 decoded it to, zlib-compressed.
 `make_mp3_vectors.sh` regenerates them and says what each is for. They
 cover a tone, noise, mid/side, a transient that forces short blocks with
 the start and stop windows either side, 32 kbit/s under reservoir
@@ -850,7 +911,7 @@ exactly as `h264.py` does it: find a gfortran, compile into a library
 named after a digest of the sources and the compiler, prefer a shipped
 prebuilt over compiling, load with `ctypes`, and remember the failure if
 any of that does not happen. No compiler means `ball.available()` is false
-and an MP3 is named and refused in public. `python3 -m feetbrowser.ball
+and an MP3 is named and refused in public. `python3 -m feetplayer.ball
 --check stream.mp3 truth.f32.z` is what the packaging asks, and it decodes
 a real vector rather than merely loading the library.
 
@@ -1065,11 +1126,12 @@ every codec wants to be handed.
    is enough to test a demuxer and not enough to test a decoder: a file built
    that way probes as a supported 82-frame AAC track, decodes to nothing at
    all, and hands the device two hundred kilobytes of silence.
-   `tests/fixtures/pcm/pcm.avi` is the same case in the other container: a
+   feetplayer's `tests/fixtures/pcm/pcm.avi` is the same case in the other
+   container: a
    real picture track and a real sound track in one AVI, this time with the
    sound uncompressed.
 7. **Per-decoder H.264 state.** Both entropy coders and all three slice types
-   are done, so what is left in `fortran/` is not a feature but the shape of
+   are done, so what is left in the Fortran is not a feature but the shape of
    the thing: the decoder's state is `COMMON`, which is to say there is one
    decoder in the process, and two `<video>` elements share it by replaying
    their history at each other. That is correct and it is quadratic. Picture
@@ -1105,120 +1167,42 @@ go through the real browser (page load, layout, click to play, and reading
 the presented pixel back off the rendered surface), and the control bar is
 driven the same way, through `Tab.click`, so what is tested is the path a
 mouse takes rather than a method call.
+That suite is also where the seam to feetplayer is proved. It imports
+`feetplayer.mediacodec` directly and drives it through `feetbrowser.media`,
+so a version of feetplayer whose container layer had drifted would fail here
+by name rather than in somebody's browser -- which is what a pinned
+dependency buys and what an unpinned one would not.
 
-H.264 is the exception to "nothing binary is committed", and it has to be:
-there is no way to write an H.264 *encoder* in a test fixture, and a decoder
-tested against its own output is tested against nothing. So
-`tests/fixtures/h264/` holds small real streams and, next to each, the exact
-picture a reference decoder produced from it, deflated. `tests/test_h264.py`
-decodes each and compares every sample: not a PSNR, not a tolerance, every
-byte. A single wrong luma sample fails the suite, because in a codec this
-size a single wrong sample is never a rounding difference; it is a bug in a
-prediction mode or a scan order that happens to be small today. The vectors
-between them cover 16x16 through 1280x720, Baseline, Main and High, both
-entropy coders, QP 1 to 51, deblocking on and off, the 8x8 transform,
-picture-level scaling matrices, multiple slices per picture and frame
-cropping on both axes.
+**The decoder suites moved with the decoders.** `test_h264.py`,
+`test_aac.py`, `test_mp3.py` and `test_pcm.py`, and the fixture trees they
+read -- fifty-odd streams and the exact pictures and samples a reference
+decoder produced from them -- are feetplayer's now, and feetplayer's own
+`test.sh` runs them. They are the same tests: H.264 compared byte for byte,
+AAC and Layer III numerically against thresholds that are the measured error
+with a small margin, PCM bit-identical where the arithmetic is exact, and in
+each of them a test that takes the loaded library away and asserts the
+browser-shaped degradation that follows. Nothing was weakened to move them,
+and nothing about them is asserted here any more, because a test that runs
+in two repositories is a test that is maintained in neither.
 
-Eighteen of them run to several frames, and for those *every frame* is
-compared, not the first: a wrong motion vector predictor shows up in one
-macroblock and then spreads by prediction, so a decoder that is checked only
-on its IDR is not checked at all. The six P vectors cover a plain I-then-P
-sequence, runs of P_Skip over a still background, sub-8x8 partitions with the
-8x8 transform, four reference frames, a picture that pans off its own edges so
-the interpolator has to clamp, and weighted prediction across a fade. The six
-CAVLC vectors cover that same ground in the other entropy coder, plus the two
-ends of the quantiser range that only CAVLC cares about: QP 44, where almost
-every block is empty and the `nC` derivation is all that is left, and QP 3 on
-noise, where the levels are long enough to run `suffixLength` up to its limit
-and reach the `level_prefix` >= 15 escape. The six B vectors cover plain IBBP,
-a B pyramid where B pictures are themselves references, spatial direct and
-temporal direct on identical content so the two vectors differ only in the
-derivation, implicit weighted bi-prediction across a fade, and long runs of
-B_Skip. Those are compared after sorting the decoded pictures by the picture
-order count the decoder reports, and the sorted order has to be the one FFmpeg
-wrote: a decoder that got the counts wrong fails even if every sample it
-produced was right.
+**Four fixtures stayed.** `tests/fixtures/h264/mb1.264`, `mb1.i420.z`,
+`tests/fixtures/aac/lowrate.aac` and `lowrate.f32.z` are still committed
+here, and they are not read by any suite in `tests/`. They are read by the
+three packagers: each builds an artifact, cuts `PATH` back to the system
+directories so no compiler and no Homebrew library can be reached, and runs
+`--check-video` and `--check-audio` inside the finished bundle against those
+four files. A bundle that shipped no decoder -- or, now, no feetplayer at
+all -- passes every other check a packager makes, installs, starts, renders,
+and admits it only to whoever opens a video. Deleting these four would make
+all three verifications pass for no reason at all, which is why they are
+called out here.
 
-`bframes.mp4` is the same IBBP content in a container, and is where `ctts` and
-the reorder buffer are tested rather than the decoder. It is encoded straight
-to MP4 rather than muxed from the `.264`, because FFmpeg's raw H.264 demuxer
-hands its muxer pts == dts and `-c copy` therefore writes a file with no
-`ctts` at all -- a file that lies about its own order would make the test pass
-for the wrong reason.
-
-`make_inter_vectors.sh` beside them is the offline tool that made all of this
-and says what each encoder option is for; it is not run by `test.sh` and
-ffmpeg is not a dependency of anything. The fixtures are committed so the
-suite runs offline and on a machine with no encoder.
-
-`tests/test_aac.py` is the same arrangement for audio, with one difference
-that matters. H.264 is bit-exact and is compared byte for byte; AAC is not,
-so the PCM comparison is numerical and the threshold is the measured error
-with a small margin rather than a round number chosen to pass -- 1e-06
-maximum absolute error against a worst measured 3.6e-07, and a 130 dB floor
-against a worst measured 137.9 dB. Because a threshold at the end can hide a
-bug in the middle, the stages that can be compared exactly are compared
-exactly and not through the samples: every frame is consumed to the bit, the
-dequantiser is recomputed in Python coefficient by coefficient and agrees to
-the last bit, the fast IMDCT is held against the standard's summation
-written out in the test, and the windows against their closed forms. There
-are also tests that the fixtures still exercise what they were chosen for --
-mid/side, intensity, noise substitution, all four window sequences, temporal
-noise shaping and all eight scalefactor band layouts -- so that a
-regenerated vector cannot quietly stop proving anything.
-`tests/fixtures/aac/make_aac_vectors.sh` is the offline tool that made them,
-and like its H.264 counterpart it is not run by `test.sh`.
-
-`tests/test_mp3.py` is the same arrangement again, with one thing done
-differently: the threshold is per vector rather than one number for all
-eighteen, because their errors span forty decibels and a single threshold
-loose enough for the worst would not catch a deleted stage in the rest --
-which is not a supposition, since deleting intensity stereo moves
-`intensity` by forty times its own limit and less than one global limit
-would have been. The measurement each threshold came from is written in
-the table beside it. Its exact-stage tests are the same four ideas as
-AAC's, plus one more: the entire back half of the decoder, from window
-switching through the polyphase filterbank, is written out again in Python
-from the standard's formulas and compared against the decoder's own PCM,
-which leaves the transform nowhere to hide.
-`tests/fixtures/mp3/make_mp3_vectors.sh` made those vectors, is not run by
-`test.sh`, and names the two of the eighteen that an encoder did not
-entirely write.
-
-`tests/test_pcm.py` goes back to exactness, because PCM can. Eighteen
-fixtures in `tests/fixtures/pcm/` are one quarter-second of two tones -- a
-different one per channel, so a channel swap fails as loudly as a byte swap
--- written out by a real muxer into every container, width and byte order
-the PCM path claims to read, and the source waveform ships beside them as
-`tone.s16le.z`. Every conversion between them is exact by construction: s16
-to s24 and s32 are shifts, s16 to float is a divide by 32768, and the
-decoder scales an n-bit sample by 2^-(n-1). So thirteen of the fixtures must
-decode to *bit-identical* floats and the assertion is equality rather than a
-tolerance. The three 8-bit files are the exception and have their own truth
-file, because requantising to eight bits is a real loss.
-
-That matters more here than the arithmetic makes it sound. A wrong byte
-order, a wrong sign convention or a width guessed from a stale fourcc does
-not raise and does not fall silent; it produces samples that look like
-sound, plot like sound and are not the sound in the file. So the suite
-carries a negative control: `twos.mov` read little-endian instead of big
-comes back the right length, in range, and wrong -- and one float of the
-truth, nudged by a single ulp, is asserted to be caught. A test that only
-counted samples would pass both.
-
-`tests/fixtures/pcm/make_pcm_vectors.sh` made all of them, offline, and is
-not run by `test.sh` either.
-
-The whole suite skips cleanly where there is no `gfortran`, and one test in
-each of the three Fortran suites forces that state on a machine that has one:
-it takes the loaded library away and asserts that what sits above the
-decoder behaves the way it did before the decoder existed: `probe()`,
-`probe_audio()`, `MediaInfo`, `AudioInfo`, `open_video()` and
-`open_audio()`, plus each decoder module's own surface. Those tests are the
-reason the degradation path is a claim rather than a hope.
-
-Audio has its own suite, `tests/test_audio.py`, and its own version of that
-last idea: `FEETBROWSER_AUDIO=null` forces a machine with a working sound
-card to behave like one without. See
+Audio has its own suite, `tests/test_audio.py`, and it is the browser's half
+of the sound seam rather than a copy of feetplayer's suite of the same name: the clock a `<video>`
+is scheduled against, `restart()` across a seek, the pictures following the
+sound, and a `<video>` element asking for its own audio through
+`browser.py`. What `arch.AudioPlayer` decodes, and every property of the
+ring, the resampler and the mixer under it, is tested over in feetplayer.
+`FEETBROWSER_AUDIO=null` still forces a machine with a working sound card to
+behave like one without. See
 [Testing sound without a sound card](#testing-sound-without-a-sound-card).

@@ -7,34 +7,34 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-# H.264, AAC and MP3 are decoded by the browser's own Fortran decoders (see
-# fortran/, feetbrowser/h264.py, feetbrowser/aac.py and feetbrowser/ball.py),
-# compiled by gfortran on the first start. They are what video and audio run
-# on, so a checkout that cannot produce them gets told so up front rather
-# than starting a browser that quietly plays nothing. The check is on the
-# decoders, not on the compiler: a packaged build can ship them prebuilt, and
-# a gfortran that is present but builds badly fails the same way as one that
-# was never installed -- warm_fortran lets each decoder say which it was.
+# H.264, AAC and MP3 are decoded by Fortran, in the feetplayer package (see
+# requirements.txt), where pip compiles them during the install. They are
+# what video and audio run on, so a machine that cannot produce them gets
+# told so up front rather than starting a browser that quietly plays
+# nothing. The check is on the decoders, not on the compiler: a packaged
+# build ships them prebuilt, and a gfortran that is present but builds badly
+# fails the same way as one that was never installed -- warm_fortran lets
+# each decoder say which it was.
 warm_fortran() {
-  # Build them here rather than on the first <video>: the stall happens once,
+  # Load them here rather than on the first <video>: the stall happens once,
   # at startup, instead of in the middle of a page.
-  "$1" -c "import feetbrowser.h264 as v, feetbrowser.aac as a
+  "$1" -c "import feetplayer.h264 as v, feetplayer.aac as a
 v.available(); a.available()" >/dev/null 2>&1 || true
   # Require them. No decoder means no audio or video at all.
   if ! "$1" -c "import sys
-import feetbrowser.h264 as v, feetbrowser.aac as a
+import feetplayer.h264 as v, feetplayer.aac as a
 sys.exit(0 if (v.available() and a.available()) else 1)" >/dev/null 2>&1; then
     {
       cat <<'NOFORTRAN'
 FeetBrowser: no H.264 or AAC decoder is available on this machine.
 
-Audio and video run on the browser's own decoders, which are Fortran (see
-fortran/) and compiled by gfortran on the first start. This machine has
-neither a working decoder nor a compiler to build one, so the browser would
-start and quietly play nothing.
+Audio and video run on the decoders in feetplayer, which are Fortran and
+compiled by gfortran when pip installs the package (see requirements.txt).
+This machine has neither a working decoder nor a compiler to build one, so
+the browser would start and quietly play nothing.
 
 NOFORTRAN
-      "$1" -c "import feetbrowser.h264 as v, feetbrowser.aac as a
+      "$1" -c "import feetplayer.h264 as v, feetplayer.aac as a
 print('  H.264:', v.unavailable_reason() or 'no decoder')
 print('  AAC:  ', a.unavailable_reason() or 'no decoder')" 2>/dev/null || true
       cat <<'NOFORTRAN2'
@@ -46,22 +46,22 @@ Install gfortran:
     macOS:          brew install gcc
     Windows:        install MinGW-w64, which ships gfortran
 
-or take a packaged build, which carries the decoders inside it. Then run
-this script again.
+then delete .venv/lib/*/site-packages/feetplayer and run this script again,
+so pip rebuilds them. Or take a packaged build, which carries the decoders
+inside it.
 NOFORTRAN2
     } >&2
     exit 1
   fi
 }
 
-# Do the decoder check before anything else -- in particular before the Rust
-# engine build below, so a machine that cannot decode gets told why now, not
-# after several minutes of cargo. The decoders do not need the engine, and
-# the cache they build is shared by every python here, so warming them with
-# the system python covers the venv start too.
-warm_fortran python3
-
-if python3 -c "import feetbrowser_engine" 2>/dev/null; then
+# The system python runs the browser only if it has both halves of it: the
+# Rust engine and the media stack. Before feetplayer was its own repository
+# the second half was these files, so having the engine was the whole test;
+# now it is a package, and a system python with the engine but no feetplayer
+# would give you a browser that plays no video. The venv below installs it.
+if python3 -c "import feetbrowser_engine, feetplayer" 2>/dev/null; then
+  warm_fortran python3
   exec python3 -m feetbrowser "$@"
 fi
 # Otherwise the venv is what runs the browser, so ask the venv -- and not
@@ -79,6 +79,31 @@ if [ -f .venv/pyvenv.cfg ] &&
    grep -qi '^include-system-site-packages *= *false' .venv/pyvenv.cfg; then
   python3 -m venv --system-site-packages .venv
 fi
+
+# feetplayer, pinned to a commit in requirements.txt, into that venv. pip
+# compiles its Fortran during the install, so this is the minute the decoders
+# cost, and it is paid once per pin rather than once per start: `pip freeze`
+# prints a VCS install as the requirement line that produced it, so the pin
+# installed and the pin asked for compare as plain strings.
+#
+# This, and the decoder check after it, come before the engine build below --
+# a machine that cannot decode is told why now, not after several minutes of
+# cargo. The venv has to exist first, which is the only reason it is created
+# here rather than there.
+if [ ! -x .venv/bin/python ]; then
+  python3 -m venv --system-site-packages .venv
+fi
+want=$(grep -v '^[[:space:]]*#' requirements.txt | grep -v '^[[:space:]]*$')
+if ! .venv/bin/python -m pip freeze 2>/dev/null | grep -qxF "$want"; then
+  echo "FeetBrowser: installing feetplayer, the media stack. This compiles its"
+  echo "Fortran decoders, so expect a minute -- and only when the pin moves."
+  echo
+  # Not fatal on its own: warm_fortran below is what refuses to start, and it
+  # says rather more about why than pip does.
+  .venv/bin/python -m pip install -q -r requirements.txt || true
+fi
+
+warm_fortran .venv/bin/python
 
 engine=""
 if [ -x .venv/bin/python ]; then
