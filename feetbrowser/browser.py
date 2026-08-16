@@ -2844,6 +2844,12 @@ def _elide(text, font, width):
 
 
 class Browser:
+    # How far back _track_scroll_velocity reads. Long enough to hold the
+    # several ticks one flick of a wheel sends, short enough that a pause
+    # in the middle of a scroll ends the flick rather than averaging over
+    # it.
+    SCROLL_VELOCITY_WINDOW = 0.15
+
     def __init__(self, window=None):
         self.tabs = []
         self.active_tab = None
@@ -2876,6 +2882,10 @@ class Browser:
         # canvas entirely while the page is idle instead of repainting every
         # 120ms forever.
         self._repaint_needed = True
+        # Scroll velocity, for the momentum-easing curve: the ticks of the
+        # flick in progress, oldest first. See _track_scroll_velocity.
+        self._scroll_ticks = []
+        self._scroll_velocity = 0.0
         # Whether the _poll_images() after-chain is already running. It is
         # started by whoever needs it first -- run(), or settle() in a
         # headless render -- and there must only ever be one of it.
@@ -3141,10 +3151,35 @@ class Browser:
         # Scrolling the page out from under a drop-down would leave it
         # pointing at nothing, so the list goes rather than travels.
         self._dismiss_select_popup()
+        self._track_scroll_velocity(delta)
         if self.active_tab:
             self.active_tab.scroll_by(delta)
             self._draw_page()
             # _draw_page re-asserts the chrome on top of the scrolled page.
+
+    def _track_scroll_velocity(self, delta):
+        """Record a scroll tick and re-read the velocity from the last
+        SCROLL_VELOCITY_WINDOW seconds of them, in pixels per second.
+
+        A momentum curve wants to know how fast the wheel is turning now,
+        which is a distance over a time. The mean of every tick this
+        session is neither: it is a distance over a count, and after a
+        minute of scrolling no flick can move it far. Dropping the ticks
+        that fell out of the window is also what stops the history growing
+        for as long as the browser is open.
+        """
+        now = time.monotonic()
+        ticks = self._scroll_ticks
+        ticks.append((delta, now))
+        # The tick just appended is at `now`, so this never empties the
+        # list and ticks[0] below is always there.
+        cutoff = now - self.SCROLL_VELOCITY_WINDOW
+        while ticks[0][1] < cutoff:
+            ticks.pop(0)
+        span = now - ticks[0][1]
+        # One tick on its own has no duration to be a speed over.
+        total = sum(d for d, _ts in ticks)
+        self._scroll_velocity = total / span if span else 0.0
 
     def _on_home_key(self, e):
         if self.focus == "address":
