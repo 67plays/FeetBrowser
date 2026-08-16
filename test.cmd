@@ -68,6 +68,8 @@ if errorlevel 1 (
 "%PY%" -m pyflakes feetbrowser tests || exit /b 1
 rem Every suite below, and nothing missing.
 %RUN% tests\test_suites.py || exit /b 1
+rem The from-scratch Discord Rich Presence client, against a fake local socket.
+%RUN% tests\test_discord.py || exit /b 1
 %RUN% tests\test_render.py || exit /b 1
 rem test_win32.py opens real windows here; the other two skip, and it is the
 rem one that skips everywhere else.
