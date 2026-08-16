@@ -3634,7 +3634,18 @@ class Browser:
         span = now - ticks[0][1]
         # One tick on its own has no duration to be a speed over.
         total = sum(d for d, _ts in ticks)
-        self._scroll_velocity = total / span if span else 0.0
+        if span:
+            self._scroll_velocity = total / span
+        elif len(ticks) > 1:
+            # Every tick landed in the same clock tick, which happens on
+            # coarser clocks (Windows) when a flick is faster than the
+            # timer can resolve. That is a maximum-speed flick, not a
+            # stillness: a span of zero would read as no velocity at all
+            # and coast nothing, so give it the speed the coast clamps to.
+            cap_speed = MOMENTUM_MAX / MOMENTUM_GAIN
+            self._scroll_velocity = cap_speed if total > 0 else -cap_speed
+        else:
+            self._scroll_velocity = 0.0
 
     def _on_home_key(self, e):
         if self.focus == "address":
