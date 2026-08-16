@@ -81,6 +81,15 @@ SCROLLBAR_GUTTER_W = SCROLLBAR_RIGHT + SCROLLBAR_GRAB_PAD
 # triple-click the line, which is the convention on both platforms we run on.
 _CLICK_GRANULARITY = {2: "word", 3: "line"}
 _image_fetch_sem = threading.Semaphore(MAX_CONCURRENT_IMAGE_FETCHES)
+# The same bound for the sheets and scripts a document names. Those are
+# fetched from the UI thread rather than from a worker, because the cascade
+# and the execution order both depend on document order, so the window is
+# frozen for as long as they take -- and a real page names a lot of them
+# (discord.com: two stylesheets and eighteen scripts, spread over four
+# hosts). Wider than the image bound because it is latency and not bandwidth
+# being spent: every one of those is a fresh TLS handshake to somewhere, and
+# the window is held still until the last of them answers. See `_fetch_all`.
+MAX_CONCURRENT_SUBRESOURCE_FETCHES = 12
 # How long Browser.settle() waits for a page to stop having work outstanding.
 # It is a ceiling, not a delay: settling returns the moment the last image is
 # in, and only a page pointing at something that never answers waits it out.
@@ -186,6 +195,78 @@ def _is_js_script_type(typ):
     if not typ:
         return True
     return typ.strip().lower() in _JS_MIME_TYPES
+
+
+def _fetch_all(urls):
+    """Fetch every URL in `urls` at once; return what each one answered.
+
+    The result maps `str(url)` to the `(headers, body, ctype)` triple
+    `URL.request()` returned, or to the exception it raised -- both are
+    answers, and the caller reports a failure in exactly the place it used to
+    fetch, so the error text and the order it appears in are unchanged.
+
+    Why this exists: `<link rel=stylesheet>` and `<script src>` have to be
+    *used* in document order, because that is what the cascade and script
+    semantics mean, but nothing says they have to be *fetched* that way.
+    Fetching them one at a time on the UI thread costs the sum of every round
+    trip with the window frozen for all of it; fetching them together costs
+    the slowest one. The loops that consume this stay exactly as serial as
+    they were.
+
+    Duplicates collapse: a page naming the same sheet twice is one fetch,
+    which is also what the per-URL caches above already assumed.
+    """
+    results = {}
+    by_key = {}
+    for u in urls:
+        by_key.setdefault(str(u), u)
+    keys = list(by_key)
+    if not keys:
+        return results
+
+    def fetch(key):
+        try:
+            results[key] = by_key[key].request()
+        except Exception as exc:  # noqa: BLE001 - reported by the caller
+            results[key] = exc
+
+    if len(keys) == 1:
+        # One URL is the common case and a thread for it buys nothing but a
+        # context switch, so pay for the machinery only when it can pay back.
+        fetch(keys[0])
+        return results
+    # A pool rather than a thread each: a page is allowed to name five
+    # hundred scripts, and five hundred sockets opened at once is a denial of
+    # service aimed at whoever is hosting them.
+    pending = deque(keys)
+
+    def drain():
+        while True:
+            try:
+                fetch(pending.popleft())
+            except IndexError:
+                return
+
+    width = min(len(keys), MAX_CONCURRENT_SUBRESOURCE_FETCHES)
+    threads = [threading.Thread(target=drain, daemon=True)
+               for _ in range(width)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    return results
+
+
+def _fetched(results, url):
+    """The `(headers, body, ctype)` for `url` out of a `_fetch_all` map,
+    re-raising whatever the fetch raised so the caller's existing `except`
+    sees the same exception it would have caught fetching inline."""
+    answer = results.get(str(url))
+    if answer is None:
+        return url.request()
+    if isinstance(answer, BaseException):
+        raise answer
+    return answer
 
 
 def find_base_href(node):
@@ -689,7 +770,14 @@ class Tab:
         # zero-delay one before we bother styling/laying out this page.
         self._check_meta_refresh()
 
-        rules = self._gather_rules(url, resolve_from)
+        # Sheets and scripts go on the wire together, before either is
+        # wanted. They are wanted at different moments -- the cascade needs
+        # the sheets, and only the finished layout runs the scripts -- and
+        # asking for them in that order would put two waits end to end when
+        # the document has already named everything both of them will fetch.
+        prefetched = _fetch_all(self._subresource_urls(resolve_from))
+
+        rules = self._gather_rules(url, resolve_from, prefetched)
 
         style(self.nodes, rules)
         # Keep the rules around so JS mutations can re-style the tree.
@@ -697,7 +785,29 @@ class Tab:
 
         self._absolutize_media_srcs()
         self.render()
-        self._run_scripts()
+        self._run_scripts(prefetched)
+
+    def _subresource_urls(self, resolve_from):
+        """Every stylesheet and script URL this document names, absolute.
+
+        Both lists are fixed the moment the HTML is parsed: `_gather_rules`
+        reads the same `<link>`s and `_run_scripts` runs the `<script>`s it
+        collected before any of them ran. An href that will not resolve is
+        left out and reported where it is used, not here.
+        """
+        hrefs = list(find_links(self.nodes, []))
+        hrefs.extend(el.attributes["src"]
+                     for el in tree_to_list(self.nodes, [])
+                     if isinstance(el, Element) and el.tag == "script"
+                     and el.attributes.get("src")
+                     and _is_js_script_type(el.attributes.get("type")))
+        out = []
+        for href in hrefs:
+            try:
+                out.append(resolve_from.resolve(href))
+            except Exception:  # noqa: BLE001 - reported where it is used
+                continue
+        return out
 
     def _stylesheet_sources(self):
         """What the cascade is currently built from: every <style> element's
@@ -712,11 +822,16 @@ class Tab:
         return (tuple(inline_styles(self.nodes, [])),
                 tuple(find_links(self.nodes, [])))
 
-    def _gather_rules(self, url, resolve_from):
+    def _gather_rules(self, url, resolve_from, prefetched=None):
         """Collect the cascade: UA + toe-injected + <style> + <link>.
 
         Linked sheets are fetched, so results are memoised against
         `_stylesheet_sources()` and the fetched bodies against their URL.
+
+        `prefetched` is a `_fetch_all` map the caller already has -- the
+        initial build hands over the one it started before styling began.
+        Anything missing from it is fetched here, which is what a re-style
+        after a script inserted a `<link>` does.
         """
         sources = self._stylesheet_sources()
         if self._last_rules is not None and sources == self._rule_sources:
@@ -736,6 +851,21 @@ class Tab:
                 rules.extend(CSSParser(sheet).parse())
             except Exception:  # noqa: BLE001 - a broken sheet shouldn't stop the page
                 pass
+        # Every linked sheet we do not already hold and nobody fetched for
+        # us, fetched together. The loop below is unchanged and still runs in
+        # document order; all it does differently is read the body out of
+        # this map.
+        fetched = dict(prefetched or {})
+        wanted = []
+        for href in sources[1]:
+            try:
+                candidate = resolve_from.resolve(href)
+            except Exception:  # noqa: BLE001 - the loop below reports it
+                continue
+            key = str(candidate)
+            if key not in self._sheet_cache and key not in fetched:
+                wanted.append(candidate)
+        fetched.update(_fetch_all(wanted))
         for href in sources[1]:
             sheet_url = None
             try:
@@ -744,7 +874,7 @@ class Tab:
                 if key in self._sheet_cache:
                     rules.extend(self._sheet_cache[key])
                     continue
-                _h, css_body, _c = sheet_url.request()
+                _h, css_body, _c = _fetched(fetched, sheet_url)
                 css_body = _expand_imports(css_body, sheet_url,
                                            log=self._add_error)
                 parsed = CSSParser(css_body).parse()
@@ -812,9 +942,12 @@ class Tab:
 
     # -- scripting ------------------------------------------------------
 
-    def _run_scripts(self):
+    def _run_scripts(self, prefetched=None):
         """Execute every <script> (inline or external) against a fresh
-        interpreter bridged to the document, then restyle and re-render."""
+        interpreter bridged to the document, then restyle and re-render.
+
+        `prefetched` is a `_fetch_all` map of sources the caller already put
+        on the wire; anything absent from it is fetched here."""
         scripts = [el for el in tree_to_list(self.nodes, [])
                    if isinstance(el, Element) and el.tag == "script"
                    and _is_js_script_type(el.attributes.get("type"))]
@@ -865,6 +998,24 @@ class Tab:
             "hardwareConcurrency": 4,
             "productSub": "20030107",
         })
+        # The list of scripts is already fixed -- it was collected before any
+        # of them ran -- so their sources can all be on the wire at once while
+        # the loop below still executes them strictly in order, which is the
+        # part of script semantics that actually matters.
+        fetched = dict(prefetched or {})
+        wanted = []
+        for el in scripts:
+            src = el.attributes.get("src")
+            if not src:
+                continue
+            try:
+                candidate = (self.base_url.resolve(src) if self.base_url
+                             else URL(src))
+            except Exception:  # noqa: BLE001 - the loop below reports it
+                continue
+            if str(candidate) not in fetched:
+                wanted.append(candidate)
+        fetched.update(_fetch_all(wanted))
         for el in scripts:
             try:
                 code = None
@@ -874,7 +1025,7 @@ class Tab:
                     try:
                         sheet_url = self.base_url.resolve(src) \
                             if self.base_url else URL(src)
-                        _h, code, _c = sheet_url.request()
+                        _h, code, _c = _fetched(fetched, sheet_url)
                         if not _is_js_script_type(_c):
                             # `file://` and error pages return an HTML body
                             # instead of raising; never execute it as JS.
@@ -1413,16 +1564,49 @@ class Tab:
                              daemon=True).start()
 
     def _fetch_video(self, key):
-        """Background thread: bytes only. Nothing here touches a player, a
-        photo or the canvas."""
+        """Background thread: the bytes, and the decode they imply. Nothing
+        here touches the canvas, the DOM or an audio device."""
         try:
             with _image_fetch_sem:
                 _headers, data, _ctype = URL(key).request_bytes()
         except Exception as exc:  # noqa: BLE001 - reported on the UI thread
             self._video_failures.append((key, str(exc)))
-            self._video_results.append((key, None))
+            self._video_results.append((key, None, None))
             return
-        self._video_results.append((key, data))
+        self._video_results.append((key, data, self._build_players(key, data)))
+
+    def _build_players(self, key, data):
+        """One ready player per element that named this URL, first frame
+        already decoded.
+
+        This used to happen in `_finish_video`, on the UI thread, and it is
+        not cheap: opening the container walks the whole sample table, and
+        `first_frame` decodes a keyframe in Python. Six autoplaying clips --
+        which is what discord.com's front page is -- froze the window for
+        about four seconds between one timer tick and the next.
+
+        Nothing here needs the UI thread. What does -- attaching a sound
+        device, publishing the player on the node, starting playback -- stays
+        in `_finish_video`, which finds the work already done and says so by
+        `first_frame` returning False the second time.
+
+        A player that would not build is stored as its exception, so the
+        failure is still reported from the thread that reports failures.
+        """
+        built = []
+        for node in self._video_nodes.get(key, ()):
+            try:
+                # `loop` is per element, not per file: the same clip can be a
+                # looping background in one place on the page and a thing you
+                # watch once in another.
+                player = media.VideoPlayer(
+                    data=data, loop="loop" in node.attributes)
+            except Exception as exc:  # noqa: BLE001 - a page must not die
+                built.append(exc)
+                continue
+            player.first_frame()
+            built.append(player)
+        return built
 
     def _drain_videos(self):
         """UI thread: build players for whatever finished downloading."""
@@ -1437,26 +1621,28 @@ class Tab:
                 arrived.append(self._video_results.popleft())
         except IndexError:
             pass
-        for key, data in arrived:
-            self._finish_video(key, data)
+        for key, data, players in arrived:
+            self._finish_video(key, data, players)
         self.render()
 
-    def _finish_video(self, key, data):
-        """Attach a player to every element that named this URL."""
+    def _finish_video(self, key, data, players=None):
+        """Attach a player to every element that named this URL.
+
+        `players` is what `_build_players` produced on the fetch thread. The
+        synchronous path (`load_videos` with no event loop to hand the work
+        to) passes None and builds them here instead, which is the same work
+        on the only thread there is.
+        """
         if key in self._video_queue:
             self._video_queue.remove(key)
         nodes = self._video_nodes.get(key, ())
         if not data:
             return
-        for node in nodes:
-            try:
-                # `loop` is per element, not per file: the same clip can be a
-                # looping background in one place on the page and a thing you
-                # watch once in another.
-                player = media.VideoPlayer(
-                    data=data, loop="loop" in node.attributes)
-            except Exception as exc:  # noqa: BLE001 - a page must not die
-                self._add_error(f"VIDEO {key}: {exc}")
+        if players is None:
+            players = self._build_players(key, data)
+        for node, player in zip(nodes, players):
+            if isinstance(player, BaseException):
+                self._add_error(f"VIDEO {key}: {player}")
                 return
             # Show frame zero straight away. A paused <video> displaying its
             # own first frame is what a browser does, and it is also the
@@ -1466,6 +1652,8 @@ class Tab:
             # it declines -- leaving the video exactly as it was -- when
             # there is no audio track or no device that can be heard.
             self._attach_video_audio(key, node, data, player)
+            # A no-op when the fetch thread got there first; the decode when
+            # it did not.
             player.first_frame()
             node.video_player = player
             self.video_players.append(player)

@@ -1728,6 +1728,184 @@ def test_settle_waits_for_images_a_finished_document_asked_for():
         shutil.rmtree(work, ignore_errors=True)
 
 
+def _serve_subresource_page(sheets, scripts, delay=0.05):
+    """A page naming `sheets` stylesheets and `scripts` scripts, served by a
+    loopback server that counts how many of them are ever in flight at once.
+
+    Every response is held for `delay` first, which is what makes the
+    overlap observable: without it a fast enough serial fetch could finish
+    one before the next began and look concurrent by accident.
+
+    The sheets each colour `h1` differently and the scripts each append their
+    own number to a global, so the same page also says whether the cascade
+    and the execution order survived being fetched out of order.
+    """
+    import http.server
+    import threading
+
+    state = {"live": 0, "peak": 0}
+    lock = threading.Lock()
+
+    body = ["<!doctype html><title>subresources</title>"]
+    body += ['<link rel="stylesheet" href="/sheet%d.css">' % i
+             for i in range(sheets)]
+    body += ['<script src="/script%d.js"></script>' % i
+             for i in range(scripts)]
+    body.append("<h1>subresources</h1>")
+    page = "".join(body).encode("utf8")
+    # Distinct enough per sheet that "the last one won" is a statement about
+    # which sheet, not about rounding.
+    colors = ["#%02x0000" % (0x10 + i * 0x20) for i in range(sheets)]
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_GET(self):  # noqa: N802 - the name http.server dispatches to
+            path = self.path
+            if path.endswith(".css"):
+                index = int(path[len("/sheet"):-len(".css")])
+                payload = ("h1 { color: %s }" % colors[index]).encode()
+                ctype = "text/css"
+            elif path.endswith(".js"):
+                index = int(path[len("/script"):-len(".js")])
+                payload = ("order = (typeof order === 'undefined' "
+                           "? '' : order) + '%d,';" % index).encode()
+                ctype = "text/javascript"
+            else:
+                payload, ctype = page, "text/html"
+            if path != "/page.html":
+                with lock:
+                    state["live"] += 1
+                    state["peak"] = max(state["peak"], state["live"])
+                time.sleep(delay)
+                with lock:
+                    state["live"] -= 1
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    url = "http://127.0.0.1:%d/page.html" % server.server_address[1]
+    return server, url, state, colors
+
+
+def test_linked_sheets_and_scripts_are_fetched_at_the_same_time():
+    """Twenty blocking round trips in a row is what froze discord.com.
+
+    The cascade and script execution both go in document order, and the
+    fetches used to go in that order too -- one at a time, on the UI thread,
+    with the window unable to repaint for the sum of them. Document order is
+    a constraint on *using* a subresource, not on getting it.
+
+    Asserted as a mechanism rather than as a stopwatch reading: the server
+    reports how many of the page's subresources were ever open at once, and
+    a serial fetch cannot make that number larger than one however fast the
+    machine is. The other two assertions are the ones that matter for
+    correctness -- fetching out of order must not let a sheet or a script
+    take effect out of order.
+    """
+    from feetbrowser.browser import Browser, Element, tree_to_list
+
+    server, url, state, colors = _serve_subresource_page(sheets=3, scripts=6)
+    try:
+        browser = Browser()
+        browser.new_tab(url)
+        assert browser.settle(30.0), "settle should not have timed out"
+        tab = browser.tabs[0]
+        assert state["peak"] > 1, (
+            "subresources were fetched one at a time (peak in flight: %d)"
+            % state["peak"])
+        heading = next(n for n in tree_to_list(tab.nodes, [])
+                       if isinstance(n, Element) and n.tag == "h1")
+        assert heading.style["color"] == colors[-1], (
+            "the last sheet in document order must win the cascade, not the "
+            "first one to come back off the wire")
+        order = tab._js_interp.globals["order"]
+        assert str(order) == "0,1,2,3,4,5,", (
+            "scripts must still run in document order, got %r" % (order,))
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_a_videos_player_is_built_off_the_ui_thread():
+    """Opening a container and decoding frame zero is not free.
+
+    Six autoplaying clips -- discord.com's front page -- cost about four
+    seconds of it, and it used to happen in `_drain_videos`, on the UI
+    thread, between one timer tick and the next. The bytes already arrive on
+    a thread of their own; the decode they imply belongs there too, and only
+    publishing the finished player needs the UI thread back.
+
+    Recorded rather than timed: which thread ran the decode is the whole
+    claim, and a fast enough machine would hide a slow enough stopwatch.
+    """
+    import http.server
+    import threading
+
+    from feetbrowser.browser import Browser, Element, tree_to_list
+
+    def painter(i):
+        return lambda x, y: (i * 20, 0, 0)
+
+    clip = media_fixtures.avi(
+        [media_fixtures.rgb24_frame(16, 12, painter(i)) for i in range(4)],
+        16, 12, fps=10.0)
+    page = (b"<!doctype html><title>clip</title>"
+            b"<video src='/clip.avi'></video>")
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_GET(self):  # noqa: N802 - the name http.server dispatches to
+            payload, ctype = ((clip, "video/x-msvideo")
+                              if self.path.endswith(".avi")
+                              else (page, "text/html"))
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+    threads = []
+    built = media.VideoPlayer.__init__
+
+    def recording(self, *args, **kwargs):
+        threads.append(threading.current_thread())
+        return built(self, *args, **kwargs)
+
+    media.VideoPlayer.__init__ = recording
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        browser = Browser()
+        browser.new_tab("http://127.0.0.1:%d/page.html"
+                        % server.server_address[1])
+        assert browser.settle(30.0), "settle should not have timed out"
+        tab = browser.tabs[0]
+        node = next(n for n in tree_to_list(tab.nodes, [])
+                    if isinstance(n, Element) and n.tag == "video")
+        player = getattr(node, "video_player", None)
+        assert player is not None and player.track is not None, \
+            "the clip should have decoded"
+        assert player.scheduler.current is not None, \
+            "and its first frame should be on screen"
+        assert threads, "no player was built at all"
+        main = threading.main_thread()
+        assert not any(t is main for t in threads), (
+            "the player was built on the UI thread, which is the freeze: %s"
+            % [t.name for t in threads])
+    finally:
+        media.VideoPlayer.__init__ = built
+        server.shutdown()
+        server.server_close()
+
+
 def test_an_animated_gif_in_a_page_moves_and_does_not_keep_the_page_busy():
     """The whole path, from `<img src=...gif>` to different pixels on screen.
 
