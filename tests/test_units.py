@@ -106,6 +106,87 @@ def test_css_cascade():
     eq(plain.style["color"], "black", "tag selector")
 
 
+def _expanded(prop, value):
+    """The longhands `_expand` yields for a declaration, as a dict."""
+    from feetbrowser.cssparser import _expand
+    return dict(list(_expand(prop, value))[1:])
+
+
+def test_inset_expands_to_the_four_offsets():
+    """`inset` is one declaration saying what top/right/bottom/left say in
+    four, and layout only reads the four. 1222 of them across the sites
+    surveyed, all on absolutely positioned boxes."""
+    eq(_expanded("inset", "0"),
+       {"top": "0", "right": "0", "bottom": "0", "left": "0"},
+       "one value is every side")
+    eq(_expanded("inset", "10px 20px"),
+       {"top": "10px", "right": "20px", "bottom": "10px", "left": "20px"},
+       "two values are block then inline")
+    eq(_expanded("inset", "1px 2px 3px 4px"),
+       {"top": "1px", "right": "2px", "bottom": "3px", "left": "4px"},
+       "four values are clock order")
+    eq(_expanded("inset", "calc(1rem + 2px) 0"),
+       {"top": "calc(1rem + 2px)", "right": "0",
+        "bottom": "calc(1rem + 2px)", "left": "0"},
+       "a calc() is one component, spaces and all")
+    eq(_expanded("inset", "1px 2px 3px 4px 5px"), {},
+       "five values are not a box, and set nothing")
+
+
+def test_logical_box_properties_become_physical_ones():
+    """Assuming horizontal-tb and ltr, which is what the rest of layout
+    already believes."""
+    eq(_expanded("padding-inline-start", "8px"), {"padding-left": "8px"})
+    eq(_expanded("padding-block-end", "4px"), {"padding-bottom": "4px"})
+    eq(_expanded("margin-inline", "auto"),
+       {"margin-left": "auto", "margin-right": "auto"},
+       "one value is both inline sides")
+    eq(_expanded("margin-block", "1rem 2rem"),
+       {"margin-top": "1rem", "margin-bottom": "2rem"},
+       "two values are start then end")
+    eq(_expanded("inset-inline-start", "3px"), {"left": "3px"})
+    eq(_expanded("inset-block", "5px"), {"top": "5px", "bottom": "5px"})
+
+
+def test_grid_gap_aliases_and_the_two_value_gap():
+    """`grid-gap` is the pre-standard spelling every grid framework of a
+    certain age still emits -- 1315 declarations across the surveyed sites,
+    and the gap between grid tracks is not a detail. The two-value `gap` is
+    here because layout reads the shorthand with parse_px, which takes the
+    first number and gives it to both axes."""
+    eq(_expanded("grid-column-gap", "12px"), {"column-gap": "12px"})
+    eq(_expanded("grid-row-gap", "4px"), {"row-gap": "4px"})
+    eq(_expanded("grid-gap", "10px 20px"),
+       {"row-gap": "10px", "column-gap": "20px"})
+    eq(_expanded("gap", "10px 20px"),
+       {"row-gap": "10px", "column-gap": "20px"},
+       "row gap first, column gap second")
+    eq(_expanded("gap", "8px"), {"row-gap": "8px", "column-gap": "8px"})
+
+
+def test_logical_padding_indents_the_box_it_is_on():
+    """End to end: docs.python.org indents every <dd> with
+    `padding-inline-start`, and without the expansion they sat flush left."""
+    from feetbrowser.layout import DrawText
+    flush = _paint_all("<dl><dd>text</dd></dl>")
+    indented = _paint_all("<dl><dd>text</dd></dl>",
+                          css="dd { padding-inline-start: 40px }")
+
+    def left(cmds):
+        return [c for c in cmds if isinstance(c, DrawText)][0].left
+    eq(left(indented), left(flush) + 40, "the logical padding moved the text")
+
+
+def test_two_value_gap_separates_the_columns():
+    from feetbrowser.layout import DrawText
+    cmds = _paint_all(
+        '<div class="g"><span>A</span><span>B</span></div>',
+        css=".g { display: flex; gap: 0 60px } span { width: 20px }")
+    xs = sorted(c.left for c in cmds if isinstance(c, DrawText))
+    assert xs[1] - xs[0] >= 60, \
+        "the column gap is the second value, not the first (%r)" % (xs,)
+
+
 def test_inheritance_and_inline():
     rules = CSSParser("body { color: green; }").parse()
     dom = HTMLParser(
