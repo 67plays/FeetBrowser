@@ -1913,9 +1913,9 @@ class _TabStub:
     """The parts of a `Tab` that building a player out of bytes touches.
 
     A whole `Tab` wants a window, a network stack and a laid-out page. The
-    real `Tab._finish_video` and `Tab._attach_video_audio` are then called
-    unbound against this, so what is under test is the shipping code and not
-    a paraphrase of it.
+    real `Tab._finish_video`, `Tab._build_players` and
+    `Tab._attach_video_audio` are then called unbound against this, so what
+    is under test is the shipping code and not a paraphrase of it.
     """
 
     def __init__(self):
@@ -1927,6 +1927,7 @@ class _TabStub:
         self._video_nodes = {}
 
     _attach_video_audio = browser.Tab._attach_video_audio
+    _build_players = browser.Tab._build_players
 
     def _add_error(self, text):
         self.errors.append(text)
