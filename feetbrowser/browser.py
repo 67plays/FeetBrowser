@@ -1623,12 +1623,18 @@ class Tab:
         self.set_scroll(self.scroll + delta)
 
     def set_scroll(self, value):
-        """Change the scroll offset and re-flatten the display list so pinned
-        (sticky/fixed) elements are repositioned for the new offset. Every
-        scroll mutation funnels through here (or render/repaint)."""
+        """Change the scroll offset. In the GUI the repaint is coalesced to
+        the next frame (latest-wins), so a fast scrollbar drag pays one full
+        redraw per frame rather than one per mouse-move event. Headless
+        callers (tests) and popup tabs repaint synchronously for
+        determinism."""
         self.scroll = value
         self._clamp_scroll()
-        self.repaint()
+        if self._gui_mode() and (self is self.browser.active_tab
+                                 or self in self.browser.tabs):
+            self.browser._schedule_scroll_repaint()
+        else:
+            self.repaint()
 
     def _clamp_scroll(self):
         max_y = max(0, self.content_height() - self.tab_height)
@@ -2901,6 +2907,10 @@ class Browser:
         # canvas entirely while the page is idle instead of repainting every
         # 120ms forever.
         self._repaint_needed = True
+        # Scroll repaint coalescing: at most one pending, run at the next
+        # frame at the latest scroll position, so a fast scrollbar drag pays
+        # one full redraw per frame instead of one per mouse-move event.
+        self._scroll_repaint_pending = False
         # Scroll velocity, for the momentum-easing curve: the ticks of the
         # flick in progress, oldest first. See _track_scroll_velocity.
         self._scroll_ticks = []
@@ -3173,8 +3183,10 @@ class Browser:
         self._track_scroll_velocity(delta)
         if self.active_tab:
             self.active_tab.scroll_by(delta)
-            self._draw_page()
-            # _draw_page re-asserts the chrome on top of the scrolled page.
+            # The thumb follows the pointer immediately; the page content is
+            # coalesced to the next frame so a fast scroll pays one full page
+            # redraw per frame instead of freezing.
+            self._draw_scrollbar()
 
     def _track_scroll_velocity(self, delta):
         """Record a scroll tick and re-read the velocity from the last
@@ -4349,6 +4361,28 @@ class Browser:
             if item_id not in before:
                 c.addtag_withtag("toe-draw", item_id)
 
+    def _schedule_scroll_repaint(self):
+        """Coalesce scroll repaints: at most one pending, run at the next
+        frame at the latest scroll position. Fast scrolls (scrollbar drags,
+        wheel bursts) then pay one full redraw per frame instead of one per
+        input event, which is what froze the UI when scrolling faster than
+        the renderer could keep up."""
+        if self._scroll_repaint_pending:
+            return
+        self._scroll_repaint_pending = True
+        self.window.after(0, self._run_scroll_repaint)
+
+    def _run_scroll_repaint(self):
+        self._scroll_repaint_pending = False
+        tab = self.active_tab
+        if tab is None:
+            return
+        # Re-flatten the display list for the latest offset (sticky/fixed
+        # elements move with scroll), then repaint once. Intermediate scroll
+        # positions between this frame and the last were already skipped.
+        tab.repaint()
+        self._draw_page()
+
     def _draw_page(self):
         """Repaint the page layer, then re-assert the chrome on top of it.
 
@@ -4721,10 +4755,11 @@ class Browser:
         # same limits the wheel gets.
         offset = (y - self._scroll_grab - track_top) / travel * span
         self._dismiss_select_popup()
+        # The thumb tracks the pointer on every event; the page content is
+        # coalesced to the next frame (latest-wins) so a fast drag does not
+        # freeze by queueing a full redraw per mouse-move.
         self.active_tab.set_scroll(offset)
-        # Same repaint the wheel gets: the page layer first, then the chrome
-        # over it -- which is where the thumb itself is drawn, so it follows.
-        self._draw_page()
+        self._draw_scrollbar()
 
     def run(self):
         self.window.update_idletasks()

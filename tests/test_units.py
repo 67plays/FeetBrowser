@@ -3141,6 +3141,9 @@ class _SelectBrowser(Browser):
     def _draw_chrome(self):
         self.paints += 1
 
+    def _draw_scrollbar(self):
+        self.paints += 1
+
     def _draw_select_popup(self):
         self.paints += 1
 
