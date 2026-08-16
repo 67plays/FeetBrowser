@@ -886,10 +886,83 @@ _INLINE_CACHE_MAX = 2048
 
 _LIST_STYLE_POSITIONS = ("inside", "outside")
 
+# A value is a run of non-space characters, except that a function call keeps
+# its parentheses -- and the spaces inside them -- together, so
+# `inset: 0 calc(1rem + 2px)` is two values rather than four. Layout has the
+# same regex for the same reason; it cannot be shared, because layout imports
+# this module and not the other way round.
+_COMPONENT_RE = re.compile(r"[^\s(]+\([^)]*\)|\S+")
+
+# The four sides a 1-to-4 value box maps onto, in CSS's clock order: one
+# value is all of them, two are (block, inline), three are (top, inline,
+# bottom), four are top/right/bottom/left.
+_CLOCK = {
+    1: (0, 0, 0, 0),
+    2: (0, 1, 0, 1),
+    3: (0, 1, 2, 1),
+    4: (0, 1, 2, 3),
+}
+
+# The physical sides the logical ones mean, assuming `writing-mode:
+# horizontal-tb` and `direction: ltr`. Both of those are properties this
+# engine does not read, so assuming them is not a shortcut so much as a
+# statement of what the rest of the layout already believes; an author who
+# writes `padding-inline-start` on an English page means padding-left, and
+# that is the overwhelming majority of what is out there. A right-to-left
+# document will get these mirrored, which is exactly as wrong as everything
+# else about it here.
+_LOGICAL_SIDES = {
+    "block": ("top", "bottom"),
+    "inline": ("left", "right"),
+    "block-start": ("top",),
+    "block-end": ("bottom",),
+    "inline-start": ("left",),
+    "inline-end": ("right",),
+}
+
+_SIDES = ("top", "right", "bottom", "left")
+
+# `inset` and its logical pieces, which say in one declaration what
+# top/right/bottom/left say in four. Layout reads the four.
+_INSET_SHORTHANDS = frozenset(
+    ["inset"] + ["inset-" + k for k in _LOGICAL_SIDES])
+
+# The box properties with a logical spelling. `margin`/`padding` themselves
+# are left alone: layout already resolves those shorthands where it uses
+# them, and expanding them here would only duplicate that.
+_LOGICAL_BOXES = frozenset(
+    "%s-%s" % (box, k) for box in ("margin", "padding")
+    for k in _LOGICAL_SIDES)
+
+# `grid-gap` and friends: the pre-standard spelling of `gap`, still emitted
+# by every grid framework of a certain age and by autoprefixer to this day.
+_GAP_ALIASES = {
+    "grid-gap": "gap",
+    "grid-row-gap": "row-gap",
+    "grid-column-gap": "column-gap",
+}
+_GAP_SHORTHANDS = frozenset(set(_GAP_ALIASES) | {"gap"})
+
 # The shorthands `_expand` has something to say about. The cascade in Rust
 # reads this to know when it has to ask, so a declaration whose property is
 # not in here is applied as it stands.
-EXPANDING_SHORTHANDS = frozenset({"list-style"})
+EXPANDING_SHORTHANDS = frozenset(
+    {"list-style"} | _GAP_SHORTHANDS | _INSET_SHORTHANDS | _LOGICAL_BOXES)
+
+
+def _components(value):
+    """Split a value into its space-separated components."""
+    return _COMPONENT_RE.findall(value or "")
+
+
+def _box_sides(value):
+    """Map a 1-to-4 value box onto (top, right, bottom, left), or None when
+    the value is not a box at all (`inset: auto`, five values, nothing)."""
+    parts = _components(value)
+    order = _CLOCK.get(len(parts))
+    if order is None:
+        return None
+    return tuple(parts[i] for i in order)
 
 
 def _expand(prop, value):
@@ -897,10 +970,18 @@ def _expand(prop, value):
 
     Almost every shorthand in this engine is left un-expanded and read
     where it is used, which works because layout can go looking for it.
-    `list-style` cannot be handled that way: only its type component
-    inherits, and the whole point of `list-style: none` on a <ul> is that
-    the <li>s inside it lose their markers. So it is expanded here, in
-    declaration order, exactly as writing the longhand would have been.
+    The ones handled here are the ones where that does not work: either
+    because the shorthand's parts do not all behave alike (`list-style`), or
+    because the property is a *different name* for one layout already reads
+    and would otherwise be cascaded onto the node and never looked at again
+    (`inset`, `grid-gap`, and the logical margins and paddings). Those three
+    account for the largest block of dropped declarations on the sites
+    surveyed -- 1222 `inset`, 1315 `grid-*-gap` -- and every one of them is
+    a box that ends up in the wrong place.
+
+    Expansion happens in declaration order, exactly as writing the longhand
+    would have been, and the shorthand itself is yielded first so anything
+    still reading it directly is unaffected.
     """
     yield prop, value
     if prop == "list-style":
@@ -912,6 +993,45 @@ def _expand(prop, value):
                 yield "list-style-image", token
             else:
                 yield "list-style-type", lowered
+        return
+    prop = _GAP_ALIASES.get(prop, prop)
+    if prop == "row-gap" or prop == "column-gap":
+        # Only reachable as the standard spelling of a `grid-*-gap` alias;
+        # the longhands themselves are read where they are used.
+        yield prop, value
+        return
+    if prop == "gap":
+        # `gap: 10px 20px` is a row gap and then a column gap. Layout reads
+        # the shorthand with parse_px, which takes the first number and uses
+        # it for both, so the two-value form silently lost its column gap.
+        parts = _components(value)
+        if parts:
+            yield "row-gap", parts[0]
+            yield "column-gap", parts[1] if len(parts) > 1 else parts[0]
+        return
+    if prop in _INSET_SHORTHANDS or prop in _LOGICAL_BOXES:
+        box, _dash, logical = prop.partition("-")
+        if prop == "inset":
+            box, logical = "", ""
+        prefix = (box + "-") if box in ("margin", "padding") else ""
+        if not logical:
+            sides = _box_sides(value)
+            if sides is None:
+                return
+            for side, part in zip(_SIDES, sides):
+                yield prefix + side, part
+            return
+        physical = _LOGICAL_SIDES[logical]
+        parts = _components(value)
+        if not parts:
+            return
+        if len(physical) == 1:
+            yield prefix + physical[0], parts[0]
+            return
+        # `margin-inline: a b` is start then end; one value is both.
+        for side, part in zip(physical, parts if len(parts) > 1
+                              else parts * 2):
+            yield prefix + side, part
 
 
 # `var(--name, fallback)` substitution used to live here, called back into
