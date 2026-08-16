@@ -2277,9 +2277,67 @@ def test_light_dark_resolves_to_the_light_side():
     eq(resolve_color("light-dark(transparent, black)"), None)
 
 
+def test_color_mix_interpolates_in_oklab():
+    """The values are the ones a real browser produces; they are not what a
+    naive average of the sRGB bytes gives, which is the whole point of the
+    space -- red-blue lands on a violet with a plausible lightness rather than
+    on the muddy #800080 that mixing the bytes produces."""
+    from feetbrowser.layout import resolve_color
+    eq(resolve_color("color-mix(in oklab, red, blue)"), "#8c53a2")
+    eq(resolve_color("color-mix(in oklab, white, black)"), "#636363",
+       "half way between black and white is perceptual middle grey")
+    eq(resolve_color("color-mix(in srgb, red, blue)"), "#800080",
+       "and mixing the bytes is what `in srgb` asks for")
+    eq(resolve_color("color-mix(in srgb, #ffffff 25%, #000000 75%)"),
+       "#404040")
+
+
+def test_color_mix_fills_in_the_missing_percentage():
+    from feetbrowser.layout import resolve_color
+    eq(resolve_color("color-mix(in srgb, red 100%, blue 0%)"), "#ff0000")
+    eq(resolve_color("color-mix(in srgb, red 0%, blue)"), "#0000ff",
+       "the omitted percentage is what is left of 100")
+    eq(resolve_color("color-mix(in srgb, red 20%, blue 20%)"), "#800080",
+       "a pair that does not add up to 100 is normalised")
+    eq(resolve_color("color-mix(in srgb, 25% red, blue)"), "#4000bf",
+       "the percentage may come first")
+    eq(resolve_color("color-mix(in srgb, red 0%, blue 0%)"), None,
+       "nothing of either is not a colour")
+    eq(resolve_color("color-mix(oklab, red, blue)"), None,
+       "the space is not optional")
+
+
+def test_color_mix_keeps_the_side_it_can_resolve():
+    """`transparent` and `currentColor` both come back from resolve_color as
+    "no colour", and voiding the whole declaration over one of them would undo
+    the fade the page was asking for. Dropping the alpha and keeping the other
+    end is what this engine already does with rgba()."""
+    from feetbrowser.layout import resolve_color
+    eq(resolve_color("color-mix(in oklab, red, transparent)"), "#ff0000")
+    eq(resolve_color("color-mix(in oklab, currentColor, #00ff00)"), "#00ff00")
+    eq(resolve_color("color-mix(in oklab, transparent, currentColor)"), None)
+
+
+def test_color_mix_through_a_custom_property_paints():
+    """The shape every real use of color-mix() arrives in: a theme class sets
+    a custom property to a mix, something else reads it through var(), and the
+    percentages come through var() fallbacks of their own."""
+    from feetbrowser.layout import DrawRect
+    cmds = _paint_all(
+        "<div class=theme><p id=x>hi</p></div>",
+        """.theme { --base: #101010;
+                    --ink: color-mix(in oklab, var(--base) 100%,
+                                     var(--theme-tint, #fff)
+                                     var(--theme-amount, 0%)); }
+           #x { background-color: var(--ink); height: 10px }""")
+    rects = [c for c in cmds if isinstance(c, DrawRect)]
+    eq([c.color for c in rects], ["#101010"],
+       "a 100%/0% mix is the first colour, and it has to reach the canvas")
+
+
 def test_unreadable_colours_paint_nothing_rather_than_black():
     from feetbrowser.layout import resolve_color
-    eq(resolve_color("color-mix(in srgb, red, blue)"), None, "unknown function")
+    eq(resolve_color("device-cmyk(0 1 1 0)"), None, "unknown function")
     eq(resolve_color("initial #2d3034"), None, "two tokens is not a colour")
     eq(resolve_color("#12345"), None, "malformed hex")
     eq(resolve_color("rebeccapurple"), "rebeccapurple", "real names survive")
