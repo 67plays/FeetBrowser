@@ -4113,7 +4113,6 @@ class Browser:
                 ("View Source", self._view_source,
                  bool(tab and isinstance(tab.url, URL))),
                 ("History", self._open_history_page, bool(tab)),
-                ("Downloads", self._toggle_downloads, True),
             ]
         doc_y = y - self.chrome_height()
         node = tab._node_at(x, doc_y)
@@ -4171,7 +4170,6 @@ class Browser:
             None,
             ("New Tab", lambda: self.new_tab("about:blank"), True),
             ("Close Tab", self.close_tab, len(self.tabs) > 1),
-            ("Downloads", self._toggle_downloads, True),
         ])
         return items
 
@@ -4589,6 +4587,7 @@ class Browser:
         return [
             ("Bookmarks", lambda: self.new_tab("about:bookmarks"), True),
             ("History", lambda: self.new_tab("about:history"), True),
+            ("Downloads", self._toggle_downloads, True),
             None,
             ("Manage Shoes", lambda: self.new_tab("about:shoes"), True),
             None,
