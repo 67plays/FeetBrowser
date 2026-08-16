@@ -22,10 +22,20 @@ name: Package (Windows)
 on:
   # The normal way to get a build: pick a branch, press the button.
   workflow_dispatch:
-  # A tagged version should have an application to download, not just wheels.
-  push:
-    tags:
-      - 'v*'
+  # A tagged version should have an application to download, not just
+  # wheels -- and release.yml is what sees to that now. It calls this
+  # workflow rather than reproducing it, so the zip on a release page is
+  # the one these jobs have always built and proved.
+  workflow_call:
+    inputs:
+      version:
+        description: >
+          Set by release.yml, and used only to name the artifact: a release
+          run leaves FeetBrowser-0.6.0-windows-x64 where a run started by
+          hand leaves FeetBrowser-windows-x64.
+        required: false
+        type: string
+        default: ''
   # And any change to the packaging itself has to prove itself before it
   # lands. Everything else is ci.yml's business -- this workflow never runs
   # the test suite.
@@ -34,9 +44,12 @@ on:
       - 'packaging/windows/**'
       - '.github/workflows/package-windows.yml'
 
+# Named rather than ${{ github.workflow }}: when a workflow is called,
+# github.workflow is the *caller's* name, so all three Package workflows
+# would land in one group and take turns instead of running at once.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+  group: package-windows-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 permissions:
   contents: read
@@ -48,7 +61,11 @@ env:
   # with the wrong tag, so the two cannot drift apart silently -- but they are
   # both derived from this one line.
   PYTHON_MINOR: '3.13'
-  BUNDLE_ARTIFACT: FeetBrowser-windows-x64
+  # One name, used by the job that uploads the bundle and the job that
+  # downloads it again onto a clean machine. A release run puts the version
+  # in it; the .zip inside keeps its own name either way, and release.yml
+  # renames that copy when it attaches it.
+  BUNDLE_ARTIFACT: FeetBrowser${{ inputs.version && format('-{0}', inputs.version) || '' }}-windows-x64
 
 jobs:
   build:

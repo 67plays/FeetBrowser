@@ -1,0 +1,329 @@
+name: Release
+
+# One run that produces all three downloads and the release they hang off.
+#
+# Until now a tagged version started three independent workflows -- Package
+# (macOS), Package (Linux) and Package (Windows) -- and only the Linux one
+# knew what a release was, so it created one, published it, and attached its
+# AppImage, while the other two left their artifacts on their own runs for
+# somebody to fetch by hand. Whether a release ended up complete depended on
+# which workflow finished first and on whether the person who tagged
+# remembered to go and collect the other two.
+#
+# So this file owns tags now. It does not reimplement any of the packaging:
+# the three Package workflows became callable, and this calls them, which
+# means a release is built by exactly the scripts and the checks that a
+# maintainer already trusts -- including the parts that are easy to forget
+# they exist, like the Intel runner that builds the x86_64 Fortran decoders
+# for the universal .app, and the jobs that install each package on a clean
+# machine and run it. Nothing is duplicated here, so nothing here can drift
+# away from them.
+#
+# What this file adds on top of them is the three things they were never
+# meant to do: run the test suite first, name the artifacts after the
+# version, and gather the results into one release.
+#
+# The release is created as a DRAFT on purpose. Everything below can be
+# proved by a machine except the two things that matter most at that
+# moment -- that the notes read properly, and that this is really the commit
+# you meant to ship -- so the last step is a person pressing Publish. To make
+# it publish by itself instead, drop `--draft` from the `gh release create`
+# line at the bottom.
+#
+# Nothing here signs anything. The packages are deliberately unsigned -- no
+# Apple Developer ID, no Authenticode certificate -- so the notes say so and
+# tell people what their operating system is about to accuse the download of,
+# which is the honest version of the same thing.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  # The same run, without having to tag first. This is how the whole thing
+  # gets exercised on a branch: it builds all three packages and leaves a
+  # draft release that can be read and then deleted.
+  workflow_dispatch:
+    inputs:
+      version:
+        description: >
+          The version to build, e.g. 0.6.0 -- it has to match __version__
+          in feetbrowser/__init__.py.
+        required: true
+        type: string
+
+# A second tag push queues behind the first rather than cancelling it: what
+# would be cancelled is a half-built release.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # Seconds, before anything expensive starts. The three packaging scripts
+  # name their output after feetbrowser.__version__ while the release is
+  # named after the tag, and packaging/release_version.py is what stops those
+  # two disagreeing quietly -- see its docstring for what that looks like.
+  version:
+    name: Version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.pick.outputs.version }}
+      tag: ${{ steps.pick.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Agree on the number
+        id: pick
+        env:
+          # On a tag push this is refs/tags/v0.6.0; on a manual run it is
+          # whatever was typed into the box. The helper takes either.
+          ASKED: ${{ inputs.version || github.ref }}
+        run: |
+          version=$(python3 -u packaging/release_version.py "$ASKED")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+          echo "Building FeetBrowser $version" >> "$GITHUB_STEP_SUMMARY"
+
+  # The suite, on each platform, before any of them is packaged. This is what
+  # makes a broken build unreleasable: the packaging jobs below wait on all
+  # three of these, so no runner spends three quarters of an hour producing a
+  # .dmg for a tree whose tests do not pass on Windows.
+  #
+  # ./test.sh and test.cmd are used rather than a list of suites copied out of
+  # ci.yml because tests/test_suites.py already forces those two scripts to
+  # name every suite in tests/, so they cannot fall behind; a third handwritten
+  # list, here, could and would. Both of them run test_nav.py and smoke.py
+  # against the real web, so a failure in those two may be somebody else's bad
+  # afternoon rather than this commit -- re-run the job before believing it.
+  test:
+    name: Tests on ${{ matrix.os }}
+    needs: version
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      # One red platform stops the other two: nothing is being released
+      # today, and the minutes are better kept.
+      fail-fast: true
+      matrix:
+        include:
+          - { os: ubuntu-latest, python: '3.12' }
+          - { os: macos-latest, python: '3.12' }
+          # The Windows bundle carries CPython 3.13 and a non-abi3 engine
+          # built for it, so that is the interpreter worth testing on here.
+          - { os: windows-latest, python: '3.13' }
+    steps:
+      - uses: actions/checkout@v4
+
+      # The venv, the engine, the fonts and gfortran -- exactly as every CI
+      # job gets them.
+      - uses: ./.github/actions/build
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: The suite
+        if: runner.os != 'Windows'
+        run: ./test.sh
+
+      # cmd.exe, because test.cmd is the runner a Windows contributor
+      # actually types, and this is the only thing that ever executes it in
+      # the release path.
+      - name: The suite
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: test.cmd
+
+  # --- the three packages, in parallel, each on its own operating system ---
+  #
+  # Three calls, and every step inside them is the one that was already
+  # there. `version` is passed only so the artifacts come out named after
+  # the release; each workflow builds the same thing either way.
+
+  macos:
+    name: macOS
+    needs: [version, test]
+    uses: ./.github/workflows/package-macos.yml
+    with:
+      version: ${{ needs.version.outputs.version }}
+
+  linux:
+    name: Linux
+    needs: [version, test]
+    uses: ./.github/workflows/package-linux.yml
+    with:
+      version: ${{ needs.version.outputs.version }}
+
+  windows:
+    name: Windows
+    needs: [version, test]
+    uses: ./.github/workflows/package-windows.yml
+    with:
+      version: ${{ needs.version.outputs.version }}
+
+  # All three have to be green before this job exists at all, which is the
+  # other half of "a broken build cannot be released": there is never a
+  # partial release to clean up, because the release is made once, at the
+  # end, out of three packages that have each already been installed on a
+  # clean machine and run.
+  draft:
+    name: Draft release
+    needs: [version, macos, linux, windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      TAG: ${{ needs.version.outputs.tag }}
+    steps:
+      # By name rather than by pattern: the packaging workflows also upload
+      # screenshots and Fortran slices, and a release should carry the three
+      # things people came for and nothing else.
+      - uses: actions/download-artifact@v4
+        with:
+          name: FeetBrowser-${{ needs.version.outputs.version }}-macos-dmg
+          path: assets
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: feetbrowser-${{ needs.version.outputs.version }}-appimage-x86_64
+          path: assets
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: FeetBrowser-${{ needs.version.outputs.version }}-windows-x64
+          path: assets
+
+      # The .dmg and the .AppImage are named after __version__ by the scripts
+      # that build them. The Windows zip is not: build.ps1 writes
+      # FeetBrowser-windows-x64.zip, which is the right name for a file on a
+      # run and the wrong one for a file sitting between two others on a
+      # release page.
+      - name: Name the bundle after the release
+        run: |
+          mv assets/FeetBrowser-windows-x64.zip \
+             "assets/FeetBrowser-$VERSION-windows-x64.zip"
+          ls -lh assets
+
+      # The notes a signature would otherwise have made unnecessary. Both
+      # operating systems are about to accuse this download of being
+      # dangerous, and somebody who has not been told why will believe them.
+      # The long versions ship inside the packages themselves --
+      # packaging/macos/OPEN-ME-FIRST.txt and the Windows README-FIRST.txt --
+      # so this is the short one, on the page the file is downloaded from.
+      - name: Write the part of the notes GitHub cannot generate
+        run: |
+          cat > notes.md <<'NOTES'
+          ### Downloads
+
+          | Platform | File |
+          |----------|------|
+          | macOS 11 and later, Apple Silicon or Intel | `FeetBrowser-VERSION.dmg` |
+          | Windows 10 or later, 64-bit | `FeetBrowser-VERSION-windows-x64.zip` |
+          | Linux, x86-64, glibc 2.28 or newer | `FeetBrowser-VERSION-x86_64.AppImage` |
+
+          Each one is self-contained: it carries its own CPython and its own
+          compiled engine, and needs nothing installed on the machine.
+
+          ### These packages are not signed
+
+          Deliberately. Signing means a paid Apple Developer membership and
+          an Authenticode certificate on a hardware token, and this is a free
+          project that would rather say so than charge for it. Every build is
+          made in public by GitHub Actions from the source in this
+          repository; the run that produced these files is this release's
+          own, and its log shows every command.
+
+          Your operating system cannot tell "nobody paid" apart from "this is
+          dangerous", so it says the scarier of the two:
+
+          **macOS** refuses the first launch: *"FeetBrowser cannot be opened
+          because Apple cannot check it for malicious software."* Open System
+          Settings, go to Privacy & Security, scroll to the bottom, and click
+          **Open Anyway** next to FeetBrowser. macOS remembers the decision
+          and every launch after that is an ordinary double-click. On macOS
+          14 and earlier you can instead right-click the app and choose
+          **Open** -- that shortcut was removed in macOS 15 Sequoia, so on a
+          current Mac use System Settings. Please do not switch Gatekeeper
+          off entirely to solve a problem with one file.
+
+          **Windows** shows a blue *"Windows protected your PC"* box from
+          SmartScreen, and Edge may warn you while the zip is downloading.
+          Click **More info**, then **Run anyway**. If Windows will not
+          unpack the archive at all, right-click the .zip, choose Properties,
+          and tick **Unblock** at the bottom.
+
+          **Linux** has nothing to say about it: `chmod +x` the AppImage and
+          run it.
+
+          ---
+          NOTES
+          sed -i "s/VERSION/$VERSION/g" notes.md
+
+      # What changed comes from GitHub's own generator, asked for directly
+      # rather than through `gh release create --generate-notes`, because
+      # this job has to be able to write the body of a release it did not
+      # create: wheels.yml also attaches to the release for a tag and may
+      # get there first, and if it does then everything above would
+      # otherwise never be written down.
+      - name: Ask GitHub what changed
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh api "repos/$GH_REPO/releases/generate-notes" \
+            -f tag_name="$TAG" -f target_commitish="$GITHUB_SHA" \
+            --jq .body >> notes.md
+          cat notes.md
+
+      # gh, not a third-party release action: it is preinstalled on the
+      # runner and it is the same tool a maintainer would use by hand.
+      - name: Create the draft and attach the three packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          # Re-running this workflow has to be safe. A draft left by an
+          # earlier attempt, or one wheels.yml made first, is reused and its
+          # notes and assets brought up to date. A release that has already
+          # been published is never touched: somebody has put their name to
+          # it by then, and a workflow quietly rewriting it is the worst
+          # thing this file could do.
+          state=$(gh release view "$TAG" --json isDraft --jq .isDraft \
+                  2>/dev/null || echo missing)
+          case "$state" in
+            missing)
+              gh release create "$TAG" --draft \
+                --title "FeetBrowser $VERSION" \
+                --notes-file notes.md \
+                --target "$GITHUB_SHA"
+              ;;
+            true)
+              echo "a draft for $TAG exists already; bringing it up to date"
+              gh release edit "$TAG" --draft \
+                --title "FeetBrowser $VERSION" --notes-file notes.md
+              ;;
+            *)
+              echo "::error::$TAG is already published; refusing to change a"\
+                   "release somebody has already put their name to."
+              exit 1
+              ;;
+          esac
+
+          gh release upload "$TAG" \
+            assets/FeetBrowser-"$VERSION".dmg \
+            assets/FeetBrowser-"$VERSION"-x86_64.AppImage \
+            assets/FeetBrowser-"$VERSION"-windows-x64.zip \
+            --clobber
+
+          url=$(gh release view "$TAG" --json url --jq .url)
+          {
+            echo "## $TAG is drafted, not published"
+            echo
+            echo "Three packages are attached. Read the notes, check the"
+            echo "commit, then press Publish: $url"
+          } >> "$GITHUB_STEP_SUMMARY"
