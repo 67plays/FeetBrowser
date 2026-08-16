@@ -67,6 +67,7 @@ fi
 run=".venv/bin/python tests/watchdog.py 900"
 
 $run tests/test_suites.py  # every file below, and nothing missing
+$run tests/test_discord.py  # the from-scratch Discord Rich Presence client
 $run tests/test_render.py
 $run tests/test_cocoa.py   # opens real windows on macOS, skips elsewhere
 $run tests/test_x11.py     # opens real windows under X11, skips elsewhere

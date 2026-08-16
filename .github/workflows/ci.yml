@@ -63,6 +63,9 @@ jobs:
       - name: Renderer tests
         run: $PY tests/test_render.py
 
+      - name: Discord Rich Presence tests
+        run: $PY tests/test_discord.py
+
       # test_cocoa opens real NSWindows on the macOS runners and test_win32
       # opens real HWNDs on the Windows ones; each skips off its own
       # platform, and test_x11 runs its whole offline half everywhere. Until

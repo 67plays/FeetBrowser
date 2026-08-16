@@ -282,6 +282,7 @@ def test_browser_tab_cycle_wraps():
     # Switching tabs takes any open <select> list down with it.
     stub.select_popup = SelectPopup()
     stub._dismiss_select_popup = lambda: Browser._dismiss_select_popup(stub)
+    stub._update_presence = lambda: None  # no RPC on this bare stub
 
     def draw():
         stub.draw_calls += 1
@@ -339,6 +340,32 @@ def test_a_single_scroll_tick_has_no_speed_yet():
     Browser._track_scroll_velocity(stub, 30)
     eq(stub._scroll_velocity, 0.0, "one tick spans no time")
     eq(len(stub._scroll_ticks), 1, "the tick was still recorded")
+
+
+def test_a_burst_faster_than_the_clock_can_tell_is_still_a_flick():
+    """A burst whose ticks all land in the same clock tick -- which is what
+    a coarse timer (Windows) does to a fast wheel -- must read as a fast
+    flick, not as stillness. A zero span used to mean zero velocity, so the
+    coast never started and the momentum suite flaked on Windows."""
+    real = time.monotonic
+    time.monotonic = lambda: 1234.5  # every tick in the same instant
+    try:
+        stub = _velocity_stub()
+        for _ in range(8):
+            Browser._track_scroll_velocity(stub, -20)
+    finally:
+        time.monotonic = real
+    assert stub._scroll_velocity < 0, \
+        "a zero-span burst read as no velocity: %.1f" \
+        % stub._scroll_velocity
+    # A lone notch in the same instant is still not a speed to coast.
+    time.monotonic = lambda: 5678.9
+    try:
+        lone = _velocity_stub()
+        Browser._track_scroll_velocity(lone, -20)
+    finally:
+        time.monotonic = real
+    eq(lone._scroll_velocity, 0.0, "one tick spans no time, even on a coarse clock")
 
 
 def test_the_scroll_history_does_not_grow_for_the_whole_session():
