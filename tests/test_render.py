@@ -4303,6 +4303,176 @@ def test_navigating_away_stops_the_decode_threads():
         shutil.rmtree(work, ignore_errors=True)
 
 
+def _av_page(work, audible):
+    """A `<video>` on a real H.264 + AAC MP4, loaded with the output device
+    declared audible or not, and nothing else about it faked.
+
+    `FEETBROWSER_AUDIO=null` pins the device to the paced null one on every
+    machine, so this neither makes a noise on a developer's speakers nor
+    depends on a CI runner having any. `silent` is then forced, because it
+    is the single bit `attach_audio` branches on and the null device always
+    reports it true. Everything above the device stays real: the container
+    finds the second track, the AAC decoder decodes it, `arch.AudioPlayer`
+    wraps it, the browser attaches it, and the null device keeps real time
+    by design, so positions still mean something.
+    """
+    from feetbrowser import arch
+    from feetbrowser.browser import Browser
+    shutil.copy(os.path.join(_FIXTURES, "video", "av.mp4"),
+                os.path.join(work, "av.mp4"))
+    page = os.path.join(work, "av.html")
+    with open(page, "w", encoding="utf8") as handle:
+        handle.write("<html><body><video src='av.mp4'></video></body>")
+    was_env = os.environ.get("FEETBROWSER_AUDIO")
+    was_silent = arch.AudioPlayer.silent
+    os.environ["FEETBROWSER_AUDIO"] = "null"
+    arch.AudioPlayer.silent = property(
+        lambda self: self.track is None or not audible)
+    try:
+        browser = Browser()
+        browser.new_tab("file://" + page)
+        browser.settle(30.0)
+        return browser
+    finally:
+        arch.AudioPlayer.silent = was_silent
+        if was_env is None:
+            os.environ.pop("FEETBROWSER_AUDIO", None)
+        else:
+            os.environ["FEETBROWSER_AUDIO"] = was_env
+
+
+def test_a_video_with_a_soundtrack_hangs_its_pictures_off_the_sound():
+    """One file, both tracks, wired to each other -- which nothing in this
+    suite covered.
+
+    Every media fixture here is video with no sound or sound with no video,
+    so the path a real MP4 takes has never been exercised: find the audio
+    track in the same file the pictures came from, build a second player for
+    it, and hand it to `attach_audio` so the scheduler stops asking the wall
+    clock what time it is and starts asking the soundtrack.
+
+    That last step is the one worth pinning. Skip it and everything still
+    looks right -- the video plays, the sound plays, the first second is
+    fine -- and then the two drift apart over minutes, because a wall clock
+    and an audio device do not agree about how long a second is. There is no
+    assertion on "it played" that catches that. The assertion that catches it
+    is that the clock driving the pictures IS the sound.
+
+    `av.mp4` is x264 Main profile with CABAC and two B frames, muxed with
+    AAC-LC stereo -- the shape of essentially every video on the web, and
+    deliberately not something this repo generated for itself.
+    """
+    from feetbrowser import media
+    from feetbrowser.layout import DrawVideo
+    work = tempfile.mkdtemp()
+    try:
+        browser = _av_page(work, audible=True)
+        tab = browser.active_tab
+        if not tab.video_players or tab.video_players[0].track is None:
+            # No gfortran, so no H.264. The rest of the suite skips the same
+            # way; saying so beats a green tick that means nothing.
+            print("  skipped: no H.264 decoder on this machine")
+            return
+
+        player = tab.video_players[0]
+        assert len(tab.audio_players) == 1, (
+            "the sound in the same file was not found: %r"
+            % (tab.audio_players,))
+        audio = tab.audio_players[0]
+        assert audio.playable, "the AAC track was found and refused: %r" % (
+            audio.error or audio.info,)
+        assert audio.info.channels == 2, audio.info
+
+        assert isinstance(player.scheduler.clock, media._AudioClock), (
+            "the pictures are still on the wall clock (%r) with a soundtrack "
+            "attached -- they will drift away from the sound"
+            % (player.scheduler.clock,))
+
+        box = [c for c in tab.display_list if isinstance(c, DrawVideo)][0]
+        top = browser.chrome_height()
+
+        def picture():
+            """Every pixel of the video box, off the painted framebuffer."""
+            browser.draw()
+            surface = browser.canvas.render()
+            return [_pixel(surface, x, y + top)
+                    for y in range(int(box.top), int(box.bottom))
+                    for x in range(int(box.left), int(box.right))]
+
+        before = picture()
+
+        tab.click(int(box.left) + 3, int(box.top) + 3)
+        assert player.playing
+        deadline = time.monotonic() + 20.0
+        while player.scheduler.presented < 6 and time.monotonic() < deadline:
+            browser.window.flush_timers()
+            time.sleep(0.005)
+        stats = player.stats()
+        assert stats["presented"] >= 6, stats
+        assert stats["decode_errors"] == 0, stats
+        assert stats["dropped"] == 0 and stats["starved"] == 0, stats
+
+        drift = abs(audio.position() - player.position())
+        assert drift < 0.2, "sound is %.3fs from the picture" % drift
+
+        assert picture() != before, \
+            "the picture on screen never changed while it was playing"
+        print("  %d frames presented, drift %.3fs" % (stats["presented"],
+                                                      drift))
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def test_a_video_on_a_machine_with_no_sound_plays_anyway():
+    """The other half of the same decision, and the reason CI is not a
+    weaker run of the test above.
+
+    A device nobody can hear is not a clock: it is a video with a new way to
+    stop. So `attach_audio` declines a silent output, hands nothing back,
+    and the pictures stay on the clock they were made with. Every headless
+    box in CI is this case, which means it is the case that actually ships
+    to a machine with an unplugged sound card -- and it has to be a video
+    that plays, not a video that hangs waiting for a soundtrack that never
+    moves.
+
+    Same file, same page, same everything as above; only the one bit the
+    decision is made on is different.
+    """
+    from feetbrowser import media
+    from feetbrowser.layout import DrawVideo
+    work = tempfile.mkdtemp()
+    try:
+        browser = _av_page(work, audible=False)
+        tab = browser.active_tab
+        if not tab.video_players or tab.video_players[0].track is None:
+            print("  skipped: no H.264 decoder on this machine")
+            return
+
+        player = tab.video_players[0]
+        assert tab.audio_players == [], (
+            "a soundtrack nobody can hear was attached anyway: %r"
+            % (tab.audio_players,))
+        assert not isinstance(player.scheduler.clock, media._AudioClock), (
+            "the pictures are being timed by a device that is not playing")
+
+        box = [c for c in tab.display_list if isinstance(c, DrawVideo)][0]
+        tab.click(int(box.left) + 3, int(box.top) + 3)
+        assert player.playing
+        deadline = time.monotonic() + 20.0
+        while player.scheduler.presented < 6 and time.monotonic() < deadline:
+            browser.window.flush_timers()
+            time.sleep(0.005)
+        stats = player.stats()
+        assert stats["presented"] >= 6, (
+            "with no sound to follow the video stopped instead of playing: "
+            "%r" % (stats,))
+        assert stats["decode_errors"] == 0, stats
+        print("  silent machine: %d frames presented anyway"
+              % stats["presented"])
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
 def test_an_mjpeg_clip_plays_on_a_page_and_the_picture_moves():
     """The whole point of the exercise, end to end: a `<video>` on an ordinary
     HTML page, pointed at an ordinary Motion JPEG file, decoding and painting
