@@ -46,6 +46,17 @@ from . import __version__
 
 WIDTH, HEIGHT = 1000, 720
 SCROLL_STEP = 80
+# Wheel momentum: a fast flick keeps coasting after the last notch and
+# decays to nothing instead of stopping dead, which is what makes quick
+# scrolling feel fast. The coast starts at a fraction of the flick's
+# pixels-per-second velocity (see _track_scroll_velocity) and advances one
+# frame per timer tick.
+MOMENTUM_FRAME_MS = 16
+MOMENTUM_DECAY = 0.86
+MOMENTUM_STOP = 1.0  # px per frame; below this the coast gives up
+MOMENTUM_SETTLE_MS = 45  # no new notch in this long -> start coasting
+MOMENTUM_GAIN = 0.012  # coast seed, as a fraction of the flick's speed
+MOMENTUM_MAX = 40.0  # px per frame the coast starts at, at most
 CHROME_HEIGHT = 80  # tabs + address bar
 LOG_HEIGHT = 16  # slim strip under the toolbar reporting load errors
 TAB_LEFT = 8  # first tab's left edge on the tab strip
@@ -2884,8 +2895,11 @@ class Browser:
         self._repaint_needed = True
         # Scroll velocity, for the momentum-easing curve: the ticks of the
         # flick in progress, oldest first. See _track_scroll_velocity.
+        # `_momentum_job` is the pending settle or coast timer handle, or
+        # None when nothing is coasting.
         self._scroll_ticks = []
         self._scroll_velocity = 0.0
+        self._momentum_job = None
         # Whether the _poll_images() after-chain is already running. It is
         # started by whoever needs it first -- run(), or settle() in a
         # headless render -- and there must only ever be one of it.
@@ -3012,6 +3026,7 @@ class Browser:
                    max(TAB_LEFT, self.canvas.winfo_width() - NEW_TAB_W))
 
     def new_tab(self, url, focus_address=False):
+        self._cancel_momentum()
         self._dismiss_select_popup()
         tab = Tab(self.tab_height(), self)
         page = self._coerce_url(url)
@@ -3030,6 +3045,7 @@ class Browser:
     def close_tab(self):
         if not self.active_tab:
             return
+        self._cancel_momentum()
         self._dismiss_select_popup()
         idx = self.tabs.index(self.active_tab)
         self.active_tab.stop_videos()
@@ -3123,6 +3139,7 @@ class Browser:
             return "break"
         if self.focus == "address" or not self.active_tab:
             return
+        self._cancel_momentum()
         self.active_tab.set_scroll(0)
         self.draw()
         return "break"
@@ -3136,6 +3153,7 @@ class Browser:
             return "break"
         if self.focus == "address" or not self.active_tab:
             return
+        self._cancel_momentum()
         self.active_tab.set_scroll(self.active_tab.content_height())
         self.draw()
         return "break"
@@ -3146,10 +3164,51 @@ class Browser:
         if self._listbox_wheel(getattr(e, "x", -1), getattr(e, "y", -1), delta):
             return
         self._scroll(delta)
+        # A wheel turn arms the coast: if no new notch lands within a
+        # settle window, the flick feeds the page on and decays.
+        self._momentum_job = self.window.after(
+            MOMENTUM_SETTLE_MS, self._momentum_settle)
+
+    def _momentum_settle(self):
+        """Turn the tracked wheel velocity into a coasting animation.
+
+        A fresh wheel tick within the settle window re-arms instead of
+        starting a coast, so a continuous flick is one unbroken glide rather
+        than a jerk, coast, jerk.
+        """
+        if self._scroll_ticks and \
+                time.monotonic() - self._scroll_ticks[-1][1] < 0.04:
+            self._momentum_job = self.window.after(
+                MOMENTUM_SETTLE_MS, self._momentum_settle)
+            return
+        speed = self._scroll_velocity
+        if not self.active_tab or not speed:
+            self._momentum_job = None
+            return
+        seed = min(abs(speed) * MOMENTUM_GAIN, MOMENTUM_MAX)
+        self._coast(seed if speed > 0 else -seed)
+
+    def _coast(self, speed):
+        frame = round(speed)
+        if not self.active_tab or abs(frame) < MOMENTUM_STOP:
+            self._momentum_job = None
+            return
+        self.active_tab.scroll_by(frame)
+        self._draw_page()
+        self._momentum_job = self.window.after(
+            MOMENTUM_FRAME_MS, self._coast, speed * MOMENTUM_DECAY)
+
+    def _cancel_momentum(self):
+        if self._momentum_job is not None:
+            self.window.after_cancel(self._momentum_job)
+            self._momentum_job = None
 
     def _scroll(self, delta):
         # Scrolling the page out from under a drop-down would leave it
         # pointing at nothing, so the list goes rather than travels.
+        # A non-wheel scroll has no momentum of its own, and it must stop
+        # whatever coast was running.
+        self._cancel_momentum()
         self._dismiss_select_popup()
         self._track_scroll_velocity(delta)
         if self.active_tab:
@@ -4290,6 +4349,7 @@ class Browser:
     def _navigate(self, tab, url, payload=None):
         """Load `url` on `tab`; image fetching + repaint happen when the
         document is ready (see Tab._complete_load)."""
+        self._cancel_momentum()
         self._dismiss_select_popup()
         tab.load(url, payload=payload)
         self.draw()
@@ -4671,6 +4731,7 @@ class Browser:
         metrics = self._scrollbar_metrics()
         if metrics is None:
             return False
+        self._cancel_momentum()
         track_x, track_top, track_h, thumb_top, thumb_h, _span = metrics
         if x < track_x - SCROLLBAR_GRAB_PAD:
             return False
