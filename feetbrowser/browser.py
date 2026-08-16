@@ -35,6 +35,7 @@ from .layout import DocumentLayout, paint_tree, get_font, _measure, \
     LISTBOX_ROW_H, LISTBOX_PAD
 from .selection import Index as SelectionIndex, Selection, \
     contrasting_text_color
+from .discord import DiscordRPC, DEFAULT_CLIENT_ID
 from . import shoes as shoes
 from . import downloads as downloads
 from . import media
@@ -3173,6 +3174,19 @@ class Browser:
         self.focus = None  # "address" or None
         self.address_text = ""
         self.bookmarks = self._load_bookmarks()
+        # Discord Rich Presence: announce the active tab and tab count on the
+        # user's Discord activity. Off unless a client id exists and the
+        # feature is not explicitly disabled.
+        self._started_at = time.time()
+        self.rpc = None
+        client_id = os.environ.get("FEETBROWSER_DISCORD_CLIENT_ID") \
+            or DEFAULT_CLIENT_ID
+        if os.environ.get("FEETBROWSER_DISCORD", "1") != "0" and client_id:
+            try:
+                self.rpc = DiscordRPC(client_id)
+                self.rpc.start()
+            except Exception:  # noqa: BLE001 - absence of Discord is fine
+                self.rpc = None
         # Shoes theme: the active color palette for the chrome.
         self.shoe = shoes.load()
         self.theme = shoes.merge(shoes.resolve(self.shoe))
@@ -3369,6 +3383,7 @@ class Browser:
             return
         if drag.target != drag.home:
             self.tabs.insert(drag.target, self.tabs.pop(drag.home))
+            self._update_presence()
         # The move is over the list of tabs themselves, and what is active is
         # a tab and not a position, so the active tab stays active across it.
         # Nothing else keeps a tab index between events either -- close_tab,
@@ -3411,6 +3426,7 @@ class Browser:
         self.active_tab = tab
         toes.dispatch(self.toe_contexts, "on_new_tab")
         self.draw()
+        self._update_presence()
         if focus_address:
             self._focus_address()
 
@@ -3424,10 +3440,14 @@ class Browser:
         self.active_tab.stop_videos()
         self.tabs.remove(self.active_tab)
         if not self.tabs:
+            if self.rpc:
+                self.rpc.close()
+                self.rpc = None
             self.window.destroy()
             return
         self.active_tab = self.tabs[min(idx, len(self.tabs) - 1)]
         self.draw()
+        self._update_presence()
 
     # -- event handlers --------------------------------------------------
 
@@ -4713,6 +4733,7 @@ class Browser:
         i = self.tabs.index(self.active_tab)
         self.active_tab = self.tabs[(i + step) % len(self.tabs)]
         self.draw()
+        self._update_presence()
         return "break"
 
     def _coerce_url(self, raw):
@@ -4807,6 +4828,7 @@ class Browser:
         idx = self.tabs.index(self.active_tab)
         self.active_tab = self.tabs[(idx + direction) % len(self.tabs)]
         self.draw()
+        self._update_presence()
 
     def _navigate(self, tab, url, payload=None):
         """Load `url` on `tab`; image fetching + repaint happen when the
@@ -4843,6 +4865,24 @@ class Browser:
         self.window.title(
             (self.active_tab.title if self.active_tab else "FeetBrowser")
             + " — FeetBrowser")
+        self._update_presence()
+
+    def _update_presence(self):
+        """Push the current tab + tab count to Discord, if RPC is enabled.
+
+        Cheap: only a queue put, and the RPC thread coalesces and throttles
+        the actual socket writes. Called whenever the active tab's title or
+        the tab set changes."""
+        if not self.rpc or not self.active_tab:
+            return
+        tab = self.active_tab
+        title = (tab.title or "").strip()
+        if not title:
+            title = str(tab.url) if tab.url else "FeetBrowser"
+        n = len(self.tabs)
+        state = f"{title[:100]} · {n} tab{'s' if n != 1 else ''} open"
+        self.rpc.set_activity(
+            "A completely from-scratch web browser", state, self._started_at)
 
     def _dispatch_toe_draw(self, c, chrome):
         """Run toe on_draw hooks, tagging new items so a repaint clears them."""
@@ -5284,6 +5324,9 @@ class Browser:
         self._poll_images()
         self._ensure_video_tick()
         self.window.mainloop()
+        if self.rpc:
+            self.rpc.close()
+            self.rpc = None
 
     def _repaint_tick(self):
         if self._repaint_needed:
