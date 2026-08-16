@@ -756,10 +756,18 @@ class Tab:
         self._js_xhr_results.clear()
 
         if ctype.startswith("image/"):
-            # We can't decode images yet; render a labelled placeholder instead
-            # of trying to parse binary data as HTML.
-            body = (f"<h1>Image</h1><p>[img: {ctype}]</p>"
-                    f"<p><code>{body[:80]}</code></p>")
+            # A document that *is* an image: show the image itself, fetched
+            # through the normal <img> pipeline (which decodes and displays
+            # it at its natural size), rather than a placeholder that dumps
+            # raw bytes. The image URL is the document URL.
+            esc_url = html.escape(str(url), quote=True)
+            body = (
+                "<!doctype html><html><head></head>"
+                "<body style='background:#202124;text-align:center;"
+                "padding:24px;margin:0'>"
+                f"<img src='{esc_url}'>"
+                "</body></html>"
+            )
 
         if self.browser:
             body = toes.rewrite(self.browser.toe_contexts, url, body)

@@ -545,7 +545,12 @@ class URL:
 
     def _request_http(self, redirects_left, payload, raw=False, refresh=False):
         # Two documents that differ only by fragment are the same resource.
-        cache_key = str(self).split("#", 1)[0]
+        # A text fetch and a bytes fetch of the same URL are not the same
+        # resource: the document that *is* an image is fetched as text (for
+        # its content type) and then re-fetched as bytes (for the <img> that
+        # shows it), and serving the text-decoded entry to the bytes caller
+        # hands the decoder mangled bytes.
+        cache_key = (str(self).split("#", 1)[0], raw)
         if not refresh and payload is None and cache_key in _CACHE:
             expires, entry = _CACHE[cache_key]
             if expires is None or expires > time.time():

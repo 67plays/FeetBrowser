@@ -2582,6 +2582,89 @@ def test_reload_bypasses_cache():
         srv.shutdown()
 
 
+def _tiny_png(w=2, h=2):
+    """A minimal valid PNG (no Pillow dependency), for image tests."""
+    import struct
+    import zlib as _z
+
+    def chunk(tag, data):
+        c = struct.pack(">I", len(data)) + tag + data
+        return c + struct.pack(">I", _z.crc32(tag + data))
+
+    rows = b"".join(b"\x00" + b"\xff\x00\x00" * w for _ in range(h))
+    raw = b"\x89PNG\r\n\x1a\n"
+    raw += chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+    raw += chunk(b"IDAT", _z.compress(rows))
+    raw += chunk(b"IEND", b"")
+    return raw
+
+
+def test_bytes_fetch_is_not_served_from_the_text_cache():
+    # The document that *is* an image is fetched as text (for its content
+    # type) and then re-fetched as bytes for the <img> that shows it. The
+    # cache must keep the two apart: serving the text-decoded entry to the
+    # bytes caller hands the decoder mangled bytes.
+    from feetbrowser.net import URL, _CACHE
+    png = _tiny_png()
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "image/png")
+            self.send_header("Cache-Control", "max-age=9999")
+            self.send_header("Content-Length", str(len(png)))
+            self.end_headers()
+            self.wfile.write(png)
+
+        def log_message(self, *a):
+            pass
+
+    srv = _start_server(H)
+    try:
+        u = URL(f"http://127.0.0.1:{srv.server_address[1]}/pic.png")
+        _h, text, _c = u.request()          # caches the text form
+        _h2, data, ctype = u.request_bytes()  # must not get the cached text
+        eq(ctype, "image/png")
+        assert data[:8] == b"\x89PNG\r\n\x1a\n", \
+            f"bytes fetch returned the cached text, got {data[:8]!r}"
+        _CACHE.clear()
+    finally:
+        srv.shutdown()
+
+
+def test_a_document_that_is_an_image_renders_it():
+    # Visiting an image URL directly (e.g. safebooru.org/includes/header.png)
+    # should show the image, not a raw-bytes placeholder.
+    from feetbrowser.layout import DrawImage
+    png = _tiny_png(4, 4)
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "image/png")
+            self.send_header("Cache-Control", "max-age=9999")
+            self.send_header("Content-Length", str(len(png)))
+            self.end_headers()
+            self.wfile.write(png)
+
+        def log_message(self, *a):
+            pass
+
+    srv = _start_server(H)
+    try:
+        tab = Tab(700)
+        tab.load(f"http://127.0.0.1:{srv.server_address[1]}/pic.png")
+        tab.load_images()
+        assert tab.image_cache, "direct-image document decoded"
+        assert any(isinstance(c, DrawImage) for c in tab.display_list), \
+            "direct-image document renders a DrawImage"
+        assert not any(getattr(c, "text", "").startswith("[img")
+                       for c in tab.display_list), \
+            "no placeholder for a directly-visited image"
+    finally:
+        srv.shutdown()
+
+
 def test_async_load_in_gui_mode():
     # With a window present, http(s) loads happen off the UI thread so the
     # spinner can spin; loading stays True until the body arrives.
