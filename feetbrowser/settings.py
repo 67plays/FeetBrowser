@@ -111,11 +111,6 @@ def search_url(engine, query):
     return prefix + query.replace(" ", "+")
 
 
-def search_engine_label(engine):
-    """Human label for a search engine value, falling back to the default."""
-    return SEARCH_ENGINES.get(engine, SEARCH_ENGINES["duckduckgo"])[0]
-
-
 def _read():
     try:
         with open(SETTINGS_FILE, encoding="utf8") as f:
