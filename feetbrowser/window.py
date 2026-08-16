@@ -17,8 +17,6 @@ import itertools
 import os
 import time
 
-from . import canvas as canvasmod
-
 # Tk's event.state bits, which browser.py reads directly. Platform windows
 # translate whatever their operating system calls a modifier into these.
 STATE_SHIFT = 0x1
@@ -206,9 +204,6 @@ class Window:
         return None
 
     def lift(self, *_args):
-        return None
-
-    def focus_set(self):
         return None
 
     def withdraw(self):
@@ -510,13 +505,3 @@ class Toplevel(Window):
         if self.master is not None and self in self.master.children:
             self.master.children.remove(self)
         super().destroy()
-
-
-def make_canvas(window, width=None, height=None, bg="white", **kwargs):
-    """Attach a canvas to `window` and return it."""
-    surface = canvasmod.Canvas(window,
-                               width=width or window.width,
-                               height=height or window.height,
-                               bg=bg, **kwargs)
-    window.canvas = surface
-    return surface

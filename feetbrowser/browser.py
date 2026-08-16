@@ -1728,9 +1728,6 @@ class Tab:
                 changed = True
         return changed
 
-    def playing_videos(self):
-        return any(p.playing for p in self.video_players)
-
     def stop_videos(self):
         """Drop every player and its decode thread. Called when the tab
         navigates away or closes -- a daemon thread still decoding a film

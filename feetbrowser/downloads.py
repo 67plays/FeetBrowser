@@ -314,19 +314,6 @@ def _name_variants(name):
         count += 1
 
 
-def unique_path(directory, name):
-    """A path in `directory` for `name` that nothing is using yet.
-
-    Advisory only -- two processes racing can still pick the same answer,
-    which is why the file itself is created with O_EXCL below.
-    """
-    for candidate in _name_variants(sanitize_filename(name)):
-        path = os.path.join(directory, candidate)
-        if not os.path.exists(path):
-            return path
-    raise RuntimeError("unreachable")  # pragma: no cover
-
-
 def _create_exclusive(directory, name, suffix=""):
     """Create `directory/name+suffix`, uniquifying until one is free.
 
@@ -642,10 +629,6 @@ class DownloadManager:
         with self._lock:
             self._downloads = [d for d in self._downloads if d.is_active()]
             self._changed = True
-
-    def cancel_all(self):
-        for download in self.active():
-            download.cancel()
 
     # -- starting one ----------------------------------------------------
 
