@@ -2,7 +2,7 @@
 # ever used on Windows. Everything else keeps LF whatever the checkout.
 *.cmd text eol=crlf
 
-# The H.264 and AAC test vectors, and the pictures and samples a reference
+# The H.264, AAC and MP3 test vectors, and the pictures and samples a reference
 # decoder made from them. A newline translated anywhere in any of these is a
 # decoder bug that only appears on one platform, so none of them is ever
 # text.
@@ -10,6 +10,7 @@
 *.i420.z binary
 *.mp4 binary
 *.aac binary
+*.mp3 binary
 *.f32.z binary
 
 # And the PCM vectors, for the same reason twice over: a container whose

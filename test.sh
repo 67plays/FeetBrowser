@@ -82,6 +82,7 @@ $run tests/test_asmx11.py    # raw assembly on Linux/x86-64, Python elsewhere
 $run tests/test_asmselect.py # the selection nearest-boundary kernel
 $run tests/test_h264.py      # the Fortran H.264 decoder, or the skip where there is no gfortran
 $run tests/test_aac.py       # the Fortran AAC decoder, against FFmpeg's samples
+$run tests/test_mp3.py       # the Fortran MPEG Layer III decoder, likewise
 $run tests/test_pcm.py       # uncompressed sound, against the waveform it was made from
 $run tests/smoke.py
 

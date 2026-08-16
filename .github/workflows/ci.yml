@@ -121,6 +121,15 @@ jobs:
       - name: AAC decoder
         run: $PY tests/test_aac.py
 
+      # The Fortran MPEG Layer III decoder, on the same argument, and with
+      # one more reason behind it: Layer III's bit reservoir means a frame's
+      # main data can live in frames already gone past, so a build whose
+      # integer arithmetic differs anywhere does not merely drift, it reads
+      # the wrong bytes. Eighteen vectors, each held to a threshold set from
+      # what it measured, catch that on whichever machine it happens on.
+      - name: MP3 decoder
+        run: $PY tests/test_mp3.py
+
       # Uncompressed sound in MP4/MOV, AVI and WAV. Unlike AAC this is exact
       # everywhere -- there is no transform in it to round differently on a
       # different compiler -- so a disagreement between the three operating

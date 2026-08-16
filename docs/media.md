@@ -96,9 +96,12 @@ without the other two, and only the last one knows what a canvas is.
 Containers and codecs. No clocks, no threads, no canvas, no imports from the
 browser. Everything in it is a pure function of a `bytes` object.
 
-- `sniff(data)` returns `"AVI"`, `"MJPEG"`, `"MOV"`, `"MP4"`, `"WebM"` or
-  `""` from the magic. `"MJPEG"` is the containerless case: a file that
-  begins with a JPEG and holds nothing but JPEGs.
+- `sniff(data)` returns `"AVI"`, `"MJPEG"`, `"MOV"`, `"MP3"`, `"MP4"`,
+  `"WebM"` or `""` from the magic. `"MJPEG"` and `"MP3"` are the
+  containerless cases: a file that begins with a JPEG and holds nothing but
+  JPEGs, and a file that is a run of MPEG audio frames with nothing wrapped
+  around them. Both are recognised last, because neither has magic so much
+  as a shape, and a real container should win first.
 - `probe(data)` returns a `MediaInfo` (container, codec fourcc or name,
   width, height, duration, frame count, `supported`, and a `reason` when it
   is not. It does not raise for a file it merely cannot decode, because "an
@@ -752,6 +755,123 @@ by any fixture, because FFmpeg's encoder never emits it. And the decoder
 refuses more than two channels rather than downmixing, so a 5.1 soundtrack
 is silent rather than folded.
 
+## MPEG Layer III, in Fortran
+
+The other half of the web's audio, and the older half. It is in
+`fortran/ball*.f`, wrapped by `feetbrowser/ball.py`, and it is called the
+*ball of the foot* -- the pad behind the toes that takes the push. `BL*`
+routines and `/BL*/` COMMON blocks, against AAC's `IP*` and H.264's `H2*`,
+for the same reason as before: Fortran has one global namespace, this
+process may hold all three, and a collision there links cleanly and
+corrupts memory at runtime.
+
+**Exactly what it does.** MPEG-1, MPEG-2 (LSF) and MPEG-2.5 Layer III --
+ISO/IEC 11172-3 and 13818-3, and the low-rate extension the standards do
+not contain -- at all nine sampling frequencies from 8 kHz to 48 kHz. Frame
+header and its CRC-16; ID3v2 skipping and resynchronisation; side
+information; the bit reservoir; scalefactors on the long path, the
+mixed/short path, MPEG-1's `scfsi` inheritance and MPEG-2's
+`scalefac_compress` partitioning including its intensity-stereo variant;
+Huffman decoding across all thirty-two table selections, their linbits
+escapes and both count1 quadruple tables; requantisation; mid/side and
+intensity stereo in both the MPEG-1 and MPEG-2 forms; alias reduction; the
+IMDCT with all three block types and window switching; the short-block
+reorder; frequency inversion; and the polyphase synthesis filterbank. Mono
+and stereo, out to float samples in [-1, 1].
+
+**The bit reservoir is the part people get wrong.** A Layer III frame's
+main data does not begin in that frame: `main_data_begin` points back up to
+511 bytes, which at 32 kbit/s is four and a half frames. So the decoder
+keeps a reservoir behind the bit reader rather than a frame buffer, and a
+frame that reaches back further than the reservoir goes is *starved* --
+its granules decode as silence and decoding continues, which is what a
+player that has just seeked needs. `lowrate` is the vector for this:
+started from its seventh frame it starves for seven frames, is silent for
+exactly those seven, and then rejoins the reference to float32 precision
+two frames later. Reading whatever was in the buffer instead would make
+noise that no comparison against a whole file would ever show.
+
+Measured on this machine, one core: 0.11 ms for a 44.1 kHz stereo frame,
+which plays for 26.1 ms -- about 225x realtime.
+
+**Ground truth.** `tests/fixtures/mp3` holds eighteen streams and, beside
+each, the exact float samples FFmpeg 7.1 decoded it to, zlib-compressed.
+`make_mp3_vectors.sh` regenerates them and says what each is for. They
+cover a tone, noise, mid/side, a transient that forces short blocks with
+the start and stop windows either side, 32 kbit/s under reservoir
+pressure, 320 kbit/s into the linbits escapes, plain stereo where neither
+stereo tool applies, all nine sampling frequencies, MPEG-1 intensity
+stereo, MPEG-2 intensity stereo, and mixed blocks with the CRC.
+
+Two of the eighteen are not simply an encoder's output, and both say so in
+the script and in the test file. `mixed.mp3` is assembled bit by bit,
+because no encoder in circulation sets `mixed_block_flag` and libmp3lame
+does not write the optional CRC either; the frames conform, FFmpeg reads
+them, and FFmpeg's reading of them is the truth beside them, exactly as
+for every other vector. `lsfint.mp3` is a real MPEG-2 joint-stereo stream
+whose `mode_extension` was overwritten to 1 in every header, because
+nothing here will emit LSF intensity stereo on demand; it validates our
+LSF intensity path against FFmpeg reading the same bytes, and it is not a
+stream LAME would have produced.
+
+Layer III is not a bit-exact specification either, so the comparison is
+numerical -- and the threshold is per vector rather than one number for
+all of them, because the spread is forty decibels wide and a single
+threshold loose enough for the worst would be meaningless for the rest.
+Most vectors land at 127 to 133 dB, which is float32 rounding. Three do
+not: `transient` at 89.5 dB, `tone` at 94.8, `lsfint` at 95.4, in all
+three because the error is localised in a handful of samples where the
+true amplitude is near zero beside a loud attack. FFmpeg's own two
+decoders disagree by more than we disagree with either -- on `transient`,
+its float against its fixed-point is 85.8 dB where we are 89.5 -- so our
+double-precision output sits inside the spread between two conforming
+implementations.
+
+For scale, with a stage deleted at a time: no alias reduction takes
+`dual` from 101.5 dB to 9.0 and `tone` from 94.8 to 33.6; no intensity
+stereo takes `intensity` from 115.6 dB to 79.5, which is forty times its
+own threshold; and ignoring the reservoir is not a tolerance question at
+all, because the first vector tried then fails to decode.
+
+The stages that can be compared exactly are, as for AAC and for the same
+reason. Every granule of every vector is consumed to the bit -- 639 of
+them -- which no wrong codeword length in any of the thirty tables can
+leave true. Requantisation is recomputed in Python from the standard's
+formula and agrees to the last bit, because the exponent is an integer
+count of quarter powers all the way through. The IMDCT is held against the
+standard's summation at both sizes and on every column. And the whole back
+half -- the four window shapes, overlap-add, frequency inversion and the
+filterbank with its 512-tap window -- is written out again in Python
+straight from the standard and agrees with the decoder's own output to
+float32 rounding.
+
+**How it is built and loaded.** Exactly as `aac.py` does it, which is
+exactly as `h264.py` does it: find a gfortran, compile into a library
+named after a digest of the sources and the compiler, prefer a shipped
+prebuilt over compiling, load with `ctypes`, and remember the failure if
+any of that does not happen. No compiler means `ball.available()` is false
+and an MP3 is named and refused in public. `python3 -m feetbrowser.ball
+--check stream.mp3 truth.f32.z` is what the packaging asks, and it decodes
+a real vector rather than merely loading the library.
+
+The state is in COMMON, so each `ball.Decoder` saves its overlap, its
+filterbank history *and* its reservoir out of the library and puts them
+back when it finds another decoder has been at it in between. Layer III
+needs the third of those where AAC needed only the first.
+
+**What it is not.** Layer I, Layer II, free-format bitrates and more than
+two channels are each refused by name, with a status code and a sentence
+that says what to do -- because "unsupported" on its own is a useless
+thing to tell somebody whose file will not play.
+
+**How it is reached.** `mediacodec.sniff()` recognises a bare MP3 by its
+ID3 tag or by a frame header that is self-consistent, `probe_audio()`
+names it, and `open_audio()` walks the frames into an `AudioTrack` whose
+packets and timestamps come from the headers. That is the whole of it: an
+MP3 carried inside an MP4 as `mp4a` is still named and not decoded, and
+the `<audio>` element does not exist, so an `.mp3` opened through
+`mediacodec` is the only route in.
+
 ## PCM
 
 The other kind of sound, and it is not a codec. A PCM packet already *is*
@@ -815,12 +935,20 @@ do not know PCM exists.
 Bluntly, because a foundation that overstates itself is worse than none:
 
 - **Sound still only arrives alongside a picture.** The `<audio>` element
-  is not implemented at all, so a `.wav` or a soundtrack has to be the audio
-  half of a `<video>` to be heard. MP4 with AAC-LC plays in sync, and so
-  does uncompressed PCM in MP4/MOV, AVI and `.wav` -- see [Sound and
-  pictures together](#sound-and-pictures-together) and [PCM](#pcm). WebM's
+  is not implemented at all, so a `.wav`, an `.mp3` or a soundtrack has to
+  be the audio half of a `<video>` to be heard. MP4 with AAC-LC plays in
+  sync, and so does uncompressed PCM in MP4/MOV, AVI and `.wav` -- see
+  [Sound and pictures together](#sound-and-pictures-together) and
+  [PCM](#pcm). A bare `.mp3` decodes through `open_audio` as well -- see
+  [MPEG Layer III, in Fortran](#mpeg-layer-iii-in-fortran) -- but an MP3
+  stored inside an MP4 under `mp4a` is still named and not decoded. WebM's
   audio is named by `probe_audio` and not decoded, for want of a Vorbis or
-  Opus decoder. MP3 is absent entirely, as are ADPCM, mu-law and A-law.
+  Opus decoder, as are ADPCM, mu-law and A-law.
+- **Layer III only, of the MPEG audio layers.** Layer I, Layer II, a
+  free-format bitrate and more than two channels are each refused by name
+  with a status code of their own. Free format is the one worth knowing
+  about: such a file carries no bitrate in its header at all, so there is
+  no frame length to trust, and it is refused rather than guessed at.
 - **No user-facing volume or mute.** `VideoPlayer.set_volume()` and
   `AudioPlayer.muted` exist and are tested; nothing in the GUI calls them,
   and `volume` and `muted` are not scriptable from JavaScript yet.
@@ -917,14 +1045,16 @@ every codec wants to be handed.
    last byte arrives. Worth doing now rather than later, because MJPEG over
    HTTP is a format we can already decode and cannot currently play at all:
    the stream never ends, so waiting for the last byte waits forever.
-6. **A second compressed audio codec, and then SBR.** The join is done --
-   see [Sound and pictures together](#sound-and-pictures-together) -- and
-   three containers now reach it: MP4/MOV, AVI and `.wav`. But only one
-   *compressed* format does. WebM's audio is identified and refused for want
-   of a Vorbis or Opus decoder, and MP3 for want of an MP3 decoder; all
-   three are codec-sized jobs rather than demuxer-sized ones, which is what
-   makes them the next thing rather than the easy thing. After those, SBR,
-   so that low-bitrate HE-AAC streams play at all.
+6. **Vorbis or Opus, and then SBR.** The join is done -- see [Sound and
+   pictures together](#sound-and-pictures-together) -- and four containers
+   now reach it: MP4/MOV, AVI, `.wav` and a bare `.mp3`. Two *compressed*
+   formats do, AAC-LC and Layer III. What is left of the web's audio is
+   WebM's, identified and refused for want of a Vorbis or Opus decoder;
+   that is a codec-sized job rather than a demuxer-sized one, which is what
+   makes it the next thing rather than the easy thing. After it, SBR, so
+   that low-bitrate HE-AAC streams play at all. The smaller loose end is
+   that an MP3 inside an MP4 under `mp4a` is still named and not decoded,
+   even though the decoder for it is now here.
 
    The end-to-end path is no longer proved a half at a time:
    `media_fixtures.mp4_av()` writes both traks over real coded frames --
@@ -1040,6 +1170,22 @@ regenerated vector cannot quietly stop proving anything.
 `tests/fixtures/aac/make_aac_vectors.sh` is the offline tool that made them,
 and like its H.264 counterpart it is not run by `test.sh`.
 
+`tests/test_mp3.py` is the same arrangement again, with one thing done
+differently: the threshold is per vector rather than one number for all
+eighteen, because their errors span forty decibels and a single threshold
+loose enough for the worst would not catch a deleted stage in the rest --
+which is not a supposition, since deleting intensity stereo moves
+`intensity` by forty times its own limit and less than one global limit
+would have been. The measurement each threshold came from is written in
+the table beside it. Its exact-stage tests are the same four ideas as
+AAC's, plus one more: the entire back half of the decoder, from window
+switching through the polyphase filterbank, is written out again in Python
+from the standard's formulas and compared against the decoder's own PCM,
+which leaves the transform nowhere to hide.
+`tests/fixtures/mp3/make_mp3_vectors.sh` made those vectors, is not run by
+`test.sh`, and names the two of the eighteen that an encoder did not
+entirely write.
+
 `tests/test_pcm.py` goes back to exactness, because PCM can. Eighteen
 fixtures in `tests/fixtures/pcm/` are one quarter-second of two tones -- a
 different one per channel, so a channel swap fails as loudly as a byte swap
@@ -1065,11 +1211,12 @@ counted samples would pass both.
 not run by `test.sh` either.
 
 The whole suite skips cleanly where there is no `gfortran`, and one test in
-each of the two Fortran suites forces that state on a machine that has one:
-it takes the loaded library away and asserts that `probe()`, `probe_audio()`,
-`MediaInfo`, `AudioInfo`, `open_video()` and `open_audio()` behave the way
-they did before the decoders existed. Those tests are the reason the
-degradation path is a claim rather than a hope.
+each of the three Fortran suites forces that state on a machine that has one:
+it takes the loaded library away and asserts that what sits above the
+decoder behaves the way it did before the decoder existed: `probe()`,
+`probe_audio()`, `MediaInfo`, `AudioInfo`, `open_video()` and
+`open_audio()`, plus each decoder module's own surface. Those tests are the
+reason the degradation path is a claim rather than a hope.
 
 Audio has its own suite, `tests/test_audio.py`, and its own version of that
 last idea: `FEETBROWSER_AUDIO=null` forces a machine with a working sound

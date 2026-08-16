@@ -92,6 +92,8 @@ rem there, so this usually checks that the browser survives not having one.
 %RUN% tests\test_h264.py || exit /b 1
 rem The Fortran AAC decoder, and the same arrangement about gfortran.
 %RUN% tests\test_aac.py || exit /b 1
+rem The Fortran MPEG Layer III decoder, and the same arrangement again.
+%RUN% tests\test_mp3.py || exit /b 1
 rem PCM, which needs no compiler anywhere: the fixtures are containers and
 rem the truth beside them, and the assertions are equalities.
 %RUN% tests\test_pcm.py || exit /b 1
