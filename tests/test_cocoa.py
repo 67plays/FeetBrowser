@@ -246,6 +246,51 @@ def test_present_is_skipped_when_nothing_changed():
             "a dirty canvas must be re-uploaded"
 
 
+def test_the_frame_is_pushed_at_the_displays_own_resolution():
+    """The HiDPI bug, asked of the machine actually running the test.
+
+    A 2x display wants two device pixels per point, so the framebuffer has to
+    be twice the window in each direction while the NSImage carrying it stays
+    the window's size in *points* -- that pairing is what makes AppKit draw
+    one image pixel onto one device pixel. Declaring the image at its pixel
+    count instead makes it a 1x image that gets stretched, which is exactly
+    the softness this is here to prevent. FEETBROWSER_SCALE forces the dense
+    path so it is exercised on a CI runner with no Retina display too.
+    """
+    from feetbrowser import canvas as canvasmod
+    with _Session() as win:
+        assert win.scale == win._backing_scale(), \
+            "the window did not adopt the display's own scale"
+    saved = os.environ.get("FEETBROWSER_SCALE")
+    os.environ["FEETBROWSER_SCALE"] = "2"
+    try:
+        with _Session() as win:
+            assert win.scale == 2.0, "the override never reached the window"
+            canvas = canvasmod.Canvas(win, width=900, height=600, bg="#654321")
+            canvas.pack()
+            win.present()
+            assert canvas.device_size() == (1800, 1200), canvas.device_size()
+            assert len(win._buffers[-1]) == 1800 * 1200 * 3, \
+                "the bytes handed to CoreGraphics are not the buffer's"
+            size = cocoa.msg(cocoa.msg(win._view, "image"), "size",
+                             restype=cocoa.NSSize)
+            assert (size.width, size.height) == (900.0, 600.0), \
+                "a 1800x1200 image declared as %rx%r points would be " \
+                "shrunk, not drawn one to one" % (size.width, size.height)
+            # A point is a CSS pixel on this platform, so a click is not
+            # converted at all -- and must not be, or it would be halved.
+            seen = []
+            win.bind("<Button-1>", lambda e: seen.append((e.x, e.y)))
+            send_mouse(win, cocoa._LEFT_DOWN, 400, 300)
+            assert seen == [(400, 300)], \
+                "a click moved when the buffer got denser: %r" % seen
+    finally:
+        if saved is None:
+            os.environ.pop("FEETBROWSER_SCALE", None)
+        else:
+            os.environ["FEETBROWSER_SCALE"] = saved
+
+
 def test_withdraw_is_not_mistaken_for_the_user_closing_the_window():
     with _Session() as win:
         win.withdraw()
