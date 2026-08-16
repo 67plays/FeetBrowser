@@ -15,6 +15,7 @@ shorthands expand, what a media query can ask about -- so the rules of the
 cascade remain readable in one place.
 """
 
+import copy
 import re
 
 import feetbrowser_engine
@@ -456,10 +457,53 @@ def _attr_selector(text, i):
     return AttrSelector(name.lower(), op, value), j + 1
 
 
+# `!important`, in the spellings a stylesheet actually arrives in: the case
+# is free, and the space between the bang and the word is legal (and minifiers
+# that leave it alone do exist). Anchored at the end because that is the only
+# place the flag may appear in a declaration value.
+_IMPORTANT_RE = re.compile(r"!\s*important\s*$", re.I)
+
+# How far an `!important` declaration is lifted above the ordinary cascade.
+#
+# CSS does not order declarations on specificity alone: importance comes
+# first, and only within one importance band does specificity decide (CSS
+# Cascade 4 sec. 6.1). The matcher in rust/src/css.rs sorts rules on the
+# selector's `priority` triple and nothing else, so the band is expressed
+# where that sort can see it -- as a constant added to the leading component,
+# far larger than any specificity a real selector can reach (that would take
+# a million ids). An `#a#b#c` rule is (3, 0, 0); an important `p` rule is
+# (1048576, 0, 1), and every important declaration therefore outranks every
+# normal one whatever it was selected by, which is the whole point of the
+# flag.
+#
+# Two deviations remain, both because they need the matcher to know about
+# origins rather than the sheet: an important rule in the UA sheet does not
+# beat an important author rule (CSS says it should), and the inline
+# `style=""` attribute -- applied last of all, unconditionally -- still beats
+# an important author rule (CSS says it should not).
+IMPORTANT_BAND = 1 << 20
+
+
+def _important_selector(sel):
+    """A copy of `sel` whose priority sits in the important band.
+
+    Copied rather than mutated because the same selector object is what the
+    normal-band rule was emitted with, and the two have to sort apart. The
+    copy is shallow: the matcher reads the structure below the top level and
+    never its `priority`, so the sub-selectors can stay shared.
+    """
+    lifted = copy.copy(sel)
+    a, b, c = sel.priority
+    lifted.priority = (a + IMPORTANT_BAND, b, c)
+    return lifted
+
+
 class CSSParser:
     def __init__(self, s):
         self.s = s
         self.i = 0
+        # Set by body(): the `!important` subset of the block it last read.
+        self.important = {}
 
     def skip_ws(self):
         while self.i < len(self.s):
@@ -519,13 +563,27 @@ class CSSParser:
         value = value.strip()
         if not value or not prop:
             return None
-        if value.endswith("!important"):
-            value = value[:-len("!important")].rstrip()
-        return (prop, value)
+        stripped = _IMPORTANT_RE.sub("", value).rstrip()
+        important = stripped != value
+        if important:
+            # `!important` on its own is not a value, and a declaration
+            # without one sets nothing in either band.
+            if not stripped:
+                return None
+            value = stripped
+        return (prop, value, important)
 
     def body(self):
-        """Parse a declaration block { ... } already positioned after '{'."""
+        """Parse a declaration block { ... } already positioned after '{'.
+
+        Returns the block's declarations. The `!important` ones among them
+        are left in here too -- same property, same value, so a caller that
+        ignores the distinction reads exactly what it read before -- and are
+        *also* put aside on `self.important`, for `parse()` to re-emit as a
+        rule of its own in the important band.
+        """
         pairs = {}
+        important = {}
         while self.i < len(self.s) and self.s[self.i] != "}":
             self.skip_ws()
             if self.i >= len(self.s) or self.s[self.i] == "}":
@@ -552,6 +610,8 @@ class CSSParser:
                 self._read_block()
             elif p:
                 pairs[p[0]] = p[1]
+                if p[2]:
+                    important[p[0]] = p[1]
             self.skip_ws()
             self.literal(";")
             if self.i == here:
@@ -560,6 +620,7 @@ class CSSParser:
                 # One character of progress turns a hang into a dropped
                 # declaration.
                 self.i += 1
+        self.important = important
         return pairs
 
     def simple_selector(self, text):
@@ -771,11 +832,18 @@ class CSSParser:
             sel_text = self.s[start:self.i].strip()
             self.literal("{")
             decls = self.body()
+            important = self.important
             self.literal("}")
             for one in _split_top_level(sel_text):
                 sel = self.selector(one.strip())
                 if sel is not None:
                     rules.append((sel, decls))
+                    if important:
+                        # The same selector twice, once per importance band.
+                        # Emitting the important declarations as a rule of
+                        # their own is what lets one flat specificity sort
+                        # express a cascade that has two levels in it.
+                        rules.append((_important_selector(sel), important))
             if self.i == here:
                 # A stylesheet is arbitrary bytes off the network, and every
                 # loop that walks one has to end. Each branch above already

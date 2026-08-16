@@ -197,6 +197,75 @@ def test_two_value_gap_separates_the_columns():
         "the column gap is the second value, not the first (%r)" % (xs,)
 
 
+def _styled(css, html, want_id="x"):
+    """Cascade `css` over `html` and hand back the element with `want_id`."""
+    dom = HTMLParser(html).parse()
+    style(dom, CSSParser(css).parse())
+    return [n for n in tree_to_list(dom, [])
+            if isinstance(n, Element)
+            and n.attributes.get("id") == want_id][0]
+
+
+def test_important_outranks_a_more_specific_rule():
+    """`!important` is a cascade band, not a specificity bonus: the flagged
+    declaration wins however weakly it was selected. Every one of the 284
+    `!important` declarations across the survey sites was written precisely
+    because it was losing this fight."""
+    el = _styled("p { color: red !important } #x { color: blue }",
+                 '<p id="x">hi</p>')
+    eq(el.style["color"], "red", "important tag rule beats a plain id rule")
+    # ... and the flag on the loser changes nothing.
+    el = _styled("p { color: red } #x { color: blue }", '<p id="x">hi</p>')
+    eq(el.style["color"], "blue", "without the flag, the id rule still wins")
+
+
+def test_important_band_still_sorts_on_specificity_inside_itself():
+    el = _styled("p { color: red !important } .a { color: blue !important }",
+                 '<p id="x" class="a">hi</p>')
+    eq(el.style["color"], "blue", "class beats tag among important rules")
+
+
+def test_important_survives_a_later_normal_declaration():
+    """Same block, flagged declaration first: the later normal one replaces
+    it in the block's dict, and the important band has to put it back."""
+    el = _styled("p { color: blue !important; color: green }",
+                 '<p id="x">hi</p>')
+    eq(el.style["color"], "blue", "the flagged value is the used one")
+
+
+def test_important_flag_spellings():
+    for css in ("p { color: red !important }",
+                "p{color:red!important}",
+                "p { color: red ! IMPORTANT }",
+                "p { color: red !important ; }"):
+        el = _styled(css + " #x { color: blue }", '<p id="x">hi</p>')
+        eq(el.style["color"], "red", "flag recognised in %r" % css)
+    # A declaration that is nothing but the flag sets nothing at all, and
+    # must not swallow the one after it.
+    el = _styled("p { color: !important; color: teal }", '<p id="x">hi</p>')
+    eq(el.style["color"], "teal", "bare flag is not a value")
+
+
+def test_important_applies_to_layout_properties_too():
+    """The flag is not a colour feature. `display`, `margin` and `padding`
+    are the three most flagged properties on the sites surveyed, and they
+    are the ones that move boxes."""
+    el = _styled("p { display: none !important } #x { display: block }",
+                 '<p id="x">hi</p>')
+    eq(el.style["display"], "none", "important display wins")
+    el = _styled("p { margin: 0 !important } #x { margin: 20px }",
+                 '<p id="x">hi</p>')
+    eq(el.style["margin"], "0", "important margin wins")
+
+
+def test_important_inside_a_media_block():
+    """@media contents are re-parsed by a nested CSSParser, so the band has
+    to be applied there as well."""
+    el = _styled("@media screen { p { color: red !important } }"
+                 " #x { color: blue }", '<p id="x">hi</p>')
+    eq(el.style["color"], "red", "important survives @media flattening")
+
+
 def test_inheritance_and_inline():
     rules = CSSParser("body { color: green; }").parse()
     dom = HTMLParser(
