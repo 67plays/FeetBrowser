@@ -3292,12 +3292,18 @@ class _SelectBrowser(Browser):
         self.focus = None
         self._tab_drag = None  # _on_escape asks the tab strip first
         self.select_popup = SelectPopup()
-        # Real _scroll() tracks velocity, and this double reaches it.
+        # Real _scroll() tracks velocity, and this double reaches it. The
+        # wheel also arms a momentum coast, so the timer half of a window is
+        # here too -- it records requests without ever running one.
         self._scroll_ticks = []
         self._scroll_velocity = 0.0
+        self._momentum_job = None
         self.paints = 0
         self.canvas = type("C", (), {"winfo_width": lambda s: 1000,
                                      "winfo_height": lambda s: 720})()
+        self.window = type("W", (), {
+            "after": lambda s, d, f=None, *a: "timer" if f else None,
+            "after_cancel": lambda s, h: None})()
 
     def chrome_height(self):
         return 0

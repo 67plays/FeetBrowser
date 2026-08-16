@@ -2365,6 +2365,64 @@ def test_a_page_that_fits_has_no_scrollbar_to_drag():
     assert tab.scroll == 0, "a page that fits scrolled to %r" % tab.scroll
 
 
+# -- wheel momentum --------------------------------------------------------
+#
+# A fast wheel flick coasts after the last notch instead of stopping dead:
+# the tracked velocity animates the page on and decays it to nothing. These
+# drive the same handler a wheel does and pump the window's own timer queue.
+
+def _wheel_flick(browser, notches, delta=-20):
+    """Dispatch `notches` wheel events in a quick burst, as one flick."""
+    for _ in range(notches):
+        browser._on_wheel(Event(delta=delta, x=200, y=300))
+
+
+def _pump_timers(browser, seconds):
+    """Run the window's timer queue until `seconds` have passed or it idles."""
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        wait = browser.window.flush_timers()
+        if wait is None:
+            break
+        time.sleep(0.005)
+
+
+def test_a_fast_wheel_flick_coasts_after_the_last_notch():
+    """A burst of notches carries the page on after the wheel stops, so
+    quick scrolling does not need a notch for every pixel it wants."""
+    browser, tab = _scrollable_browser()
+    _wheel_flick(browser, 8)
+    manual = tab.scroll
+    assert manual > 0, "the notches themselves scrolled nothing"
+    _pump_timers(browser, 2.0)
+    assert tab.scroll > manual, \
+        "the coast stopped at the last notch instead of gliding on"
+
+
+def test_a_lone_slow_notch_does_not_coast():
+    """Momentum is for flicks: a single notch is a step, not a glide, and
+    must not run away with the page by itself."""
+    browser, tab = _scrollable_browser()
+    _wheel_flick(browser, 1)
+    manual = tab.scroll
+    _pump_timers(browser, 2.0)
+    assert tab.scroll <= manual + 30, \
+        "a single notch coasted %r px past itself" % (tab.scroll - manual)
+
+
+def test_a_keyboard_scroll_stops_an_in_progress_coast():
+    """Whatever coast is running must die the moment the reader scrolls any
+    other way -- the page cannot be both gliding and keyed at once."""
+    browser, tab = _scrollable_browser()
+    _wheel_flick(browser, 8)
+    _pump_timers(browser, 0.1)  # the coast is underway
+    browser._scroll(0)  # a keyed scroll of zero is still a scroll
+    settled = tab.scroll
+    _pump_timers(browser, 2.0)
+    assert tab.scroll == settled, \
+        "the coast resumed after a keyboard scroll stopped it"
+
+
 # -- selecting page text ---------------------------------------------------
 #
 # Every test below drives the same path a mouse does -- a press, some drags,
