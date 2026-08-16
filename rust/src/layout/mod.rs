@@ -41,8 +41,8 @@
 //! # Status
 //!
 //! Compiled and tested from its own tests, wired to nothing. `layout.py`
-//! remains the live path, exactly as the DOM arena in [`crate::domtree`] and
-//! the tree builder in [`crate::html`] landed before it.
+//! remains the live path, exactly as the DOM arena in [`footnote::domtree`]
+//! and the tree builder in [`footnote`] landed before it.
 
 #![allow(dead_code)]
 
@@ -58,7 +58,7 @@ mod tests;
 
 use std::rc::Rc;
 
-use crate::domtree::{Dom, NodeData, NodeId};
+use footnote::domtree::{Dom, NodeData, NodeId};
 use geom::{BoxEdges, Rect};
 use style::{ComputedStyle, Display, Float, InnerDisplay, Position, Sides};
 use text::FontSource;

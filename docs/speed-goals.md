@@ -147,7 +147,7 @@ JavaScript engine at all:
   but is not yet the live path. The live path is still `layout.py`.
 
 Honest gaps before this tier is done, not hidden: the Rust layout builds its
-box tree off the Rust DOM arena (`domtree`), not the live Python node tree the
+box tree off the Rust DOM arena (`footnote::domtree`), not the live Python tree the
 browser renders, so the tree moves to Rust first; flex/grid are still
 "separate ad-hoc passes" in `layout.py` that the Rust engine names as future
 work; and painting/scene-graph are still Python. Tier 1 is a real 1–2 week

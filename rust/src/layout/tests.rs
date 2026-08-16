@@ -25,8 +25,7 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use crate::domtree::{Dom, NodeData, NodeId};
-use crate::html;
+use footnote::domtree::{Dom, NodeData, NodeId};
 
 use super::style::{compute, ComputedStyle, Display, StyleContext};
 use super::text::{FontSource, StubFont};
@@ -448,7 +447,7 @@ fn cascade(
 }
 
 fn lay_out(source: &str, fonts: &dyn FontSource, vw: f32, vh: f32) -> Page {
-    let (dom, doc) = html::parse(source);
+    let (dom, doc) = footnote::parse(source);
     let root = html_element(&dom, doc).expect("no <html> element");
 
     let mut rules = parse_stylesheet(UA_SHEET);

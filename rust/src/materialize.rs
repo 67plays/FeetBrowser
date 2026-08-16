@@ -2,7 +2,7 @@
 //!
 //! # Why this exists rather than a pyo3 facade over the arena
 //!
-//! The obvious move, once `html::parse` produces a real tree, is to expose the
+//! The obvious move, once `footnote::parse` produces a real tree, is to expose the
 //! arena to Python behind a `#[pyclass]` that quacks like
 //! `feetbrowser.htmlparser.Element` and let the arena be the live document.
 //! Two measured facts say otherwise.
@@ -46,8 +46,7 @@
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
-use crate::domtree::{Dom, NodeData, NodeId};
-use crate::html;
+use footnote::domtree::{Dom, NodeData, NodeId};
 
 /// The `Element` and `Text` classes, looked up once per call.
 struct Classes<'py> {
@@ -154,7 +153,7 @@ fn html_root(dom: &Dom, document: NodeId) -> Option<NodeId> {
 #[pyfunction]
 #[pyo3(signature = (source, scripting = false))]
 pub fn parse_html(py: Python<'_>, source: &str, scripting: bool) -> PyResult<Py<PyAny>> {
-    let (dom, document) = html::treebuilder::parse_document(source, scripting);
+    let (dom, document) = footnote::treebuilder::parse_document(source, scripting);
     let cls = Classes::load(py)?;
 
     let root = match html_root(&dom, document) {
@@ -194,7 +193,7 @@ pub(crate) fn fragment_children<'py>(
     source: &str,
     context: &str,
 ) -> PyResult<Bound<'py, PyList>> {
-    let (dom, fragment) = html::parse_fragment_html(source, context);
+    let (dom, fragment) = footnote::parse_fragment_html(source, context);
     let cls = Classes::load(py)?;
     let none = py.None().into_bound(py);
     let out = PyList::empty(py);

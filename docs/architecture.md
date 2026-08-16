@@ -14,10 +14,13 @@ WebKit, Gecko, or any HTTP library; it implements its own:
   client needs are implemented from scratch in this repo, and a page's
   resources share one multiplexed connection instead of each opening its
   own.
-- **HTML parser**: a tokenizer + tree builder producing a real DOM
-  (entities, comments, void elements, raw-text `<script>`/`<style>`, and
-  implicit `<html>`/`<head>`/`<body>` + `<li>`/`<p>`/`<tr>` insertion, plus
-  the spec's "a block element closes a `<p>`" rule).
+- **HTML parser**: `footnote`, a WHATWG tokenizer + tree builder of ours in
+  a repository of its own, scoring 99.6% on the html5lib tree-construction
+  suite. It builds a real DOM: entities, comments, void elements, raw-text
+  `<script>`/`<style>`, implicit `<html>`/`<head>`/`<body>` +
+  `<li>`/`<p>`/`<tr>` insertion, and the three algorithms that move nodes
+  already in the tree (foster parenting, formatting reconstruction, the
+  adoption agency). `rust/src/materialize.rs` hands its arena to Python.
 - **CSS engine**: a parser for tag / class / id / descendant / grouped
   selectors (with pseudo-classes like `:hover` collapsed to their base
   selector), the cascade with specificity, inheritance, inline `style=""`,
@@ -136,6 +139,11 @@ rust/
   font.rs        TrueType tables, cmap, metrics, outlines, flattening
   image.rs       PNG / GIF / PNM decoders and nearest-neighbour resize
   pyutil.rs      shared argument conversions (bytes, coordinates, strings)
+(footnote)       not in this repository. The HTML tokenizer and tree
+                 builder are a crate of their own, with no dependencies and
+                 no knowledge that a browser exists, pinned to a commit sha
+                 in rust/Cargo.toml. materialize.rs is the only thing that
+                 calls it. Its 27k lines of html5lib fixtures went with it.
 (feetplayer)     not in this repository. The media stack -- the containers,
                  the three FORTRAN 77 decoders (H.264, AAC-LC, MPEG Layer
                  III) and the audio output -- is a package of its own,

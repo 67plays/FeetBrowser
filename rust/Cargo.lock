@@ -12,10 +12,16 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 name = "feetbrowser-engine"
 version = "0.1.0"
 dependencies = [
+ "footnote",
  "miniz_oxide",
  "pyo3",
  "serde_json",
 ]
+
+[[package]]
+name = "footnote"
+version = "0.1.0"
+source = "git+https://github.com/67plays/footnote?rev=1a3a0b0c8f9bd7ef9b49808863db43e2aa0f4c57#1a3a0b0c8f9bd7ef9b49808863db43e2aa0f4c57"
 
 [[package]]
 name = "heck"

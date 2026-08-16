@@ -1,19 +1,12 @@
 mod ast;
 mod css;
 mod dom;
-// The arena the tree builder parses into. It is the browser's parse-time
-// representation; the laid-out document itself stays as Python objects, for
-// the reasons measured in `materialize.rs`.
-mod domtree;
 mod font;
-// The WHATWG tokeniser and tree builder. This is the browser's HTML parser:
-// `feetbrowser/htmlparser.py` now calls it and keeps only the node types.
-mod html;
 mod image;
 mod interp;
 mod layout;
-// Hands the arena tree to Python as `htmlparser.Element`/`Text` objects, which
-// is what makes the tree builder above the browser's real parser.
+// Hands `footnote`'s arena tree to Python as `htmlparser.Element`/`Text`
+// objects, which is what makes the parser crate the browser's real parser.
 mod materialize;
 mod parser;
 mod pybind;

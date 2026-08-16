@@ -27,10 +27,11 @@
 //! value that did come from the page is a String we already own.
 //!
 //! The mirror is a copy of a tree that still lives in Python, and it will stop
-//! being one: `domtree.rs` is the arena the document itself will be built in,
-//! at which point `Tree` below is deleted and the matcher indexes that arena
-//! instead. It cannot be today, because nothing populates a `domtree::Dom` yet
-//! -- the HTML tree builder that will is Phase 2. What the mirror is *not* is
+//! being one: `footnote::domtree` is the arena the document is parsed into, and
+//! the end state is that `Tree` below is deleted and the matcher indexes that
+//! arena directly. It cannot be today, because the arena is materialised into
+//! Python objects and dropped -- see `materialize.rs` for the measurement that
+//! says why. What the mirror is *not* is
 //! the cost of this module: it is measured at ~1.4% of a style pass across a
 //! corpus of real pages, against 30-94% for the two things that were fixed
 //! here instead, so removing it is a tidiness win and not a performance one.

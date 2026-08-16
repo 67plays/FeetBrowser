@@ -235,8 +235,9 @@ jobs:
         run: cargo check --manifest-path rust/Cargo.toml --all-targets
 
       # `cargo check --all-targets` compiles the tests but never runs them,
-      # so for a long time all 122 of them -- including the html5lib tree
-      # construction suite -- were only ever type-checked. They take 0.07s.
+      # so for a long time all of them were only ever type-checked. The 60
+      # that are left take hundredths of a second; the tokenizer's own suite
+      # moved out with it to `footnote`, which runs it on three platforms.
       - name: Rust tests
         run: cargo test --manifest-path rust/Cargo.toml
 
