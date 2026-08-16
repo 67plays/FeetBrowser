@@ -47,14 +47,23 @@ WebKit, Gecko, or any HTTP library; it implements its own:
   pixel (the surface, the font parser and the image decoders) are in the
   same Rust extension as the JS engine; the scene graph, the event loop and
   font *discovery* stay in Python. See [docs/rendering.md](rendering.md).
-- **Platform windows**: a real window on macOS (`cocoa.py`, ctypes into
-  AppKit), on Linux and the BSDs (`x11.py`, ctypes into Xlib, which also
-  covers Wayland desktops through XWayland) and on Windows (`win32.py`,
-  ctypes into `user32`/`gdi32`/`kernel32`), each translating native events
-  into the same Tk-shaped bindings and pushing the same framebuffer to the
-  screen. None of them needs a bindings package. Anywhere else, and anywhere
-  with no display, the browser runs headless, which is also how
-  `--screenshot` and the whole test suite run on every platform.
+- **Platform windows**: `doormat`, our own code in a repository of its own,
+  opens a real window on macOS (ctypes into AppKit), on Linux and the BSDs
+  (ctypes into Xlib, which also covers Wayland desktops through XWayland) and
+  on Windows (ctypes into `user32`/`gdi32`/`kernel32`), each translating
+  native events into the same Tk-shaped bindings and pushing the same
+  framebuffer to the screen. None of them needs a bindings package, and none
+  of them draws: a window is handed a *canvas* and asks it for `.dirty`,
+  `.render(region=None)` and `.cursor`, then presents the surface that comes
+  back, which has to carry `.pixels` (packed RGB, three bytes to a pixel),
+  `.width`, `.height` and `.stride`. That duck-typed seam -- plus
+  `device_size()`, `resize()` and `set_scale()` for the geometry -- is the
+  entire interface between the two packages; there is no base class and
+  nothing to import. `canvas.Canvas` over `raster.Surface` is what satisfies
+  it, and `feetbrowser/gui.py` is the only module on this side that knows
+  doormat exists. Anywhere else, and anywhere with no display, the browser
+  runs headless, which is also how `--screenshot` and the whole test suite
+  run on every platform.
 - **Browser UI**: a hand-drawn chrome on that canvas: tabs, an address bar
   with search fallback, back / forward / reload / home buttons, a settings
   menu off the hamburger button (the `about:` pages and the toe hub),
@@ -90,10 +99,11 @@ WebKit, Gecko, or any HTTP library; it implements its own:
   to the Rust functions.
 
 Beyond the engine extension, which is our own code in another language, and
-feetplayer, which is our own code in another repository, no third-party
-Python package is used at all, and that now includes the pixels: there is no
-Tk, Qt, GTK, SDL, Cairo, FreeType or Pillow anywhere, and the only thing the
-renderer asks of the operating system is a font file to parse. Nothing is
+feetplayer and doormat, which are our own code in repositories of their own,
+no third-party Python package is used at all, and that includes the pixels
+and the window they go in: there is no Tk, Qt, GTK, SDL, Cairo, FreeType or
+Pillow anywhere, and the only thing the renderer asks of the operating
+system is a font file to parse. Nothing is
 imported conditionally and nothing is shrugged off when absent, so what the
 browser can draw does not depend on what else the machine happens to have
 installed. SVG is the format that costs: it used to render wherever cairosvg
@@ -115,11 +125,7 @@ feetbrowser/
   raster.py      thin shim over the Rust surface, glyph cache and PNG output
   imagecodec.py  thin shim over the Rust PNG / GIF / JPEG / PNM decoders
   canvas.py      retained scene graph, fonts, colors, images
-  window.py      windows, event bindings, after() timers, main loop
-  cocoa.py       the macOS window: AppKit through ctypes, no PyObjC
-  x11.py         the Linux window: Xlib through ctypes, no python-xlib
-  win32.py       the Windows window: user32/gdi32 through ctypes, no pywin32
-  gui.py         which native window to open, or none at all
+  gui.py         which native window to open, what it is called, or none
   browser.py     window, chrome, tabs, history, event loop, layered repaint
   toes.py        extension hooking (Toes): discovery, dispatch, CLI
   toehub.py      the ToeHub: catalog fetch, install/uninstall/toggle
@@ -151,13 +157,20 @@ rust/
                  beside the engine. feetbrowser/media.py imports it. The
                  browser works without a Fortran compiler; it does not work
                  without feetplayer. See docs/media.md.
+(doormat)        not in this repository. The windows -- Cocoa, X11 and Win32
+                 through ctypes, the input translation behind them and the
+                 event loop above them -- are a package of their own, ctypes
+                 only, with an empty [dependencies], pinned to a commit sha
+                 in requirements.txt. Nothing in it knows a browser exists
+                 and nothing in it draws. feetbrowser/gui.py is the only
+                 module that imports it.
 toes/            user-installed toes (gitignored; empty on a fresh checkout)
 tests/
   test_render.py offline tests for fonts, rasteriser, image codecs, canvas
-  test_cocoa.py  the macOS window, driven by real NSEvents (macOS only)
-  test_x11.py    the X11 window, driven by real X events (skips with no server)
+  test_cocoa.py  the browser in a real Cocoa window (macOS only)
+  test_x11.py    the browser in a real X11 window (skips with no server)
   x11_shot.py    photographs a real X11 window with XGetImage (CI artifact)
-  test_win32.py  the Windows window, driven by real messages (Windows only)
+  test_win32.py  the browser in a real Win32 window (Windows only)
   test_units.py  offline unit tests (URL, HTML, CSS, layout, internal pages)
   test_js.py     offline tests for the JS engine + DOM bridge
   test_nav.py    click-to-navigate, history, view-source

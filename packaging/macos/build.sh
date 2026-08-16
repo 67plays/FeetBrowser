@@ -12,18 +12,18 @@
 # codesign, iconutil, hdiutil, security -- ships with macOS. What the build
 # machine needs beyond that is a C compiler (the Command Line Tools, which
 # building the Rust engine already requires), a Rust toolchain with both
-# Apple targets installed, a pip that can reach the network (feetplayer is a
-# dependency now, not a directory in this checkout -- see step 6), and a
-# gfortran for the decoders inside it (brew install gcc). gfortran only ever
-# targets the machine it is on, so the other architecture's half of each
-# decoder has to be built on the other architecture and handed over.
+# Apple targets installed, a pip that can reach the network (feetplayer and
+# doormat are dependencies now, not directories in this checkout -- see step
+# 6), and a gfortran for the decoders inside it (brew install gcc). gfortran
+# only ever targets the machine it is on, so the other architecture's half of
+# each decoder has to be built on the other architecture and handed over.
 #
 #   packaging/macos/build.sh              build the .app and the .dmg
 #   FEETBROWSER_SKIP_DMG=1 ...build.sh    stop after the .app
 #   FEETBROWSER_H264_X86_64=/path/to/lib  the x86_64 decoder, built elsewhere
 #   FEETBROWSER_H264_ARM64=/path/to/lib   the arm64 one, likewise
 #   FEETBROWSER_AAC_*, FEETBROWSER_BALL_* the same, for sound and for MP3
-#   FEETBROWSER_PYTHON=/path/to/python3   the python that installs feetplayer
+#   FEETBROWSER_PYTHON=/path/to/python3   the python whose pip does step 6
 #
 # Everything lands in packaging/macos/build (working files, including a cache
 # of the downloaded CPython) and packaging/macos/dist (the .app and .dmg).
@@ -291,7 +291,7 @@ find "$applib/feetbrowser" -name __pycache__ -type d -exec rm -rf {} +
 mkdir -p "$applib/toes"
 cp "$root/toes/README.md" "$applib/toes/"
 
-# -- 6. feetplayer and its Fortran decoders ----------------------------------
+# -- 6. feetplayer, doormat and the Fortran decoders -------------------------
 #
 # feetplayer is the media stack -- the container readers, the audio output and
 # the H.264, AAC and MPEG Layer III decoders. It used to be part of this tree
@@ -334,7 +334,7 @@ cp "$root/toes/README.md" "$applib/toes/"
 # hands the x86_64 slices over from the Intel runner, and otherwise from any
 # gfortran on PATH that targets it.
 
-say "installing feetplayer"
+say "installing feetplayer and doormat"
 # A throwaway venv rather than the host's pip or the bundled interpreter's.
 # The bundled one has had ensurepip pruned out of it above; the host's is
 # refused outright by any python installed from Homebrew or a distribution,
@@ -348,6 +348,16 @@ say "installing feetplayer"
   --no-compile -r "$root/requirements.txt"
 find "$applib" -maxdepth 1 -name '*.dist-info' -type d -exec rm -r {} +
 find "$applib/feetplayer" -name __pycache__ -type d -exec rm -r {} +
+# doormat, the window layer, comes out of the same file and wants nothing
+# doing to it: ctypes against Cocoa, nothing compiled anywhere in it, so what
+# pip put down is what ships. Named here because an app missing it builds,
+# renders and screenshots exactly like a correct one and opens no window for
+# anybody; verify.sh asks for it again on the copy out of the disk image.
+[ -d "$applib/doormat" ] || {
+  echo "pip installed no doormat; the app could not open a window" >&2
+  exit 1
+}
+find "$applib/doormat" -name __pycache__ -type d -exec rm -r {} +
 # The sources, not only the libraries: they are what the slices below are
 # built from, and their absence would otherwise be discovered one line later
 # as a confusing gfortran error.

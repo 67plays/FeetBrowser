@@ -45,6 +45,9 @@ FeetBrowser.app/Contents/
                                  the MPEG Layer III decoder, the same way
   Resources/lib/feetplayer/fortran/
                                  the Fortran all three were built from
+  Resources/lib/doormat/         the window layer, from the same file: the
+                                 Cocoa window, the input translation behind
+                                 it and the event loop above it, ctypes only
   Resources/lib/toes/            where discover_toes() looks
   Frameworks/Python.framework/   CPython 3.13, pruned
 ```
@@ -114,7 +117,7 @@ does not work here, and the reason is worth writing down: AppKit answers
 the path of the *currently executing image*. After an `exec` that path is the
 interpreter's, so the running application would be the `Python.app` nested
 inside Python.framework, and it would take its name, its icon and its bundle
-identifier from that plist instead of ours. `cocoa.py` calls
+identifier from that plist instead of ours. `doormat/cocoa.py` calls
 `setActivationPolicy:` and `activateIgnoringOtherApps:`, so it gets a Dock
 tile and the keyboard either way; what it cannot get from a script is that
 the tile says FeetBrowser. `appshot.py`'s `gui` stage is the check: it asks
@@ -346,6 +349,11 @@ Run either by hand against any bundle, including one copied off a mounted
   this wrong now that the media stack is a pip dependency: `verify.sh`
   requires `Resources/lib/feetplayer/mediacodec.py` and the Fortran sources
   beside it, and the decode checks above fail without them,
+* a bundle with no `doormat` in it, the same failure one dependency along and
+  a worse one: an app that cannot open a window at all. `verify.sh` requires
+  `Resources/lib/doormat/cocoa.py` by name, because nothing else here would
+  miss it -- every render check above runs headless, and `appshot.py`'s `gui`
+  stage is the only other thing that asks for a window,
 * Tcl, Tk or `_tkinter`.
 
 Paths belonging to *upstream* CPython's own build machine are reported and

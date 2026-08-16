@@ -24,9 +24,10 @@ interpreter, `python3 -m feetbrowser <url>` works directly.
 There is nothing else to install. The renderer is ours (see [the rendering
 engine](rendering.md)), so no GUI toolkit is needed: only Python 3, a Rust
 toolchain for that one extension, and at least one system font. The window is
-ours as well: AppKit on macOS, Xlib on Linux and on Wayland desktops through
-XWayland, and user32/gdi32 on Windows, all reached by ctypes with no bindings
-package in between.
+ours as well: doormat, a package of ours the scripts install beside
+feetplayer, opens one through AppKit on macOS, Xlib on Linux and on Wayland
+desktops through XWayland, and user32/gdi32 on Windows, all reached by ctypes
+with no bindings package in between.
 
 `FEETBROWSER_DISPLAY` decides which one, and normally wants leaving alone; it
 and the rest of the environment are described under [environment
@@ -124,10 +125,11 @@ on every platform. A third, the standard `DISPLAY`, is not ours but decides
 whether the X11 window can open, so it is described here too.
 
 The first is read as text, stripped of surrounding whitespace and lowercased,
-so `X11` and ` x11 ` are the same as `x11`. It is read once and the choice is
-then fixed for the life of the process; changing it from inside a running
-browser does nothing. The second is a path, so it is taken as written apart
-from a leading `~`.
+so `X11` and ` x11 ` are the same as `x11`. It is read every time a window is
+asked for rather than once at import, so a test can set it between two
+windows and a `--screenshot` run does not have to care what the environment
+said. The second is a path, so it is taken as written apart from a leading
+`~`.
 
 There is nothing here that picks a renderer. There is one: our own font
 engine, rasteriser and event loop, and every window backend and the
@@ -137,7 +139,9 @@ headless root draws through it.
 
 Which native window backend opens a window, from `feetbrowser/gui.py`. It
 picks where the pixels are put, not what draws them: the renderer is the same
-either way, and the same again when there is no window at all.
+either way, and the same again when there is no window at all. `gui.py` hands
+the value to doormat rather than exporting doormat's own `$DOORMAT_DISPLAY`,
+so the variable a user sets is this one and setting the other does nothing.
 
 | value | effect |
 | --- | --- |

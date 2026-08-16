@@ -80,11 +80,14 @@ if [ -f .venv/pyvenv.cfg ] &&
   python3 -m venv --system-site-packages .venv
 fi
 
-# feetplayer, pinned to a commit in requirements.txt, into that venv. pip
-# compiles its Fortran during the install, so this is the minute the decoders
-# cost, and it is paid once per pin rather than once per start: `pip freeze`
-# prints a VCS install as the requirement line that produced it, so the pin
-# installed and the pin asked for compare as plain strings.
+# Our own split-out libraries, each pinned to a commit in requirements.txt,
+# into that venv: feetplayer is the decoders, doormat is the windows.
+# Installing feetplayer compiles its Fortran, so this is the minute the
+# decoders cost, and it is paid once per pin rather than once per start: `pip
+# freeze` prints a VCS install as the requirement line that produced it, so
+# the pins installed and the pins asked for compare as plain strings. Every
+# line is checked -- one `grep -qxF` over the whole file would pass as soon as
+# any single pin matched, leaving a newly added dependency uninstalled.
 #
 # This, and the decoder check after it, come before the engine build below --
 # a machine that cannot decode is told why now, not after several minutes of
@@ -93,10 +96,17 @@ fi
 if [ ! -x .venv/bin/python ]; then
   python3 -m venv --system-site-packages .venv
 fi
-want=$(grep -v '^[[:space:]]*#' requirements.txt | grep -v '^[[:space:]]*$')
-if ! .venv/bin/python -m pip freeze 2>/dev/null | grep -qxF "$want"; then
-  echo "FeetBrowser: installing feetplayer, the media stack. This compiles its"
-  echo "Fortran decoders, so expect a minute -- and only when the pin moves."
+have=$(.venv/bin/python -m pip freeze 2>/dev/null || true)
+missing=""
+while IFS= read -r want; do
+  printf '%s\n' "$have" | grep -qxF "$want" || missing=1
+done <<EOF
+$(grep -v '^[[:space:]]*#' requirements.txt | grep -v '^[[:space:]]*$')
+EOF
+if [ -n "$missing" ]; then
+  echo "FeetBrowser: installing feetplayer and doormat, the media stack and"
+  echo "the windows. feetplayer compiles its Fortran decoders, so expect a"
+  echo "minute -- and only when a pin moves."
   echo
   # Not fatal on its own: warm_fortran below is what refuses to start, and it
   # says rather more about why than pip does.

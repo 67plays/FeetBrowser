@@ -6,9 +6,9 @@
 # and runs it, on a distribution that has no Python". So this refuses to run
 # if a python3 is on PATH, and it installs exactly two packages:
 #
-#   libx11-6   the X client library. x11.py dlopens libX11.so.6 through
-#              ctypes and the bundle deliberately does not carry one, so this
-#              stands in for what any machine with an X server already has.
+#   libx11-6   the X client library. doormat/x11.py dlopens libX11.so.6
+#              through ctypes and the bundle deliberately does not carry one,
+#              so this stands in for what any machine with an X server has.
 #   xvfb       an X server. A user's desktop is the X server; a container has
 #              to be given one.
 #
@@ -116,8 +116,12 @@ say "a real X11 window"
 # server with XGetImage, and fails unless the red, green and blue swatches
 # are present and land in that order across the window. Running it through
 # the bundle's own interpreter is the point -- sys.path[0] is /verify, which
-# has no feetbrowser in it, so the package, the engine, the fonts and the
-# interpreter all come out of the AppImage.
+# has no feetbrowser in it, so the package, doormat, the engine, the fonts
+# and the interpreter all come out of the AppImage.
+#
+# It is also the only step in this script that a bundle shipped without
+# doormat would fail, and it fails naming it: every check before this one
+# renders headlessly, and none of them asks anybody for a window.
 Xvfb :99 -screen 0 1600x1200x24 >/dev/null 2>&1 &
 XVFB=$!
 sleep 2

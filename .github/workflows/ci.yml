@@ -66,12 +66,13 @@ jobs:
       - name: Discord Rich Presence tests
         run: $PY tests/test_discord.py
 
-      # test_cocoa opens real NSWindows on the macOS runners and test_win32
-      # opens real HWNDs on the Windows ones; each skips off its own
-      # platform, and test_x11 runs its whole offline half everywhere. Until
-      # this matrix grew a Windows entry, the 31 tests in test_win32.py had
-      # never been executed by anything.
-      - name: Platform window tests
+      # The browser in a real window: NSWindows on the macOS runners, HWNDs
+      # on the Windows ones, and an X11 window in the `x11` job below. Each
+      # skips off its own platform. The windows themselves are doormat's and
+      # are tested in that repository against all three; what runs here is
+      # only the part that needs a browser inside the window -- clicking the
+      # chrome, typing in the address bar, a page reaching the glass.
+      - name: The browser in a real window
         run: |
           $PY tests/test_cocoa.py
           $PY tests/test_x11.py
@@ -108,10 +109,10 @@ jobs:
       - name: Toe engine tests
         run: $PY tests/test_toes.py
 
-      # Linux/x86-64 assembles and runs the real kernels here; everywhere
-      # else the module's pure-Python fallback is what gets checked.
-      - name: Assembly X11 pixel-packing kernels
-        run: $PY tests/test_asmx11.py
+      # Linux/x86-64 assembles and runs the real kernel here; everywhere else
+      # the module's pure-Python fallback is what gets checked. The X11
+      # pixel-packing kernel left with the window backends and is assembled
+      # and run in doormat's CI, against a live server at depth 16.
       - name: Assembly selection nearest-boundary kernel
         run: $PY tests/test_asmselect.py
 
@@ -183,15 +184,17 @@ jobs:
           xvfb: 'true'
 
       # 24-bit TrueColor: what every desktop actually runs, and the format
-      # the backend converts to with no per-pixel work.
-      - name: X11 tests at depth 24
+      # doormat converts to with no per-pixel work.
+      - name: The browser in an X11 window, depth 24
         run: |
           xvfb-run -a --server-args="-screen 0 1600x1200x24" \
             $PY tests/test_x11.py
 
-      # 16-bit 5-6-5, which no byte layout can describe, so this is the only
-      # thing that ever runs the slow per-channel path against a real server.
-      - name: X11 tests at depth 16
+      # The same suite at 16-bit 5-6-5, which no byte layout can describe.
+      # doormat proves the per-channel conversion pixel by pixel; this proves
+      # that a page our rasteriser drew still arrives through it, which is a
+      # different failure and the one a user would actually see.
+      - name: The browser in an X11 window, depth 16
         run: |
           xvfb-run -a --server-args="-screen 0 1600x1200x16" \
             $PY tests/test_x11.py

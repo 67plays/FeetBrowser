@@ -16,13 +16,15 @@
 #   a CPython, compiled here from the upstream tarball
 #   the feetbrowser package, from this checkout
 #   feetbrowser_engine, compiled here against that CPython
+#   feetplayer and doormat, from the shas requirements.txt pins: the media
+#   stack, and the X11 window the browser draws into
 #   the private shared libraries CPython needs (libssl, libffi, ...)
 #   DejaVu, so a machine with no fonts still renders text
 #   a CA bundle, as a fallback for a machine with no trust store
 #
 # What does not, and why:
 #
-#   libX11 and everything under it. x11.py dlopens libX11.so.6 through
+#   libX11 and everything under it. doormat/x11.py dlopens libX11.so.6 through
 #   ctypes, so the bundle has to find one at runtime -- but it should be the
 #   host's. Every machine with an X server has libX11 (it is a dependency of
 #   the server's own clients), the X protocol is stable across decades, and
@@ -182,9 +184,19 @@ cp "$SRC/packaging/linux/launcher.py" "$APPDIR/usr/lib/feetbrowser/launcher.py"
 # built -fPIC and cannot go into a shared object at all -- what is left is an
 # ordinary NEEDED entry, which collect() will bundle and the rpath pass will
 # point at $ORIGIN, and either way nothing outside the image is required.
-step "feetplayer and the Fortran decoders"
+step "feetplayer, doormat and the Fortran decoders"
 pip install --quiet --target "$SITE" --no-compile -r "$SRC/requirements.txt"
 rm -rf "$SITE"/*.dist-info
+# doormat comes out of the same file and needs nothing done to it -- it is
+# ctypes against libX11 with no compiled artifact anywhere in it, so what pip
+# laid down is what ships. It is checked by name because it is the one
+# dependency whose absence hides: an AppImage without it starts, prints its
+# version and takes a --screenshot exactly as this one does, and fails only
+# for the user who ran it with no arguments and expected a window.
+[ -d "$SITE/doormat" ] || {
+  echo "pip installed no doormat; the bundle could not open a window" >&2
+  exit 1
+}
 [ -d "$SITE/feetplayer/fortran" ] || {
   echo "feetplayer installed without its Fortran sources" >&2
   exit 1

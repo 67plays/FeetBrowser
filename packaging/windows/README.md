@@ -18,7 +18,7 @@ runner, `verify-bundle.ps1` on a second, clean one.
 
 ## What the bundle is
 
-Three things in one directory:
+Six things in one directory:
 
 1. **CPython**, from python.org's [Windows embeddable
    package](https://www.python.org/downloads/windows/), a zip of a plain
@@ -81,6 +81,15 @@ Three things in one directory:
    that has no compiler. The verification job is what proves it, running
    with `PATH` cut back to the system directories.
 
+6. **`doormat\`**, the window layer, which is not in this repository any more
+   either: the Win32 window, the input translation behind it and the event
+   loop above it, `ctypes` throughout with nothing compiled in it. It arrives
+   on the same `pip install --target -r requirements.txt` line as
+   `feetplayer`, from its own pinned sha, and nothing is done to it
+   afterwards -- what pip writes out is what ships. `build.ps1` fails if it
+   is not there, because a bundle without it starts, renders and writes a
+   `--screenshot` like a correct one and then opens no window.
+
 Plus `FeetBrowser.exe`, which is the subject of most of this document.
 
 Nothing is frozen. There is no PyInstaller, no cx_Freeze, no py2exe and no
@@ -111,6 +120,8 @@ FeetBrowser\
     LICENSE.txt                the PSF license, for all of the above
     feetbrowser_engine\        the engine, as maturin packages it
     feetbrowser\               the browser
+    feetplayer\                the media stack, pip-installed
+    doormat\                   the window layer, pip-installed
     toes\                      where extensions get installed
     LICENSE, README.md, README-FIRST.txt
     install.ps1, uninstall.ps1
@@ -143,11 +154,11 @@ resolved relative to the directory the file is in.
 
 For us, those two lines already say the right thing. `python313.zip` is the
 standard library; `.` is the bundle directory, which is where `feetbrowser\`,
-`feetbrowser_engine\` and `feetplayer\` are. So the "how do we get our
-packages importable given that the embeddable package has no pip and no
-site-packages" problem has a one-word answer: we don't need to, they are
-already on the path. It is also why `feetplayer` is installed with
-`--target` into that same directory rather than as a normal dependency:
+`feetbrowser_engine\`, `feetplayer\` and `doormat\` are. So the "how do we
+get our packages importable given that the embeddable package has no pip and
+no site-packages" problem has a one-word answer: we don't need to, they are
+already on the path. It is also why the two pip dependencies are installed
+with `--target` into that same directory rather than as normal dependencies:
 there is no site-packages for pip to aim at.
 
 `build.ps1` writes a second copy called `FeetBrowser._pth`. CPython looks for
@@ -248,7 +259,7 @@ Loading the DLL wins on three specific things:
   having any output at all. In-process, the question does not arise: this
   binary is `windows_subsystem = "windows"` and there is no second process.
 * **DPI.** `python.exe` ships a manifest that marks the process DPI-aware
-  before any FeetBrowser code runs, which makes `win32.py`'s own
+  before any FeetBrowser code runs, which makes `doormat/win32.py`'s own
   `SetProcessDpiAwarenessContext` call fail and leaves the browser on the
   coarser system-DPI path. Our manifest deliberately says nothing about DPI
   so that the window backend gets to choose per-monitor-v2 for itself.
@@ -408,10 +419,12 @@ The checks are:
    reads them.
 
    Before either of those, the script checks that there is a `feetplayer\`
-   in the bundle at all, with its `mediacodec.py` and its `fortran\`. That
-   is the new way to get this wrong: the media stack arrives by pip now, and
-   a pip step that silently did nothing produces a bundle that starts,
-   renders, browses, and cannot open a video.
+   in the bundle at all, with its `mediacodec.py` and its `fortran\`, and a
+   `doormat\` with its `win32.py`. That is the new way to get this wrong:
+   both arrive by pip now, and a pip step that silently did nothing produces
+   a bundle that starts, renders and browses, and then cannot open a video
+   -- or, without `doormat`, cannot open a window, which check 8 above is
+   what actually catches.
 
 In CI all of this happens twice, on a runner that never checks the repository
 out: once from `C:\Program Files\FeetBrowser`, and once from a directory

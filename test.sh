@@ -6,25 +6,25 @@
 # builds into the local venv, and the JS suite runs against it like every
 # other suite.
 #
-# Four suites step outside all that: test_cocoa.py, test_x11.py and
-# test_win32.py open real windows wherever their platform has one and skip
-# everywhere else, and test_nav.py and smoke.py reach the network. The last
-# of those is why CI runs both of them against the offline mirror in
-# tests/fixtures instead -- see tests/fixture_server.py.
+# Five suites step outside all that: test_cocoa.py, test_x11.py and
+# test_win32.py put the browser in a real window wherever their platform has
+# one and skip everywhere else, and test_nav.py and smoke.py reach the
+# network. The last of those is why CI runs both of them against the offline
+# mirror in tests/fixtures instead -- see tests/fixture_server.py.
 #
 # On Windows, run test.cmd instead; it runs the same suites in the same order.
 set -euo pipefail
 cd "$(dirname "$0")"
 
-# Those window suites open dozens of real windows in a few seconds, and a
-# window's default manners -- centre itself, raise above everything, take the
-# keyboard -- make the machine unusable for as long as the run lasts. QUIET
-# drops exactly those three things and nothing else: the windows are still
-# created, mapped, drawn into and sent real events, so the suites still prove
-# what they proved before. Export it rather than assign it, so it reaches the
-# suites, and honour an existing value so `FEETBROWSER_QUIET=0 ./test.sh`
-# still gets you the windows when you want to watch them.
-export FEETBROWSER_QUIET="${FEETBROWSER_QUIET:-1}"
+# Those window suites open real windows, and a window's default manners --
+# centre itself, raise above everything, take the keyboard -- make the machine
+# unusable for as long as the run lasts. QUIET drops exactly those three
+# things and nothing else: the windows are still created, mapped, drawn into
+# and sent real events, so the suites still prove what they proved before.
+# The variable is doormat's, since the windows are, and it is exported rather
+# than assigned so it reaches the suites. An existing value wins, so
+# `DOORMAT_QUIET=0 ./test.sh` still gets you the windows to watch.
+export DOORMAT_QUIET="${DOORMAT_QUIET:-1}"
 
 if [ ! -x .venv/bin/python ]; then
   # Same venv run.sh builds, and for the same reason it is not sealed. That
@@ -41,15 +41,26 @@ elif grep -qi '^include-system-site-packages *= *false' .venv/pyvenv.cfg 2>/dev/
   python3 -m venv --system-site-packages .venv
 fi
 
-# feetplayer, in the same venv: the H.264, AAC and MP3 decoders, the container
-# readers and the three audio backends, which used to live in this tree and
-# are their own repository now. requirements.txt pins it to a commit; pip
-# compiles its Fortran during the install, which takes a minute, so the pin
-# already installed is compared against the pin asked for and nothing is done
-# when they agree. `pip freeze` prints a VCS install as the requirement line
-# that produced it, which is why the comparison is a plain string match.
-want=$(grep -v '^[[:space:]]*#' requirements.txt | grep -v '^[[:space:]]*$')
-if ! .venv/bin/python -m pip freeze 2>/dev/null | grep -qxF "$want"; then
+# Our own split-out libraries, in the same venv: feetplayer, which is the
+# decoders and the container readers, and doormat, which is the windows. Both
+# used to live in this tree and are their own repositories now.
+# requirements.txt pins each to a commit; installing feetplayer compiles its
+# Fortran, which takes a minute, so the pins already installed are compared
+# against the pins asked for and nothing is done when they agree. `pip freeze`
+# prints a VCS install as the requirement line that produced it, which is why
+# the comparison is a plain string match.
+#
+# Every line has to be checked, not just one of them: a single `grep -qxF`
+# against the whole file passes as soon as ANY pin matches, which would leave
+# a newly added dependency permanently uninstalled.
+have=$(.venv/bin/python -m pip freeze 2>/dev/null || true)
+missing=""
+while IFS= read -r want; do
+  printf '%s\n' "$have" | grep -qxF "$want" || missing=1
+done <<EOF
+$(grep -v '^[[:space:]]*#' requirements.txt | grep -v '^[[:space:]]*$')
+EOF
+if [ -n "$missing" ]; then
   .venv/bin/python -m pip install -q -r requirements.txt
 fi
 
@@ -92,9 +103,9 @@ run=".venv/bin/python tests/watchdog.py 900"
 $run tests/test_suites.py  # every file below, and nothing missing
 $run tests/test_discord.py  # the from-scratch Discord Rich Presence client
 $run tests/test_render.py
-$run tests/test_cocoa.py   # opens real windows on macOS, skips elsewhere
-$run tests/test_x11.py     # opens real windows under X11, skips elsewhere
-$run tests/test_win32.py   # opens real windows on Windows, skips elsewhere
+$run tests/test_cocoa.py   # the browser in a real macOS window, else skips
+$run tests/test_x11.py     # the browser in a real X11 window, else skips
+$run tests/test_win32.py   # the browser in a real Windows window, else skips
 $run tests/test_audio.py   # a <video> element's soundtrack, and the pictures that follow it
 $run tests/test_units.py
 $run tests/test_release_version.py  # the guard release.yml runs first
@@ -104,7 +115,6 @@ $run tests/test_settings.py
 $run tests/test_e2e.py     # a fixture page in, its pixels back out
 $run tests/test_nav.py
 $run tests/test_toes.py
-$run tests/test_asmx11.py    # raw assembly on Linux/x86-64, Python elsewhere
 $run tests/test_asmselect.py # the selection nearest-boundary kernel
 $run tests/smoke.py
 

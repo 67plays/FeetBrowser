@@ -11,10 +11,12 @@
       * FeetBrowser.exe, the launcher crate in launcher/.
 
     Plus feetbrowser/ itself, which is pure Python and just gets copied, and
-    feetplayer -- the media stack, its own package, pinned to a commit in
-    requirements.txt -- which pip installs into the same directory. Its
-    Fortran decoders are compiled here with gfortran, because the machine
-    that runs the bundle has no compiler.
+    the two packages requirements.txt pins to a commit each, which pip
+    installs into the same directory: feetplayer, the media stack, whose
+    Fortran decoders are compiled here with gfortran because the machine
+    that runs the bundle has no compiler; and doormat, the Win32 window,
+    the input translation behind it and the event loop above it, which is
+    ctypes only and ships exactly as pip leaves it.
 
     Nothing is frozen, bytecode-scanned or dependency-analysed. The layout is
     the one the embeddable package was designed for: everything in one
@@ -202,16 +204,20 @@ New-Item -ItemType Directory -Force -Path (Join-Path $stage 'toes') | Out-Null
 Copy-Item (Join-Path $RepoRoot 'toes\README.md') (Join-Path $stage 'toes') -Force
 
 # ---------------------------------------------------------------------------
-# feetplayer, and the decoders it builds.
+# feetplayer and doormat, and the decoders the first of them builds.
 #
 # The media stack is its own package now, pinned to a commit in
 # requirements.txt, so it is installed rather than copied: pip puts
-# feetplayer\ beside feetbrowser\ in the bundle, with its fortran\ sources
-# inside it as package data. The install is done with the *host* interpreter,
-# because the embeddable CPython that ships in the bundle has no pip and is
-# not supposed to -- --target makes the destination the bundle regardless of
-# which interpreter runs the install, and feetplayer is pure Python plus
-# Fortran, so nothing architecture-specific comes out of the install itself.
+# feetplayer\ and doormat\ beside feetbrowser\ in the bundle, with
+# feetplayer's fortran\ sources inside it as package data. Only feetplayer
+# needs anything doing to it afterwards, which is the rest of this section;
+# doormat is ctypes and is finished the moment pip has written it out.
+#
+# The install is done with the *host* interpreter, because the embeddable
+# CPython that ships in the bundle has no pip and is not supposed to --
+# --target makes the destination the bundle regardless of which interpreter
+# runs the install, and feetplayer is pure Python plus Fortran, so nothing
+# architecture-specific comes out of the install itself.
 #
 # feetplayer\h264.py, aac.py and ball.py compile that Fortran with gfortran
 # the first time a video or a soundtrack plays. That works from a checkout,
@@ -247,7 +253,7 @@ Copy-Item (Join-Path $RepoRoot 'toes\README.md') (Join-Path $stage 'toes') -Forc
 # "shipped libgfortran-5.dll beside it" are different bundles and a log that
 # does not distinguish them is a log that cannot explain the next failure.
 # ---------------------------------------------------------------------------
-Step "installing feetplayer"
+Step "installing feetplayer and doormat"
 # The interpreter that does the installing, which is not the one in the
 # bundle: the embeddable package ships no pip and no ensurepip, on purpose.
 # FEETBROWSER_PYTHON wins, as it does in the macOS script.
@@ -258,21 +264,31 @@ foreach ($candidate in @($env:FEETBROWSER_PYTHON, 'python', 'python3', 'py')) {
     if ($found) { $hostPython = $found.Source; break }
 }
 if (-not $hostPython) {
-    Fail ("no Python on PATH to install feetplayer with. Install one from`n" +
+    Fail ("no Python on PATH to run pip with. Install one from`n" +
           "      python.org or point FEETBROWSER_PYTHON at it. The interpreter`n" +
           "      inside the bundle cannot do it: it has no pip.")
 }
 Write-Host "    installing with: $hostPython"
 & $hostPython -m pip install --disable-pip-version-check --quiet `
     --target $stage --no-compile -r (Join-Path $RepoRoot 'requirements.txt')
-if ($LASTEXITCODE -ne 0) { Fail "pip could not install feetplayer into the bundle" }
+if ($LASTEXITCODE -ne 0) { Fail "pip could not install the requirements" }
 $player = Join-Path $stage 'feetplayer'
 if (-not (Test-Path $player)) { Fail "pip installed no feetplayer\ into the bundle" }
+# doormat is the other half of that one pip line and needs nothing done to
+# it: ctypes against user32 and gdi32, nothing compiled anywhere in it, so
+# what pip laid down is what ships. It is checked separately because its
+# absence is the quietest failure this script can produce -- the bundle
+# builds, starts, prints its version and writes a --screenshot, and opens no
+# window for the one person who double-clicked the icon.
+$doormat = Join-Path $stage 'doormat'
+if (-not (Test-Path $doormat)) {
+    Fail "pip installed no doormat\ into the bundle; it could open no window"
+}
 # The install describes an installation nobody will consult, and pip writes
 # __pycache__ into a --target even with --no-compile off the wheel's own
 # sources; both go the same way feetbrowser/'s did above.
 Get-ChildItem -Path $stage -Directory -Filter '*.dist-info' | Remove-Item -Recurse -Force
-Get-ChildItem -Path $player -Recurse -Force -Directory |
+Get-ChildItem -Path $player, $doormat -Recurse -Force -Directory |
     Where-Object { $_.Name -eq '__pycache__' } |
     Remove-Item -Recurse -Force
 if (-not (Test-Path (Join-Path $player 'fortran'))) {

@@ -8,7 +8,7 @@
  * up from the path of the currently executing image; after an exec that path
  * is the interpreter's, so the running app would be Python.framework's own
  * embedded Python.app and would take its name, its icon and its bundle
- * identifier from that plist instead of ours. cocoa.py calls
+ * identifier from that plist instead of ours. doormat/cocoa.py calls
  * `setActivationPolicy:NSApplicationActivationPolicyRegular` and
  * `activateIgnoringOtherApps:`, so it gets a Dock tile and the keyboard
  * either way -- what it cannot get from a script is that the tile is

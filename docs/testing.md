@@ -24,10 +24,10 @@ The test files live in `tests/`:
 tests/
   test_suites.py    every file below is run by test.sh and by CI, or this fails
   test_render.py    fonts, rasteriser, image codecs, canvas, event model
-  test_cocoa.py     the macOS window, driven by real NSEvents (macOS only)
-  test_x11.py       the X11 window, driven by real X events (needs a server)
+  test_cocoa.py     the browser in a real Cocoa window (macOS only)
+  test_x11.py       the browser in a real X11 window (needs a server)
   x11_shot.py       photographs a real X11 window with XGetImage (CI artifact)
-  test_win32.py     the Windows window, driven by real messages (Windows only)
+  test_win32.py     the browser in a real Win32 window (Windows only)
   test_units.py     offline unit tests (URL, HTML, CSS, layout, internal pages)
   test_js.py        offline tests for the JS engine + DOM bridge
   test_shoes.py     the Shoes theme manager
@@ -35,8 +35,7 @@ tests/
   test_nav.py       click-to-navigate, history, view-source
   download_cases.py downloads, against a local server (run from test_nav.py)
   test_toes.py      toe engine + ToeHub tests (install/uninstall/toggle)
-  test_asmx11.py  the assembly pixel-packing kernels against their Python references
-  test_asmselect.py the assembly selection nearest-boundary kernel against its Python reference
+  test_asmselect.py the assembly selection kernel against its Python reference
   smoke.py          end-to-end pipeline over a real socket
   fixture_server.py serves tests/fixtures over HTTP on loopback
   fixtures/         the pages the three end-to-end suites load
@@ -116,21 +115,27 @@ least one system font, which every platform we support ships.
 
 The exceptions are `test_cocoa.py`, `test_x11.py` and `test_win32.py`, and
 deliberately so. They open real windows and feed them real platform events,
-because the
-platform layer is the one place a mistake is invisible from Python: a stale
-attribute in the mouse path once swallowed every click with the browser
-underneath looking healthy. Each skips itself with a message where its
-platform is not there, so the suite is green on all three either way.
+because the join between the browser and doormat is the one place a mistake
+is invisible from both sides: a stale attribute in the mouse path once
+swallowed every click with the browser underneath looking healthy, and
+doormat's own suite -- which proves that a window maps, that events translate
+and that a framebuffer reaches the screen -- cannot see it, having no idea a
+browser exists. So these three test the grip rather than the window: six
+cases on X11, six on Cocoa and four on Win32, clicking the chrome, sending
+shortcuts, typing in the address bar, dragging the scrollbar and getting a
+real page onto the glass. Each skips itself with a message where its platform
+is not there, so the suite is green on all three either way.
 
 Real windows have real manners, and a suite that opens dozens of them in a
 few seconds inherits all of them: each one centres itself on the display,
 raises above everything and takes the keyboard, so for as long as the run
-lasts the machine belongs to the tests. `FEETBROWSER_QUIET` drops exactly
+lasts the machine belongs to the tests. `DOORMAT_QUIET` drops exactly
 those three habits and nothing else: a quiet window is still created,
 mapped, sized, drawn into and sent real events, so every assertion in those
-suites is testing what it tested before. `test.sh` and `test.cmd` set it, so
-the ordinary way of running the tests already leaves you your machine; set
-`FEETBROWSER_QUIET=0` when you want to watch the windows work.
+suites is testing what it tested before. It is doormat's variable because the
+manners are the window's, and `test.sh` and `test.cmd` export it, so the
+ordinary way of running the tests already leaves you your machine; set
+`DOORMAT_QUIET=0` when you want to watch the windows work.
 
 The mechanism differs per platform because the manners do: macOS runs the app
 under the accessory activation policy (no Dock icon, never becomes the active
@@ -138,46 +143,47 @@ app) and orders each window in at the back instead of making it key; X11 maps
 the window override-redirect, which is the one portable way to tell a window
 manager not to place, decorate, raise or focus something; every other route
 is a hint it may ignore; Windows shows the window with `SW_SHOWNOACTIVATE`
-and skips `SetForegroundWindow`. Each backend's suite asserts the promise
-rather than the mechanism: open a quiet window, then check the keyboard did
-not move to it and that the window is nonetheless real and the size asked
-for. That last half matters: quiet is only worth having if the window it
-leaves behind is still the one the other tests are reading pixels off.
+and skips `SetForegroundWindow`. doormat asserts the promise rather than the
+mechanism, backend by backend: open a quiet window, then check the keyboard
+did not move to it and that the window is nonetheless real and the size asked
+for. That last half is what makes it usable here: quiet is only worth having
+if the window it leaves behind is still one these suites can read pixels off.
 
 One thing quiet does not do is make the windows invisible. On macOS they sit
 behind whatever you are working in; under X11 they map where the server puts
 them. Not ordering the window in at all was tried and does not work: AppKit
-gives an unordered window no usable backing store, and seventeen tests fail.
-If you want silence rather than good manners, the window suites skip cleanly
-when their platform is absent: quit XQuartz and `test_x11.py`'s live half
-steps aside on its own.
+gives an unordered window no usable backing store, and every test that reads
+a pixel back fails. If you want silence rather than good manners, the window
+suites skip cleanly when their platform is absent: quit XQuartz and
+`test_x11.py` steps aside on its own.
 
-`test_x11.py` splits in half. The arithmetic and the lookup tables (scanline
-padding, the byte layout a visual's channel masks imply, keysym names, wheel
-buttons) are plain functions over plain values, and those tests run
-everywhere, including on macOS and Windows. The rest needs a server, and asks
-it real questions: XGetGeometry for the window's true size, XSendEvent for
-input, and XGetImage to read the frame back off the server and check the
-colours arrived in the right order. CI runs that half on Linux under
-`xvfb-run`, and `x11_shot.py` uploads the resulting window as a PNG so a human
-can see what the Linux build actually drew, after checking that the three
-colour swatches on that page came back present and in order, which is what a
-wrong channel mask or byte order permutes.
+`test_x11.py` needs a server for every line of it. The arithmetic and the
+lookup tables it used to check anywhere -- scanline padding, the byte layout
+a visual's channel masks imply, keysym names, wheel buttons -- are doormat's,
+and doormat runs them on all three platforms and against a live Xvfb at depth
+24 and depth 16, which is more than this repository ever did. What is left is
+the browser in the window, asking the server real questions: XGetGeometry for
+its true size, XSendEvent for input, and XGetImage to read the frame back and
+check the page arrived. CI runs it on Linux under `xvfb-run`, and
+`x11_shot.py` uploads the resulting window as a PNG so a human can see what
+the Linux build actually drew, after checking that the three colour swatches
+on that page came back present and in order, which is what a wrong channel
+mask or byte order permutes.
 
-`test_win32.py` splits the same way, and for the same reason. Its offline
-half (DIB stride rounding, the BGRX byte order, virtual-key to keysym
-translation, the wheel-delta arithmetic) runs anywhere. Its other half opens
-real windows, pumps real messages through the window procedure and reads
-pixels back out of GDI, and that half only runs on the `windows-latest` rows
-of the matrix. Treat those rows as the verification of anything in `win32.py`:
-nothing else executes a line of it, and until they existed nothing ever had.
+`test_win32.py` and `test_cocoa.py` are the same shape and run only on the
+`windows-latest` and macOS rows of the matrix. Treat those rows as the
+verification that the browser still holds a native window on either platform:
+nothing else in this repository opens one, and two packages passing their own
+suites is exactly the state in which a broken join goes unnoticed.
 
-Two things they do not verify, and it is worth being plain about which. The
-runners are headless and run at 96 DPI, so neither the DPI handling nor
-`WM_DPICHANGED` is ever exercised; and nothing there drags a window by its
-title bar, so the timer that keeps the browser running inside Windows' modal
-loops is not exercised either. Those parts are written against the API
-documentation and checked by reading.
+Two things no row here verifies, and it is worth being plain about which. The
+runners are headless and run at 96 DPI, so nothing reaches the DPI *change*
+path -- `WM_DPICHANGED` and the resize behind it are doormat's, and the CSS
+to device pixel arithmetic on this side is checked headless in
+`test_render.py` instead; and nothing drags a window by its title bar, so the
+timer that keeps the browser running inside Windows' modal loops is never
+entered. Those parts are written against the API documentation and checked by
+reading.
 
 CI runs the offline suite on every interpreter the engine supports (3.9
 through 3.14) and on macOS and Windows as well as Linux, so `test_cocoa.py`

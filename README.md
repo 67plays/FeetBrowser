@@ -33,14 +33,15 @@ run.cmd                  :: Windows: the same script for cmd.exe
 run.cmd https://example.com
 ```
 
-No GUI toolkit to install: just Python 3 and a system font. Two things do
-get installed into a local `.venv` on a first run, and the scripts do both
-for you: the Rust extension (`feetbrowser_engine`) is compiled there when it
-isn't importable, so a first run needs the Rust toolchain (the script
-installs `maturin` into the venv for you); and
-[feetplayer](https://github.com/67plays/feetplayer) -- the media stack, our
-own code in a repository of its own -- is installed from
-[`requirements.txt`](requirements.txt), which pins it to a commit sha.
+No GUI toolkit to install: just Python 3 and a system font. Two kinds of
+thing do get installed into a local `.venv` on a first run, and the scripts
+do all of it for you: the Rust extension (`feetbrowser_engine`) is compiled
+there when it isn't importable, so a first run needs the Rust toolchain (the
+script installs `maturin` into the venv for you); and the two libraries in
+[`requirements.txt`](requirements.txt) are installed from it, each our own
+code in a repository of its own and each pinned to a commit sha --
+[feetplayer](https://github.com/67plays/feetplayer), the media stack, and
+[doormat](https://github.com/67plays/doormat), the windows.
 On Windows the first run needs a C++ linker as well,
 which rustup does not bring with it; [usage.md](docs/usage.md) has the one
 download and the one checkbox. Once the extension is built and installed
@@ -56,10 +57,12 @@ downloadable artifacts. Install one into the interpreter you run the browser
 with (`pip install feetbrowser_engine-*.whl`), and `run.sh` finds the
 engine already importable and skips the build.
 
-The window itself is ours too. macOS gets one through AppKit, Linux one
-through Xlib, and Windows one through user32/gdi32, all by ctypes, so there
-is nothing to install for any of them, and X11 covers Wayland desktops
-through XWayland. Anywhere else, and anywhere with no display, the browser
+The window itself is ours too: doormat opens one through AppKit on macOS,
+through Xlib on Linux and through user32/gdi32 on Windows, all by ctypes, so
+no bindings package and no toolkit stands behind any of them, and X11 covers
+Wayland desktops through XWayland. It draws nothing -- it is handed our
+canvas and asks it for a surface of packed RGB, which is the whole seam
+between the two. Anywhere else, and anywhere with no display, the browser
 still renders: `--screenshot` writes the page to a PNG without opening
 anything.
 

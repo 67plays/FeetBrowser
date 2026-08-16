@@ -14,7 +14,8 @@ person to pick one of these up starts from a real number.
 
 No *third-party* Python package is required. `feetbrowser/` imports the
 standard library, `feetbrowser_engine` -- which is our own code in another
-language -- and `feetplayer`, which is our own code in another repository.
+language -- and `feetplayer` and `doormat`, which are our own code in
+repositories of their own.
 
 The Rust extension has four crate dependencies. Three are third-party:
 `pyo3`, which is the reason the extension can be imported at all, and
@@ -44,6 +45,41 @@ and it is auditable in full; what a reader should check is that the pin is a
 sha and not a branch, because a branch would make every build a different
 browser. See [Fortran](#fortran) below for the compiler that pip needs while
 installing it.
+
+`doormat` is required the same way -- `feetbrowser/gui.py` imports it, so
+there is no window without it -- and the distance between depending on it and
+depending on a toolkit is what this whole file is about. Qt, GTK or Tk
+arrives with a widget set, a drawing model, a font stack and an opinion about
+what chrome looks like, and takes over precisely the parts of the renderer
+this project exists to own. doormat arrives with none of that. It is ctypes
+against AppKit, Xlib and `user32`/`gdi32`, its `dependencies` list is empty,
+there is no compiled extension and no toolkit under it, and **it draws
+nothing**: every pixel a user sees is still made by `rust/src/raster.rs`. It
+is the X11, Win32 and Cocoa windows, the input translation behind them and
+the event loop above them, extracted because none of that knows a browser
+exists -- the same reason `footnote` and `feetplayer` are elsewhere. It is
+pinned to a full commit sha in `requirements.txt`, which is the only place
+that sha appears, and the same warning applies: a branch would mean the
+window changing under the browser on a commit that touched nothing here.
+
+What holds the two apart is a duck-typed seam about six names wide, and it is
+worth writing down because nothing checks it. A window is handed a *canvas*
+and asks it for `.dirty`, `.render(region=None)` and `.cursor`, then presents
+the surface that comes back through `.pixels` (packed RGB, three bytes to a
+pixel), `.width`, `.height` and `.stride`; `device_size()`, `resize()` and
+`set_scale()` carry the geometry the other way. There is no base class to
+inherit and nothing to import: `canvas.Canvas` over `raster.Surface`
+satisfies it by having the right attributes. Either side renaming one of them
+is the only way this breaks, and it breaks at the join rather than inside
+either package, which is what `tests/test_x11.py`, `test_cocoa.py` and
+`test_win32.py` are now for. The seam is also where the decoding stays on
+this side: the window icon reaches doormat as a `(width, height, rgba)`
+triple that `gui.py` produced with our own `imagecodec`, because a browser
+that puts a picture on its window already has a PNG decoder and a windowing
+library has no business owning one. Backend selection is the same shape --
+doormat reads `$DOORMAT_DISPLAY` when nobody tells it otherwise, and `gui.py`
+tells it otherwise, passing `$FEETBROWSER_DISPLAY` on every call rather than
+at import, so the variable a user sets is the browser's.
 
 One third-party Python package is optional, and the browser runs without it:
 
@@ -107,8 +143,8 @@ Local time is the part that does not fall out for free. Three options: stay on
 UTC, which is honest and is very close to what the code already pretends,
 since `interp.rs:2058` and `2160` print the literal string `GMT+0000` while
 formatting local fields; call libc `localtime_r` over FFI, which is the same
-move `cocoa.py` and `x11.py` already make for their libraries; or parse TZif,
-which is not worth it. Start with UTC.
+move doormat already makes for AppKit and Xlib; or parse TZif, which is not
+worth it. Start with UTC.
 
 Two bugs are worth fixing in the same change, because both are live today and
 neither is covered: the entire `Date` test surface is one assertion,

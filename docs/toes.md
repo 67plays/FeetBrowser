@@ -95,9 +95,10 @@ than drawing nothing:
 - `tag_raise` / `tag_lower` / `itemcget` / `scan_mark` / `xview` /
   `postscript`, and `PhotoImage.put()` / `.get()` / `.copy()`.
 
-Import these from `feetbrowser.canvas` and `feetbrowser.window`, or take
-fonts from `layout.get_font`. There is nothing else to import: a widget built
-from some other toolkit has no window to appear in.
+Import these from `feetbrowser.canvas`, or take fonts from
+`layout.get_font`; the window itself arrives as `ctx.browser.window` and is
+doormat's, so a toe never imports it. There is nothing else to import: a
+widget built from some other toolkit has no window to appear in.
 
 ## Managing toes
 

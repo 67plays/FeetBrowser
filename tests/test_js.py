@@ -5,7 +5,7 @@ import http.server
 import sys, os, threading, time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from feetbrowser.window import Tk
+from doormat.window import Tk
 
 from feetbrowser.net import URL
 from feetbrowser.browser import Tab, tree_to_list

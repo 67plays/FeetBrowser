@@ -1,11 +1,14 @@
-"""Tests for the macOS platform layer.
+"""The browser itself, running inside a real Cocoa window.
 
-The rest of the suite runs headless, which means the one layer it cannot
-reach is the one that translates real Cocoa events into Tk-shaped bindings --
-and that is exactly where a typo costs you every mouse click in the browser
-with nothing else looking wrong. So these tests open an actual NSWindow, post
-actual NSEvents into the application queue, and let the real ``poll_events``
-pick them up. Nothing is stubbed.
+doormat carries its own tests for whether an NSWindow opens, translates
+NSEvents and gets a framebuffer onto the screen. It cannot carry these:
+doormat has no idea a browser exists, so nothing over there notices when
+a click stops reaching the tab strip, when Cmd-L stops focusing the
+address bar, or when a drag on the scrollbar stops moving the page.
+doormat proves a window works; this proves the browser works in one,
+which is the seam between the two packages and the only thing that can
+quietly come apart. So these tests open an actual NSWindow, run an
+actual Browser in it, and post actual NSEvents at it. Nothing is stubbed.
 
 Skipped with a clear message on any platform that is not macOS.
 """
@@ -25,8 +28,7 @@ if sys.platform != "darwin":
     _skip("not macOS")
 
 from feetbrowser import browser as browsermod  # noqa: E402
-from feetbrowser import cocoa  # noqa: E402
-from feetbrowser import window  # noqa: E402
+from doormat import cocoa  # noqa: E402
 
 if not cocoa.available():
     _skip("AppKit is not loadable here")
@@ -60,23 +62,11 @@ def send_mouse(win, kind, x, y, flags=0):
     Mouse events do not survive the queue with their location intact: once the
     app is active, AppKit re-resolves a posted event's location against where
     the physical cursor happens to be, which is not something a test can pin
-    down. Everything from ``_translate`` inward is the code under test anyway,
-    so the events go in there. ``post_mouse`` covers the queue itself.
+    down. Every test here asserts on *where* the click landed -- which tab
+    strip button, which pixel of the scrollbar -- so the events go in at
+    ``_translate``, and ``post_key`` is left to prove the queue delivers.
     """
     win._translate(make_mouse(win, kind, x, y, flags))
-
-
-def post_mouse(win, kind, x, y, flags=0):
-    """Queue a real mouse NSEvent, to be picked up by ``poll_events``.
-
-    Keep well clear of the window's edges. ``[NSApp sendEvent:]`` is what
-    makes the close button and the resize border work, so a press within a few
-    pixels of the frame starts AppKit's drag-hysteresis loop -- which then
-    waits for a real mouse the test does not have, and hangs.
-    """
-    cocoa.msg(win._app, "postEvent:atStart:", make_mouse(win, kind, x, y,
-                                                         flags),
-              True, argtypes=(ctypes.c_void_p, ctypes.c_bool))
 
 
 def post_key(win, chars, keycode, flags=0):
@@ -95,31 +85,6 @@ def post_key(win, chars, keycode, flags=0):
     assert event, "could not build a key NSEvent"
     cocoa.msg(win._app, "postEvent:atStart:", event, True,
               argtypes=(ctypes.c_void_p, ctypes.c_bool))
-
-
-def post_scroll(win, lines):
-    """Queue a real scroll NSEvent.
-
-    ``+mouseEventWithType:`` rejects the scroll-wheel type outright -- it
-    raises an ObjC exception, which takes the process with it -- so a scroll
-    has to come the way the window server makes one, through a CGEvent.
-    """
-    cg = cocoa._libs["cg"]
-    cg.CGEventCreate.restype = ctypes.c_void_p
-    cg.CGEventCreate.argtypes = [ctypes.c_void_p]
-    cg.CGEventSetType.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
-    cg.CGEventSetIntegerValueField.argtypes = [ctypes.c_void_p, ctypes.c_uint32,
-                                               ctypes.c_int64]
-    cg.CFRelease.argtypes = [ctypes.c_void_p]
-    handle = cg.CGEventCreate(None)
-    cg.CGEventSetType(handle, 22)              # kCGEventScrollWheel
-    cg.CGEventSetIntegerValueField(handle, 11, lines)  # DeltaAxis1
-    event = cocoa.msg(cocoa._cls("NSEvent"), "eventWithCGEvent:", handle,
-                      argtypes=(ctypes.c_void_p,))
-    assert event, "could not build a scroll NSEvent"
-    cocoa.msg(win._app, "postEvent:atStart:", event, True,
-              argtypes=(ctypes.c_void_p, ctypes.c_bool))
-    cg.CFRelease(handle)
 
 
 def pump(win, times=6):
@@ -154,312 +119,6 @@ class _Browser(_Session):
         self.browser.draw()
         win.present()
         return self.browser
-
-
-# -- the runtime bridge ----------------------------------------------------
-
-def test_window_opens_with_the_size_asked_for():
-    with _Session() as win:
-        assert win._content_size() == (900, 600), \
-            "content size does not match the requested size"
-        assert win.winfo_exists()
-
-
-def test_a_quiet_window_does_not_take_the_keyboard():
-    """The suite opens dozens of windows in a few seconds. Under QUIET each
-    one must stay out of the way -- no Dock icon, and above all no stealing
-    focus from whatever the user is typing into -- while still being a real
-    window the rest of this file can post events at. Without this, the fix
-    regresses the moment someone reinstates makeKeyAndOrderFront: and the
-    only symptom is a machine nobody can use while the tests run."""
-    if not window.QUIET:
-        print("  ..  quiet-window check needs FEETBROWSER_QUIET=1")
-        return
-    with _Session() as win:
-        assert not cocoa.msg(win._window, "isKeyWindow",
-                             restype=ctypes.c_bool), \
-            "a quiet window took the keyboard"
-        policy = cocoa.msg(win._app, "activationPolicy",
-                           restype=ctypes.c_long)
-        assert policy == cocoa._ACTIVATION_ACCESSORY, \
-            "a quiet run still asks for a Dock icon"
-        # Still a real window, or the quiet is worthless.
-        assert win.winfo_exists() and win._content_size() == (900, 600)
-
-
-def test_struct_returning_selectors_use_the_right_abi():
-    """objc_msgSend vs objc_msgSend_stret is chosen by CPU, and getting it
-    wrong returns garbage rather than failing, so assert real numbers."""
-    with _Session() as win:
-        frame = cocoa.msg_rect(win._window, "frame")
-        assert frame.size.width == 900.0, \
-            "NSRect came back wrong: width=%r" % frame.size.width
-        assert frame.size.height > 600.0, "frame should include the titlebar"
-        bounds = cocoa.msg_rect(win._view, "bounds")
-        assert (bounds.size.width, bounds.size.height) == (900.0, 600.0)
-
-
-def test_pointer_returns_are_not_truncated():
-    """A missing restype makes ctypes hand back a 32-bit int, which is how a
-    valid object silently becomes a wild pointer -- the segfault this layer
-    shipped with once. A pointer that survives a round trip through AppKit is
-    proof the full 64 bits came back."""
-    with _Session() as win:
-        for name, handle in (("window", win._window), ("view", win._view),
-                             ("app", win._app),
-                             ("colorspace", win._colorspace),
-                             ("distantPast", win._distant_past),
-                             ("runMode", win._run_mode)):
-            assert handle, "%s came back null" % name
-        assert cocoa.msg(win._window, "contentView") == int(win._view), \
-            "the window does not point back at the view we made"
-        assert cocoa.msg(win._view, "window") == int(win._window), \
-            "the view does not point back at its window"
-
-
-def test_present_pushes_the_framebuffer():
-    from feetbrowser import canvas as canvasmod
-    with _Session() as win:
-        canvas = canvasmod.Canvas(win, width=900, height=600, bg="#123456")
-        canvas.pack()
-        win.present()
-        image = cocoa.msg(win._view, "image")
-        assert image, "the view has no image after present()"
-        size = cocoa.msg(image, "size", restype=cocoa.NSSize)
-        assert (size.width, size.height) == (900.0, 600.0), \
-            "presented image is %rx%r" % (size.width, size.height)
-
-
-def test_present_is_skipped_when_nothing_changed():
-    from feetbrowser import canvas as canvasmod
-    with _Session() as win:
-        canvas = canvasmod.Canvas(win, width=200, height=100)
-        canvas.pack()
-        win.present()
-        first = cocoa.msg(win._view, "image")
-        win.present()
-        assert cocoa.msg(win._view, "image") == first, \
-            "a clean canvas should not be re-uploaded"
-        canvas.create_rectangle(0, 0, 10, 10, fill="red")
-        win.present()
-        assert cocoa.msg(win._view, "image") != first, \
-            "a dirty canvas must be re-uploaded"
-
-
-def test_the_frame_is_pushed_at_the_displays_own_resolution():
-    """The HiDPI bug, asked of the machine actually running the test.
-
-    A 2x display wants two device pixels per point, so the framebuffer has to
-    be twice the window in each direction while the NSImage carrying it stays
-    the window's size in *points* -- that pairing is what makes AppKit draw
-    one image pixel onto one device pixel. Declaring the image at its pixel
-    count instead makes it a 1x image that gets stretched, which is exactly
-    the softness this is here to prevent. FEETBROWSER_SCALE forces the dense
-    path so it is exercised on a CI runner with no Retina display too.
-    """
-    from feetbrowser import canvas as canvasmod
-    with _Session() as win:
-        assert win.scale == win._backing_scale(), \
-            "the window did not adopt the display's own scale"
-    saved = os.environ.get("FEETBROWSER_SCALE")
-    os.environ["FEETBROWSER_SCALE"] = "2"
-    try:
-        with _Session() as win:
-            assert win.scale == 2.0, "the override never reached the window"
-            canvas = canvasmod.Canvas(win, width=900, height=600, bg="#654321")
-            canvas.pack()
-            win.present()
-            assert canvas.device_size() == (1800, 1200), canvas.device_size()
-            assert len(win._buffers[-1]) == 1800 * 1200 * 3, \
-                "the bytes handed to CoreGraphics are not the buffer's"
-            size = cocoa.msg(cocoa.msg(win._view, "image"), "size",
-                             restype=cocoa.NSSize)
-            assert (size.width, size.height) == (900.0, 600.0), \
-                "a 1800x1200 image declared as %rx%r points would be " \
-                "shrunk, not drawn one to one" % (size.width, size.height)
-            # A point is a CSS pixel on this platform, so a click is not
-            # converted at all -- and must not be, or it would be halved.
-            seen = []
-            win.bind("<Button-1>", lambda e: seen.append((e.x, e.y)))
-            send_mouse(win, cocoa._LEFT_DOWN, 400, 300)
-            assert seen == [(400, 300)], \
-                "a click moved when the buffer got denser: %r" % seen
-    finally:
-        if saved is None:
-            os.environ.pop("FEETBROWSER_SCALE", None)
-        else:
-            os.environ["FEETBROWSER_SCALE"] = saved
-
-
-def test_withdraw_is_not_mistaken_for_the_user_closing_the_window():
-    with _Session() as win:
-        win.withdraw()
-        pump(win)
-        assert win.winfo_exists(), \
-            "an ordered-out window was treated as closed"
-        win.deiconify()
-        pump(win)
-        assert win.winfo_exists()
-
-
-# -- event translation -----------------------------------------------------
-
-def test_mouse_coordinates_are_flipped_to_canvas_space():
-    """Cocoa's origin is bottom-left and the canvas's is top-left. Getting
-    this wrong puts every click in the wrong place."""
-    with _Session() as win:
-        seen = []
-        win.bind("<Button-1>", lambda e: seen.append((e.x, e.y)))
-        for point in ((120, 40), (0, 0), (899, 599), (450, 300)):
-            send_mouse(win, cocoa._LEFT_DOWN, *point)
-        assert len(seen) == 4, "expected four clicks, got %r" % seen
-        for got, want in zip(seen, ((120, 40), (0, 0), (899, 599),
-                                    (450, 300))):
-            assert got == want, "click landed at %r, expected %r" % (got, want)
-
-
-def test_a_click_reaches_the_window_through_the_queue():
-    """The other mouse tests skip the queue for the sake of exact
-    coordinates; this one is here to prove the queue itself delivers."""
-    with _Session() as win:
-        seen = []
-        win.bind("<Button-1>", lambda e: seen.append(e))
-        post_mouse(win, cocoa._LEFT_DOWN, 300, 300)
-        pump(win)
-        assert seen, "no <Button-1> came out of poll_events()"
-        assert seen[0].num == 1, "button number was lost"
-
-
-def test_every_mouse_gesture_reaches_its_binding():
-    with _Session() as win:
-        seen = []
-        for name in ("<Button-1>", "<ButtonRelease-1>", "<B1-Motion>",
-                     "<Motion>", "<Button-3>", "<ButtonRelease-3>"):
-            win.bind(name, lambda e, n=name: seen.append(n))
-        send_mouse(win, cocoa._LEFT_DOWN, 200, 200)
-        send_mouse(win, cocoa._LEFT_DRAGGED, 220, 220)
-        send_mouse(win, cocoa._LEFT_UP, 220, 220)
-        send_mouse(win, cocoa._MOUSE_MOVED, 240, 240)
-        send_mouse(win, cocoa._RIGHT_DOWN, 240, 240)
-        send_mouse(win, cocoa._RIGHT_UP, 240, 240)
-        for name in ("<Button-1>", "<ButtonRelease-1>", "<B1-Motion>",
-                     "<Motion>", "<Button-3>", "<ButtonRelease-3>"):
-            assert name in seen, "%s never fired" % name
-
-
-def test_command_and_control_both_arrive_as_tk_control():
-    """The browser reads ``event.state & 0x4``, and a Mac user reaches for
-    Command. Both have to land on the same bit."""
-    with _Session() as win:
-        seen = []
-        win.bind("<Control-l>", lambda e: seen.append(e.state))
-        post_key(win, "l", 37, cocoa._MOD_COMMAND)
-        post_key(win, "l", 37, cocoa._MOD_CONTROL)
-        pump(win)
-        assert len(seen) == 2, "expected both Cmd-L and Ctrl-L, got %d" % \
-            len(seen)
-        assert all(state & 0x4 for state in seen)
-
-
-def test_named_keys_beat_the_generic_key_binding():
-    """Tk fires only the most specific binding. A browser that binds both
-    <Up> and <Key> must not see one keypress twice."""
-    with _Session() as win:
-        hits = []
-        win.bind("<Up>", lambda e: hits.append("Up"))
-        win.bind("<Key>", lambda e: hits.append("Key"))
-        post_key(win, "", 126)
-        pump(win)
-        assert hits == ["Up"], "expected only <Up>, got %r" % hits
-        post_key(win, "q", 12)
-        pump(win)
-        assert hits == ["Up", "Key"], "a plain letter should fall to <Key>"
-
-
-def test_printable_keys_carry_their_character():
-    with _Session() as win:
-        seen = []
-        win.bind("<Key>", lambda e: seen.append((e.keysym, e.char)))
-        post_key(win, "z", 6)
-        post_key(win, " ", 49)
-        pump(win)
-        assert ("z", "z") in seen, "letter key lost its char: %r" % seen
-        assert any(keysym == "space" for keysym, _c in seen), \
-            "space should have keysym 'space': %r" % seen
-
-
-def test_shift_tab_becomes_iso_left_tab():
-    """browser.py binds <Control-ISO_Left_Tab> for previous-tab, which is the
-    keysym X11 and Tk use for a shifted Tab."""
-    with _Session() as win:
-        seen = []
-        win.bind("<Control-ISO_Left_Tab>", lambda e: seen.append(1))
-        post_key(win, "\t", 48, cocoa._MOD_COMMAND | cocoa._MOD_SHIFT)
-        pump(win)
-        assert seen, "shifted Tab did not reach <Control-ISO_Left_Tab>"
-
-
-def test_wheel_keeps_its_sign_and_stays_in_the_pixel_range():
-    """browser.py treats |delta| < 30 as a pixel count and anything larger as
-    line units, so a scroll has to stay under 30 or it moves the page by a
-    screenful per notch."""
-    with _Session() as win:
-        seen = []
-        win.bind("<MouseWheel>", lambda e: seen.append(e.delta))
-        post_scroll(win, 3)
-        pump(win)
-        post_scroll(win, -3)
-        pump(win)
-        assert len(seen) == 2, "expected two wheel events, got %r" % seen
-        assert seen[0] > 0 > seen[1], "wheel direction was lost: %r" % seen
-        for delta in seen:
-            assert abs(delta) < 30, \
-                "wheel delta %r escapes the pixel path" % delta
-
-
-def test_handler_exceptions_do_not_stop_the_loop():
-    with _Session() as win:
-        errors = []
-        win.on_callback_error = lambda where, exc: errors.append(where)
-        win.bind("<Button-1>", lambda e: 1 // 0)
-        post_mouse(win, cocoa._LEFT_DOWN, 300, 300)
-        pump(win)
-        assert errors, "a raising handler was not reported"
-        assert win.winfo_exists(), "one bad handler took down the window"
-
-
-def test_clipboard_round_trips_through_nspasteboard():
-    with _Session() as win:
-        win.clipboard_clear()
-        win.clipboard_append("feetbrowser clipboard probe")
-        assert win.clipboard_get() == "feetbrowser clipboard probe"
-
-
-def test_title_reaches_the_real_window():
-    with _Session() as win:
-        win.title("a new title")
-        assert cocoa.from_nsstring(
-            cocoa.msg(win._window, "title")) == "a new title"
-
-
-def test_toplevel_events_route_to_the_right_window():
-    """One event queue per application, so the root's loop has to hand a
-    popup's events to the popup -- that is how PopupWindow has always run."""
-    with _Session() as root:
-        popup = cocoa.CocoaToplevel(root, width=400, height=300)
-        try:
-            assert popup in root.children
-            hits = []
-            root.bind("<Button-1>", lambda e: hits.append("root"))
-            popup.bind("<Button-1>", lambda e: hits.append("popup"))
-            pump(popup, 8)  # let the popup finish coming up, as above
-            post_mouse(popup, cocoa._LEFT_DOWN, 150, 150)
-            pump(root)
-            assert hits == ["popup"], \
-                "popup events went to %r" % (hits or "nobody")
-        finally:
-            popup.destroy()
-        assert popup not in root.children
 
 
 # -- the browser, driven for real ------------------------------------------
@@ -555,8 +214,8 @@ def test_a_drag_that_leaves_the_window_still_scrolls():
         send_mouse(br.window, cocoa._LEFT_DOWN, x, thumb_top + 5)
         send_mouse(br.window, cocoa._LEFT_DRAGGED, x, br.window.height + 4000)
         assert tab.scroll == bottom, \
-            "dragged off the bottom to %r, the wheel stops at %r" % (tab.scroll,
-                                                                    bottom)
+            "dragged off the bottom to %r, the wheel stops at %r" % (
+                tab.scroll, bottom)
         send_mouse(br.window, cocoa._LEFT_DRAGGED, x, -4000)
         assert tab.scroll == 0, "dragged off the top to %r" % tab.scroll
         send_mouse(br.window, cocoa._LEFT_UP, x, -4000)
@@ -577,7 +236,7 @@ def main():
     if failed:
         print(f"\n{failed} FAILED")
         sys.exit(1)
-    print(f"\nALL {len(tests)} COCOA TESTS PASSED")
+    print(f"\nALL {len(tests)} COCOA BROWSER TESTS PASSED")
 
 
 if __name__ == "__main__":

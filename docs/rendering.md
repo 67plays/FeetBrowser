@@ -50,10 +50,13 @@ Python data that the matcher compiles on first use. The rules list is compiled
 once and cached against its identity, so a script that mutates the DOM
 re-cascades without re-reading the stylesheet.
 
-`window.py` sits beside all of it and supplies everything that is not
-drawing: a binding table keyed by event sequence names, `after()` timers, and
-a main loop. `gui.py` is what is left of the seam: it decides which *native*
-window the frames are put in, and nothing else.
+`doormat` sits beside all of it and supplies everything that is not drawing:
+a binding table keyed by event sequence names, `after()` timers, a main loop,
+and the native windows under those. It is a package of its own, it is ctypes
+and nothing else, and it produces no pixels; what it asks of this stack is
+[below](#the-window-what-doormat-asks-of-this-stack). `gui.py` is our side of
+that seam: it decides which *native* window the frames are put in, and
+nothing else.
 
 ## fontengine.py: reading the font
 
@@ -101,8 +104,8 @@ font, and dropping it would have changed which family a page resolves to.
 
 A `Surface` is a run of packed RGB bytes and a clip rectangle. Nothing more.
 The buffer belongs to Rust, and `surface.pixels` is a read-only memoryview
-onto it, so presenting a frame costs no copy: the window backend hands that
-same memory to `CGImageCreate`.
+onto it, so presenting a frame costs no copy: doormat's Cocoa backend hands
+that same memory to `CGImageCreate`.
 
 Every drawing method starts by clipping its rectangle into byte offsets and
 gives up if nothing survives, which is what makes the loops underneath safe to
@@ -289,159 +292,69 @@ widths and sums them.
 Glyph fallback is not a nicety. No single text face has the toolbar's `⟳`,
 `⌂` and `☆`, and without fallback the chrome renders a row of `.notdef` boxes.
 
-## window.py: events without a toolkit
+## The window: what doormat asks of this stack
 
-`Window` is headless by design: bindings, a timer heap keyed by absolute
-deadline, and a loop that drains them. That is the entire event model, and it
-runs with no display at all, which is what makes `tests/test_render.py` and
-the rest of the suite possible on a machine with no GUI. Handler exceptions are
-reported and swallowed rather than propagated, so one broken toe cannot take
-down the browser.
+The window is `doormat`: a package of ours with the Cocoa, X11 and Win32
+backends in it, the input translation behind them and the event loop above
+them. It is ctypes throughout, it has no dependencies of its own, and it
+draws nothing at all, so the only part of it that belongs in a document about
+pixels is the seam -- which is duck-typed, and therefore invisible from both
+sides until the day it breaks.
 
-Platform windows subclass it and add two things: a source of real input
-(`poll_events()`) and somewhere to push the surface (`present()`). Everything
-above only ever sees `Window`'s own API, so adding a platform is additive.
+A window is handed a *canvas* and reads three names off it. `canvas.dirty` is
+set by every mutation and cleared by `render`, so a frame nothing changed in
+is never uploaded. `canvas.render(region=None)` composites the retained items
+and returns the surface, `region` being in CSS pixels, which is how a
+text-selection drag repaints a strip instead of a page. `canvas.cursor` is
+the pointer shape to ask the window system for.
 
-## cocoa.py: a real window, still with no toolkit
+`render` hands back a surface, and the window reads four attributes off that:
+`.pixels` -- packed RGB, three bytes to a pixel, and a read-only memoryview
+straight onto Rust's buffer -- plus `.width`, `.height` and `.stride`. That
+is the entire contract in the drawing direction, and it is what lets a frame
+reach the screen without a copy where the platform's own format happens to
+be ours: AppKit takes that memoryview through `CGImageCreate`, and an X
+server whose visual is 24bpp in RGB order gets it handed to `XPutImage`
+untouched. Where a platform disagrees -- GDI wants BGRX and its rows
+bottom-up -- converting is the window's problem, and nothing on this side of
+the seam knows it happened.
 
-Objective-C is a C library with a message dispatcher, so ctypes is enough to
-drive AppKit: `objc_getClass`, `sel_registerName`, `objc_msgSend`. No PyObjC,
-no compiled shim. Two details are not optional. Every call needs its signature
-declared, because ctypes defaults a return type to `c_int` and silently
-truncates a 64-bit pointer to a wild one; that shipped once, as a segfault on
-the first frame. And a struct larger than 16 bytes comes back through
-`objc_msgSend_stret` on x86_64 but plain `objc_msgSend` on arm64, so `NSRect`
-returns pick the entry point by CPU.
+Geometry travels the other way, because the window system is the authority on
+it and we are not. `device_size()` reports the framebuffer in device pixels;
+`resize(width, height, device=None)` and `set_scale(scale, device=None)` are
+called when the window changes size or moves to a display of a different
+ratio. Both take the device size separately rather than deriving it, because
+where the two disagree -- a HiDPI display, a fractional ratio -- the window
+system's number is the exact one and ours is a rounded one, and a
+framebuffer a pixel narrower than the window it is blitted into shears.
 
-Presenting costs no conversion: our RGB framebuffer is already a valid 24-bit
-bitmap, so it goes straight into `CGImageCreate` through a data provider and
-on to an `NSImageView`. The last couple of frames stay referenced because
-AppKit draws asynchronously, and a frame whose canvas is not dirty is not
-uploaded at all.
+There is no base class to inherit and nothing to import: `canvas.Canvas` over
+`raster.Surface` satisfies this by having the right names, and it had them
+before doormat existed, which is the only reason the split was cheap. It is
+also why nothing enforces it. A rename on either side type-checks nowhere and
+fails at the join, which is what `tests/test_x11.py`, `tests/test_cocoa.py`
+and `tests/test_win32.py` are for: a real browser in a real window on each
+platform, clicked and typed at through the real event queue.
 
-Input is the mirror image of that: Cocoa event types and virtual key codes
-become `<Button-1>`, `<Control-l>`, `<MouseWheel>`. Two binding rules matter
-here, because the browser depends on both. A binding fires when its modifiers
-are a *subset* of the ones held, which is what lets `<Control-ISO_Left_Tab>`
-catch Control-Shift-Tab; and only the most specific binding fires, so a window
-that bound `<Up>` and `<Key>` sees one keypress once. Command arrives as
-`Control`, because that is where a Mac user's muscle memory puts it.
+`gui.py` is the whole of our side of it, and it is 127 lines.
+`gui.headless_root()` is always the headless root, so tests and
+`--screenshot` never open anything, and only `gui.new_window()` asks for a
+real window; nothing gets one by accident. `FEETBROWSER_DISPLAY=x11`,
+`=cocoa` or `=win32` demands a backend by name and fails loudly rather than
+falling back to a headless root that renders a black screenshot;
+`FEETBROWSER_DISPLAY=none` forces headless even where a window is possible.
+That value is passed to doormat on each call rather than read once at import,
+so a test can set it between windows and nothing has to export doormat's own
+`$DOORMAT_DISPLAY`. With no display (no `$DISPLAY`, an X server that will not
+answer, or a platform with no backend at all), `display_problem()` says which
+of those it was and the browser renders headless instead of raising.
 
-There is one event queue per *application*, not per window, so a module-level
-registry maps each `NSWindow` back to its Python window and the root's loop
-feeds any popups. `[NSApp sendEvent:]` runs before translation; without it the
-close button, titlebar drag and live resize do not work.
-
-## x11.py: the same idea on Linux
-
-Xlib is a C library too, so this is ctypes again: `libX11.so.6` by soname,
-`XOpenDisplay`, `XCreateSimpleWindow`, `XSelectInput`, `XMapWindow`, and a
-pump over `XPending`/`XNextEvent`. No python-xlib, no compiled shim, and no
-XCB, the same rule the rest of the repo lives by. XWayland means this covers
-most Wayland desktops as well; a native Wayland backend is not written.
-
-Translation is *lighter* here than on macOS, and the reason is historical:
-the event vocabulary in `window.py` was inherited from a toolkit that was
-itself an X11 program, so `event.state` is literally X's modifier mask and the
-keysym names (`Return`, `Left`, `ISO_Left_Tab`) are X's keysym names. So
-`XLookupString` (which applies the user's keyboard layout, and is the reason
-a shifted `a` arrives as the keysym `A`) plus `XKeysymToString` is nearly the
-whole job. Two conventions have to be added back on top: a printable key is
-named by its character, and a modifier pressed on its own is not a keypress,
-which X thinks it is. The binding rules themselves (which sequences a keypress tries, most
-specific first) live in `window.py` and are shared with `cocoa.py` rather
-than written twice. The wheel is buttons 4 and 5 on X, translated to
-`<MouseWheel>` with a delta small enough that `browser.py` reads it as pixels.
-
-Presenting is where X asks for real work. The server names its pixel format
-rather than agreeing to ours, so the visual's `red_mask`/`green_mask`/
-`blue_mask` and `XImageByteOrder` are read once at startup and turned into
-byte offsets: a mask of `0x00FF0000` is byte 2 on an LSBFirst server and byte
-1 on an MSBFirst one, and getting that backwards swaps red and blue on
-exactly the machines nobody tests on. 24- and 32-bit TrueColor in either byte
-order convert with three strided slice assignments over the whole frame;
-depth 15 and 16 fall to a slower per-pixel path with a scaling table per
-channel, so white stays white on five bits of red. A server whose format is
-byte-for-byte ours (24bpp, RGB order) gets the framebuffer handed to
-`XPutImage` with no copy at all. Rows are padded to the server's
-`scanline_pad`, which is invisible at a round width and shears the picture at
-an odd one.
-
-`XShmPutImage` is deliberately not used. Shared memory is faster and does not
-exist over a network socket, and a browser that only works when the server is
-on the same machine is a worse browser than a slightly slower one.
-
-There is no close event in X: the window manager asks through a
-`WM_DELETE_WINDOW` client message, and a client that ignores it gets killed
-instead of asked. `XSetWMProtocols` opts in, and the message runs the
-window's `protocol()` handler. Xlib's default error handler calls `exit()`,
-which would take the browser down over a stale window id, so ours records the
-error and returns. As on macOS there is one event queue per *connection*, so
-a module-level registry maps each window id back to its Python window and the
-root's loop feeds any popups.
-
-## win32.py: the same window, a different operating system
-
-Win32 is a plain C API, so ctypes is enough again: load `user32`, `gdi32` and
-`kernel32`, declare the signatures, call the functions. No pywin32. The
-signatures are as non-optional here as they are on macOS and for the same
-reason: a missing `restype` truncates a 64-bit `HWND` to a handle that
-belongs to nobody.
-
-Presenting costs one conversion, which is the one thing this backend does
-that Cocoa's does not. A device-independent bitmap is BGR rather than RGB,
-and its rows run bottom-up unless the height in the header is negative, so
-the framebuffer cannot go to GDI untouched. It is converted to 32-bit BGRX
-and pushed with `StretchDIBits` under a negative `biHeight`. **32bpp rather
-than 24bpp is deliberate:** DIB rows are padded to a four-byte boundary, so a
-24-bit frame whose width is not a multiple of four needs per-row padding and
-smears diagonally down the window if you forget, while at 32bpp the stride is
-always `width * 4` and the frame is one buffer with no row loop at all. The
-conversion is three strided slice assignments, which run in C.
-
-Per-monitor-v2 DPI awareness is set before the first window opens, falling
-back through `SetProcessDpiAwareness` and `SetProcessDPIAware` on older
-systems. Without it Windows renders the whole browser at 96 DPI and has the
-compositor scale the result, which is a blurry browser on any display made
-this decade. What it does *not* do is scale the page: one CSS pixel is one
-device pixel, so text on a 200% display is sharp and small.
-
-Input is where the two backends differ most, because Windows splits a
-keypress in two. `WM_KEYDOWN` carries a virtual key code and `WM_CHAR`
-carries the character the user's keyboard layout produced, so named keys and
-anything held under Control or Alt are resolved from the virtual key; under
-Control the character message carries a control code, `0x0C` rather than
-`l`, and everything else waits for `WM_CHAR`, which is the only thing that
-knows about the layout. A character outside the basic plane arrives as two
-`WM_CHAR`s, one surrogate each. Modifiers are read from `GetKeyState` rather
-than tracked, which keeps them right when the window loses focus with a key
-held. The wheel is the one mouse message carrying *screen* coordinates.
-
-There is one message queue per *thread*, so as on macOS a module-level
-registry maps each `HWND` back to its Python window and one shared window
-procedure routes each message to whichever window it belongs to. The
-procedure itself is stored on the module, not on a window: a ctypes callback
-that gets collected leaves Windows calling into freed memory.
-
-Everything above that is arithmetic or a lookup table (the stride, the
-colour conversion, the wheel scaling, both keysym tables) is a plain
-module-level function, so the part that can only run on Windows is as small
-as it can be made. Those functions are tested from `tests/test_units.py` on
-whatever platform the suite is running on.
-
-`gui.py` picks all of this up, and this is now all it does. `window.Tk()` is
-always the headless root, so tests and `--screenshot` never open anything, and
-only `gui.new_window()` asks for a real one. Backends declare themselves in
-one table and answer `available()` for themselves, so Cocoa is tried, then
-Win32, then X11, and the first that can run wins; the order only matters
-between Cocoa and X11, since macOS is the one system that can offer both and
-XQuartz there is a deliberate choice rather than a default.
-`FEETBROWSER_DISPLAY=x11`, `=cocoa` or `=win32` demands one by name and fails
-loudly rather than falling back to a headless root that renders a black
-screenshot; `FEETBROWSER_DISPLAY=none` forces headless even where a window is
-possible. With no display (no `$DISPLAY`, an X server that will not answer,
-or a platform with no backend at all), the browser says which of those it was
-and renders headless instead of raising.
+The icon is the other thing that stays on this side. `gui.icon()` decodes
+`feetbrowser/icon.png` through our own `imagecodec` and hands the window a
+`(width, height, rgba)` triple, because a browser that puts a picture on its
+window already has a PNG decoder and a brand, and a windowing library has
+neither. It is decoded once per process and a failure to read it is no icon
+rather than no browser.
 
 ## Testing it
 
@@ -451,12 +364,15 @@ coverage, nonzero winding, the glyph cache, PNG round-tripping, every PNG
 filter type, Adam7, hand-built GIF LZW, JPEG against corrupted photographs,
 scene-graph ordering and tag deletion, and the timer and binding model.
 
-The platform windows get their own suites, each of which opens real windows on
-its own operating system and skips with a message everywhere else:
-`tests/test_cocoa.py` on macOS and `tests/test_win32.py` on Windows. The
-Win32 one blits through real GDI into a memory bitmap and reads the pixels
-back, because red and blue swapping places or the rows coming out upside down
-are exactly the mistakes a DIB lets you make quietly. CI runs both jobs.
+The seam gets its own suites, each of which opens a real window on its own
+operating system and skips with a message everywhere else:
+`tests/test_x11.py` on Linux, `tests/test_cocoa.py` on macOS and
+`tests/test_win32.py` on Windows. Each runs a whole `Browser` in that window
+and drives it with real platform events -- a click on the new-tab button,
+`Ctrl-L` into the address bar, a drag on the scrollbar, a page reaching the
+glass -- because "a window works" and "the browser has hold of one" are
+different claims and doormat's own suite can only make the first. CI runs all
+three jobs.
 
 The end-to-end check is a screenshot: `python3 -m feetbrowser --screenshot
 <url> out.png` runs the real browser (chrome, tabs, toolbar, page, scrollbar),

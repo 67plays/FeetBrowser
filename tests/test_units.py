@@ -9,7 +9,7 @@ import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from feetbrowser.canvas import CanvasError, PhotoImage
-from feetbrowser.window import Tk
+from doormat.window import Tk
 
 from feetbrowser import net as net_mod
 from feetbrowser.net import URL
@@ -2873,217 +2873,25 @@ def test_async_load_in_gui_mode():
         root.destroy()
 
 
-# -- the Win32 backend, in the parts that are not Win32 --------------------
+# -- the window, in the parts that are ours ---------------------------------
 #
-# tests/test_win32.py opens real windows and only runs on Windows. Everything
-# below is the arithmetic and the translation tables behind that window, and
-# those are plain functions on purpose: they run, and are checked, on every
-# platform the suite runs on.
-
-def test_dib_stride_rounds_rows_up_to_four_bytes():
-    from feetbrowser.win32 import dib_stride
-    eq(dib_stride(4, 24), 12, "a multiple of four needs no padding")
-    eq(dib_stride(5, 24), 16, "15 bytes of pixels round up to 16")
-    eq(dib_stride(999, 24), 3000, "2997 bytes of pixels round up to 3000")
-    # The reason this backend presents 32bpp: no row ever needs padding, so
-    # the frame is one buffer and the whole class of off-by-one row smears
-    # cannot happen.
-    for width in range(1, 40):
-        eq(dib_stride(width, 32), width * 4,
-           f"32bpp width {width} should need no padding")
-
-
-def test_rgb_becomes_bgr_without_moving_a_pixel():
-    from feetbrowser.win32 import bgra_from_rgb
-    # Two pixels: pure red, then pure green.
-    out = bgra_from_rgb(bytearray([255, 0, 0, 0, 255, 0]), 2, 1)
-    eq(bytes(out), b"\x00\x00\xff\x00\x00\xff\x00\x00", "channel order")
-    eq(len(out), 2 * 1 * 4, "four bytes per pixel")
-
-
-def test_the_dib_is_top_down_and_row_order_survives():
-    """A DIB is bottom-up by default and we declare a negative height
-    instead, so the rows must come out in the order they went in. Getting
-    this wrong flips the whole page upside down."""
-    from feetbrowser.win32 import bgra_from_rgb
-    pixels = bytearray([1, 2, 3, 4, 5, 6,        # row 0
-                        7, 8, 9, 10, 11, 12])    # row 1
-    out = bgra_from_rgb(pixels, 2, 2)
-    eq(bytes(out[0:4]), b"\x03\x02\x01\x00", "first pixel of the first row")
-    eq(bytes(out[8:12]), b"\x09\x08\x07\x00", "first pixel of the second row")
-
-
-def test_a_padded_source_stride_is_compacted():
-    from feetbrowser.win32 import bgra_from_rgb
-    # Three bytes of pixels per row plus two bytes of slack.
-    pixels = bytearray([10, 20, 30, 99, 99,
-                        40, 50, 60, 99, 99])
-    out = bgra_from_rgb(pixels, 1, 2, stride=5)
-    eq(bytes(out), b"\x1e\x14\x0a\x00\x3c\x32\x28\x00", "slack was skipped")
-
-
-def test_the_bitmap_header_is_the_size_windows_expects():
-    """GDI reads biSize to tell a BITMAPINFOHEADER from its successors, so a
-    header that is not 40 bytes is rejected outright."""
-    import ctypes
-    from feetbrowser.win32 import BITMAPINFOHEADER
-    eq(ctypes.sizeof(BITMAPINFOHEADER), 40)
-
-
-def test_packed_coordinates_can_be_negative():
-    """A drag that leaves the window on the left or the top reports a
-    negative coordinate, packed as an unsigned 16-bit field."""
-    from feetbrowser.win32 import lparam_point, signed_word
-    eq(signed_word(0xFFFF), -1)
-    eq(signed_word(0x8000), -32768)
-    eq(signed_word(0x7FFF), 32767)
-    eq(lparam_point((300 << 16) | 120), (120, 300))
-    eq(lparam_point((0xFFFB << 16) | 0xFFF6), (-10, -5), "off the top-left")
-
-
-def test_a_wheel_notch_stays_in_the_pixel_range():
-    """browser.py treats |delta| < 30 as a pixel count and anything larger as
-    line units, so a notch has to stay under 30 or one flick moves the page
-    by a screenful."""
-    from feetbrowser.win32 import wheel_delta
-    eq(wheel_delta(120), 20, "one notch forward")
-    eq(wheel_delta(-120), -20, "one notch back")
-    eq(wheel_delta(0), 0)
-    for raw in (120, -120, 360, -360, 3600, -3600, 7, -7):
-        delta = wheel_delta(raw)
-        assert abs(delta) < 30, f"{raw} became {delta}, out of the pixel range"
-        assert (delta > 0) == (raw > 0), f"{raw} lost its direction"
-
-
-def test_modifier_bits_are_the_ones_the_browser_reads():
-    from feetbrowser.win32 import modifier_state
-    from feetbrowser.window import STATE_ALT, STATE_CONTROL, STATE_SHIFT
-    eq(modifier_state(False, False, False), 0)
-    eq(modifier_state(True, False, False), STATE_SHIFT)
-    eq(modifier_state(False, True, False), STATE_CONTROL)
-    eq(modifier_state(False, False, True), STATE_ALT)
-    # browser.py tests `event.state & 0x4` directly for its shortcuts.
-    assert modifier_state(False, True, False) & 0x4
-
-
-def test_named_virtual_keys_map_to_tk_keysyms():
-    from feetbrowser.win32 import keysym_for_vk
-    from feetbrowser.window import STATE_CONTROL, STATE_SHIFT
-    eq(keysym_for_vk(0x0D, 0), "Return")
-    eq(keysym_for_vk(0x26, 0), "Up")
-    eq(keysym_for_vk(0x21, 0), "Prior", "PageUp is Tk's Prior")
-    eq(keysym_for_vk(0x7B, 0), "F12")
-    eq(keysym_for_vk(0x09, 0), "Tab")
-    # browser.py binds <Control-ISO_Left_Tab> for previous-tab, which is the
-    # keysym X11 and Tk use for a shifted Tab.
-    eq(keysym_for_vk(0x09, STATE_SHIFT), "ISO_Left_Tab")
-    eq(keysym_for_vk(0x09, STATE_SHIFT | STATE_CONTROL), "ISO_Left_Tab")
-
-
-def test_a_plain_letter_waits_for_the_character_message():
-    """WM_CHAR is the only thing that has been through the user's keyboard
-    layout, so an unmodified printable key is left to it."""
-    from feetbrowser.win32 import keysym_for_vk
-    from feetbrowser.window import STATE_ALT, STATE_CONTROL, STATE_SHIFT
-    eq(keysym_for_vk(0x4C, 0), None, "plain L")
-    eq(keysym_for_vk(0x4C, STATE_SHIFT), None, "shifted L")
-    # Under Control the character message carries a control code (Ctrl-L is
-    # 0x0C, not "l"), so the letter has to come from the virtual key.
-    eq(keysym_for_vk(0x4C, STATE_CONTROL), "l", "Ctrl-L reaches <Control-l>")
-    eq(keysym_for_vk(0x54, STATE_CONTROL), "t")
-    eq(keysym_for_vk(0x53, STATE_CONTROL | STATE_SHIFT), "S",
-       "Tk names a shifted letter by its shifted character")
-    eq(keysym_for_vk(0x31, STATE_CONTROL), "1", "digits are not cased")
-    eq(keysym_for_vk(0x25, STATE_ALT), "Left", "Alt-Left is still a named key")
-    eq(keysym_for_vk(0xBA, STATE_CONTROL), None, "no guess at an OEM key")
-
-
-def test_character_messages_become_keysyms():
-    from feetbrowser.win32 import keysym_for_char
-    from feetbrowser.window import STATE_CONTROL
-    eq(keysym_for_char("z", 0), ("z", "z"))
-    eq(keysym_for_char("é", 0), ("é", "é"), "the layout's own character")
-    eq(keysym_for_char(" ", 0), ("space", " "), "Tk calls a space 'space'")
-    eq(keysym_for_char("", 0), None, "half a surrogate pair carries nothing")
-    # Return, Tab, Escape and Backspace each arrive twice: once as a named
-    # virtual key and once as a control code. Only the first is the event.
-    eq(keysym_for_char("\r", 0), None)
-    eq(keysym_for_char("\x08", 0), None)
-    eq(keysym_for_char("\x0c", STATE_CONTROL), None,
-       "Ctrl-L was already delivered from the virtual key")
-
-
-def test_key_sequences_are_offered_most_specific_first():
-    """Tk fires exactly one binding, the most specific that matches, and a
-    binding matches when its modifiers are a subset of those held."""
-    from feetbrowser.window import STATE_CONTROL, STATE_SHIFT, key_sequences
-    names = key_sequences("l", STATE_CONTROL)
-    eq(names[0], "<Control-l>")
-    eq(names[-1], "<Key>", "the generic binding is always the last resort")
-    assert "<l>" in names
-    names = key_sequences("Up", 0)
-    eq(names, ["<Up>", "<Key>"], "an unmodified named key")
-    # browser.py binds <Control-Shift-s> for view-source and <Control-s> for
-    # nothing, so the shifted spelling has to be offered and has to win.
-    names = key_sequences("S", STATE_CONTROL | STATE_SHIFT)
-    assert "<Control-Shift-s>" in names, names
-    assert names.index("<Control-Shift-s>") < names.index("<Control-s>"), names
-    # A subset match is what lets <Control-ISO_Left_Tab> catch Ctrl-Shift-Tab.
-    names = key_sequences("ISO_Left_Tab", STATE_CONTROL | STATE_SHIFT)
-    assert "<Control-ISO_Left_Tab>" in names, names
-
-
-def test_win32_dpi_becomes_a_scale_factor():
-    """Windows offers fractional scales, so 125% has to come out as 1.25 and
-    not as 1 -- and a failed query, which comes back as zero, has to come out
-    as 1.0 rather than dividing by nothing."""
-    from feetbrowser.win32 import scale_for_dpi
-    eq(scale_for_dpi(96), 1.0, "96 DPI is 100%")
-    eq(scale_for_dpi(120), 1.25, "125%")
-    eq(scale_for_dpi(192), 2.0, "200%")
-    eq(scale_for_dpi(0), 1.0, "a failed query is not a scale of zero")
-    eq(scale_for_dpi(None), 1.0)
-
-
-def test_xft_dpi_is_read_out_of_the_resource_database():
-    """X has no request for "how dense is this display", so the scale comes
-    from the setting the desktop environment writes into the root window and
-    every other toolkit reads. Nothing else in the database is an answer."""
-    from feetbrowser.x11 import xft_dpi
-    eq(xft_dpi("Xcursor.size:\t24\nXft.dpi:\t144\nXft.hinting:\t1\n"), 144.0)
-    eq(xft_dpi("Xft.dpi: 96.5"), 96.5, "no tab, no newline, not whole")
-    # A database that says nothing about DPI, which is every bare X server
-    # and every CI runner, has to be no answer rather than a wrong one.
-    eq(xft_dpi(""), None)
-    eq(xft_dpi(None), None)
-    eq(xft_dpi("Xft.dpi:\tenormous\n"), None)
-    eq(xft_dpi("Xft.dpi:\t0\n"), None, "zero would be a division by nothing")
-    # Matched on the whole name: another program's dpi setting is not ours.
-    eq(xft_dpi("Emacs.Xft.dpi:\t192\n"), None)
-
-
-def test_win32_module_is_importable_off_windows():
-    """gui.platform_root(), pyflakes and this file all import it, so it has
-    to load on a machine with no windll at all."""
-    from feetbrowser import win32
-    if sys.platform != "win32":
-        eq(win32.available(), False, "no Win32 window off Windows")
-        try:
-            win32.Win32Tk()
-        except win32.Win32Unavailable:
-            pass
-        else:
-            assert False, "a window opened on a platform with no Win32"
-
+# The windows are doormat's now, and so are their tests: the pixel packing,
+# the keysym tables and the DPI arithmetic that used to sit here live in that
+# repository, beside the code they are about. What is left is the seam --
+# the two things gui.py decides on doormat's behalf, which are the browser's
+# and are tested nowhere else.
 
 def test_the_display_variable_picks_a_backend_by_name():
+    """$FEETBROWSER_DISPLAY has to reach doormat's chooser, and has to be
+    read on every call rather than at import, so that a test can set it."""
     from feetbrowser import gui
-    saved = gui.DISPLAY
+    saved = os.environ.get("FEETBROWSER_DISPLAY")
     try:
-        gui.DISPLAY = "none"
+        os.environ["FEETBROWSER_DISPLAY"] = "none"
         eq(gui.platform_root(), None, "'none' stays headless everywhere")
+        eq(gui.has_display(), False, "'none' means no window")
 
-        gui.DISPLAY = ""
+        os.environ["FEETBROWSER_DISPLAY"] = ""
         root = gui.platform_root()
         if sys.platform == "darwin":
             eq(root.__name__, "CocoaTk")
@@ -3096,32 +2904,39 @@ def test_the_display_variable_picks_a_backend_by_name():
             # right, so the only wrong answer is some *other* backend.
             eq(root.__name__, "X11Tk")
 
-        for name in ("win32", "windows"):
-            gui.DISPLAY = name
-            if sys.platform == "win32":
-                eq(gui.platform_root().__name__, "Win32Tk")
-            else:
-                # Asking by name and silently getting a headless root is the
-                # kind of thing you discover from an empty screenshot.
-                try:
-                    gui.platform_root()
-                except RuntimeError as e:
-                    assert "Win32" in str(e), f"unhelpful message: {e}"
-                else:
-                    assert False, f"FEETBROWSER_DISPLAY={name} should raise"
-
-        gui.DISPLAY = "cocoa"
-        if sys.platform == "darwin":
-            eq(gui.platform_root().__name__, "CocoaTk")
-        else:
+        for name, label, only_on in (("win32", "Win32", "win32"),
+                                     ("windows", "Win32", "win32"),
+                                     ("cocoa", "Cocoa", "darwin")):
+            os.environ["FEETBROWSER_DISPLAY"] = name
+            if sys.platform == only_on:
+                assert gui.platform_root() is not None, name
+                continue
+            # Asking by name and silently getting a headless root is the kind
+            # of thing you discover from an empty screenshot.
             try:
                 gui.platform_root()
             except RuntimeError as e:
-                assert "Cocoa" in str(e), f"unhelpful message: {e}"
+                assert label in str(e), f"unhelpful message: {e}"
             else:
-                assert False, "FEETBROWSER_DISPLAY=cocoa should raise here"
+                assert False, f"FEETBROWSER_DISPLAY={name} should raise"
     finally:
-        gui.DISPLAY = saved
+        if saved is None:
+            os.environ.pop("FEETBROWSER_DISPLAY", None)
+        else:
+            os.environ["FEETBROWSER_DISPLAY"] = saved
+
+
+def test_the_window_icon_is_the_bundled_art():
+    """doormat decodes no images: the icon reaches it as pixels, and the
+    pixels are ours. A window manager showing the generic 'this is a program'
+    square is the symptom, and it is not one anybody files a bug about, so
+    the decode is checked here instead."""
+    from feetbrowser import gui
+    width, height, rgba = gui.icon()
+    eq((width, height), (256, 256), "icon.png is the 256x256 canonical art")
+    eq(len(rgba), width * height * 4, "four bytes a pixel, no padding")
+    assert any(rgba[3::4]), "a fully transparent icon is an invisible icon"
+    assert gui.icon() is gui.icon(), "decoded once, not once per window"
 
 
 def test_file_urls_understand_a_drive_letter():
@@ -4685,7 +4500,7 @@ def _cli(*args, **kwargs):
         # it is how a flag that opens a browser instead of exiting turns
         # into a failure rather than a hung suite.
         timeout=kwargs.get("timeout", 30),
-        env=dict(os.environ, FEETBROWSER_QUIET="1"))
+        env=dict(os.environ, DOORMAT_QUIET="1"))
     return proc.returncode, proc.stdout
 
 

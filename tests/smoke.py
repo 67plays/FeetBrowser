@@ -4,7 +4,7 @@ import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from feetbrowser.window import Tk
+from doormat.window import Tk
 
 from feetbrowser.net import URL
 from feetbrowser.htmlparser import HTMLParser

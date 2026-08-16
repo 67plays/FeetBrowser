@@ -15,6 +15,9 @@
 #   * a file anywhere in the bundle containing a path under /Users, which is
 #     how a build machine's home directory ends up shipped to strangers,
 #   * a missing icon, plist key, trust store, engine or interpreter,
+#   * a missing doormat, which is the window layer and is a pip dependency
+#     like the media stack: without it the app renders, screenshots and
+#     passes every other check here, and opens no window for anyone,
 #   * an app that cannot decode H.264 or AAC -- asked of the app itself, with
 #     a stripped PATH, because both failures are invisible from a checkout,
 #   * Tcl, Tk or _tkinter, which this project does not use and must not ship.
@@ -72,7 +75,8 @@ for want in \
   "Resources/certs/cacert.pem" \
   "Frameworks/Python.framework/Versions/3.13/Python" \
   "Resources/lib/feetbrowser/__main__.py" \
-  "Resources/lib/feetplayer/mediacodec.py" ; do
+  "Resources/lib/feetplayer/mediacodec.py" \
+  "Resources/lib/doormat/cocoa.py" ; do
   if [ -e "$contents/$want" ]; then note "ok  $want"; else bad "missing $want"; fi
 done
 engine=$(find "$contents/Resources/lib" -name 'feetbrowser_engine*.so' | head -1)

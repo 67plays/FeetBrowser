@@ -62,6 +62,9 @@ FeetBrowser.AppDir/
                                       and MPEG Layer III, likewise
       site-packages/feetplayer/fortran/
                                       the Fortran all three were built from
+      site-packages/doormat/          the window layer, pinned the same way:
+                                      the X11 window, the input translation
+                                      behind it and the event loop above it
   usr/lib/*.so.*                      the private libraries CPython needs:
                                       libssl, libcrypto, libffi, ...
   usr/lib/feetbrowser/launcher.py     bundled-font wiring, then __main__
@@ -143,7 +146,12 @@ finished AppImage.
 
 ## X11, and what happens under Wayland
 
-`feetbrowser/x11.py` drives Xlib through `ctypes` (no bindings package, no
+The window layer is `doormat`, the second package `requirements.txt` pins:
+the X11, Win32 and Cocoa windows, the input translation behind them and the
+event loop above them, `ctypes` throughout with nothing compiled in it, so
+the same `pip install --target` line above is the whole of installing it.
+
+`doormat/x11.py` drives Xlib through `ctypes` (no bindings package, no
 compiled shim), so the bundle has to find a `libX11.so.6` at runtime. **It
 uses the host's.** That is a deliberate choice, not an oversight:
 
@@ -237,11 +245,14 @@ path degrades to the ordinary socket/TLS client, which is what happens on any
 machine without it today. Verified rather than assumed: the acceptance test
 navigates and renders with it absent.
 
-`asmlib.py` compiles `asm/x11pack.S` at import time if a C compiler is on
-`PATH`, and returns pure-Python kernels when there is none. A user's machine
-has no compiler, so the fallback is what runs; the kernels only matter on an
-X server whose TrueColor visual is depth 15 or 16, which almost nobody meets.
-It writes only to `TMPDIR`, never inside the bundle.
+Two packages assemble a hand-written kernel at import time if a C compiler is
+on `PATH`, and return pure-Python equivalents when there is none: `doormat`,
+for `doormat/asm/x11pack.S`, the X11 pixel packer, and `feetbrowser`, for
+`asm/seloffset.S`, the selection boundary scan behind `asmselect.py`. A
+user's machine has no compiler, so the fallback is what runs for both; the
+packer only matters on an X server whose TrueColor visual is depth 15 or 16,
+which almost nobody meets. Neither writes anywhere but `TMPDIR`, never
+inside the bundle.
 
 The mounted image is read-only. `PYTHONDONTWRITEBYTECODE=1` is set and every
 `.pyc` is compiled in at build time, so imports are a mapped read rather than
@@ -374,7 +385,7 @@ installs exactly two packages:
 
 | package | why a real user's machine has it |
 | --- | --- |
-| `libx11-6` | the X client library `x11.py` dlopens; every machine with an X server has it |
+| `libx11-6` | the X client library `doormat/x11.py` dlopens; every machine with an X server has it |
 | `xvfb` | an X server. A user's desktop *is* the X server; a container has to be given one |
 
 Not installed, on purpose: `ca-certificates` (so the bundled CA fallback is
@@ -394,10 +405,12 @@ page into it, reads the pixels back with `XGetImage` and fails unless the red,
 green and blue swatches are all present and land in that order across the
 window. That last one runs through the bundle's own interpreter, with
 `sys.path[0]` pointing at a directory containing no `feetbrowser`, so the
-package, the engine, the fonts and the interpreter all come out of the
-AppImage. Then `--install` runs and the `.desktop` file and icon are checked
-into place, and the image is unpacked and searched for absolute build paths;
-an artifact carrying `/home/somebody/...` is both wrong on the user's machine
-and a leak of the build machine's directory names.
+package, `doormat`, the engine, the fonts and the interpreter all come out of
+the AppImage. It is also the only step of the list that would notice an
+AppImage built without `doormat` in it: every check before it renders
+headlessly and would pass. Then `--install` runs and the `.desktop` file and
+icon are checked into place, and the image is unpacked and searched for
+absolute build paths; an artifact carrying `/home/somebody/...` is both wrong
+on the user's machine and a leak of the build machine's directory names.
 
 The PNGs are uploaded by CI and are meant to be looked at.

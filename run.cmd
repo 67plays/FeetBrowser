@@ -70,20 +70,31 @@ call :warmfortran ".venv\Scripts\python.exe"
 ".venv\Scripts\python.exe" -m feetbrowser %*
 exit /b %errorlevel%
 
+rem Our own split-out libraries, each pinned to a commit in requirements.txt:
 rem feetplayer is the media stack -- the container readers, the audio output
-rem and the Fortran decoders -- pinned to a commit in requirements.txt. pip
-rem compiles the Fortran during the install, so this is the minute the
-rem decoders cost, and it is paid once per pin rather than once per start:
-rem "pip freeze" prints a VCS install as the requirement line that produced
-rem it, so the pin installed and the pin asked for compare as plain strings.
-rem Failing to install it is not fatal -- the browser then reports H.264 and
-rem AAC as codecs it does not have, and everything else still works.
+rem and the Fortran decoders -- and doormat is the windows. Installing
+rem feetplayer compiles the Fortran, so this is the minute the decoders cost,
+rem and it is paid once per pin rather than once per start: "pip freeze"
+rem prints a VCS install as the requirement line that produced it, so the pins
+rem installed and the pins asked for compare as plain strings. Every line is
+rem checked -- keeping only the last one would leave every dependency but the
+rem bottom one permanently uninstalled.
+rem
+rem Failing to install is not fatal -- the browser then reports H.264 and AAC
+rem as codecs it does not have and falls back to a headless window, and
+rem everything else still works.
 :ensureplayer
-for /f "usebackq delims=" %%L in (`findstr /v /r /c:"^ *#" /c:"^ *$" requirements.txt`) do set "WANT=%%L"
-".venv\Scripts\python.exe" -m pip freeze 2>nul | findstr /x /c:"%WANT%" >nul
-if not errorlevel 1 goto :eof
-echo FeetBrowser: installing feetplayer, the media stack. This compiles its
-echo Fortran decoders, so expect a minute -- and only when the pin moves.
+set "FREEZE=%TEMP%\feetbrowser-freeze-%RANDOM%.txt"
+".venv\Scripts\python.exe" -m pip freeze >"%FREEZE%" 2>nul
+set "MISSING="
+for /f "usebackq delims=" %%L in (`findstr /v /r /c:"^ *#" /c:"^ *$" requirements.txt`) do (
+  findstr /x /c:"%%L" "%FREEZE%" >nul || set "MISSING=1"
+)
+del "%FREEZE%" >nul 2>&1
+if not defined MISSING goto :eof
+echo FeetBrowser: installing feetplayer and doormat, the media stack and the
+echo windows. feetplayer compiles its Fortran decoders, so expect a minute --
+echo and only when a pin moves.
 echo.
 ".venv\Scripts\python.exe" -m pip install -q -r requirements.txt
 if errorlevel 1 call :say_noplayer 1>&2
@@ -101,9 +112,10 @@ goto :eof
 
 :say_noplayer
 echo.
-echo FeetBrowser: feetplayer did not install, so this run has no video and no
-echo sound. Everything else works. The install needs git and gfortran; see
-echo requirements.txt.
+echo FeetBrowser: the dependencies did not install. Without feetplayer this
+echo run has no video and no sound; without doormat it has no window and can
+echo only render offscreen. Everything else works. The install needs git, and
+echo feetplayer needs gfortran; see requirements.txt.
 echo.
 goto :eof
 

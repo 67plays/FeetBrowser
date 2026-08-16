@@ -8,6 +8,11 @@ between the framebuffer and the screen -- the pixel conversion, the stride,
 the XImage, XPutImage -- has to be right for the picture to come out, so a
 plausible-looking PNG here is the evidence that Linux works.
 
+doormat has a script of the same name that photographs a test card it fills
+itself. This one photographs a page our rasteriser drew, which is the half
+that repository cannot see: doormat proves the window carries pixels, and
+this proves the pixels are a browser.
+
 Meant for CI under `xvfb-run`, where the result is uploaded as an artifact
 and can be looked at by a human afterwards.
 
@@ -18,8 +23,9 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from doormat import x11
 from feetbrowser import browser as browsermod
-from feetbrowser import raster, x11
+from feetbrowser import raster
 
 import test_x11 as helpers   # noqa: E402 - the same live-server plumbing
 
@@ -61,6 +67,13 @@ this server wants them.</p>
 """
 
 
+def channel(value, mask):
+    """One channel of a packed pixel, scaled back up to 0..255."""
+    shift = (mask & -mask).bit_length() - 1
+    span = mask >> shift
+    return ((value & mask) >> shift) * 255 // span
+
+
 def capture(window):
     """The window's pixels as a Surface, straight off the X server.
 
@@ -86,8 +99,8 @@ def capture(window):
         at = y * line
         for _ in range(window.width):
             value = int.from_bytes(raw[at:at + size], order)
-            for channel, mask in enumerate(masks):
-                rgba[dst + channel] = helpers._channel(value, mask)
+            for index, mask in enumerate(masks):
+                rgba[dst + index] = channel(value, mask)
             at += size
             dst += 4
     shot = raster.Surface(window.width, window.height)

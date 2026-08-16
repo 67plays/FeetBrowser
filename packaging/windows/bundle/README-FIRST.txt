@@ -78,6 +78,10 @@ WHAT IS IN HERE
     feetbrowser\            the browser, in Python
     feetbrowser_engine\     the rasteriser, font engine, image decoders and
                             JavaScript engine, compiled from Rust
+    feetplayer\             the audio output and the H.264, AAC and MP3
+                            decoders, compiled from Fortran
+    doormat\                the window: the Win32 window, the input
+                            translation behind it and the event loop above it
     python3NN.dll           CPython, from python.org's embeddable package
     python3NN.zip           its standard library
     python3NN._pth          what makes that Python private to this folder

@@ -21,7 +21,7 @@ from feetbrowser import canvas as canvasmod
 from feetbrowser import fontengine, gui, imagecodec, media, raster
 from feetplayer import mediacodec
 from feetbrowser.net import URL
-from feetbrowser.window import Event, Window
+from doormat.window import Event, Window
 
 # A Browser() reads ~/.feetbrowser_settings.json for its momentum and scroll
 # settings. Point the module at a throwaway file so a machine's real settings
@@ -1501,7 +1501,7 @@ def test_canvas_arc_strokes_without_filling():
 # that needs a real window is in test_cocoa.py, test_x11.py and test_win32.py.
 
 class _ScaleEnv:
-    """FEETBROWSER_SCALE set for the length of a test, and put back after.
+    """DOORMAT_SCALE set for the length of a test, and put back after.
 
     The variable is read every time a scale is settled rather than once at
     import, which is what makes it usable for testing at all -- but it also
@@ -1512,24 +1512,24 @@ class _ScaleEnv:
         self.value = value
 
     def __enter__(self):
-        self.saved = os.environ.get("FEETBROWSER_SCALE")
+        self.saved = os.environ.get("DOORMAT_SCALE")
         if self.value is None:
-            os.environ.pop("FEETBROWSER_SCALE", None)
+            os.environ.pop("DOORMAT_SCALE", None)
         else:
-            os.environ["FEETBROWSER_SCALE"] = self.value
+            os.environ["DOORMAT_SCALE"] = self.value
 
     def __exit__(self, *_exc):
         if self.saved is None:
-            os.environ.pop("FEETBROWSER_SCALE", None)
+            os.environ.pop("DOORMAT_SCALE", None)
         else:
-            os.environ["FEETBROWSER_SCALE"] = self.saved
+            os.environ["DOORMAT_SCALE"] = self.saved
         return False
 
 
 def test_the_scale_is_one_unless_something_says_otherwise():
     """A machine with no notion of display density, and every X server
     without an Xft.dpi, arrives here and must be left exactly as it was."""
-    from feetbrowser.window import scale_factor
+    from doormat.window import scale_factor
     with _ScaleEnv(None):
         assert scale_factor(None) == 1.0
         assert scale_factor(0) == 1.0, "a failed query reads as zero"
@@ -1807,7 +1807,7 @@ def test_window_clipboard_round_trip():
 
 
 def test_window_destroy_takes_children_with_it():
-    from feetbrowser.window import Tk, Toplevel
+    from doormat.window import Tk, Toplevel
     root = Tk()
     child = Toplevel(root)
     assert child in root.children
@@ -2940,7 +2940,7 @@ def test_selection_paints_a_themed_highlight_with_legible_text():
     import shutil
     import tempfile
     from feetbrowser.canvas import color
-    from feetbrowser.window import Event
+    from doormat.window import Event
 
     work = tempfile.mkdtemp(prefix="fb-selection-")
     try:
@@ -2986,7 +2986,7 @@ def test_selection_paints_a_themed_highlight_with_legible_text():
 def test_a_plain_click_clears_the_selection_and_copy_puts_it_on_the_clipboard():
     import shutil
     import tempfile
-    from feetbrowser.window import Event
+    from doormat.window import Event
 
     work = tempfile.mkdtemp(prefix="fb-selection-")
     try:
@@ -3029,7 +3029,7 @@ def test_a_press_in_the_scrollbar_gutter_starts_no_selection():
     """
     import shutil
     import tempfile
-    from feetbrowser.window import Event
+    from doormat.window import Event
 
     work = tempfile.mkdtemp(prefix="fb-selection-")
     try:

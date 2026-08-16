@@ -8,9 +8,10 @@ rem feetbrowser_engine, so the suite runs out of the local venv maturin builds
 rem it into, which needs a Rust toolchain and, on Windows only, a C++ linker
 rem to go with it -- see the messages at the bottom of this file.
 rem
-rem A few suites step outside all that: test_win32.py opens real windows here
-rem (test_cocoa.py and test_x11.py skip, as they do everywhere but their own
-rem platform), and test_nav.py and smoke.py reach the network.
+rem A few suites step outside all that: test_win32.py puts the browser in a
+rem real window here (test_cocoa.py and test_x11.py skip, as they do
+rem everywhere but their own platform), and test_nav.py and smoke.py reach
+rem the network.
 setlocal
 cd /d "%~dp0"
 
@@ -21,12 +22,12 @@ if errorlevel 1 (
   exit /b 1
 )
 
-rem test_win32.py opens dozens of real windows in a few seconds, and each one
-rem would otherwise take the foreground and the keyboard -- which makes the
-rem machine unusable for as long as the run lasts. QUIET drops that and
-rem nothing else: the windows are still created, shown, drawn into and sent
-rem real messages. Set FEETBROWSER_QUIET=0 to watch them work.
-if not defined FEETBROWSER_QUIET set FEETBROWSER_QUIET=1
+rem test_win32.py opens real windows, and each one would otherwise take the
+rem foreground and the keyboard -- which makes the machine unusable for as
+rem long as the run lasts. QUIET drops that and nothing else: the windows are
+rem still created, shown, drawn into and sent real messages. The variable is
+rem doormat's, since the windows are. Set DOORMAT_QUIET=0 to watch them work.
+if not defined DOORMAT_QUIET set DOORMAT_QUIET=1
 
 rem Same venv run.cmd builds, and unsealed for the same reason: the optional
 rem image decoders (Pillow, cairosvg) live in the system python, and tests
@@ -50,16 +51,26 @@ rem watchdog turns a hang into every thread's stack and a non-zero exit.
 rem See tests\watchdog.py; FEETBROWSER_TEST_TIMEOUT overrides the number.
 set RUN=%PY% tests\watchdog.py 900
 
-rem feetplayer, the media stack: the container readers, the audio output and
-rem the Fortran decoders, which used to live in this tree and are their own
-rem repository now. requirements.txt pins it to a commit; pip compiles the
-rem Fortran during the install, which takes a minute, so the pin installed is
-rem compared against the pin asked for and nothing is done when they agree.
+rem Our own split-out libraries: feetplayer, which is the container readers,
+rem the audio output and the Fortran decoders, and doormat, which is the
+rem windows. Both used to live in this tree and are their own repositories
+rem now. requirements.txt pins each to a commit; installing feetplayer
+rem compiles its Fortran, which takes a minute, so the pins installed are
+rem compared against the pins asked for and nothing is done when they agree.
 rem "pip freeze" prints a VCS install as the requirement line that produced
 rem it, which is why the comparison is a plain string match.
-for /f "usebackq delims=" %%L in (`findstr /v /r /c:"^ *#" /c:"^ *$" requirements.txt`) do set "WANT=%%L"
-"%PY%" -m pip freeze 2>nul | findstr /x /c:"%WANT%" >nul
-if errorlevel 1 "%PY%" -m pip install -q -r requirements.txt || exit /b 1
+rem
+rem Every line is checked. Keeping only the last one -- which is what a plain
+rem "do set" out of this loop does -- would leave every dependency but the
+rem bottom one permanently uninstalled.
+set "FREEZE=%TEMP%\feetbrowser-freeze-%RANDOM%.txt"
+"%PY%" -m pip freeze >"%FREEZE%" 2>nul
+set "MISSING="
+for /f "usebackq delims=" %%L in (`findstr /v /r /c:"^ *#" /c:"^ *$" requirements.txt`) do (
+  findstr /x /c:"%%L" "%FREEZE%" >nul || set "MISSING=1"
+)
+del "%FREEZE%" >nul 2>&1
+if defined MISSING "%PY%" -m pip install -q -r requirements.txt || exit /b 1
 
 rem Ensure the Rust JS engine (feetbrowser_engine) is built in the local venv.
 "%PY%" -c "import feetbrowser_engine" >nul 2>&1
@@ -92,8 +103,8 @@ rem Every suite below, and nothing missing.
 rem The from-scratch Discord Rich Presence client, against a fake local socket.
 %RUN% tests\test_discord.py || exit /b 1
 %RUN% tests\test_render.py || exit /b 1
-rem test_win32.py opens real windows here; the other two skip, and it is the
-rem one that skips everywhere else.
+rem test_win32.py puts the browser in a real window here; the other two skip,
+rem and it is the one that skips everywhere else.
 %RUN% tests\test_cocoa.py || exit /b 1
 %RUN% tests\test_x11.py || exit /b 1
 %RUN% tests\test_win32.py || exit /b 1
@@ -110,8 +121,6 @@ rem A fixture page in, its pixels back out.
 %RUN% tests\test_e2e.py || exit /b 1
 %RUN% tests\test_nav.py || exit /b 1
 %RUN% tests\test_toes.py || exit /b 1
-rem No assembler here, so this checks the pure-Python fallback.
-%RUN% tests\test_asmx11.py || exit /b 1
 %RUN% tests\test_asmselect.py || exit /b 1
 %RUN% tests\smoke.py || exit /b 1
 exit /b 0

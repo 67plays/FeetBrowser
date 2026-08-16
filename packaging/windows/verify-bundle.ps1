@@ -145,12 +145,19 @@ Write-Host "evidence  $Evidence"
 
 # ---------------------------------------------------------------------------
 Check "the folder is complete" {
+    # doormat\win32.py is named for the same reason feetplayer\ is: both are
+    # pip dependencies rather than files in this repository, so a pip step
+    # that silently did nothing leaves a bundle that starts, renders and
+    # screenshots. Without doormat it then opens no window at all, which the
+    # Explorer-launch check below proves the hard way, sixty seconds and a
+    # whole browser start later, and which this one says in a filename.
     foreach ($needed in @('FeetBrowser.exe', 'FeetBrowser._pth', 'feetbrowser\__main__.py',
-                          'feetbrowser\win32.py', 'feetbrowser\ua.css', '_ssl.pyd',
+                          'feetbrowser\ua.css', '_ssl.pyd',
                           'libssl-3.dll', 'libcrypto-3.dll', '_socket.pyd', '_ctypes.pyd',
                           'libffi-8.dll', 'vcruntime140.dll', 'README-FIRST.txt',
                           'install.ps1', 'uninstall.ps1',
-                          'feetplayer\__init__.py', 'feetplayer\mediacodec.py')) {
+                          'feetplayer\__init__.py', 'feetplayer\mediacodec.py',
+                          'doormat\__init__.py', 'doormat\win32.py')) {
         if (-not (Test-Path (Join-Path $Root $needed))) { throw "missing $needed" }
     }
     # -match rather than -Filter: in a Windows wildcard '?' also matches zero
@@ -479,7 +486,7 @@ Check "--screenshot writes to a path with a space and an accent in it" {
 Check "launching it the way Explorer does opens a real window" {
     # No redirected handles and no arguments beyond the URL: as close to a
     # double-click as a script can get. What is being proved is that the
-    # process reaches feetbrowser/win32.py and gets an HWND out of it -- a
+    # process reaches doormat/win32.py and gets an HWND out of it -- a
     # bundle that could render headlessly but could not open a window would
     # pass every check above and still be useless.
     $url = "http://127.0.0.1:$script:port/index.html"

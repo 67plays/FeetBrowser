@@ -30,7 +30,7 @@
 
   <application xmlns="urn:schemas-microsoft-com:asm.v3">
     <windowsSettings>
-      <!-- Deliberately silent about DPI. feetbrowser/win32.py calls
+      <!-- Deliberately silent about DPI. doormat/win32.py calls
            SetProcessDpiAwarenessContext itself, picking per-monitor-v2 where
            it exists and stepping down where it does not; a dpiAware entry
            here would settle the question before that code runs and make its

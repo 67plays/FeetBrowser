@@ -17,9 +17,9 @@
 //!     smother.
 //!   * The right DPI behaviour. `python.exe` ships a manifest that marks the
 //!     process DPI-aware before any of our code runs, which makes
-//!     `win32.py`'s own `SetProcessDpiAwarenessContext` call fail and leaves
-//!     the browser on the coarser system-DPI path. Our manifest stays quiet
-//!     about DPI so the backend can pick per-monitor-v2 itself.
+//!     `doormat/win32.py`'s own `SetProcessDpiAwarenessContext` call fail
+//!     and leaves the browser on the coarser system-DPI path. Our manifest
+//!     stays quiet about DPI so the backend can pick per-monitor-v2 itself.
 //!
 //! The DLL is resolved at run time with `LoadLibraryEx` + `GetProcAddress`,
 //! not linked against. The embeddable package ships no import library and no

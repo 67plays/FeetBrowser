@@ -12,7 +12,7 @@ with **Shoes** color themes (`about:shoes`, or `Ctrl+Shift+S`), and download
 files to disk with a manager that shows progress and can cancel (`Ctrl-J`).
 
 **Runs on:** macOS, Linux and Windows, with a real window of its own on each
-(`cocoa.py`, `x11.py` and `win32.py`, all ctypes and no toolkit), and
+(doormat's Cocoa, X11 and Win32 backends, all ctypes and no toolkit), and
 anywhere at all headless: `--screenshot` and the whole test suite need no
 display. X11 covers Wayland desktops through XWayland; a native Wayland
 backend is not written. On a platform with none of the three,
@@ -29,12 +29,16 @@ first `run.cmd` stops at ``error: linker `link.exe` not found`` until the
 Visual Studio build tools are installed. See [usage.md](usage.md) for the
 exact download and the one workload to tick.
 
-The media stack is a second thing to install, and it is not optional: the
+Two libraries are a second thing to install, and neither is optional. The
 decoders, the containers and the audio output live in
-[feetplayer](https://github.com/67plays/feetplayer), pinned to a commit sha
-in `requirements.txt`, and `feetbrowser/media.py` imports it. `run.sh` and
-`run.cmd` install it into the same `.venv` they build the engine into, and
-say so if they cannot.
+[feetplayer](https://github.com/67plays/feetplayer), which
+`feetbrowser/media.py` imports; the windows live in
+[doormat](https://github.com/67plays/doormat), which `feetbrowser/gui.py`
+imports. Both are ours, both are pinned to a commit sha in
+`requirements.txt`, and `run.sh` and `run.cmd` install both into the same
+`.venv` they build the engine into, and say so if they cannot. Neither is a
+toolkit in disguise: doormat is ctypes, has no dependencies of its own and
+draws nothing, so what it supplies is the window and not the picture in it.
 
 `gfortran` is a second compiler the build can use, and unlike Rust it is
 optional in the real sense: the decoders inside feetplayer are Fortran,

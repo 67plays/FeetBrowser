@@ -18,7 +18,6 @@ import html
 import threading
 from . import gui
 from .canvas import Canvas, CanvasError, PhotoImage
-from .window import Tk
 import urllib.parse
 from collections import deque
 
@@ -3277,7 +3276,7 @@ class Browser:
 
         # A headless root by default, so tests and --screenshot never open
         # anything; main() passes a real one from gui.new_window().
-        self.window = window if window is not None else Tk()
+        self.window = window if window is not None else gui.headless_root()
         self.window.title("FeetBrowser")
         self.window.geometry(f"{WIDTH}x{HEIGHT}")
         self.window.minsize(480, 320)

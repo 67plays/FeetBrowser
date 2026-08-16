@@ -7,7 +7,7 @@ import tempfile
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from feetbrowser import shoes
-from feetbrowser.window import Tk
+from doormat.window import Tk
 from feetbrowser.browser import (
     _AboutURL, _ShoesURL, _ShoesApplyURL, welcome_html, bookmarks_html,
     history_html,

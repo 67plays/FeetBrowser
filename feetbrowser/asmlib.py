@@ -1,11 +1,16 @@
 """The shared compiler behind every raw-assembly kernel module in the project.
 
-Each kernel module (``asmx11`` and any that follow) is a hand-written
+Each kernel module (``asmselect`` and any that follow) is a hand-written
 ``feetbrowser/asm/*.S`` file -- raw x86-64, no C, no assembler required at
 runtime -- compiled on demand into a shared object and called through
 ``ctypes``. Everything that makes that possible lives here once: the host
 and compiler checks, the on-disk cache keyed on the source, and the buffer
 wrappers, so a kernel module is only the ctypes plumbing and its fallback.
+
+doormat carries its own copy of this file for the X11 pixel packer. Forty
+lines of compiler invocation is not worth a dependency in either direction:
+a browser should not have to import a windowing library to assemble its own
+kernels, and a windowing library should not import a browser.
 
 If there is no compiler, or the host is not Linux/x86-64, every kernel
 module falls back to identical pure-Python implementations so nothing else

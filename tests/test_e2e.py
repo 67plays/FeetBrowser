@@ -36,7 +36,7 @@ from feetbrowser import browser as browsermod
 from feetbrowser import imagecodec
 from feetbrowser.layout import DrawText
 from feetbrowser.net import URL
-from feetbrowser.window import Event
+from doormat.window import Event
 
 # A real Browser() reads ~/.feetbrowser_settings.json for its scroll and
 # momentum settings. Point it at a throwaway file so the machine's own

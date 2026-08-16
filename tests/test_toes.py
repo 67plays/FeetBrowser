@@ -18,7 +18,7 @@ import tempfile
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from feetbrowser.canvas import Canvas
-from feetbrowser.window import Tk
+from doormat.window import Tk
 
 from feetbrowser import toes
 from feetbrowser.browser import Tab
@@ -640,7 +640,7 @@ def test_toe_keypress_sees_char_and_keysym():
     with tempfile.TemporaryDirectory() as tmp:
         ctx = _surface_ctx(tmp, warnings)
         window = Tk()
-        from feetbrowser.window import Event
+        from doormat.window import Event
         seen = []
         window.bind("<Key>", lambda e: seen.append(
             ctx.call("on_keypress", e)))

@@ -7,7 +7,7 @@ import tempfile
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from feetbrowser import settings
-from feetbrowser.window import Tk
+from doormat.window import Tk
 from feetbrowser.browser import (
     _SettingsURL, _SettingsApplyURL, settings_html,
 )
@@ -198,7 +198,7 @@ def _range_browser(body=_RANGE_PAGE):
     from feetbrowser.browser import Browser
     from feetbrowser.browser import tree_to_list
     from feetbrowser.htmlparser import Element
-    from feetbrowser.window import Event
+    from doormat.window import Event
 
     path, original = _fresh_file()
     root = Tk(); root.withdraw()
@@ -272,7 +272,7 @@ def test_settings_page_range_drag_applies_the_setting():
     from feetbrowser.browser import Browser
     from feetbrowser.browser import tree_to_list
     from feetbrowser.htmlparser import Element
-    from feetbrowser.window import Event
+    from doormat.window import Event
 
     path, original = _fresh_file()
     root = Tk(); root.withdraw()
@@ -302,7 +302,7 @@ def test_range_grab_still_works_when_the_page_is_scrolled():
     from feetbrowser.browser import Browser
     from feetbrowser.browser import tree_to_list
     from feetbrowser.htmlparser import Element
-    from feetbrowser.window import Event
+    from doormat.window import Event
 
     path, original = _fresh_file()
     root = Tk(); root.withdraw()
@@ -342,7 +342,7 @@ def test_toggle_keeps_the_scroll_position():
     from feetbrowser.browser import Browser
     from feetbrowser.browser import tree_to_list
     from feetbrowser.htmlparser import Element
-    from feetbrowser.window import Event
+    from doormat.window import Event
 
     path, original = _fresh_file()
     root = Tk(); root.withdraw()
@@ -414,7 +414,7 @@ def test_range_readout_updates_live_while_dragging():
     from feetbrowser.browser import Browser
     from feetbrowser.browser import tree_to_list
     from feetbrowser.htmlparser import Element, Text
-    from feetbrowser.window import Event
+    from doormat.window import Event
 
     path, original = _fresh_file()
     root = Tk(); root.withdraw()
@@ -445,7 +445,7 @@ def test_range_readout_updates_mid_drag_before_release():
     from feetbrowser.browser import Browser
     from feetbrowser.browser import tree_to_list
     from feetbrowser.htmlparser import Element, Text
-    from feetbrowser.window import Event
+    from doormat.window import Event
 
     path, original = _fresh_file()
     root = Tk(); root.withdraw()
@@ -528,7 +528,7 @@ def test_range_press_glides_instead_of_teleporting():
         browser.window.destroy()
         _restore(original)
     from feetbrowser.browser import Browser
-    from feetbrowser.window import Event
+    from doormat.window import Event
 
     path, original = _fresh_file()
     root = Tk(); root.withdraw()

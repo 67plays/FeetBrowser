@@ -28,3 +28,19 @@
 #     gh api repos/67plays/feetplayer/commits/main --jq .sha
 #
 feetplayer @ git+https://github.com/67plays/feetplayer@734c8da4ee6312bfb723412f30905c2c50d73cf0
+
+# doormat is the windowing layer: the X11, Win32 and Cocoa windows, the input
+# translation behind them and the event loop above them. It used to live here
+# as feetbrowser/window.py, x11.py, win32.py, cocoa.py and asmx11.py, and it
+# is the same code with the same authors -- it was split out because none of
+# it knows a browser exists. It draws nothing: a window is handed an object
+# and asks it for `.render()` and a surface of packed RGB, which is the whole
+# seam between it and our rasteriser.
+#
+# Pinned to a full sha for the same two reasons feetplayer is, above.
+#
+# To move to a newer doormat, put its sha here and nowhere else:
+#
+#     gh api repos/67plays/doormat/commits/main --jq .sha
+#
+doormat @ git+https://github.com/67plays/doormat@0e943c12a9111e451f651e8d92b3e60645ec8331

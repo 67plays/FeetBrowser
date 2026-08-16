@@ -504,8 +504,8 @@ and finished while no audio codec exists.
     probed once, and the answer remembered, so a container with no
     `/dev/snd` is not asked about it once per packet.
 - `feetplayer/coreaudio.py`, `alsa.py`, `winmm.py`: one per platform,
-  ctypes against the system library, the same shape as `cocoa.py`, `x11.py`
-  and `win32.py`. Each knows how to take bytes out of a ring and nothing
+  ctypes against the system library, the same shape as doormat's three
+  window backends. Each knows how to take bytes out of a ring and nothing
   else at all.
 
 ### Rules for the realtime side
@@ -589,8 +589,8 @@ of 39 buffer seams.
 
 ### Testing sound without a sound card
 
-feetplayer's own `tests/test_audio.py`, split the way this repository's
-`tests/test_x11.py` is. The pure half is the ring (wraparound, underrun,
+feetplayer's own `tests/test_audio.py`, split the way any suite with a live
+half has to be. The pure half is the ring (wraparound, underrun,
 overrun, partial frames, and a real two-thread producer/consumer test that
 checks every byte of a known sequence), the filter design, the resampler,
 the formats, the mixer, the clock, and the whole pipeline end to end against
