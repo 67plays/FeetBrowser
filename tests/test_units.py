@@ -4260,6 +4260,10 @@ class _TabBrowser(Browser):
             "Panel", (), {"point_in": lambda s, x, y: False})()
         self.window = type("Win", (), {"destroy": lambda s: None})()
         self._scroll_grab = None
+        self._scroll_repaint_pending = False
+        self._scroll_ticks = []
+        self._scroll_velocity = 0.0
+        self._momentum_job = None
         self._tab_drag = None
         self._drag_moved = False
         self._click_count = 0
