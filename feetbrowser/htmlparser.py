@@ -1,7 +1,8 @@
 """The DOM node types, and the entry point to the HTML parser.
 
-The parser itself is `rust/src/html/`: a WHATWG-conformant tokenizer and tree
-builder that scores 99.6% on the html5lib tree-construction suite. It parses
+The parser itself is `footnote`: a WHATWG-conformant tokenizer and tree
+builder, ours, in its own repository because nothing in it knows a browser
+exists. It scores 99.6% on the html5lib tree-construction suite. It parses
 into a Rust arena and then materialises that arena into the `Element` and
 `Text` objects defined here, which is what every consumer in this package
 reads. See `rust/src/materialize.rs` for why the document is handed to Python

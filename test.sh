@@ -65,11 +65,13 @@ if [ -z "$engine" ] || [ -n "$(find rust/src rust/Cargo.toml -newer "$engine" 2>
   .venv/bin/maturin develop --release --manifest-path rust/Cargo.toml
 fi
 
-# The Rust half has 122 tests of its own -- the tokenizer, the regexp engine,
-# the layout reproductions and the html5lib tree construction suite. They ran
-# nowhere: CI only ever did `cargo check --all-targets`, which compiles a test
-# without running it. They cost 0.07s, so they run here too rather than only
-# on a machine that happens to type `cargo test` by hand.
+# The Rust half has 60 tests of its own -- the regexp engine, the CSS
+# matcher, the layout reproductions. They ran nowhere: CI only ever did
+# `cargo check --all-targets`, which compiles a test without running it. They
+# cost hundredths of a second, so they run here too rather than only on a
+# machine that happens to type `cargo test` by hand. The tokenizer and tree
+# builder are not among them any more; they are `footnote`'s, and it runs
+# its own suite against three platforms.
 if command -v cargo >/dev/null 2>&1; then
   cargo test -q --manifest-path rust/Cargo.toml
 fi

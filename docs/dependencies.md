@@ -16,6 +16,18 @@ No *third-party* Python package is required. `feetbrowser/` imports the
 standard library, `feetbrowser_engine` -- which is our own code in another
 language -- and `feetplayer`, which is our own code in another repository.
 
+The Rust extension has four crate dependencies. Three are third-party:
+`pyo3`, which is the reason the extension can be imported at all, and
+`miniz_oxide` and `serde_json`, both argued about below. The fourth,
+`footnote`, is ours: the
+WHATWG tokenizer and tree builder, in a repository of its own for the same
+reason `feetplayer` is -- nothing in it knows a browser exists, it has an
+empty `[dependencies]` of its own, and its conformance suite is 27k lines of
+vendored fixtures that only it ever ran. It is pinned by full commit sha in
+`rust/Cargo.toml`, which is the only place that sha appears, and the same
+warning applies: check that the pin is a sha and not a branch, because a
+branch would make every build parse pages differently.
+
 `feetplayer` is required, and that is a change worth stating plainly rather
 than burying: `feetbrowser/media.py` imports it at the top of the file, so
 the browser does not start without it installed. It is the media stack --

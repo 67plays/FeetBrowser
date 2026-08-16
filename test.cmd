@@ -71,10 +71,11 @@ if errorlevel 1 goto norust
 if errorlevel 1 goto nolinker
 :built
 
-rem The Rust half has 122 tests of its own -- the tokenizer, the regexp
-rem engine, the layout reproductions and the html5lib tree construction
-rem suite. They ran nowhere: CI only ever did `cargo check --all-targets`,
-rem which compiles a test without running it. They cost 0.07s.
+rem The Rust half has 60 tests of its own -- the regexp engine, the CSS
+rem matcher, the layout reproductions. They ran nowhere: CI only ever did
+rem `cargo check --all-targets`, which compiles a test without running it.
+rem They cost hundredths of a second. The tokenizer and tree builder are
+rem `footnote`'s now, and it runs its own suite.
 where /q cargo
 if errorlevel 1 goto nocargotest
 cargo test -q --manifest-path rust/Cargo.toml || exit /b 1
