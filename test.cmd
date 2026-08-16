@@ -60,6 +60,15 @@ if errorlevel 1 goto norust
 if errorlevel 1 goto nolinker
 :built
 
+rem The Rust half has 122 tests of its own -- the tokenizer, the regexp
+rem engine, the layout reproductions and the html5lib tree construction
+rem suite. They ran nowhere: CI only ever did `cargo check --all-targets`,
+rem which compiles a test without running it. They cost 0.07s.
+where /q cargo
+if errorlevel 1 goto nocargotest
+cargo test -q --manifest-path rust/Cargo.toml || exit /b 1
+:nocargotest
+
 "%PY%" -c "import pyflakes" >nul 2>&1
 if errorlevel 1 (
   "%PY%" -m pip install -q pyflakes || exit /b 1
